@@ -1,0 +1,43 @@
+src/auth/client.rs
+  s_883239f91c6fd1::t_5f0d30a349f26a 225-240
+src/commands/login.rs
+  s_883239f91c6fd1::t_bd014aa68d8c40 76-102,104-105,107-111,141,143-151,153-155
+  s_883239f91c6fd1::t_7b869d01624bc2 112-140,142,156-169
+server/src/routes/notes.rs
+  s_883239f91c6fd1::t_4d4c4a2f4365d6 54,58-61
+  s_883239f91c6fd1::t_41c980e9a70107 50-53,55-57,62-64
+server/migrations/0002_cli_audit_log.sql
+  s_883239f91c6fd1::t_6c224261e8e7d0 1-23
+src/commands/autter_handlers.rs
+  s_883239f91c6fd1::t_e9f034813a338a 377-378
+server/src/audit.rs
+  s_883239f91c6fd1::t_758e27c04dbdd2 1,3-7,9-12,18-20,24,26-27,29-31,33,35,37,42
+  s_883239f91c6fd1::t_0e9ab229c55d6d 2,8,13-17,21-23,25,28,32,34,36,38-41,43-44
+server/src/routes/cas.rs
+  s_883239f91c6fd1::t_49c5593178fb4f 51
+  s_883239f91c6fd1::t_09db8fc6a0a692 70-72,74-77,79-87
+  s_883239f91c6fd1::t_e6c5068e063713 27
+  s_883239f91c6fd1::t_792417f964e615 73,78
+server/src/auth.rs
+  s_883239f91c6fd1::t_e25f068de85748 56-57
+  s_883239f91c6fd1::t_3fcb41f52d90a5 41-43
+  s_883239f91c6fd1::t_e495fdcf1565f1 117
+server/src/main.rs
+  s_883239f91c6fd1::t_ed6760d4d87ff6 21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "e87a9c5e20f5830e9d2564295e201a651dbde411",
+  "prompts": {},
+  "sessions": {
+    "s_883239f91c6fd1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed173-e31c-7338-b693-fc04c66237fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
