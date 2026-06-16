@@ -7,6 +7,7 @@ use axum::Json;
 use crate::models::ApiErrorResponse;
 
 #[derive(Debug)]
+#[allow(dead_code)] // BadRequest is part of the API surface, not yet used by a handler
 pub enum AppError {
     Unauthorized(String),
     BadRequest(String),
