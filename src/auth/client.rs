@@ -228,14 +228,63 @@ impl OAuthClient {
     /// returns it unchanged (PATs are stable, not rotated). Used by
     /// `autter login --token <PAT>` to validate the token and seed credentials.
     pub fn exchange_pat(&self, pat: &str) -> Result<StoredCredentials, String> {
-        let body = serde_json::json!({
+        self.exchange_pat_for_org(pat, None)
+    }
+
+    /// Exchange a PAT for credentials scoped to a specific org.
+    ///
+    /// `org_id = None` mints for the token's home org. A specific `org_id` mints
+    /// for that org (the backend verifies the PAT owner is a member) — this is how
+    /// the CLI routes a push to the org that owns the current repository.
+    pub fn exchange_pat_for_org(
+        &self,
+        pat: &str,
+        org_id: Option<&str>,
+    ) -> Result<StoredCredentials, String> {
+        let mut body = serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": pat,
             "client_id": "autter-cli"
         });
+        if let Some(org) = org_id {
+            body["org_id"] = serde_json::Value::String(org.to_string());
+        }
 
         self.exchange_token(body)
             .map_err(|e| format!("Token sign-in failed: {}", e))
+    }
+
+    /// Resolve which org owns a repository (by `owner/repo` or remote URL), so a
+    /// push can be routed to the right org. Returns `None` when no org tracks it
+    /// (the caller should fall back to the PAT's home org).
+    pub fn resolve_org_for_repo(
+        &self,
+        pat: &str,
+        repo: &str,
+    ) -> Result<Option<String>, String> {
+        let url = format!("{}/worker/oauth/resolve-org", self.base_url);
+        let body = serde_json::json!({ "pat": pat, "repo": repo });
+
+        let (_agent, request) = ApiContext::http_post(&url, Some(30));
+        let request = request.set("Content-Type", "application/json");
+        let response = http::send_with_body(request, &body.to_string())
+            .map_err(|e| format!("Failed to connect to server: {}", e))?;
+
+        if response.status_code != 200 {
+            return Err(format!("resolve-org failed ({})", response.status_code));
+        }
+
+        let body = response
+            .as_str()
+            .map_err(|e| format!("Invalid response encoding: {}", e))?;
+
+        #[derive(serde::Deserialize)]
+        struct ResolveOrgResponse {
+            org_id: Option<String>,
+        }
+        let parsed: ResolveOrgResponse = serde_json::from_str(body)
+            .map_err(|e| format!("Invalid resolve-org response: {}", e))?;
+        Ok(parsed.org_id)
     }
 
     /// Exchange an install nonce for credentials (auto-login from web install page)

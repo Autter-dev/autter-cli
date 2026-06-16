@@ -567,7 +567,7 @@ pub fn flush_notes() {
             return;
         }
     };
-    let context = ApiContext::new(Some(backend_url));
+    let context = ApiContext::new(Some(backend_url.clone()));
     let client = ApiClient::new(context);
 
     if !client.is_logged_in() && !client.has_api_key() {
@@ -600,51 +600,87 @@ pub fn flush_notes() {
         return;
     }
 
-    let commit_shas: Vec<String> = pending.iter().map(|p| p.commit_sha.clone()).collect();
+    // Route each note to the org that owns its repo. Notes whose repo isn't known
+    // or isn't tracked by any org go to the home org (org = None → default token).
+    let mut groups: std::collections::HashMap<Option<String>, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for note in &pending {
+        let org = note
+            .repo_url
+            .as_deref()
+            .and_then(crate::api::client::resolve_org_for_repo_cached);
+        groups
+            .entry(org)
+            .or_default()
+            .push((note.commit_sha.clone(), note.content.clone()));
+    }
 
-    let entries: Vec<NoteEntry> = pending
-        .iter()
-        .map(|p| NoteEntry {
-            commit_sha: p.commit_sha.clone(),
-            content: p.content.clone(),
-        })
-        .collect();
+    for (org_opt, batch) in groups {
+        let commit_shas: Vec<String> = batch.iter().map(|(sha, _)| sha.clone()).collect();
+        let entries: Vec<NoteEntry> = batch
+            .iter()
+            .map(|(sha, content)| NoteEntry {
+                commit_sha: sha.clone(),
+                content: content.clone(),
+            })
+            .collect();
 
-    let request = NotesUploadRequest { entries };
+        // Pick the client for this org. A resolved org mints an org-scoped token;
+        // if minting fails we defer (mark failed → retry) rather than misroute.
+        let group_client = match &org_opt {
+            Some(org) => match crate::api::client::access_token_for_org(org) {
+                Some(token) => {
+                    ApiClient::new(ApiContext::with_auth(Some(backend_url.clone()), token))
+                }
+                None => {
+                    if let Ok(db) = crate::notes::db::NotesDatabase::global()
+                        && let Ok(mut lock) = db.lock()
+                    {
+                        let _ = lock
+                            .mark_failed(&commit_shas, "could not mint org-scoped token");
+                    }
+                    continue;
+                }
+            },
+            None => ApiClient::new(ApiContext::new(Some(backend_url.clone()))),
+        };
 
-    match client.upload_notes(request) {
-        Ok(resp) => {
-            tracing::debug!(
-                success = resp.success_count,
-                failure = resp.failure_count,
-                "notes: uploaded batch"
-            );
-            if let Ok(db) = crate::notes::db::NotesDatabase::global()
-                && let Ok(mut lock) = db.lock()
-            {
-                if resp.failure_count == 0 {
-                    let _ = lock.mark_synced(&commit_shas);
-                } else {
-                    // Server reported partial failures but doesn't identify which
-                    // entries failed. Mark the entire batch as failed so all entries
-                    // are retried on the next flush cycle.
-                    let _ = lock.mark_failed(
-                        &commit_shas,
-                        &format!(
-                            "partial failure: {}/{} entries failed",
-                            resp.failure_count,
-                            commit_shas.len()
-                        ),
-                    );
+        let request = NotesUploadRequest { entries };
+        match group_client.upload_notes(request) {
+            Ok(resp) => {
+                tracing::debug!(
+                    success = resp.success_count,
+                    failure = resp.failure_count,
+                    org = org_opt.as_deref().unwrap_or("home"),
+                    "notes: uploaded batch"
+                );
+                if let Ok(db) = crate::notes::db::NotesDatabase::global()
+                    && let Ok(mut lock) = db.lock()
+                {
+                    if resp.failure_count == 0 {
+                        let _ = lock.mark_synced(&commit_shas);
+                    } else {
+                        // Server reported partial failures but doesn't identify which
+                        // entries failed. Mark the whole group failed so all entries
+                        // retry on the next flush cycle.
+                        let _ = lock.mark_failed(
+                            &commit_shas,
+                            &format!(
+                                "partial failure: {}/{} entries failed",
+                                resp.failure_count,
+                                commit_shas.len()
+                            ),
+                        );
+                    }
                 }
             }
-        }
-        Err(e) => {
-            tracing::warn!(%e, "notes: upload error");
-            if let Ok(db) = crate::notes::db::NotesDatabase::global()
-                && let Ok(mut lock) = db.lock()
-            {
-                let _ = lock.mark_failed(&commit_shas, &e.to_string());
+            Err(e) => {
+                tracing::warn!(%e, "notes: upload error");
+                if let Ok(db) = crate::notes::db::NotesDatabase::global()
+                    && let Ok(mut lock) = db.lock()
+                {
+                    let _ = lock.mark_failed(&commit_shas, &e.to_string());
+                }
             }
         }
     }

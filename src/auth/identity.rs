@@ -6,7 +6,25 @@ pub struct TokenIdentity {
     pub email: Option<String>,
     pub name: Option<String>,
     pub personal_org_id: Option<String>,
+    /// The org this token is scoped to (the `org_id` claim).
+    pub active_org_id: Option<String>,
     pub orgs: Vec<TokenOrg>,
+}
+
+impl TokenIdentity {
+    /// The org entry this token is scoped to, matched from `orgs` by the active
+    /// `org_id`. Falls back to the sole org when there's exactly one.
+    pub fn active_org(&self) -> Option<&TokenOrg> {
+        if let Some(id) = self.active_org_id.as_deref() {
+            if let Some(org) = self.orgs.iter().find(|o| o.org_id.as_deref() == Some(id)) {
+                return Some(org);
+            }
+        }
+        if self.orgs.len() == 1 {
+            return self.orgs.first();
+        }
+        None
+    }
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -22,6 +40,7 @@ struct AccessTokenClaims {
     pub sub: Option<String>,
     pub email: Option<String>,
     pub name: Option<String>,
+    pub org_id: Option<String>,
     #[serde(default)]
     pub orgs: Vec<TokenOrg>,
     pub personal_org_id: Option<String>,
@@ -51,6 +70,7 @@ pub fn extract_identity_from_access_token(access_token: &str) -> TokenIdentity {
         email: claims.email,
         name: claims.name,
         personal_org_id: claims.personal_org_id,
+        active_org_id: claims.org_id,
         orgs: claims.orgs,
     }
 }

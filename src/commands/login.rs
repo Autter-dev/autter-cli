@@ -90,7 +90,35 @@ pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
         .store(&creds)
         .map_err(|e| format!("Failed to store credentials: {}", e))?;
 
+    print_login_success(&creds.access_token);
     Ok(LoginOutcome::LoggedIn)
+}
+
+/// Print "Successfully logged in!" plus the signed-in user and active org, read
+/// from the access token's claims (best-effort — falls back gracefully).
+fn print_login_success(access_token: &str) {
+    use crate::auth::identity::extract_identity_from_access_token;
+
+    eprintln!("Successfully logged in!");
+    let identity = extract_identity_from_access_token(access_token);
+
+    if let Some(name) = identity.name.as_deref().filter(|s| !s.is_empty()) {
+        match identity.email.as_deref().filter(|s| !s.is_empty()) {
+            Some(email) => eprintln!("  Signed in as {} ({})", name, email),
+            None => eprintln!("  Signed in as {}", name),
+        }
+    } else if let Some(email) = identity.email.as_deref().filter(|s| !s.is_empty()) {
+        eprintln!("  Signed in as {}", email);
+    }
+
+    if let Some(org) = identity.active_org() {
+        if let Some(org_name) = org.org_name.as_deref().filter(|s| !s.is_empty()) {
+            match org.org_slug.as_deref().filter(|s| !s.is_empty()) {
+                Some(slug) => eprintln!("  Organization: {} ({})", org_name, slug),
+                None => eprintln!("  Organization: {}", org_name),
+            }
+        }
+    }
 }
 
 /// Extract a `--token <value>` or `--token=<value>` argument, if present.
@@ -110,14 +138,47 @@ fn parse_token_arg(args: &[String]) -> Option<String> {
 }
 
 /// The Autter web dashboard, where the user creates a Personal Access Token.
-/// Overridable via `AUTTER_WEB_URL` for local development (e.g. a Vite dev server).
 const DEFAULT_WEB_APP_URL: &str = "https://app.autter.dev";
 
+/// Resolve the web dashboard URL. Precedence:
+///   1. `AUTTER_WEB_URL` env (explicit override, e.g. a local Vite dev server)
+///   2. derived from the configured `api_base_url` (swap the `api` host label)
+///   3. the default `https://app.autter.dev`
 fn web_app_url() -> String {
-    std::env::var("AUTTER_WEB_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_WEB_APP_URL.to_string())
+    if let Ok(url) = std::env::var("AUTTER_WEB_URL")
+        && !url.trim().is_empty()
+    {
+        return url;
+    }
+    if let Some(web) = derive_web_url_from_api(crate::config::Config::get().api_base_url()) {
+        return web;
+    }
+    DEFAULT_WEB_APP_URL.to_string()
+}
+
+/// Derive the web app URL from the API base URL by swapping the leading `api`
+/// host label for `app`, e.g. `https://test-api.autter.dev` ->
+/// `https://test-app.autter.dev`, `https://api.autter.dev` -> `https://app.autter.dev`.
+/// Returns `None` when there is no `api` label to swap.
+fn derive_web_url_from_api(api_base_url: &str) -> Option<String> {
+    let (scheme, rest) = api_base_url.split_once("://")?;
+    let (host, tail) = match rest.split_once('/') {
+        Some((h, t)) => (h, Some(t)),
+        None => (rest, None),
+    };
+    let (first, remainder) = host.split_once('.')?;
+    let new_first = if first == "api" {
+        "app".to_string()
+    } else if let Some(prefix) = first.strip_suffix("-api") {
+        format!("{prefix}-app")
+    } else {
+        return None;
+    };
+    let new_host = format!("{new_first}.{remainder}");
+    Some(match tail {
+        Some(t) => format!("{scheme}://{new_host}/{t}"),
+        None => format!("{scheme}://{new_host}"),
+    })
 }
 
 /// Print the step-by-step browser sign-in instructions.
@@ -141,14 +202,10 @@ fn print_login_instructions(url: &str) {
 pub fn handle_login(args: &[String]) {
     // Step 2: complete sign-in with a token created in the browser.
     if let Some(token) = parse_token_arg(args) {
-        match run_pat_login(&token) {
-            Ok(_) => {
-                eprintln!("Successfully logged in!");
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
+        // run_pat_login prints the success message + identity on success.
+        if let Err(e) = run_pat_login(&token) {
+            eprintln!("{}", e);
+            std::process::exit(1);
         }
         return;
     }

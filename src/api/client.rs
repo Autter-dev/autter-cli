@@ -61,6 +61,75 @@ fn try_load_auth_token() -> Option<String> {
     // Mutex guard is automatically released when _guard is dropped
 }
 
+/// Prefix marking a Personal Access Token (mirrors the backend).
+const PAT_PREFIX: &str = "autter_pat_";
+
+/// In-process cache: repo remote URL → resolved owning org id (None = untracked).
+static ORG_RESOLVE_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<String>>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// In-process cache: org id → (access token, unix expiry).
+static ORG_TOKEN_CACHE: Lazy<Mutex<std::collections::HashMap<String, (String, i64)>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Load the stored Personal Access Token (the refresh-token slot), if the user is
+/// logged in with a PAT. Per-org routing only works with a PAT; device refresh
+/// tokens return None so callers fall back to the single home-org token.
+fn load_stored_pat() -> Option<String> {
+    let creds = CredentialStore::new().load().ok().flatten()?;
+    if creds.is_refresh_token_expired() {
+        return None;
+    }
+    if !creds.refresh_token.starts_with(PAT_PREFIX) {
+        return None;
+    }
+    Some(creds.refresh_token)
+}
+
+/// Resolve which org owns the repo at `repo_url`, cached in-process. Returns None
+/// when no org tracks it, the user isn't logged in with a PAT, or resolution fails
+/// — callers then fall back to the home org.
+pub fn resolve_org_for_repo_cached(repo_url: &str) -> Option<String> {
+    if let Ok(cache) = ORG_RESOLVE_CACHE.lock()
+        && let Some(hit) = cache.get(repo_url)
+    {
+        return hit.clone();
+    }
+    let pat = load_stored_pat()?;
+    let resolved = OAuthClient::new()
+        .resolve_org_for_repo(&pat, repo_url)
+        .ok()
+        .flatten();
+    if let Ok(mut cache) = ORG_RESOLVE_CACHE.lock() {
+        cache.insert(repo_url.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+/// Get an access token scoped to `org_id`, minted from the stored PAT and cached
+/// in-process until near expiry. Returns None if not logged in with a PAT or the
+/// mint fails (caller should NOT fall back to another org — retry instead).
+pub fn access_token_for_org(org_id: &str) -> Option<String> {
+    let now = chrono::Utc::now().timestamp();
+    if let Ok(cache) = ORG_TOKEN_CACHE.lock()
+        && let Some((token, exp)) = cache.get(org_id)
+        && *exp > now + 300
+    {
+        return Some(token.clone());
+    }
+    let pat = load_stored_pat()?;
+    let creds = OAuthClient::new()
+        .exchange_pat_for_org(&pat, Some(org_id))
+        .ok()?;
+    if let Ok(mut cache) = ORG_TOKEN_CACHE.lock() {
+        cache.insert(
+            org_id.to_string(),
+            (creds.access_token.clone(), creds.access_token_expires_at),
+        );
+    }
+    Some(creds.access_token)
+}
+
 /// Resolve the autter effective author identity without requiring a Repository instance.
 ///
 /// Uses the shared git identity helper to get the current user's identity,
