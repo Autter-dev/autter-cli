@@ -1,0 +1,36 @@
+server/Cargo.toml
+  s_e05962970fb787::t_527446e9995d7c 28
+  s_e05962970fb787::t_3546e62f320a29 14,25-27
+server/README.md
+  s_e05962970fb787::t_89e111d39dfcfd 3-5,8,10-38,40-43,47-51,63,68,71-72,77-78,84,86-88,91
+server/src/state.rs
+  s_e05962970fb787::t_b6e955a048fd59 1,3-6,8-52,56-57
+server/src/routes/cas.rs
+  s_e05962970fb787::t_060a6373d1f09a 1,23-24,31-32,34,36,38,43-44,85,104-105,107,110
+server/migrations/0001_init.sql
+  s_e05962970fb787::t_a9d9005095bb3d 1,3-6,8-11,13-14,16,18-19,21,25-26,28,31-32
+server/src/auth.rs
+  s_e05962970fb787::t_9c6eb02fab0821 138-139,144
+  s_e05962970fb787::t_67b2ad09083edd 1,3-6,8-19,22-25,29-46,48,50-51,55-62,64-77,81-84,86-99,101-108,110,112,115-122,124-131,133-137,140-143,145-202,204-215
+  s_e05962970fb787::t_893b6521bf98d8 47,49
+server/src/routes/notes.rs
+  s_e05962970fb787::t_92b275a049a082 1,3,21-22,34-40,44-46,74,91-92,94,97
+server/src/main.rs
+  s_e05962970fb787::t_2ef6b8e910dc61 1,4-9,12-18,27,30,33-37,49-51,55-59,63-69,86-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "99aa6c09f91dc210256f7100b2769101e6a8d00a",
+  "prompts": {},
+  "sessions": {
+    "s_e05962970fb787": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ecefd-c86d-719c-8170-5f7f2f4156b0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
