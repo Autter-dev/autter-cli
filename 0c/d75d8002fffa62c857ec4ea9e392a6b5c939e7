@@ -1,0 +1,19 @@
+server/src/error.rs
+  s_e05962970fb787::t_2f29f3f77dcf49 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "0cd75d8002fffa62c857ec4ea9e392a6b5c939e7",
+  "prompts": {},
+  "sessions": {
+    "s_e05962970fb787": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ecefd-c86d-719c-8170-5f7f2f4156b0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
