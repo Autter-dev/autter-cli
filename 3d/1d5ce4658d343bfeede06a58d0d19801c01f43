@@ -1,0 +1,32 @@
+scripts/dev.sh
+  s_e05962970fb787::t_a24ec99e82d888 80-82
+src/config.rs
+  s_e05962970fb787::t_d73281b444aed7 265-269
+src/commands/mod.rs
+  s_e05962970fb787::t_7581d2d417f1ba 20
+src/commands/onboard.rs
+  s_e05962970fb787::t_041a5844127b2b 1-182
+src/commands/autter_handlers.rs
+  s_e05962970fb787::t_8d41699462302c 187-189
+  s_e05962970fb787::t_0433bf34dbd090 373-376
+src/commands/login.rs
+  s_e05962970fb787::t_6ac29fb52825aa 3-16,23,31-33,59-74,76-83,87
+install.sh
+  s_e05962970fb787::t_0db02429f0d252 420-424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "3d1d5ce4658d343bfeede06a58d0d19801c01f43",
+  "prompts": {},
+  "sessions": {
+    "s_e05962970fb787": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ecefd-c86d-719c-8170-5f7f2f4156b0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
