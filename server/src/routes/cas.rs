@@ -1,0 +1,146 @@
+//! CAS (prompt-transcript) storage endpoints.
+//!
+//! - `POST /worker/cas/upload` — store a batch of content-addressed objects.
+//! - `GET  /worker/cas/?hashes=h1,h2` — read objects by hash.
+
+use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::Json;
+use serde::Deserialize;
+use std::collections::HashMap;
+
+use crate::auth::authenticate;
+use crate::error::AppError;
+use crate::models::{
+    CasReadResponse, CasReadResult, CasUploadRequest, CasUploadResponse, CasUploadResult,
+};
+use crate::state::AppState;
+
+pub async fn upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CasUploadRequest>,
+) -> Result<Json<CasUploadResponse>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+
+    let mut results = Vec::with_capacity(req.objects.len());
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+
+    for obj in req.objects {
+        let metadata = serde_json::to_value(&obj.metadata)
+            .unwrap_or_else(|_| serde_json::json!({}));
+
+        // Dedup per (org, hash): re-uploading the same content is a no-op.
+        let result = sqlx::query(
+            "INSERT INTO cas_objects (org_id, hash, content, metadata)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (org_id, hash) DO NOTHING",
+        )
+        .bind(auth.org_id)
+        .bind(&obj.hash)
+        .bind(&obj.content)
+        .bind(&metadata)
+        .execute(&state.pool)
+        .await;
+
+        match result {
+            Ok(_) => {
+                success_count += 1;
+                results.push(CasUploadResult {
+                    hash: obj.hash,
+                    status: "ok".to_string(),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(hash = %obj.hash, "cas upsert failed: {e}");
+                failure_count += 1;
+                results.push(CasUploadResult {
+                    hash: obj.hash,
+                    status: "error".to_string(),
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(Json(CasUploadResponse {
+        results,
+        success_count,
+        failure_count,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HashesQuery {
+    hashes: Option<String>,
+}
+
+pub async fn read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashesQuery>,
+) -> Result<Json<CasReadResponse>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+
+    let hashes: Vec<String> = q
+        .hashes
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    if hashes.is_empty() {
+        return Ok(Json(CasReadResponse {
+            results: Vec::new(),
+            success_count: 0,
+            failure_count: 0,
+        }));
+    }
+
+    let rows = sqlx::query_as::<_, (String, serde_json::Value)>(
+        "SELECT hash, content FROM cas_objects WHERE org_id = $1 AND hash = ANY($2)",
+    )
+    .bind(auth.org_id)
+    .bind(&hashes)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let found: HashMap<String, serde_json::Value> = rows.into_iter().collect();
+
+    let mut results = Vec::with_capacity(hashes.len());
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+
+    for hash in hashes {
+        match found.get(&hash) {
+            Some(content) => {
+                success_count += 1;
+                results.push(CasReadResult {
+                    hash,
+                    status: "ok".to_string(),
+                    content: Some(content.clone()),
+                    error: None,
+                });
+            }
+            None => {
+                failure_count += 1;
+                results.push(CasReadResult {
+                    hash,
+                    status: "error".to_string(),
+                    content: None,
+                    error: Some("not found".to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(Json(CasReadResponse {
+        results,
+        success_count,
+        failure_count,
+    }))
+}

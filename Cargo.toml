@@ -1,3 +1,12 @@
+[workspace]
+# The CLI (this root package) and the open-source platform backend live in one
+# workspace so the data contract is visible in the same repo. `default-members`
+# keeps `cargo build` / `task dev` fast by building only the CLI by default;
+# build the backend explicitly with `cargo build -p autter-server`.
+members = ["server"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "autter"
 version = "1.5.9"
