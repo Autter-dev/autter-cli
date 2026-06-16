@@ -1,0 +1,42 @@
+src/api/client.rs
+  s_883239f91c6fd1::t_56bdb5ad98c39d 64-132
+src/git/notes_api.rs
+  s_883239f91c6fd1::t_d8d2dc8b3ce6b3 23-26
+  s_883239f91c6fd1::t_ae2b571cf95ad3 629,669-670,755,813
+  s_883239f91c6fd1::t_51d82d2653fec6 515-519,524,530-533,538
+  s_883239f91c6fd1::t_5270ac551e678c 39-42
+src/commands/login.rs
+  s_883239f91c6fd1::t_466a28897a6540 205-208
+  s_883239f91c6fd1::t_c7cab75b685d56 93,97-121
+  s_883239f91c6fd1::t_646e2a7b3d54c2 143-146,148-181
+src/notes/db.rs
+  s_883239f91c6fd1::t_a6b91b3b77d987 407,426
+  s_883239f91c6fd1::t_21f05189668050 20,42-46
+  s_883239f91c6fd1::t_846d99c6624a5b 59-61
+  s_883239f91c6fd1::t_62d776927f25e1 246-255,259-260,263,269,276-284,293-294,297,305
+src/auth/identity.rs
+  s_883239f91c6fd1::t_3b3f4b7353ae39 43
+  s_883239f91c6fd1::t_a984ff21109b39 73
+  s_883239f91c6fd1::t_556349d22ec00b 9-10,14-27
+src/auth/client.rs
+  s_883239f91c6fd1::t_d9fa8f7f8c93bc 231-244,249-251,257-287
+src/daemon/telemetry_worker.rs
+  s_883239f91c6fd1::t_976eed6b95589f 603-616,618-646,648-674,677-683
+  s_883239f91c6fd1::t_6b08119a0c3f01 570
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "2a64974e6ecad37543c7205da97123f5d0e1a385",
+  "prompts": {},
+  "sessions": {
+    "s_883239f91c6fd1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed173-e31c-7338-b693-fc04c66237fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
