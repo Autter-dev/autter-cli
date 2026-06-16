@@ -18,6 +18,7 @@
 //! - `AUTTER_SERVER_DEV_AUTH`   set to `1` to decode tokens WITHOUT verifying
 //!                              the signature (development only).
 
+mod audit;
 mod auth;
 mod error;
 mod models;

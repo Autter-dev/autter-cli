@@ -222,6 +222,22 @@ impl OAuthClient {
             .map_err(|e| format!("Token refresh failed: {}", e))
     }
 
+    /// Exchange a Personal Access Token (PAT) for credentials.
+    ///
+    /// The PAT rides the refresh grant — the backend routes it by prefix and
+    /// returns it unchanged (PATs are stable, not rotated). Used by
+    /// `autter login --token <PAT>` to validate the token and seed credentials.
+    pub fn exchange_pat(&self, pat: &str) -> Result<StoredCredentials, String> {
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": pat,
+            "client_id": "autter-cli"
+        });
+
+        self.exchange_token(body)
+            .map_err(|e| format!("Token sign-in failed: {}", e))
+    }
+
     /// Exchange an install nonce for credentials (auto-login from web install page)
     pub fn exchange_install_nonce(&self, nonce: &str) -> Result<StoredCredentials, String> {
         let body = serde_json::json!({

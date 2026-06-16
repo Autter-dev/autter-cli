@@ -24,6 +24,7 @@ pub async fn upload(
     let pool = state.pools.get(&identity.org_db_url).await?;
 
     let mut results = Vec::with_capacity(req.objects.len());
+    let mut stored_hashes: Vec<String> = Vec::new();
     let mut success_count = 0usize;
     let mut failure_count = 0usize;
 
@@ -47,6 +48,7 @@ pub async fn upload(
         match result {
             Ok(_) => {
                 success_count += 1;
+                stored_hashes.push(obj.hash.clone());
                 results.push(CasUploadResult {
                     hash: obj.hash,
                     status: "ok".to_string(),
@@ -63,6 +65,24 @@ pub async fn upload(
                 });
             }
         }
+    }
+
+    // One audit row per upload batch summarizing the prompt/transcript objects
+    // pushed to the cloud (per-object would be far too chatty). Best-effort.
+    if !stored_hashes.is_empty() {
+        crate::audit::record_push(
+            &pool,
+            &identity,
+            None,
+            serde_json::json!({
+                "kind": "cas",
+                "stored_count": stored_hashes.len(),
+                "failure_count": failure_count,
+                "hashes": stored_hashes,
+                "distinct_id": identity.distinct_id,
+            }),
+        )
+        .await;
     }
 
     Ok(Json(CasUploadResponse {

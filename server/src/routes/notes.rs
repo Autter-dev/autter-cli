@@ -47,7 +47,21 @@ pub async fn upload(
         .await;
 
         match result {
-            Ok(_) => success_count += 1,
+            Ok(_) => {
+                success_count += 1;
+                // Audit the per-commit push so we know when authorship data for a
+                // given commit reached the cloud (best-effort; never fails the call).
+                crate::audit::record_push(
+                    &pool,
+                    &identity,
+                    Some(&entry.commit_sha),
+                    serde_json::json!({
+                        "kind": "notes",
+                        "distinct_id": identity.distinct_id,
+                    }),
+                )
+                .await;
+            }
             Err(e) => {
                 tracing::warn!(commit = %entry.commit_sha, "note upsert failed: {e}");
                 failure_count += 1;

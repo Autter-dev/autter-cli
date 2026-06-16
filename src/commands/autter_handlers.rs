@@ -374,7 +374,8 @@ fn print_help() {
     eprintln!("    --connect              Connect to the Autter platform (runs login)");
     eprintln!("    --local                Use local-only mode (no uploads)");
     eprintln!("    --force                Re-run onboarding even if already completed");
-    eprintln!("  login              Authenticate with Autter");
+    eprintln!("  login              Open the dashboard to create a sign-in token");
+    eprintln!("    --token <token>        Complete sign-in with a token from the dashboard");
     eprintln!("  logout             Clear stored credentials");
     eprintln!("  whoami             Show auth state and login identity");
     eprintln!("  version, -v, --version     Print the autter version");

@@ -38,6 +38,9 @@ struct Claims {
     name: Option<String>,
     org_id: Option<String>,
     org_db_url: Option<String>,
+    // Present only for PAT-minted tokens: the cli_token id, used to attribute
+    // pushed data to the specific Personal Access Token in the audit log.
+    token_id: Option<String>,
     // `exp` is validated by jsonwebtoken; we don't need to read it here.
 }
 
@@ -50,6 +53,8 @@ pub struct Identity {
     pub org_id: String,
     pub org_db_url: String,
     pub distinct_id: Option<String>,
+    /// The cli_token id, when the access token was minted from a PAT.
+    pub token_id: Option<String>,
 }
 
 pub struct JwtVerifier {
@@ -109,6 +114,7 @@ impl JwtVerifier {
             org_id,
             org_db_url,
             distinct_id,
+            token_id: claims.token_id,
         })
     }
 
