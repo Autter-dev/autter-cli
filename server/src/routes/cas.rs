@@ -1,4 +1,4 @@
-//! CAS (prompt-transcript) storage endpoints.
+//! CAS (prompt-transcript) storage endpoints (written to the caller's org database).
 //!
 //! - `POST /worker/cas/upload` — store a batch of content-addressed objects.
 //! - `GET  /worker/cas/?hashes=h1,h2` — read objects by hash.
@@ -9,7 +9,6 @@ use axum::Json;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::auth::authenticate;
 use crate::error::AppError;
 use crate::models::{
     CasReadResponse, CasReadResult, CasUploadRequest, CasUploadResponse, CasUploadResult,
@@ -21,27 +20,28 @@ pub async fn upload(
     headers: HeaderMap,
     Json(req): Json<CasUploadRequest>,
 ) -> Result<Json<CasUploadResponse>, AppError> {
-    let auth = authenticate(&state, &headers).await?;
+    let identity = state.verifier.authenticate(&headers).await?;
+    let pool = state.pools.get(&identity.org_db_url).await?;
 
     let mut results = Vec::with_capacity(req.objects.len());
     let mut success_count = 0usize;
     let mut failure_count = 0usize;
 
     for obj in req.objects {
-        let metadata = serde_json::to_value(&obj.metadata)
-            .unwrap_or_else(|_| serde_json::json!({}));
+        let metadata =
+            serde_json::to_value(&obj.metadata).unwrap_or_else(|_| serde_json::json!({}));
 
-        // Dedup per (org, hash): re-uploading the same content is a no-op.
+        // Dedup by hash: re-uploading the same content is a no-op.
         let result = sqlx::query(
-            "INSERT INTO cas_objects (org_id, hash, content, metadata)
+            "INSERT INTO cas_objects (hash, content, metadata, uploaded_by)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (org_id, hash) DO NOTHING",
+             ON CONFLICT (hash) DO NOTHING",
         )
-        .bind(auth.org_id)
         .bind(&obj.hash)
         .bind(&obj.content)
         .bind(&metadata)
-        .execute(&state.pool)
+        .bind(&identity.user_id)
+        .execute(&pool)
         .await;
 
         match result {
@@ -82,7 +82,7 @@ pub async fn read(
     headers: HeaderMap,
     Query(q): Query<HashesQuery>,
 ) -> Result<Json<CasReadResponse>, AppError> {
-    let auth = authenticate(&state, &headers).await?;
+    let identity = state.verifier.authenticate(&headers).await?;
 
     let hashes: Vec<String> = q
         .hashes
@@ -101,12 +101,13 @@ pub async fn read(
         }));
     }
 
+    let pool = state.pools.get(&identity.org_db_url).await?;
+
     let rows = sqlx::query_as::<_, (String, serde_json::Value)>(
-        "SELECT hash, content FROM cas_objects WHERE org_id = $1 AND hash = ANY($2)",
+        "SELECT hash, content FROM cas_objects WHERE hash = ANY($1)",
     )
-    .bind(auth.org_id)
     .bind(&hashes)
-    .fetch_all(&state.pool)
+    .fetch_all(&pool)
     .await?;
 
     let found: HashMap<String, serde_json::Value> = rows.into_iter().collect();

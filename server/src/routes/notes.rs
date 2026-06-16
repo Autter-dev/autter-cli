@@ -1,6 +1,6 @@
-//! Authorship-note storage endpoints.
+//! Authorship-note storage endpoints (written to the caller's org database).
 //!
-//! - `POST /worker/notes/upload` — upsert a batch of notes for the caller's org.
+//! - `POST /worker/notes/upload` — upsert a batch of notes.
 //! - `GET  /worker/notes/?commits=sha1,sha2` — read notes by commit SHA.
 
 use axum::extract::{Query, State};
@@ -9,7 +9,6 @@ use axum::Json;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::auth::authenticate;
 use crate::error::AppError;
 use crate::models::{NotesReadResponse, NotesUploadRequest, NotesUploadResponse};
 use crate::state::AppState;
@@ -19,7 +18,8 @@ pub async fn upload(
     headers: HeaderMap,
     Json(req): Json<NotesUploadRequest>,
 ) -> Result<Json<NotesUploadResponse>, AppError> {
-    let auth = authenticate(&state, &headers).await?;
+    let identity = state.verifier.authenticate(&headers).await?;
+    let pool = state.pools.get(&identity.org_db_url).await?;
 
     let mut success_count = 0usize;
     let mut failure_count = 0usize;
@@ -31,17 +31,19 @@ pub async fn upload(
         }
 
         let result = sqlx::query(
-            "INSERT INTO authorship_notes (org_id, commit_sha, content, uploaded_by, distinct_id)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (org_id, commit_sha)
-             DO UPDATE SET content = EXCLUDED.content, updated_at = now()",
+            "INSERT INTO authorship_notes (commit_sha, content, uploaded_by, distinct_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (commit_sha)
+             DO UPDATE SET content = EXCLUDED.content,
+                           uploaded_by = EXCLUDED.uploaded_by,
+                           distinct_id = EXCLUDED.distinct_id,
+                           updated_at = now()",
         )
-        .bind(auth.org_id)
         .bind(&entry.commit_sha)
         .bind(&entry.content)
-        .bind(auth.user_id)
-        .bind(&auth.distinct_id)
-        .execute(&state.pool)
+        .bind(&identity.user_id)
+        .bind(&identity.distinct_id)
+        .execute(&pool)
         .await;
 
         match result {
@@ -69,7 +71,7 @@ pub async fn read(
     headers: HeaderMap,
     Query(q): Query<CommitsQuery>,
 ) -> Result<Json<NotesReadResponse>, AppError> {
-    let auth = authenticate(&state, &headers).await?;
+    let identity = state.verifier.authenticate(&headers).await?;
 
     let commits: Vec<String> = q
         .commits
@@ -86,13 +88,13 @@ pub async fn read(
         }));
     }
 
+    let pool = state.pools.get(&identity.org_db_url).await?;
+
     let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT commit_sha, content FROM authorship_notes
-         WHERE org_id = $1 AND commit_sha = ANY($2)",
+        "SELECT commit_sha, content FROM authorship_notes WHERE commit_sha = ANY($1)",
     )
-    .bind(auth.org_id)
     .bind(&commits)
-    .fetch_all(&state.pool)
+    .fetch_all(&pool)
     .await?;
 
     let notes = rows.into_iter().collect::<HashMap<String, String>>();

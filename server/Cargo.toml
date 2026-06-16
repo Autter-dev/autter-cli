@@ -11,19 +11,21 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-native-tls",
     "postgres",
-    "uuid",
     "json",
     "macros",
     "migrate",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+# JWT verification against Better Auth's JWKS (autter.dev is the identity/control plane).
+jsonwebtoken = "9"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
