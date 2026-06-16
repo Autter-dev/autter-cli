@@ -184,6 +184,9 @@ pub fn handle_autter(args: &[String]) {
         "flush-metrics-db" => {
             commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
         }
+        "onboard" | "onboarding" | "setup" => {
+            commands::onboard::handle_onboard(&args[1..]);
+        }
         "login" => {
             commands::login::handle_login(&args[1..]);
         }
@@ -367,6 +370,10 @@ fn print_help() {
     eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
     eprintln!("    --remote <name>       Explicit remote name (default: upstream or origin)");
     eprintln!("    --json                Output result as JSON");
+    eprintln!("  onboard            Set up Autter (connect to the platform or run local)");
+    eprintln!("    --connect              Connect to the Autter platform (runs login)");
+    eprintln!("    --local                Use local-only mode (no uploads)");
+    eprintln!("    --force                Re-run onboarding even if already completed");
     eprintln!("  login              Authenticate with Autter");
     eprintln!("  logout             Clear stored credentials");
     eprintln!("  whoami             Show auth state and login identity");

@@ -417,9 +417,8 @@ fi
 echo ""
 echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use autter.${NC}"
 
-# If nonce exchange failed, run interactive login
-if [ "$NEED_LOGIN" = true ]; then
-    echo ""
-    echo "Launching login..."
-    ${INSTALL_DIR}/autter login
-fi
+# Walk the user through onboarding: choose local-only vs connecting to the
+# Autter platform. When the user opts to connect, this also handles login.
+# Skips itself gracefully in non-interactive installs (e.g. `curl | bash`).
+echo ""
+${INSTALL_DIR}/autter onboard || true

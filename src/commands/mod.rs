@@ -17,6 +17,7 @@ pub mod log;
 pub mod login;
 pub mod logout;
 pub mod notes_migrate;
+pub mod onboard;
 pub mod personal_dashboard;
 pub mod show;
 pub mod show_prompt;

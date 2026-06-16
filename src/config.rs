@@ -262,6 +262,11 @@ pub struct FileConfig {
     pub notes_backend: Option<NotesBackendConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_streaming_lookback_days: Option<u32>,
+    /// Whether the user has completed the first-run onboarding flow
+    /// (`autter onboard`). When unset/false, installers prompt the user to
+    /// choose between local-only and platform-connected modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_completed: Option<bool>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();

@@ -1,15 +1,26 @@
 use crate::auth::{CredentialStore, OAuthClient};
 
-/// Handle the `autter login` command
-pub fn handle_login(_args: &[String]) {
+/// Result of running the OAuth device-login flow.
+pub enum LoginOutcome {
+    /// Valid credentials were already present; no new login was performed.
+    AlreadyLoggedIn,
+    /// A fresh login completed successfully and credentials were stored.
+    LoggedIn,
+}
+
+/// Run the OAuth2 device-authorization flow.
+///
+/// Unlike [`handle_login`], this never calls `std::process::exit`, so it can be
+/// reused by other flows (e.g. `autter onboard`). It prints user-facing
+/// instructions to stderr and returns the outcome (or an error string).
+pub fn run_device_login() -> Result<LoginOutcome, String> {
     let store = CredentialStore::new();
 
     // Check if already logged in
     if let Ok(Some(creds)) = store.load()
         && !creds.is_refresh_token_expired()
     {
-        eprintln!("Already logged in. Use 'autter logout' to log out first.");
-        std::process::exit(0);
+        return Ok(LoginOutcome::AlreadyLoggedIn);
     }
 
     let client = OAuthClient::new();
@@ -17,13 +28,9 @@ pub fn handle_login(_args: &[String]) {
     // Start device flow
     eprintln!("Starting device authorization...\n");
 
-    let auth_response = match client.start_device_flow() {
-        Ok(response) => response,
-        Err(e) => {
-            eprintln!("Failed to start authorization: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let auth_response = client
+        .start_device_flow()
+        .map_err(|e| format!("Failed to start authorization: {}", e))?;
 
     // Build the display URL
     let display_url = auth_response
@@ -49,22 +56,35 @@ pub fn handle_login(_args: &[String]) {
     eprintln!("Waiting for authorization...");
 
     // Poll for token
-    match client.poll_for_token(
-        &auth_response.device_code,
-        auth_response.interval,
-        auth_response.expires_in,
-    ) {
-        Ok(creds) => {
-            // Store credentials
-            if let Err(e) = store.store(&creds) {
-                eprintln!("\nWarning: Failed to store credentials: {}", e);
-                eprintln!("You may need to log in again next time.");
-            }
+    let creds = client
+        .poll_for_token(
+            &auth_response.device_code,
+            auth_response.interval,
+            auth_response.expires_in,
+        )
+        .map_err(|e| format!("Authorization failed: {}", e))?;
 
+    // Store credentials (non-fatal on failure)
+    if let Err(e) = store.store(&creds) {
+        eprintln!("\nWarning: Failed to store credentials: {}", e);
+        eprintln!("You may need to log in again next time.");
+    }
+
+    Ok(LoginOutcome::LoggedIn)
+}
+
+/// Handle the `autter login` command
+pub fn handle_login(_args: &[String]) {
+    match run_device_login() {
+        Ok(LoginOutcome::AlreadyLoggedIn) => {
+            eprintln!("Already logged in. Use 'autter logout' to log out first.");
+            std::process::exit(0);
+        }
+        Ok(LoginOutcome::LoggedIn) => {
             eprintln!("\nSuccessfully logged in!");
         }
         Err(e) => {
-            eprintln!("\nAuthorization failed: {}", e);
+            eprintln!("\n{}", e);
             std::process::exit(1);
         }
     }

@@ -77,4 +77,7 @@ chmod +x "$HOME/.autter/bin/autter"
 echo "Running install hooks..."
 ~/.autter/bin/autter install
 
+# Onboarding: choose local-only vs connecting to the Autter platform.
+~/.autter/bin/autter onboard || true
+
 echo "Done!"
