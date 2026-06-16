@@ -1,0 +1,43 @@
+Cargo.toml
+  s_e05962970fb787::t_ee8965e189bb77 1-9
+server/src/main.rs
+  s_e05962970fb787::t_760f894c4293bf 1-78
+server/src/routes/cas.rs
+  s_e05962970fb787::t_38e6c5f5ac8208 1-146
+server/src/routes/notes.rs
+  s_e05962970fb787::t_2705eae45f97c5 1-100
+server/docker-compose.yml
+  s_e05962970fb787::t_089038b4952591 1-19
+server/src/models.rs
+  s_e05962970fb787::t_0574f531db1b19 1-89
+server/src/routes/mod.rs
+  s_e05962970fb787::t_0737b1dbed709b 1-24
+server/Cargo.toml
+  s_e05962970fb787::t_f284a49850b232 1-29
+server/migrations/0001_init.sql
+  s_e05962970fb787::t_691086fa8fb681 1-71
+server/src/error.rs
+  s_e05962970fb787::t_8af1300cfa9756 1-43
+server/src/state.rs
+  s_e05962970fb787::t_139d561e70f45f 1-13
+server/src/auth.rs
+  s_e05962970fb787::t_91f92e02b35d23 1-108
+server/README.md
+  s_e05962970fb787::t_5c3039865e2b73 1-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "7abea10cb1dacb203bbd77657eb5c58dc9d6d98d",
+  "prompts": {},
+  "sessions": {
+    "s_e05962970fb787": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ecefd-c86d-719c-8170-5f7f2f4156b0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
