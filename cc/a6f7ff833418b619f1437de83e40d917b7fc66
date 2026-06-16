@@ -1,0 +1,24 @@
+src/api/client.rs
+  s_3656a888a2599a::t_4a391bd2749820 108
+src/auth/client.rs
+  s_3656a888a2599a::t_cb36a0ba58a295 100-110,113
+server/src/main.rs
+  s_3656a888a2599a::t_95c5332005d31f 13-17
+  s_3656a888a2599a::t_69dded3a69527c 60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "cca6f7ff833418b619f1437de83e40d917b7fc66",
+  "prompts": {},
+  "sessions": {
+    "s_3656a888a2599a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed0ce-e250-764a-bcc6-993463ec5299",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
