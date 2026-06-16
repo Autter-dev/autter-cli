@@ -10,10 +10,11 @@
 //!
 //! Configuration (environment):
 //! - `BIND`                     listen address (default 0.0.0.0:8787)
-//! - `AUTTER_SERVER_JWKS_URL`   Better Auth JWKS endpoint, e.g.
-//!                              https://autter.dev/api/auth/jwks (required unless dev)
-//! - `AUTTER_SERVER_JWT_ISSUER`   optional expected `iss`
-//! - `AUTTER_SERVER_JWT_AUDIENCE` optional expected `aud`
+//! - `AUTTER_SERVER_JWKS_URL`   JWKS endpoint that publishes the CLI token
+//!                              signing keys, e.g.
+//!                              https://autter.dev/worker/oauth/jwks (required unless dev)
+//! - `AUTTER_SERVER_JWT_ISSUER`   optional expected `iss` (autter.dev sets it to APP_URL)
+//! - `AUTTER_SERVER_JWT_AUDIENCE` optional expected `aud` (autter.dev sets it to `autter-cli`)
 //! - `AUTTER_SERVER_DEV_AUTH`   set to `1` to decode tokens WITHOUT verifying
 //!                              the signature (development only).
 
@@ -56,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         );
     } else if jwks_url.is_none() {
         anyhow::bail!(
-            "AUTTER_SERVER_JWKS_URL must be set (e.g. https://autter.dev/api/auth/jwks), or set AUTTER_SERVER_DEV_AUTH=1 for local development"
+            "AUTTER_SERVER_JWKS_URL must be set (e.g. https://autter.dev/worker/oauth/jwks), or set AUTTER_SERVER_DEV_AUTH=1 for local development"
         );
     }
 

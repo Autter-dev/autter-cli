@@ -105,7 +105,7 @@ fn resolve_username() -> Option<String> {
     None
 }
 
-fn resolve_hostname() -> Option<String> {
+pub(crate) fn resolve_hostname() -> Option<String> {
     #[cfg(windows)]
     if let Ok(h) = std::env::var("COMPUTERNAME")
         && !h.trim().is_empty()

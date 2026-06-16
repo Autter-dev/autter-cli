@@ -97,9 +97,20 @@ impl OAuthClient {
     pub fn start_device_flow(&self) -> Result<DeviceAuthResponse, String> {
         let url = format!("{}/worker/oauth/device/code", self.base_url);
 
+        // Self-report device metadata so the approval screen and the persisted
+        // device record can show a meaningful "which device" (best-effort).
+        let device_name =
+            crate::api::client::resolve_hostname().unwrap_or_else(|| "autter CLI".to_string());
+        let body = serde_json::json!({
+            "client_id": "autter-cli",
+            "device_name": device_name,
+            "os": std::env::consts::OS,
+            "cli_version": env!("CARGO_PKG_VERSION"),
+        });
+
         let (_agent, request) = ApiContext::http_post(&url, Some(30));
         let request = request.set("Content-Type", "application/json");
-        let response = http::send_with_body(request, "{}")
+        let response = http::send_with_body(request, &body.to_string())
             .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
         if response.status_code != 200 {
