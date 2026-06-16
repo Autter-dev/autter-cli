@@ -1,0 +1,5 @@
+---
+source: src/authorship/stats.rs
+expression: mixed_output
+---
+"you  █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai\n     33%                                  67%\n"

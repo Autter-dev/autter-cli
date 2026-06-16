@@ -1,0 +1,94 @@
+---
+source: src/git/status.rs
+expression: entries
+---
+[
+    StatusEntry {
+        path: "src/lib.rs",
+        staged: Modified,
+        unstaged: Modified,
+        kind: Ordinary,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "src/bin/cli.rs",
+        staged: Added,
+        unstaged: Modified,
+        kind: Ordinary,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "src/conflict.rs",
+        staged: Unmodified,
+        unstaged: Unmerged,
+        kind: Unmerged,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "src/utils/helpers.rs",
+        staged: Renamed,
+        unstaged: Unmodified,
+        kind: Rename,
+        orig_path: Some(
+            "old utils/helpers.rs",
+        ),
+    },
+    StatusEntry {
+        path: "scripts/setup.sh",
+        staged: Copied,
+        unstaged: Unmodified,
+        kind: Copy,
+        orig_path: Some(
+            "scripts/setup-old.sh",
+        ),
+    },
+    StatusEntry {
+        path: "docs/README.md",
+        staged: Deleted,
+        unstaged: Unmodified,
+        kind: Ordinary,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "\"space dir\"/new file.txt",
+        staged: Added,
+        unstaged: Unmodified,
+        kind: Ordinary,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "path/with->symbol.rs",
+        staged: Modified,
+        unstaged: Unmodified,
+        kind: Ordinary,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "assets/logo (1).svg",
+        staged: Unmodified,
+        unstaged: Untracked,
+        kind: Untracked,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "dir with spaces/file name [draft].md",
+        staged: Unmodified,
+        unstaged: Untracked,
+        kind: Untracked,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "target/.keep",
+        staged: Unmodified,
+        unstaged: Ignored,
+        kind: Ignored,
+        orig_path: None,
+    },
+    StatusEntry {
+        path: "1 2 3 some unmerged/path.txt",
+        staged: Unmerged,
+        unstaged: Unmerged,
+        kind: Unmerged,
+        orig_path: None,
+    },
+]

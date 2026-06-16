@@ -1,0 +1,28 @@
+---
+source: tests/reset.rs
+expression: snapshot_checkpoints(&checkpoints)
+---
+[
+    SnapshotCheckpoint {
+        author: "ai",
+        has_agent: true,
+        agent_tool: Some(
+            "cursor",
+        ),
+        entries: [
+            SnapshotEntry {
+                file: "main.rs",
+                added_lines: [
+                    Range(
+                        1,
+                        2,
+                    ),
+                    Single(
+                        4,
+                    ),
+                ],
+                deleted_lines: [],
+            },
+        ],
+    },
+]

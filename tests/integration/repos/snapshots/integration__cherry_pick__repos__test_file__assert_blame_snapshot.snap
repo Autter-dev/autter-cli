@@ -1,0 +1,5 @@
+---
+source: tests/repos/test_file.rs
+expression: formatted
+---
+"Test User\n\nTest User 1) HUMAN\n\nmock_ai\n\nmock_ai 2) HUMAN\n\nTest User\n\nTest User 3) HUMAN\n\nmock_ai\n\nmock_ai 4) Hello, world!\n\nTest User\n\nTest User 5) og\n\nmock_ai\n\nmock_ai 6) og2\n"

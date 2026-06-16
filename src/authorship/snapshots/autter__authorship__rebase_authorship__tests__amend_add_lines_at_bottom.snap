@@ -1,0 +1,43 @@
+---
+source: src/authorship/rebase_authorship.rs
+expression: authorship_log
+---
+AuthorshipLogV3 {
+    attestations: [
+        FileAttestation {
+            file_path: "test.txt",
+            entries: [
+                AttestationEntry {
+                    hash: "976aa32",
+                    line_ranges: [
+                        Range(
+                            6,
+                            7,
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "",
+        prompts: {
+            "976aa32": PromptRecord {
+                agent_id: AgentId {
+                    tool: "cursor",
+                    id: "ai_agent",
+                    model: "gpt-4",
+                },
+                human_author: Some(
+                    "Test User <test@example.com>",
+                ),
+                messages: [],
+                total_additions: 2,
+                total_deletions: 0,
+                accepted_lines: 2,
+                overriden_lines: 0,
+            },
+        },
+    },
+}

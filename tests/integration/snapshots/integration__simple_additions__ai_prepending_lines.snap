@@ -1,0 +1,12 @@
+---
+source: tests/simple_additions.rs
+expression: blame
+---
+{
+    1: "Test User",
+    2: "cursor",
+    3: "cursor",
+    4: "cursor",
+    5: "Test User",
+    6: "Test User",
+}

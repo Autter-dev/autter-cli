@@ -1,0 +1,425 @@
+#!/bin/bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ============================================================
+# Ensure HOME is set when running via MDMs (e.g. JAMF) or other environments where HOME may be unbound.
+# ============================================================
+INSTALL_USER=""
+
+if [ -z "${HOME:-}" ]; then
+    if command -v scutil >/dev/null 2>&1; then
+        CURRENT_USER=$( /usr/sbin/scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ { print $3 }' || true )
+        if [ -n "${CURRENT_USER:-}" ] && [ "$CURRENT_USER" != "loginwindow" ] && [ "$CURRENT_USER" != "_mbsetupuser" ]; then
+            export HOME=$( /usr/bin/dscl . -read "/Users/$CURRENT_USER" NFSHomeDirectory | awk '{print $2}' )
+            INSTALL_USER="$CURRENT_USER"
+        else
+            echo "Error: No console user logged in. Deferring installation." >&2
+            exit 1
+        fi
+    elif id -un >/dev/null 2>&1; then
+        INSTALL_USER="$(id -un)"
+        export HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
+        if [ -z "$HOME" ]; then
+            export HOME="/root"
+        fi
+    else
+        export HOME="/root"
+    fi
+fi
+
+# Ensure SHELL is set (also may be unbound in JAMF)
+if [ -z "${SHELL:-}" ]; then
+    if command -v zsh >/dev/null 2>&1; then
+        SHELL="$(command -v zsh)"
+    elif command -v bash >/dev/null 2>&1; then
+        SHELL="$(command -v bash)"
+    else
+        SHELL="/bin/sh"
+    fi
+    export SHELL
+fi
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# GitHub repository details
+# Replaced during release builds with the actual repository (e.g., "autter-dev/autter-cli")
+# When set to __REPO_PLACEHOLDER__, defaults to "autter-dev/autter-cli"
+REPO="__REPO_PLACEHOLDER__"
+if [ "$REPO" = "__REPO_PLACEHOLDER__" ]; then
+    REPO="autter-dev/autter-cli"
+fi
+
+# Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")
+# When set to __VERSION_PLACEHOLDER__, defaults to "latest"
+PINNED_VERSION="__VERSION_PLACEHOLDER__"
+
+# Embedded checksums - replaced during release builds with actual SHA256 checksums
+# Format: "hash  filename|hash  filename|..." (pipe-separated)
+# When set to __CHECKSUMS_PLACEHOLDER__, checksum verification is skipped
+EMBEDDED_CHECKSUMS="__CHECKSUMS_PLACEHOLDER__"
+
+# Function to print error messages
+error() {
+    echo -e "${RED}Error: $1${NC}" >&2
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}Warning: $1${NC}" >&2
+}
+
+# Function to print success messages
+success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+# Function to verify checksum of downloaded binary
+verify_checksum() {
+    local file="$1"
+    local binary_name="$2"
+
+    # Skip verification if no checksums are embedded
+    if [ "$EMBEDDED_CHECKSUMS" = "__CHECKSUMS_PLACEHOLDER__" ]; then
+        return 0
+    fi
+
+    # Extract expected checksum for this binary
+    local expected=""
+    local old_ifs="$IFS"
+    IFS='|' read -ra CHECKSUM_ENTRIES <<< "$EMBEDDED_CHECKSUMS"
+    IFS="$old_ifs"
+    for entry in "${CHECKSUM_ENTRIES[@]}"; do
+        if [[ "$entry" =~ ^[[:xdigit:]]+[[:space:]]+$binary_name$ ]]; then
+            expected=$(echo "$entry" | awk '{print $1}')
+            break
+        fi
+    done
+
+    if [ -z "$expected" ]; then
+        error "No checksum found for $binary_name"
+    fi
+
+    # Calculate actual checksum
+    local actual=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        warn "Neither sha256sum nor shasum available, skipping checksum verification"
+        return 0
+    fi
+
+    if [ "$expected" != "$actual" ]; then
+        rm -f "$file" 2>/dev/null || true
+        error "Checksum verification failed for $binary_name\nExpected: $expected\nActual:   $actual"
+    fi
+
+    success "Checksum verified for $binary_name"
+}
+
+# Function to detect all shells with existing config files
+# Returns shell configurations in format: "shell_name|config_file" (one per line)
+detect_all_shells() {
+    local shells=""
+    
+    # Check for bash configs (prefer .bashrc over .bash_profile)
+    if [ -f "$HOME/.bashrc" ]; then
+        shells="${shells}bash|$HOME/.bashrc\n"
+    elif [ -f "$HOME/.bash_profile" ]; then
+        shells="${shells}bash|$HOME/.bash_profile\n"
+    fi
+    
+    # Check for zsh config
+    if [ -f "$HOME/.zshrc" ]; then
+        shells="${shells}zsh|$HOME/.zshrc\n"
+    fi
+    
+    # Check for fish config
+    if [ -f "$HOME/.config/fish/config.fish" ]; then
+        shells="${shells}fish|$HOME/.config/fish/config.fish\n"
+    fi
+    
+    # If no configs found, fall back to $SHELL detection and create config for that shell only
+    if [ -z "$shells" ]; then
+        local login_shell=""
+        if [ -n "${SHELL:-}" ]; then
+            login_shell=$(basename "$SHELL")
+        fi
+        case "$login_shell" in
+            fish)
+                shells="fish|$HOME/.config/fish/config.fish"
+                ;;
+            zsh)
+                shells="zsh|$HOME/.zshrc"
+                ;;
+            bash|*)
+                shells="bash|$HOME/.bashrc"
+                ;;
+        esac
+    fi
+    
+    # Remove trailing newline and output
+    printf '%b' "$shells" | sed '/^$/d'
+}
+
+# ============================================================
+# Warn when installing as root/sudo (not recommended).
+# Running as root creates files that normal-user processes
+# cannot access, causing persistent daemon lock failures.
+# ============================================================
+if [ "$(id -u)" = "0" ] && [ "${AUTTER_ALLOW_SUPERUSER:-}" != "1" ]; then
+    # Auto-allow in CI environments, MDM deployments (JAMF, etc.),
+    # and daemon-triggered self-updates (AUTTER_DAEMON_UPGRADE is set internally by the upgrade command)
+    IS_CI_OR_MDM=false
+    if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${GITLAB_CI:-}" ] \
+        || [ -n "${JENKINS_URL:-}" ] || [ -n "${BUILDKITE:-}" ] || [ -n "${CIRCLECI:-}" ] \
+        || [ -n "${CODEBUILD_BUILD_ID:-}" ] || [ -n "${AGENT_OS:-}" ] \
+        || [ -n "${KUBERNETES_SERVICE_HOST:-}" ] || [ -n "${INSTALL_USER:-}" ] \
+        || [ -n "${AUTTER_DAEMON_UPGRADE:-}" ] \
+        || [ -n "${container:-}" ] || [ -f "/.dockerenv" ]; then
+        IS_CI_OR_MDM=true
+    fi
+
+    if [ "$IS_CI_OR_MDM" = "false" ]; then
+        echo ""
+        echo -e "${YELLOW}Warning: installing autter as root/sudo is not recommended.${NC}"
+        echo ""
+        echo "Running with elevated privileges creates files owned by root that become"
+        echo "inaccessible to your normal user account, causing persistent daemon lock"
+        echo "failures. A future version may refuse to install in this configuration."
+        echo ""
+        echo "To suppress this warning, either:"
+        echo "  - Run this installer as your normal user (recommended), or"
+        echo "  - Set AUTTER_ALLOW_SUPERUSER=1"
+        echo ""
+    fi
+    # Propagate to child autter invocations (install-hooks, exchange-nonce, login)
+    export AUTTER_ALLOW_SUPERUSER=1
+fi
+
+# Detect OS and architecture
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+
+# Map architecture to binary name
+case $ARCH in
+    "x86_64")
+        ARCH="x64"
+        ;;
+    "aarch64"|"arm64")
+        ARCH="arm64"
+        ;;
+    *)
+        error "Unsupported architecture: $ARCH"
+        ;;
+esac
+
+# Map OS to binary name
+case $OS in
+    "darwin")
+        OS="macos"
+        ;;
+    "linux")
+        OS="linux"
+        ;;
+    *)
+        error "Unsupported operating system: $OS"
+        ;;
+esac
+
+# Determine binary name
+BINARY_NAME="autter-${OS}-${ARCH}"
+
+# Determine release tag
+# Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
+if [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
+    RELEASE_TAG="local"
+    DOWNLOAD_URL=""
+elif [ "$PINNED_VERSION" != "__VERSION_PLACEHOLDER__" ]; then
+    # Version-pinned install script from a release
+    RELEASE_TAG="$PINNED_VERSION"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
+elif [ -n "${AUTTER_RELEASE_TAG:-}" ] && [ "${AUTTER_RELEASE_TAG:-}" != "latest" ]; then
+    # Environment variable override
+    RELEASE_TAG="$AUTTER_RELEASE_TAG"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
+else
+    # Default to latest
+    RELEASE_TAG="latest"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}"
+fi
+
+# Install into the user's bin directory ~/.autter/bin
+INSTALL_DIR="$HOME/.autter/bin"
+
+# Create directory if it doesn't exist
+mkdir -p "$INSTALL_DIR"
+
+# Download and install
+TMP_FILE="${INSTALL_DIR}/autter.tmp.$$"
+if [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
+    echo "Using local autter binary (release: ${RELEASE_TAG})..."
+    if [ ! -f "$AUTTER_LOCAL_BINARY" ]; then
+        error "Local binary not found at $AUTTER_LOCAL_BINARY"
+    fi
+    cp "$AUTTER_LOCAL_BINARY" "$TMP_FILE"
+else
+    echo "Downloading autter (release: ${RELEASE_TAG})..."
+    if ! curl --fail --location --silent --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
+        rm -f "$TMP_FILE" 2>/dev/null || true
+        error "Failed to download binary (HTTP error)"
+    fi
+fi
+
+# Basic validation: ensure file is not empty
+if [ ! -s "$TMP_FILE" ]; then
+    rm -f "$TMP_FILE" 2>/dev/null || true
+    error "Downloaded file is empty"
+fi
+
+# Verify checksum if embedded (release builds only)
+verify_checksum "$TMP_FILE" "$BINARY_NAME"
+
+mv -f "$TMP_FILE" "${INSTALL_DIR}/autter"
+
+# Make executable
+chmod +x "${INSTALL_DIR}/autter"
+
+# Remove quarantine attribute on macOS
+if [ "$OS" = "macos" ]; then
+    xattr -d com.apple.quarantine "${INSTALL_DIR}/autter" 2>/dev/null || true
+fi
+
+# Create ~/.local/bin/autter symlink for systems where ~/.local/bin is already on PATH
+LOCAL_BIN_DIR="$HOME/.local/bin"
+if mkdir -p "$LOCAL_BIN_DIR" 2>/dev/null && ln -sf "${INSTALL_DIR}/autter" "${LOCAL_BIN_DIR}/autter" 2>/dev/null; then
+    success "Created symlink at ${LOCAL_BIN_DIR}/autter"
+else
+    warn "Failed to create ~/.local/bin/autter symlink. This is non-fatal."
+fi
+
+success "Successfully installed autter into ${INSTALL_DIR}"
+success "You can now run 'autter' from your terminal"
+
+# Print installed version
+INSTALLED_VERSION=$(${INSTALL_DIR}/autter --version 2>&1 || echo "unknown")
+echo "Installed autter ${INSTALLED_VERSION}"
+
+# Login user with install token if provided
+NEED_LOGIN=false
+if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
+    if ! ${INSTALL_DIR}/autter exchange-nonce; then
+        NEED_LOGIN=true
+    fi
+fi
+
+echo "Setting up IDE/agent hooks..."
+if ! ${INSTALL_DIR}/autter install-hooks; then
+    warn "Warning: Failed to set up IDE/agent hooks. Please try running 'autter install-hooks' manually."
+else
+    success "Successfully set up IDE/agent hooks"
+fi
+
+# Add to PATH in all detected shell configurations
+SHELLS_CONFIGURED=""
+SHELLS_ALREADY_CONFIGURED=""
+CREATED_SHELL_PATHS=""
+
+while IFS='|' read -r shell_name config_file; do
+    [ -z "$shell_name" ] && continue
+    
+    # Generate shell-appropriate PATH command
+    if [ "$shell_name" = "fish" ]; then
+        path_cmd="fish_add_path -g \"$INSTALL_DIR\""
+        # Create fish config directory if it doesn't exist (for fallback case)
+        config_dir="$(dirname "$config_file")"
+        if [ ! -d "$config_dir" ]; then
+            mkdir -p "$config_dir"
+            CREATED_SHELL_PATHS="${CREATED_SHELL_PATHS}${config_dir}\n"
+        fi
+    else
+        path_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
+    fi
+    
+    # Create config file if it doesn't exist (for fallback case when no configs found)
+    if [ ! -f "$config_file" ]; then
+        CREATED_SHELL_PATHS="${CREATED_SHELL_PATHS}${config_file}\n"
+    fi
+    touch "$config_file"
+    
+    # Append if not already present
+    if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
+        echo "" >> "$config_file"
+        echo "# Added by autter installer on $(date)" >> "$config_file"
+        echo "$path_cmd" >> "$config_file"
+        SHELLS_CONFIGURED="${SHELLS_CONFIGURED}${shell_name}|${config_file}\n"
+    else
+        SHELLS_ALREADY_CONFIGURED="${SHELLS_ALREADY_CONFIGURED}${shell_name}|${config_file}\n"
+    fi
+done <<< "$(detect_all_shells)"
+
+# Display results to user
+if [ -n "$SHELLS_CONFIGURED" ]; then
+    echo ""
+    echo "Updated shell configurations:"
+    printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        success "  ✓ $config_file"
+    done
+    
+    echo ""
+    echo "To apply changes immediately:"
+    printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        if [ "$shell_name" = "fish" ]; then
+            echo "  - For fish: source $config_file"
+        else
+            echo "  - For $shell_name: source $config_file"
+        fi
+    done
+fi
+
+if [ -n "$SHELLS_ALREADY_CONFIGURED" ]; then
+    echo ""
+    echo "Already configured (no changes needed):"
+    printf '%b' "$SHELLS_ALREADY_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        echo "  ✓ $config_file"
+    done
+fi
+
+if [ -z "$SHELLS_CONFIGURED" ] && [ -z "$SHELLS_ALREADY_CONFIGURED" ]; then
+    echo ""
+    echo "Could not detect any shell config files."
+    echo "Please add the following line to your shell config and restart:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+fi
+
+# Fix file ownership when running as root for a different user (MDM deployments)
+if [ "$(id -u)" = "0" ] && [ -n "$INSTALL_USER" ]; then
+    chown -R "$INSTALL_USER" "$HOME/.autter" 2>/dev/null || true
+    if [ -n "$CREATED_SHELL_PATHS" ]; then
+        printf '%b' "$CREATED_SHELL_PATHS" | while IFS= read -r created_path; do
+            [ -z "$created_path" ] && continue
+            chown "$INSTALL_USER" "$created_path" 2>/dev/null || true
+        done
+    fi
+fi
+
+echo ""
+echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use autter.${NC}"
+
+# If nonce exchange failed, run interactive login
+if [ "$NEED_LOGIN" = true ]; then
+    echo ""
+    echo "Launching login..."
+    ${INSTALL_DIR}/autter login
+fi

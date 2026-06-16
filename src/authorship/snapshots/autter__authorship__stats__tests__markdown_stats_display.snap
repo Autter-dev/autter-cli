@@ -1,0 +1,5 @@
+---
+source: src/authorship/stats.rs
+expression: mixed_output
+---
+"Stats powered by [Autter](https://github.com/autter-dev/autter-cli)\n\n```text\n🧠 you    █████████████░░░░░░░  63%\n🤖 ai     ░░░░░░░░░░░░░░██████  31%\n```\n\n<details>\n<summary>More stats</summary>\n\n\n</details>"

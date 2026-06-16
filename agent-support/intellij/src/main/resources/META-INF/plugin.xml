@@ -1,0 +1,17 @@
+<idea-plugin>
+    <id>com.useautter.plugins.jetbrains</id>
+    <name>Autter</name>
+    <vendor>Autter</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService
+            serviceImplementation="org.jetbrains.plugins.template.services.TelemetryService"/>
+        <applicationService
+            serviceImplementation="org.jetbrains.plugins.template.services.DocumentChangeTrackerService"/>
+        <applicationService
+            serviceImplementation="org.jetbrains.plugins.template.services.AutterService"/>
+        <postStartupActivity implementation="org.jetbrains.plugins.template.startup.DocumentTrackerStartupActivity"/>
+    </extensions>
+</idea-plugin>

@@ -1,0 +1,5 @@
+---
+source: tests/integration/stats.rs
+expression: markdown
+---
+"Stats powered by [Autter](https://github.com/autter-dev/autter-cli)\n\n```text\n🧠 you    █░░░░░░░░░░░░░░░░░░░  2%\n🤖 ai     ████████████████████  98%\n```\n\n<details>\n<summary>More stats</summary>\n\n\n</details>"

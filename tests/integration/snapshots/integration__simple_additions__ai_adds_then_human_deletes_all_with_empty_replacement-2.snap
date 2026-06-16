@@ -1,0 +1,7 @@
+---
+source: tests/simple_additions.rs
+expression: blame
+---
+{
+    1: "Test User",
+}

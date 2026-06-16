@@ -1,0 +1,84 @@
+---
+source: tests/simple_additions.rs
+expression: "(authorship_log, second_authorship_log)"
+---
+(
+    AuthorshipLogV3 {
+        attestations: [
+            FileAttestation {
+                file_path: "test.ts",
+                entries: [
+                    AttestationEntry {
+                        hash: "1cee1d9",
+                        line_ranges: [
+                            Range(
+                                4,
+                                5,
+                            ),
+                        ],
+                    },
+                ],
+            },
+        ],
+        metadata: AuthorshipMetadata {
+            schema_version: "authorship/3.0.0",
+            base_commit_sha: "00821120258f267c87c2548a84e47f0dc14e8bf7",
+            prompts: {
+                "1cee1d9": PromptRecord {
+                    agent_id: AgentId {
+                        tool: "cursor",
+                        id: "test_session_fixed",
+                        model: "claude-3-sonnet",
+                    },
+                    human_author: Some(
+                        "Test User",
+                    ),
+                    messages: [],
+                    total_additions: 4,
+                    total_deletions: 0,
+                    accepted_lines: 4,
+                    overriden_lines: 0,
+                },
+            },
+        },
+    },
+    AuthorshipLogV3 {
+        attestations: [
+            FileAttestation {
+                file_path: "test.ts",
+                entries: [
+                    AttestationEntry {
+                        hash: "1cee1d9",
+                        line_ranges: [
+                            Range(
+                                6,
+                                7,
+                            ),
+                        ],
+                    },
+                ],
+            },
+        ],
+        metadata: AuthorshipMetadata {
+            schema_version: "authorship/3.0.0",
+            base_commit_sha: "725417747aa03b4507540cf3d2c9846743f635fa",
+            prompts: {
+                "1cee1d9": PromptRecord {
+                    agent_id: AgentId {
+                        tool: "cursor",
+                        id: "test_session_fixed",
+                        model: "claude-3-sonnet",
+                    },
+                    human_author: Some(
+                        "Test User",
+                    ),
+                    messages: [],
+                    total_additions: 2,
+                    total_deletions: 0,
+                    accepted_lines: 2,
+                    overriden_lines: 0,
+                },
+            },
+        },
+    },
+)

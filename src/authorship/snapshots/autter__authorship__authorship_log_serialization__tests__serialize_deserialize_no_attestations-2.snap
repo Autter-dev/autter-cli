@@ -1,0 +1,32 @@
+---
+source: src/authorship/authorship_log_serialization.rs
+expression: deserialized
+---
+AuthorshipLogV3 {
+    attestations: [],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        autter_version: Some(
+            "development",
+        ),
+        base_commit_sha: "abc123",
+        prompts: {
+            "c9883b05a2487d6d": PromptRecord {
+                agent_id: AgentId {
+                    tool: "cursor",
+                    id: "session_123",
+                    model: "claude-3-sonnet",
+                },
+                human_author: None,
+                messages_url: None,
+                total_additions: 0,
+                total_deletions: 0,
+                accepted_lines: 0,
+                overriden_lines: 0,
+                custom_attributes: None,
+            },
+        },
+        humans: {},
+        sessions: {},
+    },
+}

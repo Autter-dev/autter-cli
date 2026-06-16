@@ -1,0 +1,12 @@
+---
+source: src/log_fmt/authorship_log_serialization.rs
+expression: new_log
+---
+AuthorshipLogV3 {
+    attestations: [],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "test-commit-sha",
+        prompts: {},
+    },
+}

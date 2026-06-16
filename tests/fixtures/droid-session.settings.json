@@ -1,0 +1,15 @@
+{
+  "assistantActiveTimeMs": 27913,
+  "model": "custom:BYOK-GPT-5-MINI-0",
+  "reasoningEffort": "off",
+  "autonomyMode": "auto-low",
+  "providerLock": "openai",
+  "providerLockTimestamp": "2026-01-28T16:57:01.086Z",
+  "tokenUsage": {
+    "inputTokens": 6743,
+    "outputTokens": 1450,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 42496,
+    "thinkingTokens": 1088
+  }
+}

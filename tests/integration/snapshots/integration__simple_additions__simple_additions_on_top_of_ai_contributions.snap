@@ -1,0 +1,11 @@
+---
+source: tests/simple_additions.rs
+expression: blame
+---
+{
+    30: "Test User",
+    31: "Test User",
+    32: "Test User",
+    33: "Test User",
+    34: "Test User",
+}

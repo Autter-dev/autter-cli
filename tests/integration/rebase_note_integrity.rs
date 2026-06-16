@@ -1,0 +1,1354 @@
+/// Tests for intermediate-commit note integrity after rebase.
+///
+/// ## The Bug
+///
+/// `rewrite_authorship_after_rebase_v2` (src/authorship/rebase_authorship.rs) has a
+/// slow-path processing loop that seeds `cached_file_attestation_text` and
+/// `existing_files` from the **full cumulative state of the last pre-rebase commit**
+/// (all commits in the chain combined). When it writes the note for an *intermediate*
+/// new commit K, it emits ALL entries in `cached_file_attestation_text` that appear in
+/// `existing_files`, which includes files introduced by commits K+1, K+2, … (future
+/// commits).
+///
+/// Concrete example from PR #967 (5-commit chain):
+///   - Commit f70ab45e (early – daemon changes only): note shows `revert_hooks.rs`
+///     attributed, but revert_hooks.rs was first introduced in a LATER commit
+///     (f1fdede4). Every intermediate commit ended up with the same large set of
+///     file attestations as the tip commit, and `accepted_lines` counts became
+///     non-monotonic (earlier commits showed higher counts than later ones).
+///
+/// ## When the slow path fires
+///
+/// The fast path (`try_fast_path_rebase_note_remap_cached`) just copies original
+/// notes verbatim (only updating `base_commit_sha`) and is correct. It only fires
+/// when the AI-touched file blobs are *identical* between old and new commits. If
+/// *any* tracked file's blob changes after rebasing (e.g. the upstream prepended a
+/// header to a file the feature also modifies), the fast path is skipped and the
+/// buggy slow path runs.
+///
+/// ## Setup pattern used to force the slow path
+///
+/// Each test creates a `shared.rs` file (with a proper trailing newline, committed via
+/// `git_og` to avoid the no-trailing-newline issue with `set_contents`). The upstream
+/// branch prepends a header to `shared.rs`. The feature branch then APPENDS to
+/// `shared.rs` via `set_contents` (which writes content without a trailing newline –
+/// that's fine because git can merge "prepend on upstream" with "append on feature"
+/// even when they have different trailing-newline styles).
+///
+/// After rebasing, the shared.rs blob in each feature commit differs from its
+/// pre-rebase counterpart, so `tracked_paths_match_for_commit_pairs` returns false
+/// → fast path is bypassed → the buggy slow path runs.
+///
+/// ## Expected vs broken behaviour
+///
+/// | Commit | Expected note files                | Broken note files (current)          |
+/// |--------|------------------------------------|--------------------------------------|
+/// | A′     | shared.rs + module_a.rs            | shared.rs + module_a.rs + module_b.rs ← LEAK |
+/// | B′     | shared.rs + module_a.rs + module_b.rs | correct (it is the tip)           |
+///
+/// These tests are intentionally written to **FAIL** with the current (buggy) code
+/// and to **PASS** once the bug is fixed.
+use crate::repos::test_file::ExpectedLineExt;
+use crate::repos::test_repo::TestRepo;
+use autter::authorship::authorship_log_serialization::AuthorshipLog;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn total_accepted_lines(note: &str) -> u32 {
+    let log = AuthorshipLog::deserialize_from_string(note)
+        .expect("should parse authorship note as AuthorshipLog");
+    // Count AI lines from attestations where hash starts with "s_" (sessions)
+    log.attestations
+        .iter()
+        .flat_map(|a| &a.entries)
+        .filter(|e| e.hash.starts_with("s_"))
+        .flat_map(|e| &e.line_ranges)
+        .map(|r| match r {
+            autter::authorship::authorship_log::LineRange::Single(_) => 1,
+            autter::authorship::authorship_log::LineRange::Range(s, e) => e - s + 1,
+        })
+        .sum()
+}
+
+fn files_in_note(note: &str) -> Vec<String> {
+    let log = AuthorshipLog::deserialize_from_string(note)
+        .expect("should parse authorship note as AuthorshipLog");
+    log.attestations
+        .iter()
+        .map(|a| a.file_path.clone())
+        .collect()
+}
+
+/// Write `content` to `filename` in the repo's working directory, add, and
+/// commit via `git_og` (bypassing autter hooks). The content is written with
+/// a trailing newline so that 3-way merges work correctly when the feature
+/// branch later appends content via `set_contents` (which omits trailing
+/// newlines).
+fn write_raw_commit(repo: &TestRepo, filename: &str, content: &str, message: &str) {
+    let path = repo.path().join(filename);
+    // Ensure content ends with newline for clean 3-way merge behaviour
+    let content_with_nl = if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{}\n", content)
+    };
+    std::fs::write(&path, content_with_nl.as_bytes()).expect("write file");
+    repo.git_og(&["add", filename]).expect("git add");
+    repo.git_og(&["commit", "-m", message]).expect("git commit");
+}
+
+// ---------------------------------------------------------------------------
+// Test 1: future-file attribution must not leak into earlier commit notes
+// ---------------------------------------------------------------------------
+
+/// After a rebase where the slow path fires (upstream prepended a line to
+/// shared.rs, diverging blobs), commit A′'s note must NOT reference module_b.rs,
+/// which was only introduced by commit B (a later commit).
+///
+/// Broken: the slow path seeds `cached_file_attestation_text` + `existing_files`
+/// from the final pre-rebase state. module_b.rs is in that state (added by B),
+/// so it leaks into every intermediate commit's note including A′.
+#[test]
+fn test_rebase_future_file_does_not_leak_into_earlier_commit_note() {
+    let repo = TestRepo::new();
+
+    // Initial commit: shared.rs with a proper trailing newline (via git_og).
+    // Feature branch will APPEND lines; upstream will PREPEND.
+    // 3-way merge: prepend (upstream) + append (feature) = non-conflicting.
+    write_raw_commit(&repo, "shared.rs", "fn original() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream PREPENDS a header line to shared.rs.
+    // After rebasing, every feature commit that touches shared.rs will have a
+    // different blob OID → fast path cannot fire → slow path runs.
+    write_raw_commit(
+        &repo,
+        "shared.rs",
+        "// upstream header\nfn original() {}",
+        "Upstream: prepend header to shared.rs",
+    );
+
+    // Feature branch starts from BEFORE the upstream commit.
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    // Commit A: appends AI lines to shared.rs + creates module_a.rs.
+    // module_b.rs does NOT exist at this point.
+    let mut shared = repo.filename("shared.rs");
+    shared.set_contents(crate::lines![
+        "fn original() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai()
+    ]);
+    let mut module_a = repo.filename("module_a.rs");
+    module_a.set_contents(crate::lines!["fn ma() {}".ai()]);
+    repo.stage_all_and_commit("Commit A: shared (append) + module_a.rs")
+        .unwrap();
+
+    // Commit B: appends more AI lines to shared.rs + creates module_b.rs.
+    shared.set_contents(crate::lines![
+        "fn original() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai(),
+        "fn b1() {}".ai(),
+        "fn b2() {}".ai()
+    ]);
+    let mut module_b = repo.filename("module_b.rs");
+    module_b.set_contents(crate::lines!["fn mb1() {}".ai(), "fn mb2() {}".ai()]);
+    repo.stage_all_and_commit("Commit B: shared (append) + module_b.rs")
+        .unwrap();
+
+    // Rebase feature onto the advanced main branch (non-conflicting).
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let new_sha_b = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let new_sha_a = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let note_a = repo
+        .read_authorship_note(&new_sha_a)
+        .expect("commit A′ must have an authorship note after rebase");
+    let note_b = repo
+        .read_authorship_note(&new_sha_b)
+        .expect("commit B′ must have an authorship note after rebase");
+
+    let files_a = files_in_note(&note_a);
+    let files_b = files_in_note(&note_b);
+
+    // -----------------------------------------------------------------------
+    // Core assertion: module_b.rs was introduced in commit B (AFTER commit A).
+    // Commit A′'s note must NOT reference module_b.rs.
+    // With the slow-path bug, the cache is pre-seeded from the final pre-rebase
+    // state which already includes module_b.rs → it leaks into A′'s note.
+    // -----------------------------------------------------------------------
+    assert!(
+        !files_a.iter().any(|f| f.contains("module_b")),
+        "REBASE NOTE CORRUPTION (slow-path future-file leak): \
+         Commit A′'s note contains 'module_b.rs', but module_b.rs was only \
+         introduced in commit B (a later commit). \
+         The slow path seeds cached_file_attestation_text from the full \
+         pre-rebase HEAD state, causing future files to appear in earlier \
+         commit notes. Files found in A′'s note: {:?}",
+        files_a
+    );
+
+    // Sanity: A′ should reference the files A actually introduced.
+    assert!(
+        files_a
+            .iter()
+            .any(|f| f.contains("module_a") || f.contains("shared")),
+        "Commit A′'s note should contain module_a.rs or shared.rs, \
+         but found: {:?}",
+        files_a
+    );
+
+    // Sanity: B′ (tip) must include module_b.rs.
+    assert!(
+        files_b.iter().any(|f| f.contains("module_b")),
+        "Commit B′'s note should contain module_b.rs, but found: {:?}",
+        files_b
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: accepted_lines must not be inflated for intermediate commits
+// ---------------------------------------------------------------------------
+
+/// Two-commit feature branch where both commits append to a shared file that
+/// the upstream prepended to (forcing the slow path without conflicts).
+///
+/// Commit 1 adds exactly 10 AI lines. Commit 2 adds 10 more. After rebase,
+/// commit 1′'s `accepted_lines` should reflect only its own ~10 lines, not
+/// the full-chain total of ~20.
+///
+/// Broken: the slow path writes the full-chain `accepted_lines` to every
+/// intermediate commit because `current_attributions` starts at the final
+/// pre-rebase state and is never rewound to the per-commit checkpoint.
+#[test]
+fn test_rebase_intermediate_commit_accepted_lines_not_inflated() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "impl.rs", "fn base() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends to impl.rs (diverges blobs → forces slow path).
+    write_raw_commit(
+        &repo,
+        "impl.rs",
+        "// upstream header\nfn base() {}",
+        "Upstream: prepend to impl.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut shared = repo.filename("impl.rs");
+
+    // Commit 1: appends exactly 10 AI lines to impl.rs.
+    shared.set_contents(crate::lines![
+        "fn base() {}",
+        "fn c01() {}".ai(),
+        "fn c02() {}".ai(),
+        "fn c03() {}".ai(),
+        "fn c04() {}".ai(),
+        "fn c05() {}".ai(),
+        "fn c06() {}".ai(),
+        "fn c07() {}".ai(),
+        "fn c08() {}".ai(),
+        "fn c09() {}".ai(),
+        "fn c10() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit 1: 10 AI lines appended to impl.rs")
+        .unwrap();
+
+    // Commit 2: appends 10 more AI lines to impl.rs.
+    shared.set_contents(crate::lines![
+        "fn base() {}",
+        "fn c01() {}".ai(),
+        "fn c02() {}".ai(),
+        "fn c03() {}".ai(),
+        "fn c04() {}".ai(),
+        "fn c05() {}".ai(),
+        "fn c06() {}".ai(),
+        "fn c07() {}".ai(),
+        "fn c08() {}".ai(),
+        "fn c09() {}".ai(),
+        "fn c10() {}".ai(),
+        "fn c11() {}".ai(),
+        "fn c12() {}".ai(),
+        "fn c13() {}".ai(),
+        "fn c14() {}".ai(),
+        "fn c15() {}".ai(),
+        "fn c16() {}".ai(),
+        "fn c17() {}".ai(),
+        "fn c18() {}".ai(),
+        "fn c19() {}".ai(),
+        "fn c20() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit 2: 10 more AI lines appended to impl.rs")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let new_sha2 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let new_sha1 = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let note1 = repo
+        .read_authorship_note(&new_sha1)
+        .expect("commit 1′ should have an authorship note");
+    let note2 = repo
+        .read_authorship_note(&new_sha2)
+        .expect("commit 2′ should have an authorship note");
+
+    let lines1 = total_accepted_lines(&note1);
+    let lines2 = total_accepted_lines(&note2);
+
+    // Session format: attestation line ranges reflect the file state at each commit.
+    // Commit 1 has 10 AI lines in impl.rs. Commit 2 has all 20 (10 original + 10 new).
+    // The key invariant: commit 1′ must NOT show 20 (that would mean future-commit leakage).
+    assert_eq!(
+        lines1, 10,
+        "REBASE NOTE CORRUPTION: commit 1′ should report exactly 10 AI lines (file state at commit 1), got {}. If > 10, the slow path is leaking future commit lines.",
+        lines1
+    );
+    assert_eq!(
+        lines2, 20,
+        "REBASE NOTE CORRUPTION: commit 2′ should report exactly 20 AI lines (file state at commit 2), got {}.",
+        lines2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: three-commit chain — no future-file leakage (slow path forced)
+// ---------------------------------------------------------------------------
+
+/// Three-commit feature branch, each appending to a shared file that upstream
+/// prepended to (forcing slow path). Each commit also adds its own unique file.
+///
+/// After rebase:
+///   - A′ note: must NOT contain unit_b.rs or unit_c.rs (future files)
+///   - B′ note: must NOT contain unit_c.rs (future file)
+///   - C′ note: tip commit, no future-leak concern
+#[test]
+fn test_rebase_three_commits_no_future_file_leakage() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "core.rs", "fn core_base() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends to core.rs → forces slow path.
+    write_raw_commit(
+        &repo,
+        "core.rs",
+        "// upstream\nfn core_base() {}",
+        "Upstream: prepend to core.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut shared = repo.filename("core.rs");
+
+    // Commit A: appends to core.rs + adds unit_a.rs.
+    shared.set_contents(crate::lines!["fn core_base() {}", "fn core_a() {}".ai()]);
+    let mut unit_a = repo.filename("unit_a.rs");
+    unit_a.set_contents(crate::lines!["fn ua() {}".ai()]);
+    repo.stage_all_and_commit("Commit A: core + unit_a")
+        .unwrap();
+
+    // Commit B: appends to core.rs + adds unit_b.rs.
+    shared.set_contents(crate::lines![
+        "fn core_base() {}",
+        "fn core_a() {}".ai(),
+        "fn core_b() {}".ai()
+    ]);
+    let mut unit_b = repo.filename("unit_b.rs");
+    unit_b.set_contents(crate::lines!["fn ub() {}".ai()]);
+    repo.stage_all_and_commit("Commit B: core + unit_b")
+        .unwrap();
+
+    // Commit C: appends to core.rs + adds unit_c.rs.
+    shared.set_contents(crate::lines![
+        "fn core_base() {}",
+        "fn core_a() {}".ai(),
+        "fn core_b() {}".ai(),
+        "fn core_c() {}".ai()
+    ]);
+    let mut unit_c = repo.filename("unit_c.rs");
+    unit_c.set_contents(crate::lines!["fn uc() {}".ai()]);
+    repo.stage_all_and_commit("Commit C: core + unit_c")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let _sha_c = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let sha_b = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let sha_a = repo
+        .git(&["rev-parse", "HEAD~2"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let note_a = repo
+        .read_authorship_note(&sha_a)
+        .expect("commit A′ should have note");
+    let note_b = repo
+        .read_authorship_note(&sha_b)
+        .expect("commit B′ should have note");
+
+    let files_a = files_in_note(&note_a);
+    let files_b = files_in_note(&note_b);
+
+    // A′ must not reference unit_b.rs or unit_c.rs (future files).
+    assert!(
+        !files_a.iter().any(|f| f.contains("unit_b")),
+        "REBASE NOTE CORRUPTION: commit A′'s note contains 'unit_b.rs', \
+         which was only introduced in commit B (a later commit). \
+         Files in A′: {:?}",
+        files_a
+    );
+    assert!(
+        !files_a.iter().any(|f| f.contains("unit_c")),
+        "REBASE NOTE CORRUPTION: commit A′'s note contains 'unit_c.rs', \
+         which was only introduced in commit C (a later commit). \
+         Files in A′: {:?}",
+        files_a
+    );
+
+    // B′ must not reference unit_c.rs (future file relative to B).
+    assert!(
+        !files_b.iter().any(|f| f.contains("unit_c")),
+        "REBASE NOTE CORRUPTION: commit B′'s note contains 'unit_c.rs', \
+         which was only introduced in commit C (a later commit). \
+         Files in B′: {:?}",
+        files_b
+    );
+
+    // Sanity: A′ should reference what A actually introduced.
+    assert!(
+        files_a
+            .iter()
+            .any(|f| f.contains("unit_a") || f.contains("core")),
+        "Commit A′ should reference unit_a.rs or core.rs, but found: {:?}",
+        files_a
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: deleted file must not reappear in later commit notes (slow path)
+// ---------------------------------------------------------------------------
+
+/// Commit A appends to shared file + adds temp.rs.
+/// Commit B appends to shared file + deletes temp.rs + adds final.rs.
+/// Commit C appends to shared file + adds extra.rs.
+/// Upstream prepends to shared file (forces slow path).
+///
+/// After rebase:
+///   - B′ note: must NOT contain temp.rs (it was deleted in B)
+///   - B′ note: must NOT contain extra.rs (introduced in future commit C)
+///   - C′ note: must NOT contain temp.rs (deleted before C ever ran)
+#[test]
+fn test_rebase_deleted_file_does_not_persist_in_later_notes() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "engine.rs", "fn engine_base() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends to engine.rs → forces slow path.
+    write_raw_commit(
+        &repo,
+        "engine.rs",
+        "// upstream\nfn engine_base() {}",
+        "Upstream: prepend to engine.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut engine = repo.filename("engine.rs");
+
+    // Commit A: appends to engine.rs + adds temp.rs.
+    engine.set_contents(crate::lines!["fn engine_base() {}", "fn eng_a() {}".ai()]);
+    let mut temp = repo.filename("temp.rs");
+    temp.set_contents(crate::lines!["fn tmp1() {}".ai(), "fn tmp2() {}".ai()]);
+    repo.stage_all_and_commit("Commit A: engine + temp.rs")
+        .unwrap();
+
+    // Commit B: appends to engine.rs + removes temp.rs + adds final.rs.
+    engine.set_contents(crate::lines![
+        "fn engine_base() {}",
+        "fn eng_a() {}".ai(),
+        "fn eng_b() {}".ai()
+    ]);
+    repo.git(&["rm", "temp.rs"]).unwrap();
+    let mut final_rs = repo.filename("final.rs");
+    final_rs.set_contents(crate::lines!["fn fin() {}".ai()]);
+    repo.stage_all_and_commit("Commit B: engine + rm temp.rs + final.rs")
+        .unwrap();
+
+    // Commit C: appends to engine.rs + adds extra.rs.
+    engine.set_contents(crate::lines![
+        "fn engine_base() {}",
+        "fn eng_a() {}".ai(),
+        "fn eng_b() {}".ai(),
+        "fn eng_c() {}".ai()
+    ]);
+    let mut extra = repo.filename("extra.rs");
+    extra.set_contents(crate::lines!["fn ex() {}".ai()]);
+    repo.stage_all_and_commit("Commit C: engine + extra.rs")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let sha_c = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let sha_b = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let note_b = repo
+        .read_authorship_note(&sha_b)
+        .expect("commit B′ should have note");
+    let note_c = repo
+        .read_authorship_note(&sha_c)
+        .expect("commit C′ should have note");
+
+    let files_b = files_in_note(&note_b);
+    let files_c = files_in_note(&note_c);
+
+    // B′: temp.rs was deleted in B — must not appear.
+    assert!(
+        !files_b.iter().any(|f| f.contains("temp")),
+        "REBASE NOTE CORRUPTION: commit B′ contains 'temp.rs', which was \
+         deleted in commit B. files_b: {:?}",
+        files_b
+    );
+
+    // B′: extra.rs was introduced in commit C (future) — must not appear.
+    assert!(
+        !files_b.iter().any(|f| f.contains("extra")),
+        "REBASE NOTE CORRUPTION: commit B′ contains 'extra.rs', which was \
+         only introduced in commit C (a later commit). files_b: {:?}",
+        files_b
+    );
+
+    // C′: temp.rs was deleted in B (before C) — must not appear in C.
+    assert!(
+        !files_c.iter().any(|f| f.contains("temp")),
+        "REBASE NOTE CORRUPTION: commit C′ contains 'temp.rs', which was \
+         deleted in commit B (before C). files_c: {:?}",
+        files_c
+    );
+
+    // Sanity: final.rs must appear in B′ (B introduced it).
+    assert!(
+        files_b.iter().any(|f| f.contains("final")),
+        "Commit B′ should contain final.rs, but found: {:?}",
+        files_b
+    );
+    // Per-commit-delta: C′ only contains files that C itself touched (engine.rs, extra.rs).
+    // final.rs was introduced in B, not C, so it must NOT appear in C′.
+    assert!(
+        !files_c.iter().any(|f| f.contains("final")),
+        "Commit C′ should NOT contain final.rs (per-commit-delta: C didn't touch it), \
+         but found: {:?}",
+        files_c
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: line-level blame + accepted_lines correctness after slow-path rebase
+// ---------------------------------------------------------------------------
+
+/// After a slow-path rebase the per-line AI blame attribution must be correct
+/// and `accepted_lines` for an intermediate commit must be strictly less than
+/// for the tip commit.
+///
+/// Two-commit chain, both appending to a file whose upstream prepended a line.
+///   - A′ note: must NOT contain separate.rs (introduced by B)
+///   - accepted_lines for A′ < accepted_lines for B′
+///   - Line-level blame on main.rs reflects the expected attribution
+#[test]
+fn test_rebase_slow_path_line_attribution_is_correct() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "main.rs", "fn original() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends to main.rs → forces slow path.
+    write_raw_commit(
+        &repo,
+        "main.rs",
+        "// upstream\nfn original() {}",
+        "Upstream: prepend to main.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut main_rs = repo.filename("main.rs");
+
+    // Commit A: appends 3 AI lines to main.rs (no separate.rs yet).
+    main_rs.set_contents(crate::lines![
+        "fn original() {}",
+        "fn ai_a1() {}".ai(),
+        "fn ai_a2() {}".ai(),
+        "fn ai_a3() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit A: 3 AI lines").unwrap();
+
+    // Commit B: appends 3 more AI lines to main.rs + adds separate.rs.
+    main_rs.set_contents(crate::lines![
+        "fn original() {}",
+        "fn ai_a1() {}".ai(),
+        "fn ai_a2() {}".ai(),
+        "fn ai_a3() {}".ai(),
+        "fn ai_b1() {}".ai(),
+        "fn ai_b2() {}".ai(),
+        "fn ai_b3() {}".ai()
+    ]);
+    let mut separate = repo.filename("separate.rs");
+    separate.set_contents(crate::lines!["fn sep() {}".ai()]);
+    repo.stage_all_and_commit("Commit B: 3 more AI lines + separate.rs")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let sha_b = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let sha_a = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let note_a = repo
+        .read_authorship_note(&sha_a)
+        .expect("commit A′ should have a note");
+    let note_b = repo
+        .read_authorship_note(&sha_b)
+        .expect("commit B′ should have a note");
+
+    let files_a = files_in_note(&note_a);
+
+    // A′: separate.rs was introduced in B (future) — must not appear in A.
+    assert!(
+        !files_a.iter().any(|f| f.contains("separate")),
+        "REBASE NOTE CORRUPTION: commit A′'s note contains 'separate.rs', \
+         which was only introduced in commit B. Files in A′: {:?}",
+        files_a
+    );
+
+    // accepted_lines for A′ (3 lines) must be less than B′ (7 lines).
+    let lines_a = total_accepted_lines(&note_a);
+    let lines_b = total_accepted_lines(&note_b);
+    assert!(
+        lines_a < lines_b,
+        "REBASE NOTE CORRUPTION: commit A′ has accepted_lines={} and \
+         commit B′ has accepted_lines={}. A′ came before B′ and introduced \
+         fewer AI lines, so A′ should have a strictly smaller count.",
+        lines_a,
+        lines_b
+    );
+
+    // Verify line-level blame reflects the upstream header + AI appended lines.
+    main_rs.assert_lines_and_blame(crate::lines![
+        "// upstream",
+        "fn original() {}",
+        "fn ai_a1() {}".ai(),
+        "fn ai_a2() {}".ai(),
+        "fn ai_a3() {}".ai(),
+        "fn ai_b1() {}".ai(),
+        "fn ai_b2() {}".ai(),
+        "fn ai_b3() {}".ai()
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: AI lines newly added in commit K≥2 must not be attributed as human
+// ---------------------------------------------------------------------------
+
+/// The hunk-based path (used for all new commits after the first content-diff)
+/// only carries EXISTING attributions forward by shifting line numbers. It does
+/// NOT stamp newly-inserted lines with attribution. This means any AI line that
+/// is "new" in commit B relative to commit A (i.e., was inserted in the A′→B′ diff)
+/// will appear as human in B′'s blame, even though the original commit B had it
+/// 100% AI.
+///
+/// Setup:
+///   - Upstream prepends `// upstream` to shared.rs (forces slow path for all commits)
+///   - Commit A: appends `fn ai_a()` to shared.rs (AI)
+///   - Commit B: appends `fn ai_b()` to shared.rs (AI) — this line is "inserted" in A′→B′
+///
+/// After rebase:
+///   - A′ is processed via content-diff (first commit, correct)
+///   - B′ is processed via hunk-based path
+///     → hunk-based path shifts fn_ai_a's attribution (line offset +0) ✓
+///     → hunk-based path sees fn_ai_b as an "inserted" line → assigns NO attribution ✗
+///   - `autter diff B′` (blame) shows fn_ai_b as human even though it's 100% AI
+#[test]
+fn test_rebase_hunk_path_does_not_drop_ai_attribution_for_new_lines() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "shared.rs", "fn original() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends — forces slow path for all feature commits.
+    write_raw_commit(
+        &repo,
+        "shared.rs",
+        "// upstream\nfn original() {}",
+        "Upstream: prepend to shared.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut shared = repo.filename("shared.rs");
+
+    // Commit A: appends fn_ai_a (AI).
+    shared.set_contents(crate::lines!["fn original() {}", "fn ai_a() {}".ai()]);
+    repo.stage_all_and_commit("Commit A: fn ai_a").unwrap();
+
+    // Commit B: appends fn_ai_b (AI).
+    // After rebase, B′'s diff vs A′ shows fn_ai_b as an "inserted" line.
+    // The hunk-based path has no way to stamp inserted lines as AI → bug.
+    shared.set_contents(crate::lines![
+        "fn original() {}",
+        "fn ai_a() {}".ai(),
+        "fn ai_b() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit B: fn ai_b").unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    // After rebase, shared.rs at HEAD (B′) should have:
+    //   line 1: // upstream  ← human (added by upstream)
+    //   line 2: fn original() {}  ← human
+    //   line 3: fn ai_a() {}  ← AI (from commit A, correctly preserved)
+    //   line 4: fn ai_b() {}  ← AI (from commit B, DROPPED by hunk-based path)
+    //
+    // The assert_lines_and_blame call tests the per-line blame attribution.
+    // If fn ai_b is attributed as human, this will fail with the right message.
+    shared.assert_lines_and_blame(crate::lines![
+        "// upstream",
+        "fn original() {}",
+        "fn ai_a() {}".ai(),
+        "fn ai_b() {}".ai() // BUG: hunk-based path drops this → shown as human
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: attribution loss for the second-commit's per-note accepted_lines
+// ---------------------------------------------------------------------------
+
+/// Stronger variant: verify via note inspection that B′'s note attributes
+/// fn_ai_b as AI. The blame test above checks line-level; this checks the
+/// stored note directly. Both fail with the current buggy code.
+#[test]
+fn test_rebase_second_commit_note_attributes_its_own_ai_lines() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "work.rs", "fn base() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends → slow path for all commits.
+    write_raw_commit(
+        &repo,
+        "work.rs",
+        "// header\nfn base() {}",
+        "Upstream: prepend to work.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut work = repo.filename("work.rs");
+
+    // Commit A: 3 AI lines.
+    work.set_contents(crate::lines![
+        "fn base() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai(),
+        "fn a3() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit A: 3 AI lines").unwrap();
+
+    // Commit B: 3 more AI lines (different functions so there's no overlap with A).
+    work.set_contents(crate::lines![
+        "fn base() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai(),
+        "fn a3() {}".ai(),
+        "fn b1() {}".ai(),
+        "fn b2() {}".ai(),
+        "fn b3() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit B: 3 more AI lines")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let sha_b = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let sha_a = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let note_a = repo
+        .read_authorship_note(&sha_a)
+        .expect("commit A′ should have a note");
+    let note_b = repo
+        .read_authorship_note(&sha_b)
+        .expect("commit B′ should have a note");
+
+    let lines_a = total_accepted_lines(&note_a);
+    let lines_b = total_accepted_lines(&note_b);
+    // Session format: attestation line ranges reflect the cumulative file state.
+    // A′: content-diff path carries 3 AI lines (fn a1..a3) → exactly 3.
+    // B′: file has all 6 AI lines (fn a1..a3 from A + fn b1..b3 from B) → 6.
+    // The regression case: B′ gets 0 because inserts are dropped.
+    assert_eq!(
+        lines_a, 3,
+        "REBASE ATTRIBUTION LOSS: A′ should have exactly 3 AI lines (fn a1..a3), got {}.",
+        lines_a
+    );
+    assert_eq!(
+        lines_b, 6,
+        "REBASE ATTRIBUTION LOSS: B′ should have exactly 6 AI lines (fn a1..a3 + fn b1..b3), got {}. If 0: hunk-path is treating newly-inserted AI lines as unattributed.",
+        lines_b
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: three-commit chain — attribution loss compounds across commits
+// ---------------------------------------------------------------------------
+
+/// Three-commit feature chain (A, B, C) each appending to the same file.
+/// Upstream prepends (forces slow path). Only commit A′ is processed via
+/// content-diff; B′ and C′ use the hunk-based path.
+///
+/// Expected: each commit's note includes ONLY its own newly-added AI lines.
+/// Broken: B′ and C′ notes don't include their own new AI lines at all
+/// (they only retain A's lines shifted by offset).
+#[test]
+fn test_rebase_attribution_loss_compounds_across_three_commits() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "lib.rs", "fn base() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    write_raw_commit(
+        &repo,
+        "lib.rs",
+        "// upstream\nfn base() {}",
+        "Upstream: prepend to lib.rs",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut lib = repo.filename("lib.rs");
+
+    // Commit A: adds fn_a (2 AI lines).
+    lib.set_contents(crate::lines![
+        "fn base() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit A: 2 AI lines").unwrap();
+
+    // Commit B: adds fn_b (2 AI lines on top of A).
+    lib.set_contents(crate::lines![
+        "fn base() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai(),
+        "fn b1() {}".ai(),
+        "fn b2() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit B: 2 more AI lines")
+        .unwrap();
+
+    // Commit C: adds fn_c (2 AI lines on top of B).
+    lib.set_contents(crate::lines![
+        "fn base() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai(),
+        "fn b1() {}".ai(),
+        "fn b2() {}".ai(),
+        "fn c1() {}".ai(),
+        "fn c2() {}".ai()
+    ]);
+    repo.stage_all_and_commit("Commit C: 2 more AI lines")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    // Line-level blame at HEAD (C′) — all 6 AI lines should be attributed as AI.
+    lib.assert_lines_and_blame(crate::lines![
+        "// upstream",
+        "fn base() {}",
+        "fn a1() {}".ai(),
+        "fn a2() {}".ai(),
+        "fn b1() {}".ai(), // BUG: hunk path drops this in B′ processing
+        "fn b2() {}".ai(), // BUG: hunk path drops this in B′ processing
+        "fn c1() {}".ai(), // BUG: hunk path drops this in C′ processing
+        "fn c2() {}".ai()  // BUG: hunk path drops this in C′ processing
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: same-file consecutive commits where B overwrites A's AI line
+// ---------------------------------------------------------------------------
+
+/// Two commits both touch the same file; commit B overwrites a line that commit A introduced.
+///
+/// Commit A: APPENDS `fn compute() { return 42; }` (AI) to the file.
+/// Commit B: CHANGES that same line to `fn compute() { return 100; }` (AI).
+///
+/// After rebase (upstream prepends a header, forcing the slow path for A′):
+/// - A′: `fn compute() { return 42; }` is AI-attributed via `original_head_line_to_author`
+///   lookup in the content-diff/slow path.  BUT since the feature tip has `return 100`,
+///   `return 42` is NOT in the original-HEAD content map.  A′ may or may not have a note.
+/// - B′: `fn compute() { return 100; }` IS in the original-HEAD content map (it's the
+///   feature tip).  The hunk-based Replace lookup correctly attributes it as AI.
+///
+/// Regression: if the hunk-based content-map lookup for Replace/Insert hunks were broken,
+/// B′ would show `return 100` as human because `apply_hunks_to_line_attributions` alone
+/// only shifts existing attributions and does not stamp newly inserted/replaced lines.
+#[test]
+fn test_rebase_same_line_overwritten_by_consecutive_commits() {
+    let repo = TestRepo::new();
+
+    // Initial: a file with one human line.
+    write_raw_commit(&repo, "compute.rs", "fn base() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends a module comment → forces slow path for A′.
+    write_raw_commit(
+        &repo,
+        "compute.rs",
+        "// module\nfn base() {}",
+        "Upstream: prepend comment",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut compute = repo.filename("compute.rs");
+
+    // Commit A: APPENDS a new AI function with return value 42.
+    compute.set_contents(crate::lines![
+        "fn base() {}",
+        "fn compute() -> u32 { return 42; }".ai(),
+    ]);
+    repo.stage_all_and_commit("A: add compute() returning 42")
+        .unwrap();
+
+    // Commit B: CHANGES the return value from 42 to 100 (overwrites A's line with AI content).
+    compute.set_contents(crate::lines![
+        "fn base() {}",
+        "fn compute() -> u32 { return 100; }".ai(),
+    ]);
+    repo.stage_all_and_commit("B: change compute() to return 100")
+        .unwrap();
+
+    // Rebase: upstream prepended a comment, feature added+modified a function.
+    // These are independent changes → no conflict expected.
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed without conflicts");
+
+    let sha_b = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    // B′: hunk-based path. B's diff (A→B) replaces `return 42` with `return 100`.
+    // `return 100` IS in original_head_line_to_author (feature tip content).
+    // The hunk content-map lookup stamps it as AI.
+    let note_b = repo
+        .read_authorship_note(&sha_b)
+        .expect("B′ must have a note: `return 100` is in the original-HEAD content map");
+    assert!(!note_b.is_empty(), "B′ note must not be empty");
+
+    // HEAD (= B′) must show compute() as AI-attributed.
+    compute.assert_lines_and_blame(crate::lines![
+        "// module",
+        "fn base() {}",
+        "fn compute() -> u32 { return 100; }".ai(),
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: empty file in slow path — no panic, no spurious attribution
+// ---------------------------------------------------------------------------
+
+/// When a commit introduces an empty file (0 bytes), the slow path must not panic
+/// and must produce no AI attribution for that file.  A second non-empty AI file
+/// in the same commit still receives correct attribution.
+#[test]
+fn test_rebase_empty_file_does_not_panic_or_pollute_attribution() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "existing.rs", "fn base() {}\n", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends to existing.rs → forces slow path for the feature commits.
+    write_raw_commit(
+        &repo,
+        "existing.rs",
+        "// upstream header\nfn base() {}\n",
+        "Upstream: prepend header",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    let mut existing = repo.filename("existing.rs");
+
+    // Commit 1: AI modifies existing.rs AND creates an empty file.
+    existing.set_contents(crate::lines!["fn base() {}", "fn ai_fn() {}".ai(),]);
+    // Create an empty file alongside the AI change.
+    std::fs::write(repo.path().join("empty.rs"), b"").unwrap();
+    repo.git(&["add", "empty.rs"]).unwrap();
+    repo.stage_all_and_commit("feat: AI adds ai_fn + empty placeholder")
+        .unwrap();
+
+    repo.git(&["rebase", &default_branch])
+        .expect("rebase should succeed");
+
+    let sha1 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    let note = repo
+        .read_authorship_note(&sha1)
+        .expect("commit 1′ must have a note for existing.rs");
+
+    // existing.rs must be attributed (AI line survived content-diff).
+    let files: Vec<String> = files_in_note(&note);
+    assert!(
+        files.iter().any(|f| f.contains("existing")),
+        "note must include existing.rs, got: {:?}",
+        files
+    );
+    // empty.rs must NOT appear in the note — an empty file has no AI lines.
+    assert!(
+        !files.iter().any(|f| f.contains("empty")),
+        "empty.rs must not appear in attribution note, got: {:?}",
+        files
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1079: conflict rebase — AI file IS the conflict file
+// ---------------------------------------------------------------------------
+
+/// When the ONLY AI-tracked file is the one that has a merge conflict, and the
+/// human resolves the conflict manually (not through autter), the authorship note
+/// must survive the rebase.  Before the fix:
+///   1. Fast path fails (blobs differ due to conflict resolution)
+///   2. Slow path content-diff finds no matching AI lines in the human-resolved content
+///   3. The note is silently dropped (no fallback remap)
+///
+/// Fix: after the slow-path loop, remap the original note for any commit that
+/// had a note but wasn't covered by the diff-based attribution transfer.
+#[test]
+fn test_rebase_conflict_on_ai_file_preserves_note() {
+    let repo = TestRepo::new();
+
+    // shared.rs with trailing newline for clean conflict detection.
+    write_raw_commit(&repo, "shared.rs", "fn original() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream: completely different content for shared.rs → will conflict.
+    write_raw_commit(
+        &repo,
+        "shared.rs",
+        "fn upstream_version() {}",
+        "Upstream: rewrite shared.rs",
+    );
+
+    // Feature branch from before upstream change.
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    // AI modifies shared.rs — the only commit, the only AI file.
+    let mut shared = repo.filename("shared.rs");
+    shared.set_contents(crate::lines!["fn ai_version() {}".ai()]);
+    repo.stage_all_and_commit("feat: AI rewrites shared.rs")
+        .unwrap();
+
+    // Verify note exists before rebase.
+    let pre_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    assert!(
+        repo.read_authorship_note(&pre_sha).is_some(),
+        "AI commit must have a note before rebase"
+    );
+
+    // Rebase → conflict on shared.rs.
+    repo.git(&["checkout", "feature"]).unwrap();
+    let result = repo.git(&["rebase", &default_branch]);
+    assert!(result.is_err(), "rebase should conflict on shared.rs");
+
+    // Human resolves with completely different content (no AI lines survive).
+    std::fs::write(repo.path().join("shared.rs"), "fn human_resolved() {}\n").unwrap();
+    repo.git(&["add", "shared.rs"]).unwrap();
+    repo.git_with_env(&["rebase", "--continue"], &[("GIT_EDITOR", "true")], None)
+        .expect("rebase --continue should succeed");
+
+    // Post-rebase: the note must still exist (remapped from original).
+    let post_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let post_note = repo.read_authorship_note(&post_sha);
+    assert!(
+        post_note.is_some(),
+        "AI authorship note must survive conflict rebase where the AI file IS the \
+         conflict file (issue #1079). The original note should be remapped to the \
+         rebased commit to preserve AI provenance."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1079: metadata-only notes must survive slow-path rebase
+// ---------------------------------------------------------------------------
+
+/// When a rebase forces the slow path (AI-tracked file blobs differ between
+/// original and rebased commits), human-only commits that touch DIFFERENT files
+/// than the AI-tracked files used to lose their notes.  The slow path only wrote
+/// notes for commits whose diff-tree intersected the AI pathspecs, silently
+/// dropping metadata-only notes.
+///
+/// Fix: after the slow-path loop, remap original metadata-only notes for any
+/// commits not covered by the diff-based attribution transfer.
+#[test]
+fn test_rebase_metadata_only_notes_survive_slow_path() {
+    let repo = TestRepo::new();
+
+    // shared.rs with trailing newline via git_og for clean 3-way merge.
+    write_raw_commit(&repo, "shared.rs", "fn original() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    // Upstream prepends to shared.rs → forces slow path (blob differs after rebase).
+    write_raw_commit(
+        &repo,
+        "shared.rs",
+        "// upstream header\nfn original() {}",
+        "Upstream: prepend header to shared.rs",
+    );
+
+    // Feature branch from before the upstream change.
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    // Commit A: AI modifies shared.rs (creates real attestation).
+    let mut shared = repo.filename("shared.rs");
+    shared.set_contents(crate::lines!["fn original() {}", "fn ai_added() {}".ai()]);
+    repo.stage_all_and_commit("Commit A: AI changes shared.rs")
+        .unwrap();
+
+    // Commit B: Human adds a DIFFERENT file (metadata-only note, no AI pathspecs).
+    let mut human_file = repo.filename("human_only.txt");
+    human_file.set_contents(crate::lines!["human work"]);
+    repo.stage_all_and_commit("Commit B: human-only change")
+        .unwrap();
+    let pre_rebase_human_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    // Verify human commit has a note before rebase.
+    let pre_note = repo.read_authorship_note(&pre_rebase_human_sha);
+    assert!(
+        pre_note.is_some(),
+        "human-only commit should have a metadata-only note before rebase"
+    );
+
+    // Rebase feature onto upstream (forces slow path because shared.rs blob differs).
+    repo.git(&["checkout", "feature"]).unwrap();
+    repo.git(&["rebase", &default_branch]).unwrap();
+
+    // Get post-rebase commit SHAs.
+    let log_output = repo
+        .git(&["log", "--oneline", &format!("{}..feature", default_branch)])
+        .unwrap();
+    let commit_count = log_output.trim().lines().count();
+    assert_eq!(commit_count, 2, "should have 2 rebased commits");
+
+    // Verify AI commit preserved its attestation.
+    shared.assert_lines_and_blame(crate::lines![
+        "// upstream header",
+        "fn original() {}",
+        "fn ai_added() {}".ai()
+    ]);
+
+    // Verify human-only commit still has a note after rebase (the fix for #1079).
+    let post_rebase_human_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let post_note = repo.read_authorship_note(&post_rebase_human_sha);
+    assert!(
+        post_note.is_some(),
+        "human-only commit must retain its metadata-only note after slow-path rebase (issue #1079)"
+    );
+}
+
+/// Same as above but with 3 AI commits and 2 human-only commits interleaved,
+/// ensuring all notes survive the slow path.
+#[test]
+fn test_rebase_mixed_ai_and_human_commits_all_retain_notes_after_slow_path() {
+    let repo = TestRepo::new();
+
+    write_raw_commit(&repo, "shared.rs", "fn original() {}", "Initial commit");
+    let default_branch = repo.current_branch();
+
+    write_raw_commit(
+        &repo,
+        "shared.rs",
+        "// header\nfn original() {}",
+        "Upstream: prepend",
+    );
+
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
+
+    // Commit 1: AI modifies shared.rs
+    let mut shared = repo.filename("shared.rs");
+    shared.set_contents(crate::lines!["fn original() {}", "fn ai1() {}".ai()]);
+    repo.stage_all_and_commit("AI commit 1").unwrap();
+
+    // Commit 2: Human adds file_a.txt
+    let mut file_a = repo.filename("file_a.txt");
+    file_a.set_contents(crate::lines!["human file a"]);
+    repo.stage_all_and_commit("Human commit 2").unwrap();
+
+    // Commit 3: AI adds module_b.rs
+    let mut module_b = repo.filename("module_b.rs");
+    module_b.set_contents(crate::lines!["fn b() {}".ai()]);
+    repo.stage_all_and_commit("AI commit 3").unwrap();
+
+    // Commit 4: Human adds file_c.txt
+    let mut file_c = repo.filename("file_c.txt");
+    file_c.set_contents(crate::lines!["human file c"]);
+    repo.stage_all_and_commit("Human commit 4").unwrap();
+
+    // Commit 5: AI appends to shared.rs
+    shared.set_contents(crate::lines![
+        "fn original() {}",
+        "fn ai1() {}".ai(),
+        "fn ai5() {}".ai()
+    ]);
+    repo.stage_all_and_commit("AI commit 5").unwrap();
+
+    // Rebase
+    repo.git(&["checkout", "feature"]).unwrap();
+    repo.git(&["rebase", &default_branch]).unwrap();
+
+    // All 5 rebased commits must have notes.
+    let log_output = repo
+        .git(&[
+            "log",
+            "--format=%H",
+            &format!("{}..feature", default_branch),
+        ])
+        .unwrap();
+    let rebased_shas: Vec<&str> = log_output.trim().lines().collect();
+    assert_eq!(rebased_shas.len(), 5, "should have 5 rebased commits");
+
+    for sha in &rebased_shas {
+        let note = repo.read_authorship_note(sha);
+        assert!(
+            note.is_some(),
+            "rebased commit {} must have an authorship note after slow-path rebase (issue #1079)",
+            &sha[..8]
+        );
+    }
+
+    // Verify AI attribution survived.
+    shared.assert_lines_and_blame(crate::lines![
+        "// header",
+        "fn original() {}",
+        "fn ai1() {}".ai(),
+        "fn ai5() {}".ai()
+    ]);
+    module_b.assert_lines_and_blame(crate::lines!["fn b() {}".ai()]);
+}
+
+crate::reuse_tests_in_worktree!(
+    test_rebase_future_file_does_not_leak_into_earlier_commit_note,
+    test_rebase_intermediate_commit_accepted_lines_not_inflated,
+    test_rebase_three_commits_no_future_file_leakage,
+    test_rebase_deleted_file_does_not_persist_in_later_notes,
+    test_rebase_slow_path_line_attribution_is_correct,
+    test_rebase_hunk_path_does_not_drop_ai_attribution_for_new_lines,
+    test_rebase_second_commit_note_attributes_its_own_ai_lines,
+    test_rebase_attribution_loss_compounds_across_three_commits,
+    test_rebase_same_line_overwritten_by_consecutive_commits,
+    test_rebase_empty_file_does_not_panic_or_pollute_attribution,
+    test_rebase_conflict_on_ai_file_preserves_note,
+    test_rebase_metadata_only_notes_survive_slow_path,
+    test_rebase_mixed_ai_and_human_commits_all_retain_notes_after_slow_path,
+);

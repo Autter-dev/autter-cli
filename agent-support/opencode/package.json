@@ -1,0 +1,17 @@
+{
+  "name": "autter-opencode-plugin",
+  "version": "0.1.0",
+  "description": "autter plugin for OpenCode",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.15.13"
+  },
+  "devDependencies": {
+    "@types/node": "^25.x",
+    "typescript": "^5.8.3"
+  }
+}

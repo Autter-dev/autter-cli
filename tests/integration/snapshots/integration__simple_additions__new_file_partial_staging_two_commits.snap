@@ -1,0 +1,97 @@
+---
+source: tests/simple_additions.rs
+expression: "(log1, log2, blame1, blame2)"
+---
+(
+    AuthorshipLogV3 {
+        attestations: [
+            FileAttestation {
+                file_path: "planets.txt",
+                entries: [
+                    AttestationEntry {
+                        hash: "1cee1d9",
+                        line_ranges: [
+                            Range(
+                                1,
+                                5,
+                            ),
+                        ],
+                    },
+                ],
+            },
+        ],
+        metadata: AuthorshipMetadata {
+            schema_version: "authorship/3.0.0",
+            base_commit_sha: "6da30bcc5a08c892cdc390d22ff0f1ccd24f30ba",
+            prompts: {
+                "1cee1d9": PromptRecord {
+                    agent_id: AgentId {
+                        tool: "cursor",
+                        id: "test_session_fixed",
+                        model: "gpt-4",
+                    },
+                    human_author: Some(
+                        "Test User",
+                    ),
+                    messages: [],
+                    total_additions: 9,
+                    total_deletions: 1,
+                    accepted_lines: 9,
+                    overriden_lines: 0,
+                },
+            },
+        },
+    },
+    AuthorshipLogV3 {
+        attestations: [
+            FileAttestation {
+                file_path: "planets.txt",
+                entries: [
+                    AttestationEntry {
+                        hash: "1cee1d9",
+                        line_ranges: [
+                            Range(
+                                6,
+                                9,
+                            ),
+                        ],
+                    },
+                ],
+            },
+        ],
+        metadata: AuthorshipMetadata {
+            schema_version: "authorship/3.0.0",
+            base_commit_sha: "50c72a11a400ff9e49d90ca4db5a038ecebbfe48",
+            prompts: {
+                "1cee1d9": PromptRecord {
+                    agent_id: AgentId {
+                        tool: "cursor",
+                        id: "test_session_fixed",
+                        model: "gpt-4",
+                    },
+                    human_author: Some(
+                        "Test User",
+                    ),
+                    messages: [],
+                    total_additions: 4,
+                    total_deletions: 0,
+                    accepted_lines: 4,
+                    overriden_lines: 0,
+                },
+            },
+        },
+    },
+    {
+        1: "cursor",
+        2: "cursor",
+        3: "cursor",
+        4: "cursor",
+        5: "cursor",
+    },
+    {
+        6: "cursor",
+        7: "cursor",
+        8: "cursor",
+        9: "cursor",
+    },
+)

@@ -1,0 +1,123 @@
+version: "3"
+
+vars:
+  TEST_FILTER: '{{default "" .TEST_FILTER}}'
+  CARGO_TEST_ARGS: '{{default "" .CARGO_TEST_ARGS}}'
+  EXTRA_TEST_BINARY_ARGS: '{{default "" .EXTRA_TEST_BINARY_ARGS}}'
+  NO_CAPTURE: '{{default "false" .NO_CAPTURE}}'
+  TEST_BINARY_ARGS:
+    sh: |
+      args=""
+      if [ "{{.NO_CAPTURE}}" = "true" ]; then
+        args="--nocapture"
+      fi
+      if [ -n "{{.EXTRA_TEST_BINARY_ARGS}}" ]; then
+        args="$args {{.EXTRA_TEST_BINARY_ARGS}}"
+      fi
+      printf '%s' "$args"
+  TEST_THREADS:
+    sh: |
+      if [ -n "$NUMBER_OF_PROCESSORS" ]; then
+        n=$(powershell -NoProfile -NonInteractive -Command "[Environment]::ProcessorCount")
+      elif command -v nproc >/dev/null 2>&1; then
+        n=$(nproc)
+      elif command -v getconf >/dev/null 2>&1; then
+        n=$(getconf _NPROCESSORS_ONLN)
+      else
+        n=$(sysctl -n hw.ncpu)
+      fi
+      [ "$n" -gt 12 ] && echo 12 || echo "$n"
+
+tasks:
+  dev:
+    desc: |
+      Install a autter debug build for local dev on the system so that all git commands will route through it.
+      Installs to the same location as real release builds, so it overrides system-wide. It also runs `autter install`
+      and restarts the daemon to ensure all latest code changes are fully installed and propagated system-wide.
+      Use this for trying out changes locally -- do not use any other approaches for runing autter locally. They will
+      not work, interfere, and break things.
+    cmds:
+      - cmd: powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1
+        platforms: [windows]
+      - cmd: ./scripts/dev.sh
+        platforms: [linux, darwin]
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cargo clean
+
+  build:
+    desc: Build the project (only use this for checking that the project builds, not for running locally -- use `task dev` instead)
+    cmds:
+      - cargo build
+
+  test:base:
+    internal: true
+    cmds:
+      - cargo test {{.CARGO_TEST_ARGS}} {{.TEST_FILTER}} -- --test-threads {{.TEST_THREADS}} {{.TEST_BINARY_ARGS}}
+    env:
+      AUTTER_TEST_GIT_MODE: "{{.AUTTER_TEST_GIT_MODE}}"
+      AUTTER_TEST_SHARED_DAEMON_POOL_SIZE: "{{.TEST_THREADS}}"
+
+  test:
+    desc: Run unit tests (daemon mode by default)
+    cmds:
+      - task: test:base
+        vars:
+          AUTTER_TEST_GIT_MODE: daemon
+
+  test:wrapper-daemon:
+    desc: |
+      Run unit tests in wrapper-daemon mode. Wrapper-daemon mode is where we simulate `git` pointing to the autter-wrapped git, but
+      all autter processing is still done in the shared daemon with some extra context from the wrapper that is passed over the control
+      socket. Do not use this test mode unless explicitly requested, use `task test` for normal testing purposes.
+    cmds:
+      - task: test:base
+        vars:
+          AUTTER_TEST_GIT_MODE: wrapper-daemon
+
+  lint:
+    desc: Run cargo check and clippy with warnings as errors
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  doc:
+    desc: Build documentation with warnings as errors
+    cmds:
+      - cargo doc --no-deps
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+
+  format:
+    desc: Format code with rustfmt
+    aliases: [fmt]
+    cmds:
+      - cargo fmt
+
+  format:check:
+    desc: Check code formatting (CI)
+    cmds:
+      - cargo fmt -- --check
+
+  coverage:
+    desc: Run tests with coverage and show summary
+    cmds:
+      - cargo llvm-cov test --ignore-filename-regex='tests/.*|benches/.*|examples/.*'
+
+  coverage:html:
+    desc: Generate HTML coverage report and open in browser
+    cmds:
+      - cargo llvm-cov test --ignore-filename-regex='tests/.*|benches/.*|examples/.*' --html --open
+
+  coverage:lcov:
+    desc: Generate LCOV coverage report
+    cmds:
+      - cargo llvm-cov test --ignore-filename-regex='tests/.*|benches/.*|examples/.*' --lcov --output-path lcov.info
+
+  coverage:check:
+    desc: Run coverage and fail if below threshold
+    cmds:
+      - cargo llvm-cov test --ignore-filename-regex='tests/.*|benches/.*|examples/.*' --fail-under-lines {{.COVERAGE_THRESHOLD}}
+    vars:
+      COVERAGE_THRESHOLD: '{{.COVERAGE_THRESHOLD | default "50"}}'

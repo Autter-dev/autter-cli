@@ -1,0 +1,29 @@
+# Autter - GitLab CI Configuration
+# Add this job to your .gitlab-ci.yml file
+#
+# SETUP: Create a GITLAB_TOKEN variable with api and write_repository scopes.
+#
+# Note: CI_JOB_TOKEN (auto-provided) often lacks API query permissions.
+#       Setting GITLAB_TOKEN explicitly ensures proper access.
+#
+# 1. Settings > Access tokens > Add new token
+#    - Name: autter
+#    - Role: Maintainer
+#    - Scopes: api, write_repository (both required)
+# 2. Settings > CI/CD > Variables > Add variable
+#    - Key: GITLAB_TOKEN
+#    - Value: <paste token>
+#    - Masked: checked
+
+autter:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      when: always
+  script:
+    - curl -fsSL https://autter.dev/install.sh | bash
+    - export PATH="$HOME/.autter/bin:$PATH"
+    - git config --global user.name "gitlab-ci[bot]"
+    - git config --global user.email "gitlab-ci[bot]@users.noreply.gitlab.com"
+    - autter ci gitlab run
+

@@ -1,0 +1,62 @@
+---
+source: src/log_fmt/authorship_log_serialization.rs
+expression: deserialized
+---
+AuthorshipLogV3 {
+    attestations: [
+        FileAttestation {
+            file_path: "src/file.xyz",
+            entries: [
+                AttestationEntry {
+                    hash: "xyzAbc",
+                    line_ranges: [
+                        Single(
+                            1,
+                        ),
+                        Single(
+                            2,
+                        ),
+                        Range(
+                            19,
+                            222,
+                        ),
+                    ],
+                },
+                AttestationEntry {
+                    hash: "123456",
+                    line_ranges: [
+                        Range(
+                            400,
+                            405,
+                        ),
+                    ],
+                },
+            ],
+        },
+        FileAttestation {
+            file_path: "src/file2.xyz",
+            entries: [
+                AttestationEntry {
+                    hash: "123456",
+                    line_ranges: [
+                        Range(
+                            1,
+                            111,
+                        ),
+                        Single(
+                            245,
+                        ),
+                        Single(
+                            260,
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "abc123",
+        prompts: {},
+    },
+}
