@@ -1,0 +1,28 @@
+src/api/metrics.rs
+  s_9f0c2db23ca141::t_8086b564efa7c7 104-108,111,114-115,120-127
+  s_9f0c2db23ca141::t_3c2a9df31b9972 4-5
+src/api/org_db.rs
+  s_9f0c2db23ca141::t_a1aebf4bcc5243 27,34
+  s_9f0c2db23ca141::t_5f1a527ebeb817 437-490
+  s_9f0c2db23ca141::t_d1b6e1d5ade652 127-140
+src/commands/flush_metrics_db.rs
+  s_9f0c2db23ca141::t_0818b83bd2102c 14-15,19-20
+src/daemon/telemetry_worker.rs
+  s_9f0c2db23ca141::t_fe9fffb2090b8e 322-325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "a4d5b9ccea2b5da3ae5990b767fde80688cc4af7",
+  "prompts": {},
+  "sessions": {
+    "s_9f0c2db23ca141": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed51a-3547-76a6-b384-7506c75e9b65",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
