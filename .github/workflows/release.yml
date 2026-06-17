@@ -1,0 +1,152 @@
+name: Release
+
+# Builds the `autter` binary for every supported platform, publishes them as a
+# GitHub Release, and attaches a version-pinned install.sh (placeholders filled
+# in with the real repo, version, and SHA256 checksums).
+#
+# Trigger:
+#   - pushing a tag matching `v*` (e.g. v1.5.9) publishes a release
+#   - manual run via the Actions tab (workflow_dispatch) builds the binaries
+#     for validation but does NOT publish (no tag to release against)
+#
+# Asset names match what install.sh expects: autter-<os>-<arch>
+#   macos/arm64 -> autter-macos-arm64    macos/x64 -> autter-macos-x64
+#   linux/x64   -> autter-linux-x64      linux/arm64 -> autter-linux-arm64
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: autter-macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            tool: cargo
+          - asset: autter-macos-x64
+            os: macos-13
+            target: x86_64-apple-darwin
+            tool: cargo
+          - asset: autter-linux-x64
+            # 22.04 keeps the glibc requirement low (2.35) for broader portability
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            tool: cargo
+          - asset: autter-linux-arm64
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            tool: cross
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.tool == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cargo)
+        if: matrix.tool == 'cargo'
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin autter
+
+      - name: Build (cross)
+        if: matrix.tool == 'cross'
+        # cross runs the build inside a Docker image that bundles the aarch64
+        # cross toolchain, which is what makes the vendored openssl + bundled
+        # sqlite C builds work for the non-native target.
+        run: cross build --release --locked --target ${{ matrix.target }} --bin autter
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/autter" "dist/${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish for tag pushes; workflow_dispatch runs stop after building.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets
+        id: assemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # download-artifact nests each artifact under its own directory
+          for asset in autter-macos-arm64 autter-macos-x64 autter-linux-x64 autter-linux-arm64; do
+            cp "artifacts/${asset}/${asset}" "dist/${asset}"
+            chmod +x "dist/${asset}"
+          done
+
+          # Build the checksums file and the pipe-separated string install.sh embeds.
+          : > dist/checksums.txt
+          CHECKSUMS=""
+          for asset in autter-macos-arm64 autter-macos-x64 autter-linux-x64 autter-linux-arm64; do
+            line="$(cd dist && sha256sum "${asset}")"
+            echo "${line}" >> dist/checksums.txt
+            CHECKSUMS="${CHECKSUMS:+${CHECKSUMS}|}${line}"
+          done
+          echo "Checksums:"
+          cat dist/checksums.txt
+
+          # Fill the install.sh placeholders for the version-pinned release copy.
+          python3 scripts/fill-install-template.py install.sh dist/install.sh \
+            --repo "${GITHUB_REPOSITORY}" \
+            --version "${GITHUB_REF_NAME}" \
+            --checksums "${CHECKSUMS}"
+          chmod +x dist/install.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/autter-macos-arm64 \
+            dist/autter-macos-x64 \
+            dist/autter-linux-x64 \
+            dist/autter-linux-arm64 \
+            dist/install.sh \
+            dist/checksums.txt
