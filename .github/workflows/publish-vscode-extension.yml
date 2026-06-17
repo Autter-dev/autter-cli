@@ -1,0 +1,72 @@
+name: Publish VS Code Extension
+
+# Publishes the autter VS Code extension (agent-support/vscode) to the
+# Open VSX Registry and, if a token is configured, the VS Code Marketplace.
+#
+# Triggers:
+#   - pushing a tag matching `vscode-v*` (e.g. vscode-v0.1.23)
+#   - manual run via the Actions tab (workflow_dispatch)
+#
+# Required repository secrets:
+#   OVSX_PAT  - Open VSX access token (https://open-vsx.org user settings)
+#   VSCE_PAT  - VS Code Marketplace PAT (optional; Marketplace step is skipped if unset)
+
+on:
+  push:
+    tags:
+      - "vscode-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-support/vscode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: agent-support/vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # When triggered by a `vscode-v<x.y.z>` tag, the tag is the source of truth
+      # for the version. Sync package.json to it so the packaged/published .vsix
+      # can't drift from the tag (e.g. tag vscode-v0.1.23 must publish 0.1.23).
+      - name: Sync version to tag
+        if: startsWith(github.ref, 'refs/tags/vscode-v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#vscode-v}"
+          echo "Setting extension version to $VERSION (from tag $GITHUB_REF_NAME)"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Package extension (.vsix)
+        run: npm run package
+
+      - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx ovsx publish *.vsix -p "$OVSX_PAT"
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ secrets.VSCE_PAT != '' }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx vsce publish --packagePath *.vsix -p "$VSCE_PAT"
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: autter-vscode-vsix
+          path: agent-support/vscode/*.vsix
+          if-no-files-found: warn

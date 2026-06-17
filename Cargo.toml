@@ -1,3 +1,11 @@
+[workspace]
+# The CLI writes authorship notes and prompt CAS objects straight to each org's
+# own Postgres (connection URL comes from the access-token JWT's `org_db_url`
+# claim), so there is no separate backend crate to build or deploy.
+members = []
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "autter"
 version = "1.5.9"
@@ -25,6 +33,12 @@ jsonc-parser = { version = "0.32", features = ["cst"] }
 dirs = "5.0"
 ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
+# Direct writes to each org's own Postgres (authorship notes + prompt CAS). The
+# org's connection URL is read from the access-token JWT's `org_db_url` claim, so
+# the CLI talks to the org database itself — there is no intermediate backend.
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+postgres-native-tls = "0.5"
+base64 = "0.22"
 url = "2.5"
 glob = "0.3"
 ignore = "0.4"

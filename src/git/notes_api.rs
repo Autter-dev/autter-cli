@@ -20,7 +20,10 @@ pub use crate::git::refs::CommitAuthorship;
 
 pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<(), AutterError> {
     match Config::get().notes_backend_kind() {
-        NotesBackendKind::Http => http_write_note(commit_sha, content),
+        NotesBackendKind::Http => {
+            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
+            http_write_note(commit_sha, content, repo_url.as_deref())
+        }
         NotesBackendKind::GitNotes => crate::git::refs::notes_add(repo, commit_sha, content),
     }
 }
@@ -33,7 +36,10 @@ pub fn write_notes_batch(
         return Ok(());
     }
     match Config::get().notes_backend_kind() {
-        NotesBackendKind::Http => http_write_batch(entries),
+        NotesBackendKind::Http => {
+            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
+            http_write_batch(entries, repo_url.as_deref())
+        }
         NotesBackendKind::GitNotes => crate::git::refs::notes_add_batch(repo, entries),
     }
 }
@@ -506,23 +512,30 @@ pub fn warm_cache_for_remote(repo: &Repository, remote: &str) -> Result<(), Autt
 
 // --- HTTP backend helpers (private) ---
 
-fn http_write_note(commit_sha: &str, content: &str) -> Result<(), AutterError> {
+fn http_write_note(
+    commit_sha: &str,
+    content: &str,
+    repo_url: Option<&str>,
+) -> Result<(), AutterError> {
     let db = crate::notes::db::NotesDatabase::global()?;
     let mut db_lock = db
         .lock()
         .map_err(|e| AutterError::Generic(format!("notes-db lock: {}", e)))?;
-    db_lock.upsert_note(commit_sha, content)?;
+    db_lock.upsert_note_with_repo(commit_sha, content, repo_url)?;
     drop(db_lock);
     crate::daemon::telemetry_handle::submit_notes();
     Ok(())
 }
 
-fn http_write_batch(entries: &[(String, String)]) -> Result<(), AutterError> {
+fn http_write_batch(
+    entries: &[(String, String)],
+    repo_url: Option<&str>,
+) -> Result<(), AutterError> {
     let db = crate::notes::db::NotesDatabase::global()?;
     let mut db_lock = db
         .lock()
         .map_err(|e| AutterError::Generic(format!("notes-db lock: {}", e)))?;
-    db_lock.upsert_notes_batch(entries)?;
+    db_lock.upsert_notes_batch_with_repo(entries, repo_url)?;
     drop(db_lock);
     crate::daemon::telemetry_handle::submit_notes();
     Ok(())
@@ -613,7 +626,7 @@ mod tests {
         }
 
         // Write directly via http helper (no repo needed).
-        http_write_note("abc123def456abc123def456abc123def456abc1", "test content").expect("write");
+        http_write_note("abc123def456abc123def456abc123def456abc1", "test content", None).expect("write");
 
         // Read back from cache.
         let content = http_read_note("abc123def456abc123def456abc123def456abc1");
@@ -653,8 +666,8 @@ mod tests {
         let sha2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
         let sha3 = "cccccccccccccccccccccccccccccccccccccccc".to_string();
 
-        http_write_note(&sha1, "content-a").expect("write sha1");
-        http_write_note(&sha2, "content-b").expect("write sha2");
+        http_write_note(&sha1, "content-a", None).expect("write sha1");
+        http_write_note(&sha2, "content-b", None).expect("write sha2");
 
         // sha3 is not written — should not appear in result.
         let result = http_read_notes(&[sha1.clone(), sha2.clone(), sha3.clone()]);
@@ -739,7 +752,7 @@ mod tests {
         let sha = repo.commit_all("msg").expect("commit");
 
         // Write a note for this SHA using the Http helper.
-        http_write_note(&sha, "some-note-content").expect("http write");
+        http_write_note(&sha, "some-note-content", None).expect("http write");
 
         // Confirm it is in notes-db with synced=0.
         let db = crate::notes::db::NotesDatabase::global().expect("global db");
@@ -797,7 +810,7 @@ mod tests {
         let sha = repo.commit_all("test commit").expect("commit");
 
         // Put a note in the cache for this commit.
-        http_write_note(&sha, "display-note-content").expect("write note");
+        http_write_note(&sha, "display-note-content", None).expect("write note");
 
         // Materialize the cache into refs/notes/ai-display.
         let count = materialize_notes_for_display(repo.autter_repo(), 50).expect("materialize");

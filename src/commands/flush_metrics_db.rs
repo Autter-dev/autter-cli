@@ -11,14 +11,13 @@ const MAX_BATCH_SIZE: usize = 1000;
 
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {
-    // Check conditions: (!using_default_api) || is_logged_in() || has_api_key()
+    // Metrics are written to the org database via the access token's
+    // `org_db_url` claim, so a write requires being logged in.
     let context = ApiContext::new(None);
-    let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
-    let using_default_api = api_base_url == crate::config::DEFAULT_API_BASE_URL;
-    if using_default_api && !client.is_logged_in() && !client.has_api_key() {
-        eprintln!("flush-metrics-db: skipping (not logged in and using default API)");
+    if !client.is_logged_in() {
+        eprintln!("flush-metrics-db: skipping (not logged in)");
         return;
     }
 

@@ -114,10 +114,12 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
         }
     }
 
-    // Upload prompt/usage data to the platform while keeping local git notes.
+    // Connected mode: upload prompts (CAS) and authorship notes to the hosted
+    // data plane. `backend_url: None` resolves to DEFAULT_NOTES_BACKEND_URL
+    // (cli.autter.dev) via Config::notes_backend_url().
     cfg.prompt_storage = Some("default".to_string());
     cfg.notes_backend = Some(NotesBackendConfig {
-        kind: NotesBackendKind::GitNotes,
+        kind: NotesBackendKind::Http,
         backend_url: None,
     });
 

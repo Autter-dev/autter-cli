@@ -1,4 +1,4 @@
-//! `autter notes migrate` — bulk-upload existing git notes to the HTTP backend.
+//! `autter notes migrate` — bulk-upload existing git notes to the org's database.
 //!
 //! This command reads all notes stored in `refs/notes/ai` via `git notes --ref=ai list`,
 //! fetches their content using `git cat-file --batch`, uploads them to the remote HTTP
@@ -45,7 +45,7 @@ pub fn handle_notes_migrate(args: &[String]) {
             "error: `autter notes migrate` requires notes_backend.kind = http.\n\
              Current backend: {}\n\
              \n\
-             To enable the HTTP backend, run:\n\
+             To enable cloud sync, run:\n\
              \n\
              \x20 autter config set notes_backend.kind http",
             cfg.notes_backend_kind()
@@ -396,7 +396,7 @@ fn cat_file_batch(
 }
 
 fn print_help() {
-    eprintln!("autter notes migrate - Bulk-upload existing git notes to the HTTP backend");
+    eprintln!("autter notes migrate - Bulk-upload existing git notes to your org's database");
     eprintln!();
     eprintln!("Usage: autter notes migrate [options]");
     eprintln!();

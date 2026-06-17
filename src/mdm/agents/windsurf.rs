@@ -3,8 +3,9 @@ use crate::mdm::hook_installer::{
     HookCheckResult, HookInstaller, HookInstallerParams, InstallResult, UninstallResult,
 };
 use crate::mdm::utils::{
-    generate_diff, home_dir, install_vsc_editor_extension, is_autter_checkpoint_command,
-    is_github_codespaces, is_vsc_editor_extension_installed, resolve_editor_cli, write_atomic,
+    generate_diff, home_dir, install_vsc_editor_extension_with_vsix_fallback,
+    is_autter_checkpoint_command, is_github_codespaces, is_vsc_editor_extension_installed,
+    resolve_editor_cli, write_atomic,
 };
 
 use serde_json::{Value, json};
@@ -348,7 +349,10 @@ impl HookInstaller for WindsurfInstaller {
                     } else {
                         println!("Installing extensions...");
                         println!("\tInstalling extension 'autter.autter-vscode'...");
-                        match install_vsc_editor_extension(&cli, "autter.autter-vscode") {
+                        match install_vsc_editor_extension_with_vsix_fallback(
+                            &cli,
+                            "autter.autter-vscode",
+                        ) {
                             Ok(()) => {
                                 results.push(InstallResult {
                                     changed: true,

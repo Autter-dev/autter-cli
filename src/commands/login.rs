@@ -73,20 +73,157 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     Ok(LoginOutcome::LoggedIn)
 }
 
-/// Handle the `autter login` command
-pub fn handle_login(_args: &[String]) {
-    match run_device_login() {
-        Ok(LoginOutcome::AlreadyLoggedIn) => {
-            eprintln!("Already logged in. Use 'autter logout' to log out first.");
-            std::process::exit(0);
+/// Sign in with a Personal Access Token instead of the interactive device flow.
+///
+/// Validates the token by exchanging it for an access token up-front, so a bad
+/// token fails immediately rather than being stored and failing later.
+pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("No token provided. Usage: autter login --token <token>".to_string());
+    }
+
+    let creds = OAuthClient::new().exchange_pat(token)?;
+
+    let store = CredentialStore::new();
+    store
+        .store(&creds)
+        .map_err(|e| format!("Failed to store credentials: {}", e))?;
+
+    print_login_success(&creds.access_token);
+    Ok(LoginOutcome::LoggedIn)
+}
+
+/// Print "Successfully logged in!" plus the signed-in user and active org, read
+/// from the access token's claims (best-effort — falls back gracefully).
+fn print_login_success(access_token: &str) {
+    use crate::auth::identity::extract_identity_from_access_token;
+
+    eprintln!("Successfully logged in!");
+    let identity = extract_identity_from_access_token(access_token);
+
+    if let Some(name) = identity.name.as_deref().filter(|s| !s.is_empty()) {
+        match identity.email.as_deref().filter(|s| !s.is_empty()) {
+            Some(email) => eprintln!("  Signed in as {} ({})", name, email),
+            None => eprintln!("  Signed in as {}", name),
         }
-        Ok(LoginOutcome::LoggedIn) => {
-            eprintln!("\nSuccessfully logged in!");
+    } else if let Some(email) = identity.email.as_deref().filter(|s| !s.is_empty()) {
+        eprintln!("  Signed in as {}", email);
+    }
+
+    if let Some(org) = identity.active_org() {
+        if let Some(org_name) = org.org_name.as_deref().filter(|s| !s.is_empty()) {
+            match org.org_slug.as_deref().filter(|s| !s.is_empty()) {
+                Some(slug) => eprintln!("  Organization: {} ({})", org_name, slug),
+                None => eprintln!("  Organization: {}", org_name),
+            }
         }
-        Err(e) => {
-            eprintln!("\n{}", e);
+    }
+}
+
+/// Extract a `--token <value>` or `--token=<value>` argument, if present.
+fn parse_token_arg(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(rest) = arg.strip_prefix("--token=") {
+            return Some(rest.to_string());
+        }
+        if arg == "--token" {
+            return args.get(i + 1).cloned();
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The Autter web dashboard, where the user creates a Personal Access Token.
+const DEFAULT_WEB_APP_URL: &str = "https://app.autter.dev";
+
+/// Resolve the web dashboard URL. Precedence:
+///   1. `AUTTER_WEB_URL` env (explicit override, e.g. a local Vite dev server)
+///   2. derived from the configured `api_base_url` (swap the `api` host label)
+///   3. the default `https://app.autter.dev`
+fn web_app_url() -> String {
+    if let Ok(url) = std::env::var("AUTTER_WEB_URL")
+        && !url.trim().is_empty()
+    {
+        return url;
+    }
+    if let Some(web) = derive_web_url_from_api(crate::config::Config::get().api_base_url()) {
+        return web;
+    }
+    DEFAULT_WEB_APP_URL.to_string()
+}
+
+/// Derive the web app URL from the API base URL by swapping the leading `api`
+/// host label for `app`, e.g. `https://test-api.autter.dev` ->
+/// `https://test-app.autter.dev`, `https://api.autter.dev` -> `https://app.autter.dev`.
+/// Returns `None` when there is no `api` label to swap.
+fn derive_web_url_from_api(api_base_url: &str) -> Option<String> {
+    let (scheme, rest) = api_base_url.split_once("://")?;
+    let (host, tail) = match rest.split_once('/') {
+        Some((h, t)) => (h, Some(t)),
+        None => (rest, None),
+    };
+    let (first, remainder) = host.split_once('.')?;
+    let new_first = if first == "api" {
+        "app".to_string()
+    } else if let Some(prefix) = first.strip_suffix("-api") {
+        format!("{prefix}-app")
+    } else {
+        return None;
+    };
+    let new_host = format!("{new_first}.{remainder}");
+    Some(match tail {
+        Some(t) => format!("{scheme}://{new_host}/{t}"),
+        None => format!("{scheme}://{new_host}"),
+    })
+}
+
+/// Print the step-by-step browser sign-in instructions.
+fn print_login_instructions(url: &str) {
+    eprintln!("To sign in to Autter:\n");
+    eprintln!("  1. We've opened the Autter dashboard in your browser:");
+    eprintln!("       {}", url);
+    eprintln!("     (If it didn't open, copy that link into your browser.)\n");
+    eprintln!("  2. Log in, then open any organization's");
+    eprintln!("       Settings -> Access Tokens\n");
+    eprintln!("  3. Click \"Create token\", give it a name, and copy the token.\n");
+    eprintln!("  4. Come back here and run:");
+    eprintln!("       autter login --token <paste-your-token>\n");
+}
+
+/// Handle the `autter login` command.
+///
+/// Two-step, browser-assisted Personal Access Token flow:
+///   1. `autter login` opens the dashboard so the user can create + copy a token.
+///   2. `autter login --token <PAT>` completes sign-in with that token.
+pub fn handle_login(args: &[String]) {
+    // Step 2: complete sign-in with a token created in the browser.
+    if let Some(token) = parse_token_arg(args) {
+        // run_pat_login prints the success message + identity on success.
+        if let Err(e) = run_pat_login(&token) {
+            eprintln!("{}", e);
             std::process::exit(1);
         }
+        return;
+    }
+
+    // Already signed in? Nothing to do.
+    let store = CredentialStore::new();
+    if let Ok(Some(creds)) = store.load()
+        && !creds.is_refresh_token_expired()
+    {
+        eprintln!("Already logged in. Use 'autter logout' to log out first.");
+        return;
+    }
+
+    // Step 1: open the dashboard and tell the user what to do next.
+    let url = web_app_url();
+    print_login_instructions(&url);
+    if open_browser(&url).is_err() {
+        eprintln!("  (Could not open the browser automatically — open the link above.)");
     }
 }
 

@@ -1,76 +1,46 @@
+//! CAS (prompt-transcript) storage, written directly to the org's own Postgres.
+//!
+//! The connection URL comes from the `org_db_url` claim in the context's access
+//! token (see [`crate::api::org_db`]); there is no intermediate backend.
+
 use crate::api::client::ApiClient;
-use crate::api::types::{
-    ApiErrorResponse, CAPromptStoreReadResponse, CasUploadRequest, CasUploadResponse,
-};
+use crate::api::org_db;
+use crate::api::types::{CAPromptStoreReadResponse, CasUploadRequest, CasUploadResponse};
+use crate::config;
 use crate::error::AutterError;
 
 /// CAS API endpoints
 impl ApiClient {
-    /// Upload CAS objects to the server
+    /// Store CAS objects in the org's database (dedup by hash).
     ///
     /// # Arguments
     /// * `request` - The CAS upload request containing objects to upload
     ///
     /// # Returns
-    /// * `Ok(CasUploadResponse)` - Success response
-    /// * `Err(AutterError)` - Error response
+    /// * `Ok(CasUploadResponse)` - Per-object results plus counts
+    /// * `Err(AutterError)` - When not authenticated or the DB write fails
     pub fn upload_cas(&self, request: CasUploadRequest) -> Result<CasUploadResponse, AutterError> {
-        let response = self.context().post_json("/worker/cas/upload", &request)?;
-        let status_code = response.status_code;
-
-        let body = response
-            .as_str()
-            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
-
-        match status_code {
-            200 => {
-                let cas_response: CasUploadResponse =
-                    serde_json::from_str(body).map_err(AutterError::JsonError)?;
-                Ok(cas_response)
-            }
-            400 => {
-                let error_response: ApiErrorResponse =
-                    serde_json::from_str(body).unwrap_or_else(|_| ApiErrorResponse {
-                        error: "Invalid request body".to_string(),
-                        details: Some(serde_json::Value::String(body.to_string())),
-                    });
-                Err(AutterError::Generic(format!(
-                    "Bad Request: {}",
-                    error_response.error
-                )))
-            }
-            500 => {
-                let error_response: ApiErrorResponse =
-                    serde_json::from_str(body).unwrap_or_else(|_| ApiErrorResponse {
-                        error: "Internal server error".to_string(),
-                        details: None,
-                    });
-                Err(AutterError::Generic(format!(
-                    "Internal Server Error: {}",
-                    error_response.error
-                )))
-            }
-            _ => Err(AutterError::Generic(format!(
-                "Unexpected status code {}: {}",
-                status_code, body
-            ))),
-        }
+        let identity = self.org_identity()?;
+        org_db::upsert_cas(
+            &identity,
+            &request.objects,
+            &config::get_or_create_distinct_id(),
+        )
     }
 
-    /// Read CAS objects by hash from the server
+    /// Read CAS objects by hash from the org's database.
     ///
     /// # Arguments
-    /// * `hashes` - Slice of CAS hashes to fetch (max 100 per call)
+    /// * `hashes` - Slice of CAS hashes to fetch
     ///
     /// # Returns
     /// * `Ok(CAPromptStoreReadResponse)` - Response with results for each hash
-    /// * `Err(AutterError)` - On network or server errors
+    /// * `Err(AutterError)` - On invalid input, auth, or DB errors
     pub fn read_ca_prompt_store(
         &self,
         hashes: &[&str],
     ) -> Result<CAPromptStoreReadResponse, AutterError> {
-        // Validate all hashes are hex-only before building the URL to prevent
-        // injection via crafted hash values in the query string.
+        // Validate all hashes are hex-only to guard against malformed input.
         for hash in hashes {
             if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(AutterError::Generic(format!(
@@ -80,33 +50,7 @@ impl ApiClient {
             }
         }
 
-        let query = hashes.join(",");
-        let endpoint = format!("/worker/cas/?hashes={}", query);
-        let response = self.context().get(&endpoint)?;
-        let status_code = response.status_code;
-
-        let body = response
-            .as_str()
-            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
-
-        match status_code {
-            200 => {
-                let cas_response: CAPromptStoreReadResponse =
-                    serde_json::from_str(body).map_err(AutterError::JsonError)?;
-                Ok(cas_response)
-            }
-            404 => {
-                // All hashes not found — return empty response gracefully
-                Ok(CAPromptStoreReadResponse {
-                    results: Vec::new(),
-                    success_count: 0,
-                    failure_count: hashes.len(),
-                })
-            }
-            _ => Err(AutterError::Generic(format!(
-                "CAS read failed with status {}: {}",
-                status_code, body
-            ))),
-        }
+        let identity = self.org_identity()?;
+        org_db::read_cas(&identity, hashes)
     }
 }

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// Current schema version (must equal MIGRATIONS.len()).
-const SCHEMA_VERSION: usize = 1;
+const SCHEMA_VERSION: usize = 2;
 
 /// Database migrations — each entry upgrades the schema by one version.
 const MIGRATIONS: &[&str] = &[
@@ -39,6 +39,12 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_notes_pending
         ON notes(synced, next_retry_at) WHERE synced = 0;
     "#,
+    // Migration 1 → 2: record the canonical repo remote URL per note so the
+    // daemon flush can route each note to the org that owns that repository.
+    // NULL means "no known repo" → upload to the user's home org.
+    r#"
+    ALTER TABLE notes ADD COLUMN repo_url TEXT;
+    "#,
 ];
 
 /// Global singleton for the notes database.
@@ -50,6 +56,9 @@ pub struct PendingNote {
     pub commit_sha: String,
     pub content: String,
     pub attempts: i64,
+    /// Canonical remote URL of the repo this note came from (None = unknown →
+    /// home org). Used to route the upload to the org that owns the repository.
+    pub repo_url: Option<String>,
 }
 
 /// SQLite wrapper for notes storage and queue.
@@ -234,25 +243,45 @@ impl NotesDatabase {
     /// - If the content changed, `synced` and `attempts` are reset to 0 so the
     ///   updated note is queued for re-upload.
     pub fn upsert_note(&mut self, commit_sha: &str, content: &str) -> Result<(), AutterError> {
+        self.upsert_note_with_repo(commit_sha, content, None)
+    }
+
+    /// Upsert a note, associating it with the repo it came from (for org routing).
+    pub fn upsert_note_with_repo(
+        &mut self,
+        commit_sha: &str,
+        content: &str,
+        repo_url: Option<&str>,
+    ) -> Result<(), AutterError> {
         let now = unix_now();
         self.conn.execute(
             r#"
-            INSERT INTO notes (commit_sha, content, synced, created_at, updated_at, next_retry_at)
-            VALUES (?1, ?2, 0, ?3, ?3, ?3)
+            INSERT INTO notes (commit_sha, content, repo_url, synced, created_at, updated_at, next_retry_at)
+            VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4)
             ON CONFLICT(commit_sha) DO UPDATE SET
                 content        = excluded.content,
+                repo_url       = excluded.repo_url,
                 synced         = CASE WHEN notes.content = excluded.content THEN notes.synced ELSE 0 END,
                 attempts       = CASE WHEN notes.content = excluded.content THEN notes.attempts ELSE 0 END,
                 next_retry_at  = CASE WHEN notes.content = excluded.content THEN notes.next_retry_at ELSE excluded.next_retry_at END,
                 updated_at     = excluded.updated_at
             "#,
-            params![commit_sha, content, now],
+            params![commit_sha, content, repo_url, now],
         )?;
         Ok(())
     }
 
     /// Upsert a batch of notes inside a single transaction.
     pub fn upsert_notes_batch(&mut self, entries: &[(String, String)]) -> Result<(), AutterError> {
+        self.upsert_notes_batch_with_repo(entries, None)
+    }
+
+    /// Upsert a batch of notes from a single repo (for org routing).
+    pub fn upsert_notes_batch_with_repo(
+        &mut self,
+        entries: &[(String, String)],
+        repo_url: Option<&str>,
+    ) -> Result<(), AutterError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -261,10 +290,11 @@ impl NotesDatabase {
         {
             let mut stmt = tx.prepare_cached(
                 r#"
-                INSERT INTO notes (commit_sha, content, synced, created_at, updated_at, next_retry_at)
-                VALUES (?1, ?2, 0, ?3, ?3, ?3)
+                INSERT INTO notes (commit_sha, content, repo_url, synced, created_at, updated_at, next_retry_at)
+                VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4)
                 ON CONFLICT(commit_sha) DO UPDATE SET
                     content        = excluded.content,
+                    repo_url       = excluded.repo_url,
                     synced         = CASE WHEN notes.content = excluded.content THEN notes.synced ELSE 0 END,
                     attempts       = CASE WHEN notes.content = excluded.content THEN notes.attempts ELSE 0 END,
                     next_retry_at  = CASE WHEN notes.content = excluded.content THEN notes.next_retry_at ELSE excluded.next_retry_at END,
@@ -272,7 +302,7 @@ impl NotesDatabase {
                 "#,
             )?;
             for (sha, content) in entries {
-                stmt.execute(params![sha, content, now])?;
+                stmt.execute(params![sha, content, repo_url, now])?;
             }
         }
         tx.commit()?;
@@ -374,7 +404,7 @@ impl NotesDatabase {
 
         // Read back the locked rows.
         let select_sql = format!(
-            "SELECT commit_sha, content, attempts FROM notes WHERE commit_sha IN ({})",
+            "SELECT commit_sha, content, attempts, repo_url FROM notes WHERE commit_sha IN ({})",
             shas.iter()
                 .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
@@ -393,6 +423,7 @@ impl NotesDatabase {
                 commit_sha: row.get(0)?,
                 content: row.get(1)?,
                 attempts: row.get(2)?,
+                repo_url: row.get(3)?,
             })
         })?;
 
