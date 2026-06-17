@@ -48,6 +48,52 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://autter.dev/i
 
 **No per-repo setup or git hooks required.** Commit with the Agent, git, or your favorite git client. Attribution will be linked to commits automatically.
 
+During install you'll be asked whether to run **local-only** or **connect to the Autter platform**. You can change this any time with `autter onboard`.
+
+## Connect to the Autter platform (optional)
+
+Local-only mode works fully offline with no account. Connecting links this machine to your Autter account so attribution and prompt history sync to the platform's dashboards (per-user / per-team usage, prompt search, and audit logs).
+
+Sign in is a two-step, browser-based flow using a **Personal Access Token (PAT)**:
+
+```bash
+# 1. Opens https://app.autter.dev in your browser
+autter login
+
+# 2. In the dashboard: Settings → Access Tokens → Create token → copy it.
+#    Then complete sign-in with the token you copied:
+autter login --token autter_pat_xxxxxxxx
+
+# Confirm who you're signed in as:
+autter whoami
+```
+
+Once connected:
+
+- **Authorship notes** (which lines are AI vs human, per commit) and **prompt transcripts** are written on commit straight to **your organization's own database** — never shared across orgs. The CLI connects to that database directly using the connection URL carried in your signed access token; there is no intermediate Autter server in the data path.
+- A token is scoped to your account; if you belong to multiple organizations, each push is automatically routed to the org that owns the repository (resolved from its git remote), falling back to your default org.
+- Manage and revoke tokens, and view CLI activity (token created, sign-in, data pushed), under **Settings → Access Tokens** in the dashboard.
+
+To go back to local-only at any time:
+
+```bash
+autter logout                 # clear stored credentials
+autter onboard --force        # re-choose local or connected
+```
+
+### Configuration
+
+`autter` reads `~/.autter/config.json`. Defaults point at the hosted platform; override per machine (e.g. for self-hosting or CI):
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `api_base_url` | `https://api.autter.dev` | Auth + token exchange |
+| `notes_backend.kind` | `git_notes` (local) / `http` (connected) | Where authorship notes go |
+| `notes_backend.backend_url` | `https://cli.autter.dev` | Gate that enables cloud sync; the actual notes/prompt writes go straight to your org database (URL from your token), not to this host |
+| `prompt_storage` | `local` / `default` (connected) | `default` uploads prompts, `local` keeps them on-device |
+
+Env overrides: `AUTTER_API_BASE_URL`, `AUTTER_WEB_URL`, `AUTTER_NOTES_BACKEND_KIND`, `AUTTER_NOTES_BACKEND_URL`, `AUTTER_API_KEY` (for CI).
+
 **The [Autter standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) is supported by:**
 <table>
 <tr>

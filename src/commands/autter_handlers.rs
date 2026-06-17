@@ -237,19 +237,13 @@ fn handle_notes_subcommand(args: &[String]) {
         "migrate" => {
             commands::notes_migrate::handle_notes_migrate(&args[1..]);
         }
-        // Hidden: in-memory reference implementation of the notes backend HTTP
-        // contract. Intentionally not advertised in `--help`; it is for
-        // developers, tests, and benchmarks, not end users.
-        "serve" => {
-            handle_notes_serve(&args[1..]);
-        }
         "--help" | "-h" | "help" => {
             eprintln!("autter notes - Notes backend management commands");
             eprintln!();
             eprintln!("Usage: autter notes <subcommand> [options]");
             eprintln!();
             eprintln!("Subcommands:");
-            eprintln!("  migrate    Bulk-upload existing git notes to the HTTP backend");
+            eprintln!("  migrate    Bulk-upload existing git notes to your org's database");
             eprintln!();
             eprintln!("Run 'autter notes <subcommand> --help' for details.");
         }
@@ -258,50 +252,6 @@ fn handle_notes_subcommand(args: &[String]) {
             eprintln!("Run 'autter notes --help' for usage.");
             std::process::exit(1);
         }
-    }
-}
-
-/// `autter notes serve` — run the in-memory reference notes backend.
-///
-/// This is a developer/test tool. The server stores everything in process
-/// memory and accepts any auth header. See
-/// `crate::notes::reference_server` for the wire contract.
-fn handle_notes_serve(args: &[String]) {
-    let mut bind: String = "127.0.0.1:0".to_string();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--bind" if i + 1 < args.len() => {
-                bind = args[i + 1].clone();
-                i += 2;
-            }
-            "--port" if i + 1 < args.len() => {
-                bind = format!("127.0.0.1:{}", args[i + 1]);
-                i += 2;
-            }
-            "--help" | "-h" => {
-                eprintln!(
-                    "autter notes serve - Run the in-memory notes backend reference server\n\
-                     \n\
-                     Usage: autter notes serve [--bind <addr:port>] [--port <port>]\n\
-                     \n\
-                     This is a reference implementation. All notes are stored in process\n\
-                     memory; auth headers are accepted but not validated. It exists to\n\
-                     document the HTTP wire contract and to enable local testing of the\n\
-                     `notes_backend.kind = http` code path without a real backend."
-                );
-                return;
-            }
-            other => {
-                eprintln!("Unknown argument to `autter notes serve`: {}", other);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if let Err(e) = crate::notes::reference_server::run_blocking(&bind) {
-        eprintln!("notes reference server failed: {}", e);
-        std::process::exit(1);
     }
 }
 

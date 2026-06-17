@@ -699,12 +699,23 @@ pub fn flush_notes() {
 }
 
 fn flush_cas(records: Vec<CasSyncPayload>) {
-    let context = ApiContext::new(None);
-    let api_base_url = context.base_url.clone();
+    // CAS (prompt transcripts) is data-plane traffic. When the HTTP notes backend
+    // is active, send it to the same hosted data plane as notes (cli.autter.dev);
+    // otherwise fall back to the API base URL (legacy behavior).
+    let cfg = Config::fresh();
+    let dataplane_url =
+        if cfg.notes_backend_kind() == crate::config::NotesBackendKind::Http {
+            cfg.notes_backend_url().map(|s| s.to_string())
+        } else {
+            None
+        };
+    let context = ApiContext::new(dataplane_url);
+    let target_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
-    let using_default_api = api_base_url == crate::config::DEFAULT_API_BASE_URL;
-    if using_default_api && !client.is_logged_in() && !client.has_api_key() {
+    let using_hosted = target_url == crate::config::DEFAULT_API_BASE_URL
+        || target_url == crate::config::DEFAULT_NOTES_BACKEND_URL;
+    if using_hosted && !client.is_logged_in() && !client.has_api_key() {
         tracing::debug!("telemetry: skipping CAS flush, not logged in");
         return;
     }

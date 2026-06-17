@@ -17,7 +17,11 @@ use crate::mdm::utils::home_dir;
 use std::sync::RwLock;
 
 /// Default API base URL for comparison
-pub const DEFAULT_API_BASE_URL: &str = "https://autter.dev";
+pub const DEFAULT_API_BASE_URL: &str = "https://api.autter.dev";
+
+/// Default data-plane (notes/CAS) endpoint used when the HTTP notes backend is
+/// enabled but no explicit `backend_url` is configured.
+pub const DEFAULT_NOTES_BACKEND_URL: &str = "https://cli.autter.dev";
 
 /// Which backend to use for storing authorship notes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -615,12 +619,19 @@ impl Config {
         self.notes_backend.kind
     }
 
-    /// Returns the configured notes backend URL, or `None` if unset.
+    /// Returns the notes backend URL.
     ///
-    /// Callers must handle `None` explicitly — typically by skipping the operation when the HTTP backend
-    /// is enabled but no URL has been configured.
+    /// Precedence: an explicit `backend_url` wins; otherwise, when the HTTP backend
+    /// is active, falls back to [`DEFAULT_NOTES_BACKEND_URL`] (the hosted data plane).
+    /// Returns `None` only when the HTTP backend is not enabled and no URL is set.
     pub fn notes_backend_url(&self) -> Option<&str> {
-        self.notes_backend.backend_url.as_deref()
+        if let Some(url) = self.notes_backend.backend_url.as_deref() {
+            return Some(url);
+        }
+        if self.notes_backend.kind == NotesBackendKind::Http {
+            return Some(DEFAULT_NOTES_BACKEND_URL);
+        }
+        None
     }
 
     /// Returns true when the HTTP notes backend is active.
