@@ -317,11 +317,12 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
 
 fn flush_metrics(events: &[MetricEvent]) {
     let context = ApiContext::new(None);
-    let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
-    let using_default_api = api_base_url == crate::config::DEFAULT_API_BASE_URL;
-    let should_upload = !using_default_api || client.is_logged_in() || client.has_api_key();
+    // Metrics are written straight to the org database, which we reach via the
+    // `org_db_url` claim in the access token — so a write is only possible when
+    // logged in. Otherwise the events fall back to the local SQLite queue.
+    let should_upload = client.is_logged_in();
 
     let mut upload_failed = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

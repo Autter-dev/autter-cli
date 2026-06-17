@@ -24,12 +24,14 @@ use std::time::Duration;
 use base64::Engine;
 use once_cell::sync::Lazy;
 use postgres::Client;
+use sha2::{Digest, Sha256};
 
 use crate::api::types::{
     CAPromptStoreReadResponse, CAPromptStoreReadResult, CasObject, CasUploadResponse,
     CasUploadResult, NoteEntry, NotesReadResponse, NotesUploadResponse,
 };
 use crate::error::AutterError;
+use crate::metrics::MetricEvent;
 
 /// Identity + routing decoded from the caller's access-token JWT.
 #[derive(Debug, Clone)]
@@ -122,7 +124,20 @@ CREATE TABLE IF NOT EXISTS cli_audit_log (
 );
 CREATE INDEX IF NOT EXISTS cli_audit_log_eventType_idx ON cli_audit_log (event_type);
 CREATE INDEX IF NOT EXISTS cli_audit_log_tokenId_idx ON cli_audit_log (token_id);
-CREATE INDEX IF NOT EXISTS cli_audit_log_createdAt_idx ON cli_audit_log (created_at);";
+CREATE INDEX IF NOT EXISTS cli_audit_log_createdAt_idx ON cli_audit_log (created_at);
+CREATE TABLE IF NOT EXISTS cli_metrics (
+    id            BIGSERIAL PRIMARY KEY,
+    event_id      INTEGER NOT NULL,
+    event_ts      TIMESTAMPTZ NOT NULL,
+    event_values  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    event_attrs   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    uploaded_by   TEXT,
+    distinct_id   TEXT,
+    dedup_key     TEXT UNIQUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS cli_metrics_eventId_idx ON cli_metrics (event_id);
+CREATE INDEX IF NOT EXISTS cli_metrics_eventTs_idx ON cli_metrics (event_ts);";
 
 /// Open a new TLS connection to `org_db_url` and ensure the schema exists.
 fn connect(org_db_url: &str) -> Result<Client, AutterError> {
@@ -416,6 +431,60 @@ pub fn read_cas(
             success_count,
             failure_count,
         })
+    })
+}
+
+/// Insert a batch of usage-metric events. Each event is stored as one row, with
+/// its sparse `values`/`attrs` kept as JSONB. A content-hash `dedup_key` makes
+/// the write idempotent, so re-flushing the local queue after a partial failure
+/// can't create duplicates.
+///
+/// Returns the `(index, error)` pairs for any individual rows that failed; the
+/// call itself only errors if the whole batch can't run (e.g. connection lost).
+pub fn insert_metrics(
+    identity: &OrgIdentity,
+    events: &[MetricEvent],
+    distinct_id: &str,
+) -> Result<Vec<(usize, String)>, AutterError> {
+    run(&identity.org_db_url, |client| {
+        let mut errors = Vec::new();
+
+        for (index, event) in events.iter().enumerate() {
+            // Canonicalize so the dedup hash is stable regardless of map order.
+            let canonical = serde_json_canonicalizer::to_string(event)
+                .unwrap_or_else(|_| serde_json::to_string(event).unwrap_or_default());
+            let mut hasher = Sha256::new();
+            hasher.update(distinct_id.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(canonical.as_bytes());
+            let dedup_key = format!("{:x}", hasher.finalize());
+
+            let values = serde_json::to_value(&event.values).unwrap_or_else(|_| serde_json::json!({}));
+            let attrs = serde_json::to_value(&event.attrs).unwrap_or_else(|_| serde_json::json!({}));
+
+            let result = client.execute(
+                "INSERT INTO cli_metrics
+                    (event_id, event_ts, event_values, event_attrs, uploaded_by, distinct_id, dedup_key)
+                 VALUES ($1, to_timestamp($2), $3, $4, $5, $6, $7)
+                 ON CONFLICT (dedup_key) DO NOTHING",
+                &[
+                    &(event.event_id as i32),
+                    &(event.timestamp as f64),
+                    &values,
+                    &attrs,
+                    &identity.user_id,
+                    &distinct_id,
+                    &dedup_key,
+                ],
+            );
+
+            if let Err(e) = result {
+                tracing::warn!(event_id = event.event_id, "metric insert failed: {e}");
+                errors.push((index, e.to_string()));
+            }
+        }
+
+        Ok(errors)
     })
 }
 
