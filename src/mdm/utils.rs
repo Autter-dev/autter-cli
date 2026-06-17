@@ -651,6 +651,100 @@ pub fn install_vsc_editor_extension(
     )))
 }
 
+/// Open VSX is the editor-independent fallback source for the extension. Every
+/// VS Code-family editor (VS Code, Cursor, Windsurf, VSCodium) can install from
+/// a local `.vsix` file, but they don't all share one marketplace: Cursor and
+/// VS Code resolve extension IDs against the Microsoft Marketplace, while
+/// VSCodium uses Open VSX. So when an ID-based install fails (the editor's
+/// gallery doesn't carry the extension), we download the `.vsix` from Open VSX
+/// and install from the file instead — which works everywhere.
+const OPEN_VSX_API: &str = "https://open-vsx.org/api";
+
+/// Fetch a URL and return its body bytes (follows redirects; Open VSX serves the
+/// `.vsix` via a 302 to blob storage).
+fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let agent = crate::http::build_agent(Some(60));
+    let request = agent.get(url).set(
+        "User-Agent",
+        &format!("autter/{}", env!("CARGO_PKG_VERSION")),
+    );
+    let response = crate::http::send(request)?;
+    if response.status_code != 200 {
+        return Err(format!("HTTP {} from {url}", response.status_code));
+    }
+    Ok(response.into_bytes())
+}
+
+/// Download the latest `.vsix` for `publisher.name` from Open VSX into a temp
+/// file and return its path. The caller is responsible for deleting it.
+fn download_extension_vsix(extension_id: &str) -> Result<PathBuf, AutterError> {
+    let (publisher, name) = extension_id.split_once('.').ok_or_else(|| {
+        AutterError::Generic(format!(
+            "invalid extension id '{extension_id}' (expected publisher.name)"
+        ))
+    })?;
+
+    // Look up the latest version to find its download URL.
+    let meta_url = format!("{OPEN_VSX_API}/{publisher}/{name}/latest");
+    let meta_bytes = http_get_bytes(&meta_url)
+        .map_err(|e| AutterError::Generic(format!("Open VSX metadata fetch failed: {e}")))?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(&meta_bytes).map_err(AutterError::JsonError)?;
+
+    let download_url = meta
+        .get("files")
+        .and_then(|files| files.get("download"))
+        .and_then(|url| url.as_str())
+        .ok_or_else(|| {
+            AutterError::Generic(format!("Open VSX has no .vsix download for '{extension_id}'"))
+        })?;
+    let version = meta
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("latest");
+
+    let vsix_bytes = http_get_bytes(download_url)
+        .map_err(|e| AutterError::Generic(format!("Open VSX .vsix download failed: {e}")))?;
+
+    let path = std::env::temp_dir().join(format!("{publisher}.{name}-{version}.vsix"));
+    fs::write(&path, vsix_bytes).map_err(|e| {
+        AutterError::Generic(format!("failed to write .vsix to {}: {e}", path.display()))
+    })?;
+    Ok(path)
+}
+
+/// Install an extension, falling back to a direct Open VSX `.vsix` download when
+/// the editor's marketplace can't resolve it by ID. This makes onboarding install
+/// the extension regardless of which gallery a given editor is wired to.
+pub fn install_vsc_editor_extension_with_vsix_fallback(
+    cli: &EditorCliCommand,
+    extension_id: &str,
+) -> Result<(), AutterError> {
+    let id_err = match install_vsc_editor_extension(cli, extension_id) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    tracing::debug!(
+        "{}: marketplace install of '{extension_id}' failed ({id_err}); trying Open VSX .vsix fallback",
+        cli.program
+    );
+
+    let vsix_path = download_extension_vsix(extension_id).map_err(|dl_err| {
+        AutterError::Generic(format!(
+            "marketplace install failed ({id_err}); could not download .vsix from Open VSX: {dl_err}"
+        ))
+    })?;
+
+    let result = install_vsc_editor_extension(cli, &vsix_path.to_string_lossy());
+    let _ = fs::remove_file(&vsix_path);
+    result.map_err(|vsix_err| {
+        AutterError::Generic(format!(
+            "marketplace install failed ({id_err}); .vsix fallback install also failed: {vsix_err}"
+        ))
+    })
+}
+
 /// Strip the Windows extended-length path prefix (`\\?\`) if present.
 /// On Windows, `std::fs::canonicalize` returns paths prefixed with `\\?\`
 /// (e.g. `\\?\C:\Users\...`). This prefix causes problems when the path is

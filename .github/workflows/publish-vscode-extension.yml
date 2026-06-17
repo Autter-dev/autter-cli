@@ -40,6 +40,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # When triggered by a `vscode-v<x.y.z>` tag, the tag is the source of truth
+      # for the version. Sync package.json to it so the packaged/published .vsix
+      # can't drift from the tag (e.g. tag vscode-v0.1.23 must publish 0.1.23).
+      - name: Sync version to tag
+        if: startsWith(github.ref, 'refs/tags/vscode-v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#vscode-v}"
+          echo "Setting extension version to $VERSION (from tag $GITHUB_REF_NAME)"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
       - name: Package extension (.vsix)
         run: npm run package
 
