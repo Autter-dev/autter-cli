@@ -1,0 +1,70 @@
+src/api/notes.rs
+  s_9f0c2db23ca141::t_daf6190c5e0921 1,3-6,9-11,15,22,27-32,35,37,44,46,56-57
+src/daemon/telemetry_worker.rs
+  s_883239f91c6fd1::t_540a25cc8c5725 702-713,716-718
+Cargo.toml
+  s_9f0c2db23ca141::t_fac394e849bda3 2-5
+  s_9f0c2db23ca141::t_f47d66927d8707 36-41
+src/commands/autter_handlers.rs
+  s_9f0c2db23ca141::t_a88b10e7893b47 246
+src/api/mod.rs
+  s_9f0c2db23ca141::t_8512240f698221 6
+src/api/cas.rs
+  s_9f0c2db23ca141::t_d472ca0778459e 1-5,7-9,14,20-21,23-28,31,34,38,43,53-54
+.github/workflows/publish-vscode-extension.yml
+  s_83deec1160b9dc::t_a700895f7e0ef3 62
+  s_83deec1160b9dc::t_05d54decadbac1 1-61
+src/notes/mod.rs
+  s_9f0c2db23ca141::t_6d08bb3c94336f 4-5
+src/commands/notes_migrate.rs
+  s_9f0c2db23ca141::t_80661301b259d8 1
+  s_9f0c2db23ca141::t_117512fdb0a8a1 48
+  s_9f0c2db23ca141::t_7ab4da622c1d1d 399
+src/config.rs
+  s_883239f91c6fd1::t_cbf75d23052410 622,624-626,628-634
+  s_883239f91c6fd1::t_a696f25ebc1296 20-24
+src/commands/onboard.rs
+  s_883239f91c6fd1::t_a8e2187d6ff58e 117-119,122
+README.md
+  s_883239f91c6fd1::t_3b10e5f46836c9 51-72,74-91,93-96
+  s_9f0c2db23ca141::t_f64ef14f6054b0 73
+  s_9f0c2db23ca141::t_526b810870b5b7 92
+src/api/org_db.rs
+  s_9f0c2db23ca141::t_c6820fcb59b9e6 22
+  s_9f0c2db23ca141::t_5b5aa62981c30e 157-164,167,169-170,172-181,183,185-188
+  s_9f0c2db23ca141::t_462a22973a9ca4 1-21,23-156,165-166,168,171,182,184,189-474
+src/api/client.rs
+  s_9f0c2db23ca141::t_d145399cd2776e 449-458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "ccb1a93be12734a9d312a1277df1b16aa56eea59",
+  "prompts": {},
+  "sessions": {
+    "s_83deec1160b9dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed526-3f65-7391-a6e0-aa29fe4a89f2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    },
+    "s_883239f91c6fd1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed173-e31c-7338-b693-fc04c66237fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    },
+    "s_9f0c2db23ca141": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed51a-3547-76a6-b384-7506c75e9b65",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
