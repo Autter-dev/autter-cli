@@ -1,0 +1,32 @@
+src/mdm/agents/windsurf.rs
+  s_9f0c2db23ca141::t_b06c972ca943ae 352-355
+  s_9f0c2db23ca141::t_dadacf7b8644dc 6-8
+src/mdm/utils.rs
+  s_9f0c2db23ca141::t_21c9320a5d202e 654-747
+src/mdm/agents/vscode.rs
+  s_9f0c2db23ca141::t_861593c7a64652 6
+  s_9f0c2db23ca141::t_71204163f0f4f7 146-149
+.github/workflows/publish-vscode-extension.yml
+  s_9f0c2db23ca141::t_62f494e254f8fc 43-52
+agent-support/vscode/package.json
+  s_9f0c2db23ca141::t_fd692bfc04c9e7 5
+src/mdm/agents/cursor.rs
+  s_9f0c2db23ca141::t_3157ce25e7b2b0 350-353
+  s_9f0c2db23ca141::t_12aa6517a017a1 6-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.5.9",
+  "base_commit_sha": "a5e57d84a9f5113bff55e9d1492b46d31f8273b7",
+  "prompts": {},
+  "sessions": {
+    "s_9f0c2db23ca141": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ed51a-3547-76a6-b384-7506c75e9b65",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>"
+    }
+  }
+}
