@@ -162,6 +162,22 @@ fn print_status_summary() {
         eprintln!("Autter is connected to the platform as {who}.");
     } else {
         eprintln!("Autter is running in local mode (not connected to the platform).");
+        eprintln!();
+        eprintln!("  Why connect? Linking this machine to the Autter platform lets you:");
+        eprintln!(
+            "    \u{2022} See detailed prompt usage \u{2014} the prompts and model behind each AI change"
+        );
+        eprintln!(
+            "    \u{2022} Track AI vs human authorship across your whole team, not just this machine"
+        );
+        eprintln!("    \u{2022} View team/user usage dashboards and trends over time");
+        eprintln!();
+        eprintln!(
+            "  Your attribution stays in local git notes (refs/notes/ai) either way; connecting"
+        );
+        eprintln!("  additionally syncs prompt and usage data to your org's Autter dashboard.");
+        eprintln!();
+        eprintln!("  To connect:  autter onboard --connect");
     }
 }
 
