@@ -35,7 +35,10 @@ jobs:
             target: aarch64-apple-darwin
             tool: cargo
           - asset: autter-macos-x64
-            os: macos-13
+            # Cross-compile x86_64 on an Apple Silicon runner: the macOS SDK is
+            # universal, and the scarce/deprecated macos-13 Intel runners can
+            # leave this job queued for hours before it is cancelled.
+            os: macos-14
             target: x86_64-apple-darwin
             tool: cargo
           - asset: autter-linux-x64
