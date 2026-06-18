@@ -111,12 +111,12 @@ fn print_login_success(access_token: &str) {
         eprintln!("  Signed in as {}", email);
     }
 
-    if let Some(org) = identity.active_org() {
-        if let Some(org_name) = org.org_name.as_deref().filter(|s| !s.is_empty()) {
-            match org.org_slug.as_deref().filter(|s| !s.is_empty()) {
-                Some(slug) => eprintln!("  Organization: {} ({})", org_name, slug),
-                None => eprintln!("  Organization: {}", org_name),
-            }
+    if let Some(org) = identity.active_org()
+        && let Some(org_name) = org.org_name.as_deref().filter(|s| !s.is_empty())
+    {
+        match org.org_slug.as_deref().filter(|s| !s.is_empty()) {
+            Some(slug) => eprintln!("  Organization: {} ({})", org_name, slug),
+            None => eprintln!("  Organization: {}", org_name),
         }
     }
 }

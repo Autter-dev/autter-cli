@@ -15,10 +15,10 @@ impl TokenIdentity {
     /// The org entry this token is scoped to, matched from `orgs` by the active
     /// `org_id`. Falls back to the sole org when there's exactly one.
     pub fn active_org(&self) -> Option<&TokenOrg> {
-        if let Some(id) = self.active_org_id.as_deref() {
-            if let Some(org) = self.orgs.iter().find(|o| o.org_id.as_deref() == Some(id)) {
-                return Some(org);
-            }
+        if let Some(id) = self.active_org_id.as_deref()
+            && let Some(org) = self.orgs.iter().find(|o| o.org_id.as_deref() == Some(id))
+        {
+            return Some(org);
         }
         if self.orgs.len() == 1 {
             return self.orgs.first();
