@@ -168,7 +168,8 @@ fn test_build_rebase_commit_mappings_excludes_merge_commits_from_new_commits() {
 
     // Call build_rebase_commit_mappings with onto_head = None (daemon fallback)
     let path_str = repo.path().to_str().expect("valid path");
-    let autter_repo = autter::git::repository::find_repository_in_path(path_str).expect("open repo");
+    let autter_repo =
+        autter::git::repository::find_repository_in_path(path_str).expect("open repo");
     let (original_commits, new_commits) =
         autter::commands::hooks::rebase_hooks::build_rebase_commit_mappings(
             &autter_repo,
@@ -236,7 +237,8 @@ fn test_build_rebase_commit_mappings_excludes_merge_commits_when_onto_equals_mer
         .to_string();
 
     let path_str = repo.path().to_str().expect("valid path");
-    let autter_repo = autter::git::repository::find_repository_in_path(path_str).expect("open repo");
+    let autter_repo =
+        autter::git::repository::find_repository_in_path(path_str).expect("open repo");
     let (original_commits, new_commits) =
         autter::commands::hooks::rebase_hooks::build_rebase_commit_mappings(
             &autter_repo,
@@ -300,7 +302,8 @@ fn test_build_rebase_commit_mappings_multi_commit_with_onto_equals_merge_base() 
         .to_string();
 
     let path_str = repo.path().to_str().expect("valid path");
-    let autter_repo = autter::git::repository::find_repository_in_path(path_str).expect("open repo");
+    let autter_repo =
+        autter::git::repository::find_repository_in_path(path_str).expect("open repo");
     let (original_commits, new_commits) =
         autter::commands::hooks::rebase_hooks::build_rebase_commit_mappings(
             &autter_repo,

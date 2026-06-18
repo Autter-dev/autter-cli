@@ -5,9 +5,8 @@ use crate::mdm::hook_installer::{
 use crate::mdm::utils::{
     MIN_CURSOR_VERSION, generate_diff, get_editor_version, home_dir,
     install_vsc_editor_extension_with_vsix_fallback, is_vsc_editor_extension_installed,
-    parse_version, resolve_editor_cli,
-    settings_paths_for_products, should_process_settings_target, version_meets_requirement,
-    write_atomic,
+    parse_version, resolve_editor_cli, settings_paths_for_products, should_process_settings_target,
+    version_meets_requirement, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;

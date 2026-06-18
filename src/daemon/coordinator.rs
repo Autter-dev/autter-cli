@@ -64,7 +64,10 @@ impl<B: GitBackend> Coordinator<B> {
         actor.update_watermarks(update).await
     }
 
-    pub async fn status_family(&self, repo_working_dir: &Path) -> Result<FamilyStatus, AutterError> {
+    pub async fn status_family(
+        &self,
+        repo_working_dir: &Path,
+    ) -> Result<FamilyStatus, AutterError> {
         let family = self.backend.resolve_family(repo_working_dir)?;
         let actor = self.get_or_create_family_actor(family).await;
         actor.status().await

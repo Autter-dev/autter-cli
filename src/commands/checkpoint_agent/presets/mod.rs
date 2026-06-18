@@ -166,6 +166,9 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, AutterError> {
         "mock_ai" => Ok(Box::new(mock_ai::MockAiPreset)),
         "known_human" => Ok(Box::new(known_human::KnownHumanPreset)),
         "mock_known_human" => Ok(Box::new(mock_known_human::MockKnownHumanPreset)),
-        _ => Err(AutterError::PresetError(format!("Unknown preset: {}", name))),
+        _ => Err(AutterError::PresetError(format!(
+            "Unknown preset: {}",
+            name
+        ))),
     }
 }

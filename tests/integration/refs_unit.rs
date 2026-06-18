@@ -49,8 +49,8 @@ fn test_notes_add_and_show_authorship_note() {
     notes_add(&autter_repo, &commit_sha, note_content).expect("Failed to add authorship note");
 
     // Read the note back
-    let retrieved_content =
-        show_authorship_note(&autter_repo, &commit_sha).expect("Failed to retrieve authorship note");
+    let retrieved_content = show_authorship_note(&autter_repo, &commit_sha)
+        .expect("Failed to retrieve authorship note");
 
     // Assert the content matches exactly
     assert_eq!(retrieved_content, note_content);

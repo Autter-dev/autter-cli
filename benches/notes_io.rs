@@ -60,9 +60,9 @@
 //! on a developer laptop. Adjust `SAMPLE_SIZE` and `MEASUREMENT_TIME_SECS` if you
 //! need tighter confidence intervals.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use autter::git::test_utils::{TmpRepo, init_test_git_config};
 use autter::notes::db::NotesDatabase;
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -360,9 +360,11 @@ fn bench_read_batch_100(c: &mut Criterion) {
     // --- git_notes backend ---
     group.bench_function(BenchmarkId::new("git_notes", "100_reads"), |b| {
         b.iter(|| {
-            let _ =
-                autter::git::refs::note_blob_oids_for_commits(bench.repo.autter_repo(), &batch_shas)
-                    .expect("note_blob_oids_for_commits failed");
+            let _ = autter::git::refs::note_blob_oids_for_commits(
+                bench.repo.autter_repo(),
+                &batch_shas,
+            )
+            .expect("note_blob_oids_for_commits failed");
         });
     });
 

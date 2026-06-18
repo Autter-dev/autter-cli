@@ -550,7 +550,8 @@ fn transform_attributions_to_final_state_preserves_unchanged_files() {
     file_contents.insert("a.txt".to_string(), "aaa\n".to_string());
     file_contents.insert("b.txt".to_string(), "bbb\n".to_string());
 
-    let source_va = VirtualAttributions::new(autter_repo.clone(), base_sha, attrs, file_contents, 1);
+    let source_va =
+        VirtualAttributions::new(autter_repo.clone(), base_sha, attrs, file_contents, 1);
 
     let mut final_state = HashMap::new();
     final_state.insert("a.txt".to_string(), "aaa!\n".to_string());

@@ -4460,10 +4460,9 @@ impl ActorDaemonCoordinator {
         seq: u64,
         error: &AutterError,
     ) -> Result<(), AutterError> {
-        let mut map = self
-            .side_effect_errors_by_family
-            .lock()
-            .map_err(|_| AutterError::Generic("side effect errors map lock poisoned".to_string()))?;
+        let mut map = self.side_effect_errors_by_family.lock().map_err(|_| {
+            AutterError::Generic("side effect errors map lock poisoned".to_string())
+        })?;
         let family_errors = map.entry(family.to_string()).or_insert_with(BTreeMap::new);
         family_errors.insert(seq, error.to_string());
         while family_errors.len() > 256 {
@@ -4477,10 +4476,9 @@ impl ActorDaemonCoordinator {
     }
 
     fn latest_side_effect_error(&self, family: &str) -> Result<Option<String>, AutterError> {
-        let map = self
-            .side_effect_errors_by_family
-            .lock()
-            .map_err(|_| AutterError::Generic("side effect errors map lock poisoned".to_string()))?;
+        let map = self.side_effect_errors_by_family.lock().map_err(|_| {
+            AutterError::Generic("side effect errors map lock poisoned".to_string())
+        })?;
         Ok(map
             .get(family)
             .and_then(|errors| errors.iter().next_back().map(|(_, error)| error.clone())))
@@ -4680,7 +4678,10 @@ impl ActorDaemonCoordinator {
         self.record_trace_payload_enqueued_root(Self::trace_payload_root_sid(payload).as_deref())
     }
 
-    fn record_trace_payload_enqueued_root(&self, root_sid: Option<&str>) -> Result<(), AutterError> {
+    fn record_trace_payload_enqueued_root(
+        &self,
+        root_sid: Option<&str>,
+    ) -> Result<(), AutterError> {
         let Some(root_sid) = root_sid else {
             return Ok(());
         };
@@ -4711,7 +4712,10 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
-    fn enqueue_stale_connection_close_fallbacks(&self, roots: &[String]) -> Result<(), AutterError> {
+    fn enqueue_stale_connection_close_fallbacks(
+        &self,
+        roots: &[String],
+    ) -> Result<(), AutterError> {
         let stale_roots = {
             let mut ingress = self.trace_ingress_state.lock().map_err(|_| {
                 AutterError::Generic("trace ingress state lock poisoned".to_string())
@@ -4829,7 +4833,9 @@ impl ActorDaemonCoordinator {
         );
         self.carryover_snapshots_by_id
             .lock()
-            .map_err(|_| AutterError::Generic("carryover snapshot store lock poisoned".to_string()))?
+            .map_err(|_| {
+                AutterError::Generic("carryover snapshot store lock poisoned".to_string())
+            })?
             .insert(snapshot_id.clone(), snapshot);
         self.carryover_snapshot_ids_by_root
             .lock()

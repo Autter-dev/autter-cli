@@ -52,9 +52,10 @@ pub struct OrgIdentity {
 /// autter.dev and verified there at issue time, so we only need to *read* its
 /// claims here, not re-verify the signature.
 pub fn identity_from_token(token: &str) -> Result<OrgIdentity, AutterError> {
-    let payload = token.split('.').nth(1).ok_or_else(|| {
-        AutterError::Generic("access token is not a well-formed JWT".to_string())
-    })?;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| AutterError::Generic("access token is not a well-formed JWT".to_string()))?;
 
     // JWT uses base64url without padding; tolerate padding just in case.
     let trimmed = payload.trim_end_matches('=');
@@ -163,10 +164,7 @@ fn get_or_connect(org_db_url: &str) -> Result<Arc<Mutex<Client>>, AutterError> {
     let client = Arc::new(Mutex::new(connect(org_db_url)?));
     let mut map = CONNECTIONS.lock().expect("connection cache poisoned");
     // Another thread may have connected while we were dialing — keep theirs.
-    Ok(map
-        .entry(org_db_url.to_string())
-        .or_insert(client)
-        .clone())
+    Ok(map.entry(org_db_url.to_string()).or_insert(client).clone())
 }
 
 /// Run a DB operation against the org's client.
@@ -459,8 +457,10 @@ pub fn insert_metrics(
             hasher.update(canonical.as_bytes());
             let dedup_key = format!("{:x}", hasher.finalize());
 
-            let values = serde_json::to_value(&event.values).unwrap_or_else(|_| serde_json::json!({}));
-            let attrs = serde_json::to_value(&event.attrs).unwrap_or_else(|_| serde_json::json!({}));
+            let values =
+                serde_json::to_value(&event.values).unwrap_or_else(|_| serde_json::json!({}));
+            let attrs =
+                serde_json::to_value(&event.attrs).unwrap_or_else(|_| serde_json::json!({}));
 
             let result = client.execute(
                 "INSERT INTO cli_metrics

@@ -165,7 +165,9 @@ pub fn handle_fetch_notes(args: &[String]) {
     }
 }
 
-fn resolve_default_remote(repo: &crate::git::repository::Repository) -> Result<String, AutterError> {
+fn resolve_default_remote(
+    repo: &crate::git::repository::Repository,
+) -> Result<String, AutterError> {
     // Try upstream tracking remote first, then default remote
     if let Ok(Some(upstream)) = repo.upstream_remote() {
         return Ok(upstream);

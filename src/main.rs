@@ -1,6 +1,6 @@
-use clap::Parser;
 use autter::commands;
 use autter::utils::{SuperuserCheckResult, check_superuser_guard, print_superuser_warning};
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "autter")]

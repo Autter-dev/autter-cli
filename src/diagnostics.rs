@@ -1,5 +1,5 @@
 use crate::authorship::working_log::CheckpointKind;
-use crate::commands::blame::{BlameAnalysisResult, AutterBlameOptions};
+use crate::commands::blame::{AutterBlameOptions, BlameAnalysisResult};
 use crate::config::Config;
 use crate::daemon::control_api::{ControlRequest, FamilyStatus};
 use crate::diagnostic_sentinels::{

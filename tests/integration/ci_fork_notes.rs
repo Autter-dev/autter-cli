@@ -92,8 +92,9 @@ fn test_ci_fork_squash_merge() {
         .to_string();
 
     // Run CI context with fork_clone_url set
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
 
     let fork_url = fork.path().to_str().unwrap().to_string();
 
@@ -199,8 +200,9 @@ fn test_ci_fork_merge_commit() {
         .to_string();
 
     // Run CI context with fork_clone_url
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
 
     let fork_url = fork.path().to_str().unwrap().to_string();
 
@@ -320,8 +322,9 @@ function forkFeature() {
         .trim()
         .to_string();
 
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
     let ci_context = CiContext::with_repository(
         upstream_repo,
         CiEvent::Merge {
@@ -413,8 +416,9 @@ fn test_ci_fork_no_notes() {
         .to_string();
 
     // Run CI with fork URL
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
 
     let fork_url = fork.path().to_str().unwrap().to_string();
 
@@ -503,8 +507,9 @@ fn test_ci_fork_notes_ignores_notes_outside_pr_commit_range() {
         .trim()
         .to_string();
 
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
 
     let ci_context = CiContext::with_repository(
         upstream_repo,
@@ -602,8 +607,9 @@ fn test_ci_fork_merge_commit_no_notes_skips_without_push_error() {
         .trim()
         .to_string();
 
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
 
     let fork_url = fork.path().to_str().unwrap().to_string();
 
@@ -661,8 +667,9 @@ fn test_ci_non_fork_merge_commit_still_skipped() {
         .trim()
         .to_string();
 
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find repository");
 
     let ci_context = CiContext::with_repository(
         upstream_repo,
@@ -757,8 +764,9 @@ fn test_ci_fork_squash_merge_multiple_commits() {
         .to_string();
 
     // Run CI with fork URL
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
 
     let fork_url = fork.path().to_str().unwrap().to_string();
 
@@ -901,8 +909,9 @@ fn test_ci_local_merge_can_use_preloaded_fork_notes_ref() {
         output
     );
 
-    let upstream_repo = AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
-        .expect("Failed to find upstream repository");
+    let upstream_repo =
+        AutterRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
     assert!(
         show_authorship_note(&upstream_repo, &base_sha).is_none(),
         "local CI must not import unrelated notes from the preloaded fork ref"

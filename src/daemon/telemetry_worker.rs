@@ -641,8 +641,7 @@ pub fn flush_notes() {
                     if let Ok(db) = crate::notes::db::NotesDatabase::global()
                         && let Ok(mut lock) = db.lock()
                     {
-                        let _ = lock
-                            .mark_failed(&commit_shas, "could not mint org-scoped token");
+                        let _ = lock.mark_failed(&commit_shas, "could not mint org-scoped token");
                     }
                     continue;
                 }

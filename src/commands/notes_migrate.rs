@@ -303,9 +303,9 @@ fn cat_file_batch(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AutterError::Generic(format!("failed to spawn git cat-file --batch: {}", e)))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        AutterError::Generic(format!("failed to spawn git cat-file --batch: {}", e))
+    })?;
 
     // Take stdin out of the child so we can write in a separate thread.
     // This avoids a pipe deadlock: with many notes, stdout fills its buffer

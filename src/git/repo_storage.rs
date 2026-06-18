@@ -40,7 +40,10 @@ pub struct RepoStorage {
 }
 
 impl RepoStorage {
-    pub fn for_repo_path(repo_path: &Path, repo_workdir: &Path) -> Result<RepoStorage, AutterError> {
+    pub fn for_repo_path(
+        repo_path: &Path,
+        repo_workdir: &Path,
+    ) -> Result<RepoStorage, AutterError> {
         Self::for_ai_dir(&repo_path.join("ai"), repo_workdir)
     }
 

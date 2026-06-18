@@ -257,11 +257,7 @@ impl OAuthClient {
     /// Resolve which org owns a repository (by `owner/repo` or remote URL), so a
     /// push can be routed to the right org. Returns `None` when no org tracks it
     /// (the caller should fall back to the PAT's home org).
-    pub fn resolve_org_for_repo(
-        &self,
-        pat: &str,
-        repo: &str,
-    ) -> Result<Option<String>, String> {
+    pub fn resolve_org_for_repo(&self, pat: &str, repo: &str) -> Result<Option<String>, String> {
         let url = format!("{}/worker/oauth/resolve-org", self.base_url);
         let body = serde_json::json!({ "pat": pat, "repo": repo });
 

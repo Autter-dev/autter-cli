@@ -116,8 +116,9 @@ pub fn read_authorship_v3(
     match Config::get().notes_backend_kind() {
         NotesBackendKind::Http => {
             if let Some(content) = http_read_note(commit_sha) {
-                AuthorshipLog::deserialize_from_string(&content)
-                    .map_err(|e| AutterError::Generic(format!("notes deserialization error: {}", e)))
+                AuthorshipLog::deserialize_from_string(&content).map_err(|e| {
+                    AutterError::Generic(format!("notes deserialization error: {}", e))
+                })
             } else {
                 crate::git::refs::get_reference_as_authorship_log_v3(repo, commit_sha)
             }
@@ -266,7 +267,10 @@ pub fn search_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, Aut
 /// `from 0000...` so stale notes from prior calls are discarded.
 ///
 /// Returns the number of notes that were written into `refs/notes/ai-display`.
-pub fn materialize_notes_for_display(repo: &Repository, limit: usize) -> Result<usize, AutterError> {
+pub fn materialize_notes_for_display(
+    repo: &Repository,
+    limit: usize,
+) -> Result<usize, AutterError> {
     use crate::git::repository::exec_git;
     use crate::git::repository::exec_git_stdin;
 
@@ -626,7 +630,12 @@ mod tests {
         }
 
         // Write directly via http helper (no repo needed).
-        http_write_note("abc123def456abc123def456abc123def456abc1", "test content", None).expect("write");
+        http_write_note(
+            "abc123def456abc123def456abc123def456abc1",
+            "test content",
+            None,
+        )
+        .expect("write");
 
         // Read back from cache.
         let content = http_read_note("abc123def456abc123def456abc123def456abc1");
@@ -710,7 +719,10 @@ mod tests {
         let result: Result<HashMap<String, String>, _> = match kind {
             crate::config::NotesBackendKind::Http => Ok(HashMap::new()),
             crate::config::NotesBackendKind::GitNotes => {
-                crate::git::refs::note_blob_oids_for_commits(tmp.autter_repo(), &["abc".to_string()])
+                crate::git::refs::note_blob_oids_for_commits(
+                    tmp.autter_repo(),
+                    &["abc".to_string()],
+                )
             }
         };
 

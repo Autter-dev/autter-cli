@@ -118,8 +118,11 @@ impl ApiClient {
         batch: &MetricsBatch,
     ) -> Result<MetricsUploadResponse, AutterError> {
         let identity = self.org_identity()?;
-        let failed =
-            org_db::insert_metrics(&identity, &batch.events, &config::get_or_create_distinct_id())?;
+        let failed = org_db::insert_metrics(
+            &identity,
+            &batch.events,
+            &config::get_or_create_distinct_id(),
+        )?;
         let errors = failed
             .into_iter()
             .map(|(index, error)| MetricsUploadError { index, error })

@@ -736,7 +736,10 @@ pub fn fallback_merge_notes_ours(repo: &Repository, source_ref: &str) -> Result<
 }
 
 /// List all notes on a given ref. Returns Vec<(note_blob_sha, annotated_object_sha)>.
-fn list_all_notes(repo: &Repository, notes_ref: &str) -> Result<Vec<(String, String)>, AutterError> {
+fn list_all_notes(
+    repo: &Repository,
+    notes_ref: &str,
+) -> Result<Vec<(String, String)>, AutterError> {
     // `git notes list` uses --ref to specify which notes ref.
     // The --ref option prepends "refs/notes/" automatically, so for full refs
     // like "refs/notes/ai-remote/origin" we need to strip the prefix.

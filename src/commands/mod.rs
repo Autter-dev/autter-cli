@@ -1,3 +1,4 @@
+pub mod autter_handlers;
 pub mod blame;
 pub mod checkpoint_agent;
 pub mod ci_handlers;
@@ -8,7 +9,6 @@ pub mod diff;
 pub mod exchange_nonce;
 pub mod fetch_notes;
 pub mod flush_metrics_db;
-pub mod autter_handlers;
 pub mod git_handlers;
 pub mod git_hook_handlers;
 pub mod hooks;

@@ -696,7 +696,9 @@ fn download_extension_vsix(extension_id: &str) -> Result<PathBuf, AutterError> {
         .and_then(|files| files.get("download"))
         .and_then(|url| url.as_str())
         .ok_or_else(|| {
-            AutterError::Generic(format!("Open VSX has no .vsix download for '{extension_id}'"))
+            AutterError::Generic(format!(
+                "Open VSX has no .vsix download for '{extension_id}'"
+            ))
         })?;
     let version = meta
         .get("version")
