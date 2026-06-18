@@ -1,4 +1,4 @@
-# autter   <a href="https://discord.gg/XJStYvkb5U"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white" /></a>        
+# autter   <a href="https://github.com/orgs/Autter-dev/discussions"><img alt="Discussions" src="https://img.shields.io/github/discussions/autter-dev/autter?style=flat-square" /></a>        
 
 <img src="https://github.com/autter-dev/autter-cli/raw/main/assets/docs/autter.png" align="right"
      alt="Autter Logo" width="200" height="200">
@@ -20,11 +20,11 @@ you  ██░░░░░░░░░░░░░░░░░░░░░░░
 `autter blame /src/log_fmt/authorship_log.rs`
 
 ```bash
-cb832b7 (Aidan Cunniffe      2025-12-13  133) pub fn execute_diff(
-cb832b7 (Aidan Cunniffe      2025-12-13  134)     repo: &Repository,
-cb832b7 (Aidan Cunniffe      2025-12-13  135)     spec: DiffSpec,
-fe2c4c8 (Aidan Cunniffe      2025-12-02  136)     format: DiffFormat,
-fe2c4c8 (Aidan Cunniffe      2025-12-02  137) ) -> Result<…> {
+cb832b7 (Sagnik Ghosh      2025-12-13  133) pub fn execute_diff(
+cb832b7 (Sagnik Ghosh      2025-12-13  134)     repo: &Repository,
+cb832b7 (Sagnik Ghosh      2025-12-13  135)     spec: DiffSpec,
+fe2c4c8 (Sagnik Ghosh      2025-12-02  136)     format: DiffFormat,
+fe2c4c8 (Sagnik Ghosh      2025-12-02  137) ) -> Result<…> {
 fe2c4c8 (claude              2025-12-02  138)     // Resolve commits
 fe2c4c8 (claude              2025-12-02  139)     let (from, to) = match spec {
 fe2c4c8 (claude              2025-12-02  140)         DiffSpec::TwoCommit(s, e) => {
@@ -186,8 +186,8 @@ autter blame /src/log_fmt/authorship_log.rs
 ```
 
 ```bash
-cb832b7 (Aidan Cunniffe 2025-12-13 08:16:29 -0500  136)     format: DiffFormat,
-cb832b7 (Aidan Cunniffe 2025-12-13 08:16:29 -0500  137) ) -> Result<String, AutterError> {
+cb832b7 (Sagnik Ghosh 2025-12-13 08:16:29 -0500  136)     format: DiffFormat,
+cb832b7 (Sagnik Ghosh 2025-12-13 08:16:29 -0500  137) ) -> Result<String, AutterError> {
 fe2c4c8 (claude         2025-12-02 19:25:13 -0500  138)     // Resolve commits to get from/to SHAs
 fe2c4c8 (claude         2025-12-02 19:25:13 -0500  139)     let (from_commit, to_commit) = match spec {
 fe2c4c8 (claude         2025-12-02 19:25:13 -0500  140)         DiffSpec::TwoCommit(start, end) => {
@@ -258,7 +258,7 @@ Hundreds of engineering teams (including many in the Fortune 100) use Autter to 
 The CLI accurately attributes AI code on every commit. The teams version adds a secure prompt store and joins in data from across the SDLC — tying token spend to individual Pull Requests, calculating % AI by PR, team, and repo, and connecting signals like amount of rework during code review, and even tying incidents back to the AI session that caused them. Self-host it or run it in our cloud: connect your SCM and get aggregate stats across thousands of repos plus full observability into everything your coding agents do.
 
 #### Who built this?
-[Aidan](https://github.com/autter-dev/autter-cli) and [Sasha](https://github.com/svarlamov) — say hi in [Discord](https://discord.gg/XJStYvkb5U) or set up a [Meet the maintainers call](https://calendly.com/d/cxjh-z79-ktm/meeting-with-autter-authors).
+[Sagnik](https://github.com/sagnik11) and [Sasha](https://github.com/svarlamov) — [start a discussion](https://github.com/orgs/Autter-dev/discussions) or email [hi@autter.dev](mailto:hi@autter.dev).
 
 #### What are the capabilities and known limitations?
 Autter provides line-level attribution for AI-generated code - whether it is written with an edit tool or a bash command. When a Git rewrite operation is run (`rebase`, `stash`, `squash --merge`, etc) Autter will move and merge attributions so nothing is lost. 

@@ -75,5 +75,5 @@ The project uses standard Rust formatting. Please run `task fmt` and `task lint`
 
 If you have questions about contributing, feel free to open an issue or reach out to the maintainers.
 
-- **Discord**: https://discord.gg/XJStYvkb5U
-- **Office Hours**: https://calendly.com/d/cxjh-z79-ktm/meeting-with-autter-authors
+- **GitHub Discussions**: https://github.com/orgs/Autter-dev/discussions
+- **Email**: hi@autter.dev

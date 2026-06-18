@@ -907,23 +907,23 @@ Another AI line
 #[test]
 fn test_ai_heading_checkpoint_then_human_top_commit_then_rest_preserves_attribution() {
     let repo = TestRepo::new();
-    let file_path = repo.path().join("aidanwashere.md");
+    let file_path = repo.path().join("sagnikwashere.md");
 
     let initial = "\
 > \"First, solve the problem. Then, write the code.\"
 > \"It works on my machine.\"
 
 *Verse 1:*
-Aidan was here, left his mark on the page,
+Sagnik Ghosh was here, left his mark on the page,
 Writing code through the night, line by line, stage by stage.
 
 *Chorus:*
-Oh, Aidan was here, yeah, Aidan was here,
+Oh, Sagnik Ghosh was here, yeah, Sagnik Ghosh was here,
 The git log will show it, the history's clear.
 
 *Verse 2:*
 From branches to merges, through conflicts and fear,
-One thing is certain - Aidan was here.
+One thing is certain - Sagnik Ghosh was here.
 ";
     fs::write(&file_path, initial).unwrap();
     repo.stage_all_and_commit("Initial markdown").unwrap();
@@ -933,19 +933,19 @@ One thing is certain - Aidan was here.
 > \"It works on my machine.\"
 
 ### Verse 1
-Aidan was here, left his mark on the page,
+Sagnik Ghosh was here, left his mark on the page,
 Writing code through the night, line by line, stage by stage.
 
 ### Chorus
-Oh, Aidan was here, yeah, Aidan was here,
+Oh, Sagnik Ghosh was here, yeah, Sagnik Ghosh was here,
 The git log will show it, the history's clear.
 
 ### Verse 2
 From branches to merges, through conflicts and fear,
-One thing is certain - Aidan was here.
+One thing is certain - Sagnik Ghosh was here.
 ";
     fs::write(&file_path, ai_rewrites).unwrap();
-    repo.autter(&["checkpoint", "mock_ai", "aidanwashere.md"])
+    repo.autter(&["checkpoint", "mock_ai", "sagnikwashere.md"])
         .unwrap();
 
     let with_human_top = "\
@@ -956,25 +956,25 @@ Human preface 2
 > \"It works on my machine.\"
 
 ### Verse 1
-Aidan was here, left his mark on the page,
+Sagnik Ghosh was here, left his mark on the page,
 Writing code through the night, line by line, stage by stage.
 
 ### Chorus
-Oh, Aidan was here, yeah, Aidan was here,
+Oh, Sagnik Ghosh was here, yeah, Sagnik Ghosh was here,
 The git log will show it, the history's clear.
 
 ### Verse 2
 From branches to merges, through conflicts and fear,
-One thing is certain - Aidan was here.
+One thing is certain - Sagnik Ghosh was here.
 ";
     fs::write(&file_path, with_human_top).unwrap();
     // Intentionally no checkpoint for this human top edit.
 
     let patch_path = repo.path().join(".git").join("stage_human_top_only.patch");
     let top_hunk_patch = "\
-diff --git a/aidanwashere.md b/aidanwashere.md
---- a/aidanwashere.md
-+++ b/aidanwashere.md
+diff --git a/sagnikwashere.md b/sagnikwashere.md
+--- a/sagnikwashere.md
++++ b/sagnikwashere.md
 @@ -0,0 +1,3 @@
 +Human preface 1
 +Human preface 2
@@ -1003,7 +1003,7 @@ diff --git a/aidanwashere.md b/aidanwashere.md
         "second commit should contain AI heading rewrite attributions"
     );
 
-    let mut file = repo.filename("aidanwashere.md");
+    let mut file = repo.filename("sagnikwashere.md");
     file.assert_lines_and_blame(lines![
         "Human preface 1".human(),
         "Human preface 2".human(),
@@ -1012,16 +1012,16 @@ diff --git a/aidanwashere.md b/aidanwashere.md
         "> \"It works on my machine.\"".human(),
         "".human(),
         "### Verse 1".ai(),
-        "Aidan was here, left his mark on the page,".human(),
+        "Sagnik Ghosh was here, left his mark on the page,".human(),
         "Writing code through the night, line by line, stage by stage.".human(),
         "".human(),
         "### Chorus".ai(),
-        "Oh, Aidan was here, yeah, Aidan was here,".human(),
+        "Oh, Sagnik Ghosh was here, yeah, Sagnik Ghosh was here,".human(),
         "The git log will show it, the history's clear.".human(),
         "".human(),
         "### Verse 2".ai(),
         "From branches to merges, through conflicts and fear,".human(),
-        "One thing is certain - Aidan was here.".human(),
+        "One thing is certain - Sagnik Ghosh was here.".human(),
     ]);
 }
 

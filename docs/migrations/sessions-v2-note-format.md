@@ -10,7 +10,7 @@ We intend for the notes format to be as stable as possible and we do not take th
 
 This is the first major change to the notes format since Autter v1.0 was released in Oct 2025 (over 6 months ago) and we have no further major changes planned.
 
-We sincerely thank the community for your partnership and appreciate any and all input. Please join us on [Discord](https://discord.gg/XJStYvkb5U) to join the discussion.
+We sincerely thank the community for your partnership and appreciate any and all input. Please [start a discussion](https://github.com/orgs/Autter-dev/discussions) or email [hi@autter.dev](mailto:hi@autter.dev) with feedback.
 
 ## Major changes, but not breaking changes
 

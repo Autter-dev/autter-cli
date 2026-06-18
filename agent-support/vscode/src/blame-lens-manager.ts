@@ -1061,7 +1061,7 @@ export class BlameLensManager {
   }
 
   /**
-   * Extract just the name from a git author string like "Aidan Cunniffe <acunniffe@gmail.com>"
+   * Extract just the name from a git author string like "Sagnik Ghosh <hi@autter.dev>"
    */
   private extractHumanName(authorString: string): string {
     if (!authorString) {

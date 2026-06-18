@@ -6,12 +6,12 @@ This project provides a Nix flake for easy installation on NixOS, nix-darwin, or
 
 Try without installing:
 ```bash
-nix run github:acunniffe/autter -- --version
+nix run github:autter-dev/autter-cli -- --version
 ```
 
 Install to user profile:
 ```bash
-nix profile install github:acunniffe/autter
+nix profile install github:autter-dev/autter-cli
 ```
 
 ## What's Included
@@ -48,7 +48,7 @@ Add the input to your flake:
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     home-manager.url = "github:nix-community/home-manager";
-    autter.url = "github:acunniffe/autter";
+    autter.url = "github:autter-dev/autter-cli";
   };
 }
 ```
@@ -88,7 +88,7 @@ This approach:
   inputs = {
     darwin.url = "github:lnl7/nix-darwin";
     home-manager.url = "github:nix-community/home-manager";
-    autter.url = "github:acunniffe/autter";
+    autter.url = "github:autter-dev/autter-cli";
   };
 
   outputs = { darwin, home-manager, autter, nixpkgs, ... }: {
@@ -123,7 +123,7 @@ This approach:
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    autter.url = "github:acunniffe/autter";
+    autter.url = "github:autter-dev/autter-cli";
   };
 
   outputs = { nixpkgs, autter, ... }: {
@@ -182,12 +182,12 @@ home.packages = [
 
 Enter a development shell with Rust toolchain:
 ```bash
-nix develop github:acunniffe/autter
+nix develop github:autter-dev/autter-cli
 ```
 
 Or clone and develop locally:
 ```bash
-git clone https://github.com/acunniffe/autter
+git clone https://github.com/autter-dev/autter-cli
 cd autter
 nix develop
 

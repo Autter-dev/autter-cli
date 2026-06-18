@@ -436,7 +436,7 @@ mod tests {
         let input = json!({
             "conversation_id": "conv-shell",
             "session_id": "conv-shell",
-            "workspace_roots": ["/Users/aidan/Desktop/test-repo"],
+            "workspace_roots": ["/Users/sagnik/Desktop/test-repo"],
             "hook_event_name": "preToolUse",
             "tool_name": "Shell",
             "tool_use_id": "tu-shell-1",
@@ -458,7 +458,7 @@ mod tests {
                 assert_eq!(e.context.agent_id.model, "composer-2");
                 assert_eq!(
                     e.context.cwd,
-                    PathBuf::from("/Users/aidan/Desktop/test-repo")
+                    PathBuf::from("/Users/sagnik/Desktop/test-repo")
                 );
                 assert_eq!(e.tool_use_id, "tu-shell-1");
             }
@@ -471,7 +471,7 @@ mod tests {
         let input = json!({
             "conversation_id": "conv-shell",
             "session_id": "conv-shell",
-            "workspace_roots": ["/Users/aidan/Desktop/test-repo"],
+            "workspace_roots": ["/Users/sagnik/Desktop/test-repo"],
             "hook_event_name": "postToolUse",
             "tool_name": "Shell",
             "tool_use_id": "tu-shell-2",
@@ -497,7 +497,7 @@ mod tests {
     fn test_cursor_shell_falls_back_to_default_tool_use_id() {
         let input = json!({
             "conversation_id": "conv-shell",
-            "workspace_roots": ["/Users/aidan/Desktop/test-repo"],
+            "workspace_roots": ["/Users/sagnik/Desktop/test-repo"],
             "hook_event_name": "preToolUse",
             "tool_name": "Shell",
             "tool_input": {"command": "ls"}

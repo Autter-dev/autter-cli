@@ -72,7 +72,7 @@
 
           meta = with pkgs.lib; {
             description = "AI-powered Git wrapper that tracks AI-generated code changes";
-            homepage = "https://github.com/acunniffe/autter";
+            homepage = "https://github.com/autter-dev/autter-cli";
             license = licenses.gpl3Plus;
             maintainers = [ ];
             mainProgram = "autter";
