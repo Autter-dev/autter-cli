@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # create the GitHub Release and attach the .vsix
+  contents: read
 
 jobs:
   publish:
@@ -73,17 +73,3 @@ jobs:
           name: autter-vscode-vsix
           path: agent-support/vscode/*.vsix
           if-no-files-found: warn
-
-      # On a vscode-v* tag, attach the packaged .vsix to a GitHub Release so the
-      # extension has a durable, downloadable release artifact (Open VSX is the
-      # primary install source; this is the release record / fallback).
-      - name: Create GitHub Release with .vsix
-        if: startsWith(github.ref, 'refs/tags/vscode-v')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "autter VS Code extension ${GITHUB_REF_NAME#vscode-v}" \
-            *.vsix
