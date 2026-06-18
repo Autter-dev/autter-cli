@@ -191,6 +191,19 @@ pub fn post_commit_with_final_state(
         }
     }
 
+    // Bridge each AI session's prompt transcript into the CAS queue and record
+    // the resulting `cas:<hash>` on its PromptRecord so the note links back to
+    // the conversation that produced the code. Only in `Default` storage mode;
+    // `Local`/`Notes` modes keep transcripts off the CAS data plane.
+    if config.effective_prompt_storage(&Some(repo.clone()))
+        == crate::config::PromptStorageMode::Default
+    {
+        crate::authorship::cas_bridge::enqueue_prompt_transcripts(
+            &mut authorship_log.metadata.prompts,
+            &parent_working_log,
+        );
+    }
+
     let authorship_note_str = authorship_log
         .serialize_to_string()
         .map_err(|_| AutterError::Generic("Failed to serialize authorship log".to_string()))?;

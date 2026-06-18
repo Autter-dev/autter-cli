@@ -306,10 +306,14 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
         );
     }
 
-    // Flush CAS records
+    // Flush CAS records submitted in-memory (e.g. daemon-internal stream worker).
     if !batch.cas_records.is_empty() {
         flush_cas(batch.cas_records);
     }
+
+    // Drain the durable CAS queue (the post-commit transcript bridge enqueues
+    // here). This reads directly from the internal DB, mirroring flush_notes.
+    flush_cas_queue();
 
     // Flush pending notes (reads directly from notes-db; no-op when kind != Http).
     flush_notes();
@@ -699,24 +703,32 @@ pub fn flush_notes() {
     }
 }
 
-fn flush_cas(records: Vec<CasSyncPayload>) {
-    // CAS (prompt transcripts) is data-plane traffic. When the HTTP notes backend
-    // is active, send it to the same hosted data plane as notes (cli.autter.dev);
-    // otherwise fall back to the API base URL (legacy behavior).
+/// Build the CAS data-plane client and report whether uploads are currently
+/// possible (i.e. we have credentials when targeting the hosted plane).
+///
+/// CAS (prompt transcripts) is data-plane traffic. When the HTTP notes backend
+/// is active, send it to the same hosted data plane as notes (cli.autter.dev);
+/// otherwise fall back to the API base URL (legacy behavior).
+fn cas_client() -> (ApiClient, bool) {
     let cfg = Config::fresh();
-    let dataplane_url =
-        if cfg.notes_backend_kind() == crate::config::NotesBackendKind::Http {
-            cfg.notes_backend_url().map(|s| s.to_string())
-        } else {
-            None
-        };
+    let dataplane_url = if cfg.notes_backend_kind() == crate::config::NotesBackendKind::Http {
+        cfg.notes_backend_url().map(|s| s.to_string())
+    } else {
+        None
+    };
     let context = ApiContext::new(dataplane_url);
     let target_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
     let using_hosted = target_url == crate::config::DEFAULT_API_BASE_URL
         || target_url == crate::config::DEFAULT_NOTES_BACKEND_URL;
-    if using_hosted && !client.is_logged_in() && !client.has_api_key() {
+    let enabled = !using_hosted || client.is_logged_in() || client.has_api_key();
+    (client, enabled)
+}
+
+fn flush_cas(records: Vec<CasSyncPayload>) {
+    let (client, enabled) = cas_client();
+    if !enabled {
         tracing::debug!("telemetry: skipping CAS flush, not logged in");
         return;
     }
@@ -768,6 +780,57 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
                 tracing::warn!(%e, "telemetry: CAS upload error");
             }
         }
+    }
+}
+
+/// Drain the durable CAS queue (`cas_sync_queue` in the internal DB) and upload
+/// in batches via [`flush_cas`], which deletes each record on success. Records
+/// that fail to upload stay locked as `processing` and are recovered to
+/// `pending` by `dequeue_cas_batch`'s stale-lock sweep on a later tick.
+fn flush_cas_queue() {
+    // Don't lock records as `processing` if we can't upload them anyway — that
+    // would just churn the queue through the 10-minute stale-lock recovery.
+    if !cas_client().1 {
+        return;
+    }
+
+    let Ok(db) = crate::authorship::internal_db::InternalDatabase::global() else {
+        return;
+    };
+
+    // Bound the number of batches per tick so a large backlog can't monopolize
+    // the flush loop; the remainder is picked up on subsequent ticks.
+    const MAX_BATCHES_PER_TICK: usize = 20;
+    const BATCH_SIZE: usize = 50;
+
+    for _ in 0..MAX_BATCHES_PER_TICK {
+        let records = {
+            let Ok(mut db_lock) = db.lock() else {
+                return;
+            };
+            match db_lock.dequeue_cas_batch(BATCH_SIZE) {
+                Ok(records) => records,
+                Err(e) => {
+                    tracing::warn!(%e, "telemetry: CAS dequeue error");
+                    return;
+                }
+            }
+        };
+
+        if records.is_empty() {
+            break;
+        }
+
+        let payloads: Vec<CasSyncPayload> = records
+            .into_iter()
+            .map(|record| CasSyncPayload {
+                hash: record.hash,
+                data: record.data,
+                metadata: serde_json::to_string(&record.metadata).ok(),
+            })
+            .collect();
+
+        flush_cas(payloads);
     }
 }
 

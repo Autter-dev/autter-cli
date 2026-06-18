@@ -48,23 +48,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://autter.dev/i
 
 **No per-repo setup or git hooks required.** Commit with the Agent, git, or your favorite git client. Attribution will be linked to commits automatically.
 
-During install you'll be asked whether to run **local-only** or **connect to the Autter platform**. You can change this any time with `autter onboard`.
+During install you'll be asked whether to run **local-only** or **connect to the Autter platform**. Login is optional: the open source CLI's attribution, blame, and stats features work locally without uploading code, prompts, or agent usage data. You can change modes any time with `autter onboard`.
+
+See the **[complete installation and setup guide](INSTALL.md)** for verification, local-only privacy controls, platform setup, everyday commands, and troubleshooting.
 
 ## Connect to the Autter platform (optional)
 
-Local-only mode works fully offline with no account. Connecting links this machine to your Autter account so attribution and prompt history sync to the platform's dashboards (per-user / per-team usage, prompt search, and audit logs).
+Local-only mode works without an account. Connecting links this machine to your Autter organization so attribution and prompt history can power cross-repository dashboards, prompt search, team/user analytics, and audit history.
 
-Sign in is a two-step, browser-based flow using a **Personal Access Token (PAT)**:
+The recommended login is the guided browser flow:
 
 ```bash
-# 1. Opens https://app.autter.dev in your browser
-autter login
+autter onboard
+```
 
-# 2. In the dashboard: Settings → Access Tokens → Create token → copy it.
-#    Then complete sign-in with the token you copied:
+Choose to connect and authorize the device in your browser. If onboarding does not work, create a **Personal Access Token (PAT)** under **Org Settings → Access Tokens**, then add it with:
+
+```bash
 autter login --token autter_pat_xxxxxxxx
 
-# Confirm who you're signed in as:
 autter whoami
 ```
 
@@ -78,7 +80,7 @@ To go back to local-only at any time:
 
 ```bash
 autter logout                 # clear stored credentials
-autter onboard --force        # re-choose local or connected
+autter onboard --local --force
 ```
 
 ### Configuration

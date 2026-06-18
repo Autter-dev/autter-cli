@@ -3,6 +3,7 @@ pub mod attribution_tracker;
 pub mod authorship_log;
 pub mod authorship_log_serialization;
 pub mod background_agent;
+pub mod cas_bridge;
 pub mod diff_ai_accepted;
 pub mod autter_hooks;
 pub mod ignore;
