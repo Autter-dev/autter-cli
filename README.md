@@ -258,7 +258,7 @@ Hundreds of engineering teams (including many in the Fortune 100) use Autter to 
 The CLI accurately attributes AI code on every commit. The teams version adds a secure prompt store and joins in data from across the SDLC — tying token spend to individual Pull Requests, calculating % AI by PR, team, and repo, and connecting signals like amount of rework during code review, and even tying incidents back to the AI session that caused them. Self-host it or run it in our cloud: connect your SCM and get aggregate stats across thousands of repos plus full observability into everything your coding agents do.
 
 #### Who built this?
-[Sagnik](https://github.com/sagnik11) and [Sasha](https://github.com/svarlamov) — [start a discussion](https://github.com/orgs/Autter-dev/discussions) or email [hi@autter.dev](mailto:hi@autter.dev).
+Connect with the team at Autter [hi@autter.dev](mailto:hi@autter.dev).
 
 #### What are the capabilities and known limitations?
 Autter provides line-level attribution for AI-generated code - whether it is written with an edit tool or a bash command. When a Git rewrite operation is run (`rebase`, `stash`, `squash --merge`, etc) Autter will move and merge attributions so nothing is lost. 
