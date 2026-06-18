@@ -57,6 +57,7 @@ const BACKGROUND_SPAWN_THROTTLE_SECS: u64 = 60;
 const ENV_BACKGROUND_UPGRADE_WORKER: &str = "AUTTER_BACKGROUND_UPGRADE_WORKER";
 
 static UPDATE_NOTICE_EMITTED: AtomicBool = AtomicBool::new(false);
+static MIN_VERSION_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 static LAST_BACKGROUND_SPAWN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq)]
@@ -83,6 +84,10 @@ struct ChannelRelease {
     tag: String,
     semver: String,
     checksum: String,
+    /// Minimum CLI version the platform currently requires, parsed to a bare
+    /// semver. `None` when the releases payload doesn't advertise one (older
+    /// workers), in which case no min-version warning is shown.
+    min_semver: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +96,11 @@ struct UpdateCache {
     available_tag: Option<String>,
     available_semver: Option<String>,
     channel: String,
+    /// Minimum CLI version the platform requires (bare semver). Populated from
+    /// the releases payload's `min_version`. `#[serde(default)]` keeps caches
+    /// written by older binaries readable.
+    #[serde(default)]
+    min_semver: Option<String>,
 }
 
 impl UpdateCache {
@@ -100,6 +110,7 @@ impl UpdateCache {
             available_tag: None,
             available_semver: None,
             channel: channel.as_str().to_string(),
+            min_semver: None,
         }
     }
 
@@ -116,6 +127,10 @@ impl UpdateCache {
 struct ChannelInfo {
     version: String,
     checksum: String,
+    /// Optional minimum CLI version the platform requires for this channel.
+    /// Absent on older workers; `#[serde(default)]` keeps those payloads valid.
+    #[serde(default)]
+    min_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,6 +325,7 @@ fn persist_update_state(channel: UpdateChannel, release: Option<&ChannelRelease>
     if let Some(release) = release {
         cache.available_tag = Some(release.tag.clone());
         cache.available_semver = Some(release.semver.clone());
+        cache.min_semver = release.min_semver.clone();
     }
     write_update_cache(&cache);
 }
@@ -479,10 +495,19 @@ fn release_from_response(
         return Err("Checksum not found in response".to_string());
     }
 
+    // A blank or unparseable min_version is treated as "no minimum" rather than
+    // an error, so a malformed field never blocks an otherwise-valid release.
+    let min_semver = channel_info
+        .min_version
+        .as_deref()
+        .map(semver_from_tag)
+        .filter(|s| !s.is_empty());
+
     Ok(ChannelRelease {
         tag,
         semver,
         checksum,
+        min_semver,
     })
 }
 
@@ -847,6 +872,62 @@ fn print_cached_notice(cache: &UpdateCache) {
     eprintln!(
         "\x1b[1;33mRun \x1b[1;36mautter upgrade\x1b[0m \x1b[1;33mto upgrade to the latest version.\x1b[0m"
     );
+    eprintln!();
+}
+
+/// Returns the required semver when the running CLI is older than the platform's
+/// advertised minimum version, otherwise `None`.
+fn below_min_version(cache: &UpdateCache) -> Option<String> {
+    let min = cache.min_semver.as_deref()?;
+    if is_newer_version(min, env!("CARGO_PKG_VERSION")) {
+        Some(min.to_string())
+    } else {
+        None
+    }
+}
+
+/// Print a prominent warning when the CLI is older than the minimum version the
+/// platform requires. Unlike the soft "new version available" nudge, this fires
+/// on every command (still at most once per process) because running below the
+/// minimum can silently drop or mis-record authorship data. Gated on an
+/// interactive stdout so it never pollutes scripts or piped output, and on the
+/// same `disable_version_checks` config as the nudge.
+pub fn maybe_warn_below_min_version() {
+    let config = config::Config::get();
+    if config.version_checks_disabled() {
+        return;
+    }
+
+    let channel = config.update_channel();
+    let Some(cache) = read_update_cache() else {
+        return;
+    };
+    if !cache.matches_channel(channel) {
+        return;
+    }
+    let Some(min) = below_min_version(&cache) else {
+        return;
+    };
+
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    if MIN_VERSION_WARNING_EMITTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let current = env!("CARGO_PKG_VERSION");
+    eprintln!();
+    eprintln!(
+        "\x1b[1;31m⚠ autter v{current} is below v{min}, the minimum version this platform now requires.\x1b[0m"
+    );
+    eprintln!(
+        "\x1b[1;31m  Authorship data may not be recorded correctly until you upgrade.\x1b[0m"
+    );
+    eprintln!("\x1b[1;33m  Run \x1b[1;36mautter upgrade\x1b[0m\x1b[1;33m to update now.\x1b[0m");
     eprintln!();
 }
 
@@ -1430,6 +1511,7 @@ mod tests {
             tag: "v1.0.0".to_string(),
             semver: "1.0.0".to_string(),
             checksum: "abc".to_string(),
+            min_semver: None,
         };
         let action = determine_action(true, &release, "1.0.0");
         assert_eq!(action, UpgradeAction::ForceReinstall);
@@ -1441,6 +1523,7 @@ mod tests {
             tag: "v1.0.0".to_string(),
             semver: "1.0.0".to_string(),
             checksum: "abc".to_string(),
+            min_semver: None,
         };
         let action = determine_action(false, &release, "1.0.0");
         assert_eq!(action, UpgradeAction::AlreadyLatest);
@@ -1452,6 +1535,7 @@ mod tests {
             tag: "v2.0.0".to_string(),
             semver: "2.0.0".to_string(),
             checksum: "abc".to_string(),
+            min_semver: None,
         };
         let action = determine_action(false, &release, "1.0.0");
         assert_eq!(action, UpgradeAction::UpgradeAvailable);
@@ -1463,6 +1547,7 @@ mod tests {
             tag: "v1.0.0".to_string(),
             semver: "1.0.0".to_string(),
             checksum: "abc".to_string(),
+            min_semver: None,
         };
         let action = determine_action(false, &release, "2.0.0");
         assert_eq!(action, UpgradeAction::RunningNewerVersion);
@@ -1571,6 +1656,7 @@ mod tests {
             ChannelInfo {
                 version: "".to_string(),
                 checksum: "abc123".to_string(),
+                min_version: None,
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1587,6 +1673,7 @@ mod tests {
             ChannelInfo {
                 version: "v1.0.0".to_string(),
                 checksum: "".to_string(),
+                min_version: None,
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1603,12 +1690,84 @@ mod tests {
             ChannelInfo {
                 version: "v-invalid-version".to_string(),
                 checksum: "abc123".to_string(),
+                min_version: None,
             },
         );
         let releases = ReleasesResponse { channels };
         let result = release_from_response(releases, UpdateChannel::Latest);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("semver"));
+    }
+
+    #[test]
+    fn test_release_from_response_parses_min_version() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            "latest".to_string(),
+            ChannelInfo {
+                version: "v1.6.1".to_string(),
+                checksum: "abc123".to_string(),
+                min_version: Some("v1.6.0".to_string()),
+            },
+        );
+        let release = release_from_response(ReleasesResponse { channels }, UpdateChannel::Latest)
+            .expect("release should parse");
+        assert_eq!(release.min_semver.as_deref(), Some("1.6.0"));
+    }
+
+    #[test]
+    fn test_release_from_response_blank_min_version_is_none() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            "latest".to_string(),
+            ChannelInfo {
+                version: "v1.6.1".to_string(),
+                checksum: "abc123".to_string(),
+                min_version: Some("   ".to_string()),
+            },
+        );
+        let release = release_from_response(ReleasesResponse { channels }, UpdateChannel::Latest)
+            .expect("release should parse");
+        // A blank min_version must not block the release, just disable the warning.
+        assert_eq!(release.min_semver, None);
+    }
+
+    #[test]
+    fn test_below_min_version() {
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        // No minimum advertised → never below.
+        assert_eq!(below_min_version(&cache), None);
+
+        // A minimum far above any real version → below, returns the requirement.
+        cache.min_semver = Some("999.0.0".to_string());
+        assert_eq!(below_min_version(&cache).as_deref(), Some("999.0.0"));
+
+        // A minimum at or below the running version → not below.
+        cache.min_semver = Some("0.0.1".to_string());
+        assert_eq!(below_min_version(&cache), None);
+    }
+
+    #[test]
+    fn test_update_cache_persists_min_semver() {
+        let cache = UpdateCache {
+            last_checked_at: 1,
+            available_tag: Some("v999.0.0".to_string()),
+            available_semver: Some("999.0.0".to_string()),
+            channel: "latest".to_string(),
+            min_semver: Some("999.0.0".to_string()),
+        };
+        let json = serde_json::to_vec(&cache).unwrap();
+        let decoded: UpdateCache = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.min_semver.as_deref(), Some("999.0.0"));
+    }
+
+    #[test]
+    fn test_update_cache_reads_legacy_without_min_semver() {
+        // Caches written by older binaries have no min_semver field; serde default
+        // must keep them readable rather than failing to deserialize.
+        let legacy = r#"{"last_checked_at":1,"available_tag":null,"available_semver":null,"channel":"latest"}"#;
+        let decoded: UpdateCache = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.min_semver, None);
     }
 
     #[test]
@@ -1619,6 +1778,7 @@ mod tests {
             ChannelInfo {
                 version: "v1.2.3".to_string(),
                 checksum: "abc123def456".to_string(),
+                min_version: None,
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1642,6 +1802,7 @@ mod tests {
             available_tag: None,
             available_semver: None,
             channel: "latest".to_string(),
+            min_semver: None,
         };
         assert!(should_check_for_updates(
             UpdateChannel::Latest,
@@ -1657,6 +1818,7 @@ mod tests {
             available_tag: None,
             available_semver: None,
             channel: "latest".to_string(),
+            min_semver: None,
         };
         assert!(should_check_for_updates(UpdateChannel::Next, Some(&cache)));
     }
@@ -1686,6 +1848,7 @@ mod tests {
             tag: "v1.5.0".to_string(),
             semver: "1.5.0".to_string(),
             checksum: "test".to_string(),
+            min_semver: None,
         };
 
         // Manually construct what persist_update_state would create

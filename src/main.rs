@@ -83,6 +83,12 @@ fn main() {
                 SuperuserCheckResult::Allowed => {}
             }
         }
+        // Warn if the CLI is below the platform's minimum required version.
+        // Skip exempt commands (help, version, upgrade, daemon control) where the
+        // warning would be noise or redundant.
+        if !is_superuser_exempt_command(&cli.args) {
+            commands::upgrade::maybe_warn_below_min_version();
+        }
         commands::autter_handlers::handle_autter(&cli.args);
         std::process::exit(0);
     }

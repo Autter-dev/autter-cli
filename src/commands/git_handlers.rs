@@ -143,6 +143,10 @@ pub fn handle_git(args: &[String]) {
         maybe_show_async_post_commit_stats(&parsed, repo);
     }
 
+    // Warn (loudly, once per process) if this CLI is below the platform's
+    // minimum required version. Reads the cached releases payload — no network.
+    crate::commands::upgrade::maybe_warn_below_min_version();
+
     exit_with_status(exit_status);
 }
 
