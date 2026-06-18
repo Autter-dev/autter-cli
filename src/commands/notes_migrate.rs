@@ -157,6 +157,7 @@ pub fn handle_notes_migrate(args: &[String]) {
     );
 
     // 6. Upload in chunks of 50 and cache locally.
+    let repo_url = crate::repo_url::resolve_repo_url_from_repo(&repo);
     let mut total_uploaded = 0usize;
     let mut total_failed = 0usize;
     let mut cached_entries: Vec<(String, String)> = Vec::new();
@@ -167,6 +168,7 @@ pub fn handle_notes_migrate(args: &[String]) {
             .map(|(commit_sha, content)| NoteEntry {
                 commit_sha: commit_sha.clone(),
                 content: content.clone(),
+                repo_url: repo_url.clone(),
             })
             .collect();
 
@@ -522,6 +524,7 @@ mod tests {
             .map(|(sha, content)| NoteEntry {
                 commit_sha: sha.clone(),
                 content: content.clone(),
+                repo_url: None,
             })
             .collect();
         let request = NotesUploadRequest {
@@ -700,6 +703,7 @@ mod tests {
                 .map(|(sha, content)| NoteEntry {
                     commit_sha: sha.clone(),
                     content: content.clone(),
+                    repo_url: None,
                 })
                 .collect();
             let request = NotesUploadRequest {

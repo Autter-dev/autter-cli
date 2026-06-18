@@ -106,6 +106,7 @@ mod tests {
             entries: vec![NoteEntry {
                 commit_sha: "abc123".to_string(),
                 content: "authorship data".to_string(),
+                repo_url: Some("https://github.com/acme/repo.git".to_string()),
             }],
         };
 
@@ -113,6 +114,43 @@ mod tests {
         assert!(json.contains("abc123"));
         assert!(json.contains("authorship data"));
         assert!(json.contains("entries"));
+        // The repository the note belongs to must travel in the payload so the
+        // org database can store which repo each note came from.
+        assert!(json.contains("repo_url"));
+        assert!(json.contains("https://github.com/acme/repo.git"));
+    }
+
+    #[test]
+    fn test_note_entry_repo_url_round_trips() {
+        // A note carrying a repo_url survives a serialize → deserialize cycle,
+        // matching what the daemon flush sends and what the org DB upserts.
+        let entry = NoteEntry {
+            commit_sha: "deadbeef".to_string(),
+            content: "note body".to_string(),
+            repo_url: Some("git@github.com:acme/widgets.git".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: NoteEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(
+            decoded.repo_url.as_deref(),
+            Some("git@github.com:acme/widgets.git")
+        );
+    }
+
+    #[test]
+    fn test_note_entry_without_repo_url_omits_field() {
+        // When the repo couldn't be determined, repo_url is None and is omitted
+        // from the wire payload (skip_serializing_if), decoding back to None.
+        let entry = NoteEntry {
+            commit_sha: "cafef00d".to_string(),
+            content: "note body".to_string(),
+            repo_url: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("repo_url"));
+        let decoded: NoteEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.repo_url, None);
     }
 
     #[test]

@@ -123,6 +123,11 @@ pub struct CasMessagesObject {
 pub struct NoteEntry {
     pub commit_sha: String,
     pub content: String,
+    /// Repository the note belongs to (the remote URL used to route the note to
+    /// its org). Stored on the row so the org knows which repo each note came
+    /// from. `None` when the repo couldn't be determined at checkpoint time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
 }
 
 /// Request body for uploading notes to the HTTP backend.

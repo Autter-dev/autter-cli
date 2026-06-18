@@ -607,26 +607,29 @@ pub fn flush_notes() {
 
     // Route each note to the org that owns its repo. Notes whose repo isn't known
     // or isn't tracked by any org go to the home org (org = None → default token).
-    let mut groups: std::collections::HashMap<Option<String>, Vec<(String, String)>> =
+    type NoteBatchRow = (String, String, Option<String>);
+    let mut groups: std::collections::HashMap<Option<String>, Vec<NoteBatchRow>> =
         std::collections::HashMap::new();
     for note in &pending {
         let org = note
             .repo_url
             .as_deref()
             .and_then(crate::api::client::resolve_org_for_repo_cached);
-        groups
-            .entry(org)
-            .or_default()
-            .push((note.commit_sha.clone(), note.content.clone()));
+        groups.entry(org).or_default().push((
+            note.commit_sha.clone(),
+            note.content.clone(),
+            note.repo_url.clone(),
+        ));
     }
 
     for (org_opt, batch) in groups {
-        let commit_shas: Vec<String> = batch.iter().map(|(sha, _)| sha.clone()).collect();
+        let commit_shas: Vec<String> = batch.iter().map(|(sha, _, _)| sha.clone()).collect();
         let entries: Vec<NoteEntry> = batch
             .iter()
-            .map(|(sha, content)| NoteEntry {
+            .map(|(sha, content, repo_url)| NoteEntry {
                 commit_sha: sha.clone(),
                 content: content.clone(),
+                repo_url: repo_url.clone(),
             })
             .collect();
 

@@ -100,11 +100,13 @@ const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS authorship_notes (
     commit_sha  TEXT PRIMARY KEY,
     content     TEXT NOT NULL,
+    repo_url    TEXT,
     uploaded_by TEXT,
     distinct_id TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE authorship_notes ADD COLUMN IF NOT EXISTS repo_url TEXT;
 CREATE TABLE IF NOT EXISTS cas_objects (
     hash        TEXT PRIMARY KEY,
     content     JSONB NOT NULL,
@@ -243,16 +245,18 @@ pub fn upsert_notes(
             }
 
             let result = client.execute(
-                "INSERT INTO authorship_notes (commit_sha, content, uploaded_by, distinct_id)
-                 VALUES ($1, $2, $3, $4)
+                "INSERT INTO authorship_notes (commit_sha, content, repo_url, uploaded_by, distinct_id)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (commit_sha)
                  DO UPDATE SET content = EXCLUDED.content,
+                               repo_url = EXCLUDED.repo_url,
                                uploaded_by = EXCLUDED.uploaded_by,
                                distinct_id = EXCLUDED.distinct_id,
                                updated_at = now()",
                 &[
                     &entry.commit_sha,
                     &entry.content,
+                    &entry.repo_url,
                     &identity.user_id,
                     &distinct_id,
                 ],
@@ -539,5 +543,20 @@ mod tests {
         assert!(id.user_id.is_none());
         assert!(id.email.is_none());
         assert!(id.token_id.is_none());
+    }
+
+    #[test]
+    fn schema_provisions_repo_url_column() {
+        // The org's authorship_notes table must carry repo_url so each note
+        // records which repository it belongs to. The ALTER guarantees existing
+        // org databases (created before this column) are migrated on connect.
+        assert!(
+            SCHEMA.contains("repo_url    TEXT"),
+            "authorship_notes schema should declare a repo_url column"
+        );
+        assert!(
+            SCHEMA.contains("ALTER TABLE authorship_notes ADD COLUMN IF NOT EXISTS repo_url TEXT"),
+            "schema should backfill repo_url on pre-existing org databases"
+        );
     }
 }
