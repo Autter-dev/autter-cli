@@ -271,6 +271,91 @@ fn test_codex_commit_inside_bash_inflight_is_attributed_to_codex() {
 }
 
 #[test]
+fn test_codex_session_transcript_is_stored_locally_and_resolvable() {
+    use crate::repos::test_repo::TestRepo;
+    use autter::authorship::authorship_log_serialization::generate_session_id;
+
+    let mut repo = TestRepo::new();
+    repo.patch_autter_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec![]);
+        patch.prompt_storage = Some("default".to_string());
+    });
+
+    let repo_root = repo.canonical_path();
+    let file_path = repo_root.join("test.txt");
+    fs::write(&file_path, "line one\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    let simple_fixture = fixture_path("codex-session-simple.jsonl");
+    let transcript_path = repo_root.join("codex-rollout.jsonl");
+    fs::copy(&simple_fixture, &transcript_path).unwrap();
+
+    let session_id = "codex-prompt-session";
+    let pre_hook_input = json!({
+        "session_id": session_id,
+        "cwd": repo_root.to_string_lossy().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "bash-use-1",
+        "tool_input": { "command": "echo test" },
+        "transcript_path": transcript_path.to_string_lossy().to_string()
+    })
+    .to_string();
+
+    repo.autter(&["checkpoint", "codex", "--hook-input", &pre_hook_input])
+        .expect("pre-hook checkpoint should succeed");
+
+    fs::write(&file_path, "line one\nline two\n").unwrap();
+
+    let post_hook_input = json!({
+        "session_id": session_id,
+        "cwd": repo_root.to_string_lossy().to_string(),
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "bash-use-1",
+        "tool_input": { "command": "echo test" },
+        "transcript_path": transcript_path.to_string_lossy().to_string()
+    })
+    .to_string();
+
+    repo.autter(&["checkpoint", "codex", "--hook-input", &post_hook_input])
+        .expect("post-hook checkpoint should succeed");
+
+    let commit = repo
+        .stage_all_and_commit("Apply codex edit")
+        .expect("commit should succeed");
+
+    let session_key = generate_session_id(session_id, "codex");
+    let session = commit
+        .authorship_log
+        .metadata
+        .sessions
+        .get(&session_key)
+        .expect("session record should exist");
+
+    let messages_url = session
+        .messages_url
+        .as_deref()
+        .expect("session should have CAS messages_url after commit");
+    assert!(
+        messages_url.starts_with("cas:"),
+        "messages_url should reference local CAS hash, got {messages_url}"
+    );
+
+    let show_prompt_output = repo
+        .autter(&["show-prompt", &session_key])
+        .expect("show-prompt should succeed");
+    assert!(
+        show_prompt_output.contains("\"messages\""),
+        "show-prompt should resolve messages from local CAS storage"
+    );
+    assert!(
+        show_prompt_output.contains("Refactor src/main.rs"),
+        "show-prompt should include user prompt text from codex transcript"
+    );
+}
+
+#[test]
 fn test_codex_commit_inside_bash_inflight_repeated_append_keeps_file_ai() {
     use crate::repos::test_repo::TestRepo;
 

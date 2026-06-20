@@ -1,3 +1,4 @@
+use crate::authorship::cas_bridge;
 use crate::authorship::prompt_utils::find_prompt;
 use crate::git::find_repository;
 
@@ -31,12 +32,26 @@ pub fn handle_show_prompt(args: &[String]) {
         parsed.offset,
     ) {
         Ok((commit_sha, prompt_record)) => {
-            // Output the prompt as JSON, including the commit SHA for context
-            // Note: messages will be empty if they were uploaded to CAS (legacy behavior)
+            let mut prompt_json = serde_json::to_value(&prompt_record).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "agent_id": prompt_record.agent_id,
+                    "human_author": prompt_record.human_author,
+                    "messages_url": prompt_record.messages_url,
+                })
+            });
+
+            if let Some(messages_url) = prompt_record.messages_url.as_deref()
+                && let Ok(Some(messages)) = cas_bridge::resolve_cas_messages(messages_url)
+                && let Ok(messages_json) = serde_json::to_value(&messages)
+                && let Some(obj) = prompt_json.as_object_mut()
+            {
+                obj.insert("messages".to_string(), messages_json);
+            }
+
             let output = serde_json::json!({
                 "commit": commit_sha,
                 "prompt_id": parsed.prompt_id,
-                "prompt": prompt_record,
+                "prompt": prompt_json,
             });
             println!(
                 "{}",

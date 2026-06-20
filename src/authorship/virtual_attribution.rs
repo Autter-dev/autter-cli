@@ -464,6 +464,7 @@ impl VirtualAttributions {
                     let session_record = SessionRecord {
                         agent_id: agent_id.clone(),
                         human_author: human_author.clone(),
+                        messages_url: None,
                         custom_attributes: None,
                     };
 
@@ -662,6 +663,7 @@ impl VirtualAttributions {
                     let session_record = SessionRecord {
                         agent_id: agent_id.clone(),
                         human_author: human_author.clone(),
+                        messages_url: None,
                         custom_attributes: None,
                     };
 
@@ -848,6 +850,7 @@ impl VirtualAttributions {
                     let session_record = SessionRecord {
                         agent_id: agent_id.clone(),
                         human_author: human_author.clone(),
+                        messages_url: None,
                         custom_attributes: None,
                     };
 

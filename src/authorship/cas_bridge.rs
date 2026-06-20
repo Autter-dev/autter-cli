@@ -4,8 +4,9 @@
 //! `agent_metadata` (`"transcript_path"`). At post-commit time we read that
 //! transcript, redact secrets, and enqueue it as a CAS object keyed by the hash
 //! of its canonicalized content. The resulting `cas:<hash>` reference is written
-//! onto the matching [`PromptRecord::messages_url`] so the authorship note can
-//! point back at the full conversation that produced each AI attribution.
+//! onto the matching [`PromptRecord::messages_url`] / [`SessionRecord::messages_url`]
+//! so the authorship note can point back at the full conversation that produced
+//! each AI attribution.
 //!
 //! The durable queue (`cas_sync_queue` in the internal DB) is drained and
 //! uploaded by the daemon's telemetry flush loop.
@@ -17,45 +18,35 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
+use crate::api::client::{ApiClient, ApiContext};
 use crate::api::types::CasMessagesObject;
-use crate::authorship::authorship_log::PromptRecord;
-use crate::authorship::authorship_log_serialization::generate_short_hash;
+use crate::authorship::authorship_log::{PromptRecord, SessionRecord};
+use crate::authorship::authorship_log_serialization::{generate_session_id, generate_short_hash};
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::transcript::Message;
 use crate::authorship::working_log::{AgentId, Checkpoint};
+use crate::config;
 use crate::error::AutterError;
 
 /// Schema tag stored in each CAS transcript object's metadata so consumers
 /// (PR review, blame, etc.) can evolve the shape over time.
 const TRANSCRIPT_SCHEMA: &str = "cas/transcript/1.0.0";
 
-/// For every AI `PromptRecord` that has a captured transcript, enqueue the
+/// For every AI prompt/session that has a captured transcript, enqueue the
 /// transcript as a CAS object and record the `cas:<hash>` on `messages_url`.
 ///
 /// `checkpoints` is the working log for the commit being processed; it is the
 /// only place the transcript file path is available (via `agent_metadata`).
 pub fn enqueue_prompt_transcripts(
     prompts: &mut BTreeMap<String, PromptRecord>,
+    sessions: &mut BTreeMap<String, SessionRecord>,
     checkpoints: &[Checkpoint],
 ) {
-    if prompts.is_empty() {
+    if prompts.is_empty() && sessions.is_empty() {
         return;
     }
 
-    // Map prompt short-hash -> transcript path from checkpoint agent metadata.
-    // Checkpoints are in chronological order, so the latest path for a given
-    // session wins (transcripts are append-only files keyed by session).
-    let mut transcript_paths: HashMap<String, String> = HashMap::new();
-    for cp in checkpoints {
-        let (Some(agent_id), Some(meta)) = (&cp.agent_id, &cp.agent_metadata) else {
-            continue;
-        };
-        if let Some(path) = meta.get("transcript_path") {
-            let hash = generate_short_hash(&agent_id.id, &agent_id.tool);
-            transcript_paths.insert(hash, path.clone());
-        }
-    }
-
+    let transcript_paths = transcript_paths_from_checkpoints(checkpoints);
     if transcript_paths.is_empty() {
         return;
     }
@@ -67,13 +58,39 @@ pub fn enqueue_prompt_transcripts(
         let Some(path) = transcript_paths.get(hash) else {
             continue;
         };
-        // On a missing/empty/unparseable transcript or an enqueue failure we
-        // leave messages_url unset: the note is still valid, just without a
-        // transcript link.
         if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id) {
             record.messages_url = Some(format!("cas:{cas_hash}"));
         }
     }
+
+    for (session_key, record) in sessions.iter_mut() {
+        if record.messages_url.is_some() {
+            continue;
+        }
+        let Some(path) = transcript_paths.get(session_key) else {
+            continue;
+        };
+        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id) {
+            record.messages_url = Some(format!("cas:{cas_hash}"));
+        }
+    }
+}
+
+/// Build a map of prompt/session hash -> transcript path from checkpoint metadata.
+fn transcript_paths_from_checkpoints(checkpoints: &[Checkpoint]) -> HashMap<String, String> {
+    let mut transcript_paths: HashMap<String, String> = HashMap::new();
+    for cp in checkpoints {
+        let (Some(agent_id), Some(meta)) = (&cp.agent_id, &cp.agent_metadata) else {
+            continue;
+        };
+        if let Some(path) = meta.get("transcript_path") {
+            let short_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
+            let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
+            transcript_paths.insert(short_hash, path.clone());
+            transcript_paths.insert(session_id, path.clone());
+        }
+    }
+    transcript_paths
 }
 
 /// Read and normalize a single transcript file, then enqueue it as a CAS object.
@@ -99,7 +116,7 @@ fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<Stri
         return Ok(None);
     }
 
-    let cas_object = CasMessagesObject { messages };
+    let cas_object = CasMessagesObject { messages: messages.clone() };
     let mut payload = serde_json::to_value(&cas_object)
         .map_err(|e| AutterError::Generic(format!("Failed to serialize transcript: {e}")))?;
 
@@ -119,28 +136,133 @@ fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<Stri
         .lock()
         .map_err(|_| AutterError::Generic("CAS internal DB lock poisoned".to_string()))?;
     let cas_hash = db_lock.enqueue_cas_object(&payload, Some(&metadata))?;
+
+    // Cache locally so show-prompt can resolve before cloud upload completes.
+    if let Ok(messages_json) = serde_json::to_string(&messages) {
+        let _ = db_lock.set_cas_cache(&cas_hash, &messages_json);
+    }
+
     Ok(Some(cas_hash))
 }
 
+/// Resolve transcript messages from a `cas:<hash>` URL.
+///
+/// Lookup order:
+/// 1. Local SQLite cache (`cas_cache`)
+/// 2. Local sync queue (`cas_sync_queue`, not yet uploaded)
+/// 3. Cloud CAS API (when authenticated)
+pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, AutterError> {
+    let Some(hash) = messages_url.strip_prefix("cas:") else {
+        return Ok(None);
+    };
+    if hash.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(db) = InternalDatabase::global()
+        && let Ok(db_lock) = db.lock()
+    {
+        if let Some(cached) = db_lock.get_cas_cache(hash)?
+            && let Ok(messages) = serde_json::from_str::<Vec<Message>>(&cached)
+        {
+            return Ok(Some(messages));
+        }
+
+        if let Some(queue_data) = db_lock.get_cas_queue_data(hash)?
+            && let Ok(messages) = extract_messages_from_cas_payload(&queue_data)
+        {
+            return Ok(Some(messages));
+        }
+    }
+
+    let cfg = config::Config::fresh();
+    let dataplane_url = if cfg.notes_backend_kind() == config::NotesBackendKind::Http {
+        cfg.notes_backend_url().map(|s| s.to_string())
+    } else {
+        None
+    };
+    let client = ApiClient::new(ApiContext::new(dataplane_url));
+    if !client.is_logged_in() && !client.has_api_key() {
+        return Ok(None);
+    }
+
+    let response = client.read_ca_prompt_store(&[hash])?;
+    for result in response.results {
+        if result.status == "ok"
+            && result.hash == hash
+            && let Some(content) = result.content
+            && let Ok(messages) = extract_messages_from_cas_value(&content)
+        {
+            if let Ok(db) = InternalDatabase::global()
+                && let Ok(mut db_lock) = db.lock()
+                && let Ok(messages_json) = serde_json::to_string(&messages)
+            {
+                let _ = db_lock.set_cas_cache(hash, &messages_json);
+            }
+            return Ok(Some(messages));
+        }
+    }
+
+    Ok(None)
+}
+
+fn extract_messages_from_cas_payload(payload: &str) -> Result<Vec<Message>, AutterError> {
+    let value: Value = serde_json::from_str(payload)
+        .map_err(|e| AutterError::Generic(format!("Failed to parse CAS payload: {e}")))?;
+    extract_messages_from_cas_value(&value)
+}
+
+fn extract_messages_from_cas_value(value: &Value) -> Result<Vec<Message>, AutterError> {
+    if let Ok(obj) = serde_json::from_value::<CasMessagesObject>(value.clone()) {
+        return Ok(obj.messages);
+    }
+    if let Some(messages) = value.get("messages") {
+        return serde_json::from_value(messages.clone())
+            .map_err(|e| AutterError::Generic(format!("Failed to parse CAS messages: {e}")));
+    }
+    Err(AutterError::Generic(
+        "CAS payload missing messages".to_string(),
+    ))
+}
+
 /// Convert one raw transcript event into zero or more typed [`Message`]s.
-///
-/// Handles the common JSONL agent shapes seen across presets:
-/// - role lives in the top-level `type` (`"user"` vs anything else) or
-///   `message.role`;
-/// - content lives in `message.content` (Claude) or top-level `content`
-///   (Gemini), and is either a plain string or an array of content blocks;
-/// - content blocks are `{type:"text",text}`, `{type:"thinking",thinking}`,
-///   `{type:"tool_use",name,input}`, or a bare `{text}` (Gemini).
-///
-/// Anything that doesn't carry recognizable content yields no messages.
 fn messages_from_event(event: &Value) -> Vec<Message> {
-    let role = event_role(event);
+    let (event, outer_timestamp) = normalize_transcript_event(event);
+    let role = event_role(&event);
     let timestamp = event
         .get("timestamp")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(str::to_string)
+        .or(outer_timestamp);
 
-    // Content is nested under `message` (Claude) or at the top level (Gemini).
+    if event
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "function_call")
+    {
+        let name = event
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let input = event
+            .get("arguments")
+            .and_then(|v| {
+                if let Some(raw) = v.as_str() {
+                    serde_json::from_str(raw).ok()
+                } else {
+                    Some(v.clone())
+                }
+            })
+            .unwrap_or(Value::Null);
+        return vec![Message::ToolUse {
+            name,
+            input,
+            timestamp,
+        }];
+    }
+
+    // Content is nested under `message` (Claude) or at the top level (Gemini/Codex).
     let content = event
         .get("message")
         .and_then(|m| m.get("content"))
@@ -156,6 +278,22 @@ fn messages_from_event(event: &Value) -> Vec<Message> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Normalize agent-specific transcript envelopes into a common event shape.
+fn normalize_transcript_event(event: &Value) -> (Value, Option<String>) {
+    let outer_timestamp = event
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    if event.get("type").and_then(Value::as_str) == Some("response_item")
+        && let Some(payload) = event.get("payload")
+    {
+        return (payload.clone(), outer_timestamp);
+    }
+
+    (event.clone(), None)
 }
 
 /// Map a single content block to messages, preserving thinking and tool calls.
@@ -197,9 +335,11 @@ fn block_to_messages(role: Role, block: &Value, timestamp: &Option<String>) -> V
                 }]
             }
         }
-        // "text" blocks and Gemini's `{text}` blocks (no `type`).
+        // "text" blocks and Gemini/Codex `{text}` / `{input_text}` / `{output_text}` blocks.
         _ => block
             .get("text")
+            .or_else(|| block.get("input_text"))
+            .or_else(|| block.get("output_text"))
             .and_then(Value::as_str)
             .and_then(|text| text_message(role, text.to_string(), timestamp.clone()))
             .into_iter()
@@ -215,6 +355,16 @@ enum Role {
 }
 
 fn event_role(event: &Value) -> Role {
+    // Codex uses type="message" with a separate role field.
+    if let Some(role) = event.get("role").and_then(Value::as_str) {
+        if role.eq_ignore_ascii_case("user") {
+            return Role::User;
+        }
+        if role.eq_ignore_ascii_case("assistant") {
+            return Role::Assistant;
+        }
+    }
+
     let raw = event
         .get("type")
         .and_then(Value::as_str)
@@ -224,7 +374,6 @@ fn event_role(event: &Value) -> Role {
                 .and_then(|m| m.get("role"))
                 .and_then(Value::as_str)
         })
-        .or_else(|| event.get("role").and_then(Value::as_str))
         .unwrap_or("");
     if raw.eq_ignore_ascii_case("user") {
         Role::User
@@ -359,6 +508,57 @@ mod tests {
         });
         let msgs = messages_from_event(&event);
         assert!(matches!(&msgs[0], Message::Thinking { text, .. } if text == "Let me reason."));
+    }
+
+    #[test]
+    fn codex_response_item_user_message_maps() {
+        let event = serde_json::json!({
+            "timestamp": "2026-02-11T05:53:33.360Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Refactor src/main.rs" }]
+            }
+        });
+        let msgs = messages_from_event(&event);
+        assert_eq!(
+            msgs,
+            vec![Message::User {
+                text: "Refactor src/main.rs".to_string(),
+                timestamp: Some("2026-02-11T05:53:33.360Z".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn codex_response_item_function_call_maps_to_tool_use() {
+        let event = serde_json::json!({
+            "timestamp": "2026-02-11T05:53:33.420Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": "{\"patch\":\"*** Begin Patch\"}"
+            }
+        });
+        let msgs = messages_from_event(&event);
+        assert!(matches!(&msgs[0], Message::ToolUse { name, .. } if name == "apply_patch"));
+    }
+
+    #[test]
+    fn codex_response_item_assistant_message_maps() {
+        let event = serde_json::json!({
+            "timestamp": "2026-02-11T05:53:33.520Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Done." }]
+            }
+        });
+        let msgs = messages_from_event(&event);
+        assert!(matches!(&msgs[0], Message::Assistant { text, .. } if text == "Done."));
     }
 
     #[test]

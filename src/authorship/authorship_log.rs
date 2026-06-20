@@ -218,6 +218,8 @@ pub struct SessionRecord {
     pub agent_id: AgentId,
     pub human_author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
 }
 
@@ -227,7 +229,7 @@ impl SessionRecord {
         PromptRecord {
             agent_id: self.agent_id.clone(),
             human_author: self.human_author.clone(),
-            messages_url: None,
+            messages_url: self.messages_url.clone(),
             total_additions: 0,
             total_deletions: 0,
             accepted_lines: 0,

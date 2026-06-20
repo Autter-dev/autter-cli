@@ -461,6 +461,21 @@ impl InternalDatabase {
         }
     }
 
+    /// Read canonical CAS payload from the local sync queue (before cloud upload).
+    pub fn get_cas_queue_data(&self, hash: &str) -> Result<Option<String>, AutterError> {
+        let result = self.conn.query_row(
+            "SELECT data FROM cas_sync_queue WHERE hash = ?1 LIMIT 1",
+            params![hash],
+            |row| row.get::<_, String>(0),
+        );
+
+        match result {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Cache CAS messages by hash (INSERT OR REPLACE since content is immutable)
     pub fn set_cas_cache(&mut self, hash: &str, messages_json: &str) -> Result<(), AutterError> {
         let now = std::time::SystemTime::now()
