@@ -240,6 +240,10 @@ impl DaemonProcess {
             .current_dir(test_home)
             .env("AUTTER_TEST_DB_PATH", test_db_path)
             .env("AUTTER_TEST_DB_PATH", test_db_path)
+            .env(
+                "AUTTER_TEST_FILE_CHANGES_DB_PATH",
+                test_file_changes_db_path(test_db_path),
+            )
             .env("AUTTER_DAEMON_HOME", test_home)
             .env("AUTTER_DAEMON_CONTROL_SOCKET", &control_socket_path)
             .env("AUTTER_DAEMON_TRACE_SOCKET", &trace_socket_path)
@@ -669,6 +673,10 @@ fn resolve_test_db_path(
     } else {
         base.join(format!("{}-db", id))
     }
+}
+
+fn test_file_changes_db_path(test_db_path: &std::path::Path) -> PathBuf {
+    PathBuf::from(format!("{}-file-changes", test_db_path.display()))
 }
 
 #[derive(Debug, Default)]
@@ -2155,8 +2163,6 @@ impl TestRepo {
             .current_dir(&self.path)
             .args(["git-hooks", "ensure"]);
         self.configure_autter_env(&mut command);
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
 
         let output = command
             .output()
@@ -2205,6 +2211,14 @@ impl TestRepo {
         }
     }
 
+    fn configure_test_db_env(&self, command: &mut Command) {
+        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+        command.env(
+            "AUTTER_TEST_FILE_CHANGES_DB_PATH",
+            test_file_changes_db_path(&self.test_db_path),
+        );
+    }
+
     fn configure_autter_env(&self, command: &mut Command) {
         // Isolate all git + autter config reads from developer machine settings.
         configure_test_home_env(command, &self.test_home);
@@ -2217,8 +2231,7 @@ impl TestRepo {
             "AUTTER_DAEMON_TRACE_SOCKET",
             self.daemon_trace_socket_path(),
         );
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+        self.configure_test_db_env(command);
 
         if self.has_active_daemon() {
             command.env("AUTTER_DAEMON_CHECKPOINT_DELEGATE", "true");
@@ -2548,8 +2561,7 @@ impl TestRepo {
             {
                 command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
             }
-            command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
-            command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+            self.configure_test_db_env(&mut command);
 
             // Add custom environment variables
             for (key, value) in envs {
@@ -2643,9 +2655,6 @@ impl TestRepo {
             command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
         }
 
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
-
         let output = command
             .output()
             .unwrap_or_else(|_| panic!("Failed to execute autter command: {:?}", args));
@@ -2709,10 +2718,6 @@ impl TestRepo {
         {
             command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
         }
-
-        // Add test database path for isolation
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
-        command.env("AUTTER_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
 
         // Add custom environment variables
         for (key, value) in envs {

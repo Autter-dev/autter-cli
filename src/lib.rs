@@ -9,6 +9,7 @@ pub mod diagnostic_sentinels;
 pub mod diagnostics;
 pub mod error;
 pub mod feature_flags;
+pub mod file_changes;
 pub mod git;
 pub mod http;
 pub mod mdm;

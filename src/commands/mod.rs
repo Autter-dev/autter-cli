@@ -8,6 +8,7 @@ pub mod debug;
 pub mod diff;
 pub mod exchange_nonce;
 pub mod fetch_notes;
+pub mod file_changes;
 pub mod flush_metrics_db;
 pub mod git_handlers;
 pub mod git_hook_handlers;
