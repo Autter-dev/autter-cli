@@ -152,6 +152,7 @@ pub fn fill_unattributed_lines(
         SessionRecord {
             agent_id,
             human_author: Some(human_author.to_string()),
+            messages_url: None,
             custom_attributes: None,
         },
     );

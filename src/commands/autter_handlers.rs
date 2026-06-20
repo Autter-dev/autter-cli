@@ -108,6 +108,9 @@ pub fn handle_autter(args: &[String]) {
             }
             handle_stats(&args[1..]);
         }
+        "file-changes" => {
+            commands::file_changes::handle_file_changes(&args[1..]);
+        }
         "status" => {
             commands::status::handle_status(&args[1..]);
         }
@@ -286,6 +289,9 @@ fn print_help() {
     );
     eprintln!("  stats [commit]     Show AI authorship statistics for a commit");
     eprintln!("    --json                 Output in JSON format");
+    eprintln!("  file-changes       Show the most frequently changed files in this repo");
+    eprintln!("    --json                 Output in JSON format");
+    eprintln!("    --limit, -n <n>        Number of files to show (default: 20)");
     eprintln!("  status             Show uncommitted AI authorship status (debug)");
     eprintln!("    --json                 Output in JSON format");
     eprintln!("  show <rev|range>   Display authorship logs for a revision or range");

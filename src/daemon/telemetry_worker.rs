@@ -317,6 +317,9 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
 
     // Flush pending notes (reads directly from notes-db; no-op when kind != Http).
     flush_notes();
+
+    // Flush pending file change aggregates to the org database.
+    crate::file_changes::flush_pending_to_cloud();
 }
 
 fn flush_metrics(events: &[MetricEvent]) {

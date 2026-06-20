@@ -287,7 +287,7 @@ impl AuthorshipLog {
                             accepted_lines: 0,
                             overriden_lines: 0,
                             custom_attributes: session_record.custom_attributes.clone(),
-                            messages_url: None,
+                            messages_url: session_record.messages_url.clone(),
                         };
                         return Some((
                             Author {
@@ -1379,6 +1379,7 @@ mod tests {
             crate::authorship::authorship_log::SessionRecord {
                 agent_id: agent_id.clone(),
                 human_author: Some("dev@example.com".to_string()),
+                messages_url: None,
                 custom_attributes: None,
             },
         );

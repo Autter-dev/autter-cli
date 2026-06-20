@@ -140,7 +140,21 @@ CREATE TABLE IF NOT EXISTS cli_metrics (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS cli_metrics_eventId_idx ON cli_metrics (event_id);
-CREATE INDEX IF NOT EXISTS cli_metrics_eventTs_idx ON cli_metrics (event_ts);";
+CREATE INDEX IF NOT EXISTS cli_metrics_eventTs_idx ON cli_metrics (event_ts);
+CREATE TABLE IF NOT EXISTS file_change_counts (
+    repo_url        TEXT NOT NULL,
+    file_path       TEXT NOT NULL,
+    change_count    BIGINT NOT NULL DEFAULT 0,
+    lines_added     BIGINT NOT NULL DEFAULT 0,
+    lines_deleted   BIGINT NOT NULL DEFAULT 0,
+    last_changed_at TIMESTAMPTZ NOT NULL,
+    distinct_id     TEXT,
+    uploaded_by     TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (repo_url, file_path)
+);
+CREATE INDEX IF NOT EXISTS file_change_counts_repo_idx ON file_change_counts (repo_url);
+CREATE INDEX IF NOT EXISTS file_change_counts_count_idx ON file_change_counts (repo_url, change_count DESC);";
 
 /// Open a new TLS connection to `org_db_url` and ensure the schema exists.
 fn connect(org_db_url: &str) -> Result<Client, AutterError> {
@@ -489,6 +503,69 @@ pub fn insert_metrics(
         }
 
         Ok(errors)
+    })
+}
+
+/// Row for upserting aggregated file change counts.
+#[derive(Debug, Clone)]
+pub struct FileChangeCountRow {
+    pub repo_url: String,
+    pub file_path: String,
+    pub change_count: u64,
+    pub lines_added: u64,
+    pub lines_deleted: u64,
+    pub last_changed_at: u64,
+}
+
+/// Upsert aggregated file change counts into the org database.
+///
+/// Returns `(repo_url, file_path)` pairs for rows that failed individually.
+pub fn upsert_file_change_counts(
+    identity: &OrgIdentity,
+    rows: &[FileChangeCountRow],
+    distinct_id: &str,
+) -> Result<Vec<(String, String)>, AutterError> {
+    run(&identity.org_db_url, |client| {
+        let mut failed = Vec::new();
+
+        for row in rows {
+            let result = client.execute(
+                "INSERT INTO file_change_counts
+                    (repo_url, file_path, change_count, lines_added, lines_deleted,
+                     last_changed_at, distinct_id, uploaded_by)
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7, $8)
+                 ON CONFLICT (repo_url, file_path)
+                 DO UPDATE SET
+                    change_count = GREATEST(file_change_counts.change_count, EXCLUDED.change_count),
+                    lines_added = GREATEST(file_change_counts.lines_added, EXCLUDED.lines_added),
+                    lines_deleted = GREATEST(file_change_counts.lines_deleted, EXCLUDED.lines_deleted),
+                    last_changed_at = GREATEST(file_change_counts.last_changed_at, EXCLUDED.last_changed_at),
+                    distinct_id = EXCLUDED.distinct_id,
+                    uploaded_by = EXCLUDED.uploaded_by,
+                    updated_at = now()",
+                &[
+                    &row.repo_url,
+                    &row.file_path,
+                    &(row.change_count as i64),
+                    &(row.lines_added as i64),
+                    &(row.lines_deleted as i64),
+                    &(row.last_changed_at as f64),
+                    &distinct_id,
+                    &identity.user_id,
+                ],
+            );
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    repo_url = %row.repo_url,
+                    file_path = %row.file_path,
+                    "file_change_counts upsert failed: {e}"
+                );
+                failed.push((row.repo_url.clone(), row.file_path.clone()));
+            }
+        }
+
+        Ok(failed)
     })
 }
 

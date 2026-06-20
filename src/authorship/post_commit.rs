@@ -192,14 +192,18 @@ pub fn post_commit_with_final_state(
     }
 
     // Bridge each AI session's prompt transcript into the CAS queue and record
-    // the resulting `cas:<hash>` on its PromptRecord so the note links back to
-    // the conversation that produced the code. Only in `Default` storage mode;
-    // `Local`/`Notes` modes keep transcripts off the CAS data plane.
-    if config.effective_prompt_storage(&Some(repo.clone()))
-        == crate::config::PromptStorageMode::Default
-    {
+    // the resulting `cas:<hash>` on its PromptRecord/SessionRecord so the note
+    // links back to the conversation that produced the code. In `Default` mode
+    // the daemon uploads queued objects to the cloud; in `Local` mode they stay
+    // on disk only. `Notes` mode stores transcripts in git notes instead.
+    let storage_mode = config.effective_prompt_storage(&Some(repo.clone()));
+    if matches!(
+        storage_mode,
+        crate::config::PromptStorageMode::Default | crate::config::PromptStorageMode::Local
+    ) {
         crate::authorship::cas_bridge::enqueue_prompt_transcripts(
             &mut authorship_log.metadata.prompts,
+            &mut authorship_log.metadata.sessions,
             &parent_working_log,
         );
     }

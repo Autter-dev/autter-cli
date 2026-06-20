@@ -4315,6 +4315,7 @@ fn build_note_from_conflict_wl(
                 .or_insert_with(|| crate::authorship::authorship_log::SessionRecord {
                     agent_id: agent_id.clone(),
                     human_author: None,
+                    messages_url: None,
                     custom_attributes: None,
                 });
         } else {

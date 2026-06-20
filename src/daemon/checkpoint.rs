@@ -379,6 +379,14 @@ fn execute_resolved_checkpoint(
 
             let file_attrs = attrs.clone().author(&checkpoint.author);
             crate::metrics::record(values, file_attrs);
+
+            crate::file_changes::record_checkpoint_file(
+                repo,
+                &entry.file,
+                file_stat.additions,
+                file_stat.deletions,
+                checkpoint.timestamp,
+            );
         }
     }
 

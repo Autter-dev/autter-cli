@@ -300,20 +300,24 @@ fn test_old_session_with_messages_deserializes_without_them() {
 
     assert_eq!(log.metadata.sessions.len(), 1, "should have 1 session");
 
-    // The old messages/messages_url fields should be silently ignored (backward compat)
+    // The old inline `messages` field is ignored; `messages_url` is preserved.
     let session = log.metadata.sessions.values().next().unwrap();
     assert_eq!(session.agent_id.tool, "test_tool");
     assert_eq!(session.agent_id.id, "test_agent");
+    assert_eq!(
+        session.messages_url.as_deref(),
+        Some("https://api.example.com/cas/abc123")
+    );
 
-    // Verify serialization does NOT include messages or messages_url
+    // Verify serialization does NOT include inline messages
     let serialized = log.serialize_to_string().expect("should serialize");
     assert!(
         !serialized.contains("\"messages\""),
-        "re-serialized note should not contain messages field"
+        "re-serialized note should not contain inline messages field"
     );
     assert!(
-        !serialized.contains("\"messages_url\""),
-        "re-serialized note should not contain messages_url field"
+        serialized.contains("\"messages_url\""),
+        "re-serialized note should preserve messages_url"
     );
 }
 
