@@ -8571,6 +8571,8 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     // Spawn the telemetry worker inside the daemon's tokio runtime.
     let telemetry_handle = crate::daemon::telemetry_worker::spawn_telemetry_worker();
     crate::daemon::telemetry_worker::set_daemon_internal_telemetry(telemetry_handle.clone());
+    // Report daemon panics to PostHog Error Tracking (best-effort, consent-gated).
+    crate::observability::install_panic_hook();
     coordinator_inner.telemetry_worker = Some(telemetry_handle.clone());
 
     // Spawn the transcript worker BEFORE wrapping coordinator in Arc

@@ -57,6 +57,11 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Report unexpected panics as errors (surfaces in PostHog Error Tracking
+    // via the daemon when the user has opted into telemetry). Best-effort and
+    // preserves normal panic-to-stderr behavior.
+    autter::observability::install_panic_hook();
+
     let cli = Cli::parse();
 
     #[cfg(debug_assertions)]

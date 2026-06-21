@@ -93,8 +93,29 @@ autter onboard --local --force
 | `notes_backend.kind` | `git_notes` (local) / `http` (connected) | Where authorship notes go |
 | `notes_backend.backend_url` | `https://cli.autter.dev` | Gate that enables cloud sync; the actual notes/prompt writes go straight to your org database (URL from your token), not to this host |
 | `prompt_storage` | `local` / `default` (connected) | `default` uploads prompts, `local` keeps them on-device |
+| `telemetry_oss` | `on` | `off` disables all anonymous usage analytics and error reporting |
 
 Env overrides: `AUTTER_API_BASE_URL`, `AUTTER_WEB_URL`, `AUTTER_NOTES_BACKEND_KIND`, `AUTTER_NOTES_BACKEND_URL`, `AUTTER_API_KEY` (for CI).
+
+### Telemetry
+
+Autter sends **anonymous** usage analytics and error reports to help us improve the tool. Telemetry is **on by default** and you are asked to confirm during `autter onboard`. It is designed to be safe and fully transparent:
+
+- **No personal data, ever** — no code, prompts, file paths, repo names, usernames, or IP addresses.
+- **Only anonymous, coarse data** is sent: a random install ID, device info (OS, CPU architecture, core count), the Autter version, and error/exception messages.
+- **Everything is mirrored locally** so you can audit exactly what left your machine, at `~/.autter/internal/telemetry.log` (one JSON object per event).
+
+Inspect or change it anytime:
+
+```bash
+autter telemetry status      # is it on/off + where the audit log lives
+autter telemetry log         # show everything that has been sent (last 50)
+autter telemetry log --all   # show the full audit log
+autter telemetry off         # disable telemetry
+autter telemetry on          # re-enable telemetry
+```
+
+You can also disable it by setting `"telemetry_oss": "off"` in `~/.autter/config.json`, or re-run the prompt with `autter onboard --force` (non-interactive installs accept `--telemetry` / `--no-telemetry`).
 
 **The [Autter standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) is supported by:**
 <table>
