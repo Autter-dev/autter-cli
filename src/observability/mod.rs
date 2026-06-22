@@ -30,6 +30,43 @@ pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Valu
     submit_telemetry_envelope(vec![envelope]);
 }
 
+/// Install a panic hook that reports unexpected panics as error events
+/// (surfacing in PostHog Error Tracking via the daemon) while preserving the
+/// default behavior of printing the panic to stderr.
+///
+/// Reporting is best-effort and routes through the same consent-gated path as
+/// every other event: the daemon only forwards to PostHog when the user has
+/// opted into telemetry.
+pub fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+
+        let envelope = crate::daemon::TelemetryEnvelope::Error {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message: format!("panic: {payload}"),
+            context: Some(serde_json::json!({
+                "kind": "panic",
+                "location": location,
+            })),
+        };
+        submit_telemetry_envelope(vec![envelope]);
+
+        // Preserve normal panic output (and any abort behavior).
+        default_hook(info);
+    }));
+}
+
 /// Log a performance metric to Sentry (via daemon telemetry worker)
 pub fn log_performance(
     operation: &str,

@@ -26,6 +26,14 @@ jobs:
   build:
     name: Build ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
+    # PostHog project public ("client") key + host, baked into release binaries
+    # at compile time via option_env!. Public keys are safe to embed (they ship
+    # in browser bundles too); telemetry only sends after the user opts in during
+    # `autter onboard`. To rotate, change these values (or move them to repo
+    # variables and reference ${{ vars.POSTHOG_API_KEY }}).
+    env:
+      POSTHOG_API_KEY: phc_aWveMd1bPhuEYtFnCS1G2IHgln3iGQqjfIdkfnuolxI
+      POSTHOG_HOST: https://us.i.posthog.com
     strategy:
       fail-fast: false
       matrix:

@@ -19,5 +19,6 @@ pub mod observability;
 pub mod process_timeout;
 pub mod repo_url;
 pub mod streams;
+pub mod telemetry_client;
 pub mod utils;
 pub mod uuid;

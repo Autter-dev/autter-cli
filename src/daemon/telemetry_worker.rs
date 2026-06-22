@@ -395,21 +395,11 @@ fn flush_sentry_and_posthog(
             .filter(|s| !s.is_empty())
     };
 
-    // Check for PostHog configuration
-    let posthog_api_key = if config.is_telemetry_oss_disabled() {
-        None
-    } else {
-        std::env::var("POSTHOG_API_KEY")
-            .ok()
-            .or_else(|| option_env!("POSTHOG_API_KEY").map(|s| s.to_string()))
-            .filter(|s| !s.is_empty())
-    };
-
-    let posthog_host = std::env::var("POSTHOG_HOST")
-        .ok()
-        .or_else(|| option_env!("POSTHOG_HOST").map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://us.i.posthog.com".to_string());
+    // PostHog destination for usage messages + error tracking. Resolves to
+    // `None` (nothing sent or logged) when the user has not consented to
+    // telemetry. Every event it captures is also mirrored to the local audit
+    // log at ~/.autter/internal/telemetry.log.
+    let posthog = crate::telemetry_client::PostHogClient::resolve(config);
 
     // Build Sentry clients
     let oss_client = oss_dsn.and_then(|dsn| SentryClient::from_dsn(&dsn));
@@ -447,6 +437,26 @@ fn flush_sentry_and_posthog(
         }
         if let Some(client) = &enterprise_client {
             let _ = client.send_event(event);
+        }
+
+        // Error tracking via PostHog: emitted as a `$exception` event so it
+        // lands in PostHog's Error Tracking product.
+        if let Some(ph) = &posthog {
+            let mut props = BTreeMap::new();
+            props.insert("$exception_message".to_string(), json!(error.message));
+            props.insert(
+                "$exception_list".to_string(),
+                json!([{ "type": "AutterError", "value": error.message }]),
+            );
+            props.insert("level".to_string(), json!("error"));
+            if let Some(ctx) = &error.context
+                && let Some(obj) = ctx.as_object()
+            {
+                for (key, value) in obj {
+                    props.insert(key.clone(), value.clone());
+                }
+            }
+            ph.capture(distinct_id, "$exception", props);
         }
     }
 
@@ -516,39 +526,21 @@ fn flush_sentry_and_posthog(
             let _ = client.send_event(sentry_event);
         }
 
-        // PostHog only gets messages
-        if let Some(api_key) = &posthog_api_key {
-            let mut properties = BTreeMap::new();
-            properties.insert("os".to_string(), json!(std::env::consts::OS));
-            properties.insert("arch".to_string(), json!(std::env::consts::ARCH));
-            properties.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
-            properties.insert("message".to_string(), json!(msg.message));
-            properties.insert("level".to_string(), json!(msg.level));
+        // Usage tracking via PostHog: forward the message as a named event.
+        // Device properties and the local audit-log mirror are handled inside
+        // `capture`.
+        if let Some(ph) = &posthog {
+            let mut props = BTreeMap::new();
+            props.insert("message".to_string(), json!(msg.message));
+            props.insert("level".to_string(), json!(msg.level));
             if let Some(ctx) = &msg.context
                 && let Some(obj) = ctx.as_object()
             {
                 for (key, value) in obj {
-                    properties.insert(key.clone(), value.clone());
+                    props.insert(key.clone(), value.clone());
                 }
             }
-
-            let endpoint = format!("{}/capture/", posthog_host.trim_end_matches('/'));
-            let mut ph_event = json!({
-                "api_key": api_key,
-                "event": msg.message,
-                "properties": properties,
-                "distinct_id": distinct_id,
-            });
-            ph_event["timestamp"] = json!(msg.timestamp);
-
-            let agent = crate::http::build_agent(Some(30));
-            let request = agent
-                .post(&endpoint)
-                .set("Content-Type", "application/json");
-            let _ = crate::http::send_with_body(
-                request,
-                &serde_json::to_string(&ph_event).unwrap_or_default(),
-            );
+            ph.capture(distinct_id, &msg.message, props);
         }
     }
 }

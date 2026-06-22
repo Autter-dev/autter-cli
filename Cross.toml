@@ -1,0 +1,6 @@
+# `cross` runs the build inside a Docker container, which does NOT inherit the
+# host's environment by default. Forward the PostHog compile-time variables so
+# `option_env!("POSTHOG_API_KEY")` resolves inside the container for the
+# cross-compiled targets (e.g. aarch64-unknown-linux-gnu).
+[build.env]
+passthrough = ["POSTHOG_API_KEY", "POSTHOG_HOST"]

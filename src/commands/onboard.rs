@@ -11,6 +11,12 @@
 //!   and prompt/usage data additionally syncs to the org's Autter platform
 //!   (persisted in the org's PostgreSQL via the platform API).
 //!
+//! After the mode choice (and regardless of whether the user signed in), the
+//! flow asks for consent to anonymous usage analytics and error tracking. The
+//! answer is stored in `telemetry_oss` ("on"/"off"); when enabled, events flow
+//! to PostHog and are mirrored to a local audit log at
+//! `~/.autter/internal/telemetry.log` so the user can see exactly what is sent.
+//!
 //! The chosen mode is recorded in `~/.autter/config.json` via
 //! `onboarding_completed`, so re-running an installer does not nag the user.
 //!
@@ -19,7 +25,10 @@
 //! in-repo backend. Today, connected mode keeps local git notes and uploads
 //! prompt/usage data via the existing CAS upload path.
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+
+use serde_json::json;
 
 use crate::auth::{AuthState, collect_auth_status};
 use crate::commands::login::run_device_login;
@@ -30,6 +39,14 @@ pub fn handle_onboard(args: &[String]) {
     let force = args.iter().any(|a| a == "--force" || a == "-f");
     let choose_connect = args.iter().any(|a| a == "--connect");
     let choose_local = args.iter().any(|a| a == "--local");
+    // Non-interactive telemetry overrides (for scripted installs).
+    let telemetry_flag = if args.iter().any(|a| a == "--telemetry") {
+        Some(true)
+    } else if args.iter().any(|a| a == "--no-telemetry") {
+        Some(false)
+    } else {
+        None
+    };
 
     let mut file_config = config::load_file_config_public().unwrap_or_default();
 
@@ -37,6 +54,7 @@ pub fn handle_onboard(args: &[String]) {
     if file_config.onboarding_completed == Some(true) && !force && !choose_connect && !choose_local
     {
         print_status_summary();
+        print_telemetry_summary(&file_config);
         eprintln!();
         eprintln!("Already set up. Re-run with `autter onboard --force` to change your choice.");
         return;
@@ -71,9 +89,81 @@ pub fn handle_onboard(args: &[String]) {
         setup_local(&mut file_config);
     }
 
+    // Telemetry consent is asked regardless of the connected/local choice above.
+    let telemetry_enabled = configure_telemetry(&mut file_config, telemetry_flag);
+
     file_config.onboarding_completed = Some(true);
     if let Err(e) = config::save_file_config(&file_config) {
         eprintln!("Warning: could not save onboarding state: {e}");
+    }
+
+    // Fire a one-off install/onboard event so we can count installs by version
+    // and platform. Only when the user just opted in.
+    if telemetry_enabled {
+        // Reflect the mode actually configured: a connect attempt can fall back
+        // to local if the device login fails.
+        let connected = file_config.prompt_storage.as_deref() != Some("local");
+        record_install_event(connected);
+    }
+}
+
+/// Ask whether to enable anonymous telemetry + error tracking and persist the
+/// choice into `telemetry_oss` ("on"/"off"). Returns whether telemetry ended up
+/// enabled.
+fn configure_telemetry(cfg: &mut config::FileConfig, flag: Option<bool>) -> bool {
+    let local_log = config::id_file_path()
+        .and_then(|p| p.parent().map(|d| d.join("telemetry.log")))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.autter/internal/telemetry.log".to_string());
+
+    eprintln!();
+    eprintln!("  Help improve Autter with anonymous usage analytics and error reporting?");
+    eprintln!();
+    eprintln!("  \u{2022} No personal data is ever collected \u{2014} no code, prompts, file");
+    eprintln!("    paths, repo names, usernames, or IP addresses.");
+    eprintln!("  \u{2022} We capture only a random install ID and coarse device info");
+    eprintln!("    (OS, CPU architecture, core count) plus the Autter version.");
+    eprintln!("  \u{2022} Everything we send is mirrored to a local log you can inspect:");
+    eprintln!("      {local_log}");
+    eprintln!("  \u{2022} You can change this anytime with `autter onboard --force`.");
+    eprintln!();
+
+    let enabled = match flag {
+        Some(value) => value,
+        None => {
+            if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+                prompt_yes_no("Enable anonymous telemetry and error tracking?", true)
+            } else {
+                // Non-interactive and no explicit flag: default to disabled so we
+                // never collect data the user didn't actively agree to.
+                false
+            }
+        }
+    };
+
+    cfg.telemetry_oss = Some(if enabled { "on" } else { "off" }.to_string());
+
+    eprintln!();
+    if enabled {
+        eprintln!("  \u{2713} Telemetry enabled. Thank you \u{2014} you can review what's sent at:");
+        eprintln!("      {local_log}");
+    } else {
+        eprintln!("  \u{2713} Telemetry disabled. Nothing will be collected or sent.");
+    }
+
+    enabled
+}
+
+/// Send a single anonymous install/onboard event to PostHog (best-effort).
+fn record_install_event(connected: bool) {
+    if let Some(client) = crate::telemetry_client::PostHogClient::resolve_unchecked() {
+        let distinct_id = config::get_or_create_distinct_id();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "mode".to_string(),
+            json!(if connected { "connected" } else { "local" }),
+        );
+        client.capture(&distinct_id, "autter_installed", props);
     }
 }
 
@@ -180,6 +270,22 @@ fn print_status_summary() {
         eprintln!("  additionally syncs prompt and usage data to your org's Autter dashboard.");
         eprintln!();
         eprintln!("  To connect:  autter onboard --connect");
+    }
+}
+
+/// Show the current telemetry setting and where to inspect what's sent.
+fn print_telemetry_summary(cfg: &config::FileConfig) {
+    let enabled = cfg.telemetry_oss.as_deref() != Some("off");
+    eprintln!();
+    if enabled {
+        let local_log = config::id_file_path()
+            .and_then(|p| p.parent().map(|d| d.join("telemetry.log")))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.autter/internal/telemetry.log".to_string());
+        eprintln!("Anonymous telemetry is ON. Everything sent is logged at:");
+        eprintln!("  {local_log}");
+    } else {
+        eprintln!("Anonymous telemetry is OFF.");
     }
 }
 

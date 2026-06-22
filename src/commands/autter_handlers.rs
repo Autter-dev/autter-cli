@@ -53,6 +53,7 @@ pub fn handle_autter(args: &[String]) {
             | "install-hooks"
             | "install"
             | "uninstall-hooks"
+            | "telemetry"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -189,6 +190,9 @@ pub fn handle_autter(args: &[String]) {
         }
         "onboard" | "onboarding" | "setup" => {
             commands::onboard::handle_onboard(&args[1..]);
+        }
+        "telemetry" => {
+            commands::telemetry::handle_telemetry(&args[1..]);
         }
         "login" => {
             commands::login::handle_login(&args[1..]);
@@ -334,6 +338,10 @@ fn print_help() {
     eprintln!("    --token <token>        Complete sign-in with a token from the dashboard");
     eprintln!("  logout             Clear stored credentials");
     eprintln!("  whoami             Show auth state and login identity");
+    eprintln!("  telemetry          Inspect or change anonymous telemetry");
+    eprintln!("    status                 Show on/off state and the local audit log path");
+    eprintln!("    log [-n N|--all]       Print the local audit log of data sent");
+    eprintln!("    on | off               Enable or disable telemetry");
     eprintln!("  version, -v, --version     Print the autter version");
     eprintln!("  help, -h, --help           Show this help message");
     eprintln!();
