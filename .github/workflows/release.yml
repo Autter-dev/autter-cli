@@ -16,7 +16,10 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      # Match CLI version tags like v1.6.4 only. The leading digit class is
+      # important so this does NOT also fire on the extension's `vscode-v*`
+      # tags (which start with "v" too and would otherwise match "v*").
+      - "v[0-9]*"
   workflow_dispatch:
 
 permissions:
