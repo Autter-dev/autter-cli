@@ -83,7 +83,18 @@ pub fn handle_autter(args: &[String]) {
         "help" | "--help" | "-h" => {
             print_help();
         }
-        "version" | "--version" | "-v" => {
+        "version" => {
+            // Human-friendly release info. Keep `--version`/`-v` bare below so
+            // scripts (e.g. install.sh) can parse the raw version string.
+            let version = env!("CARGO_PKG_VERSION");
+            if cfg!(debug_assertions) {
+                println!("autter {version} (debug build)");
+            } else {
+                println!("autter {version}");
+            }
+            std::process::exit(0);
+        }
+        "--version" | "-v" => {
             if cfg!(debug_assertions) {
                 println!("{} (debug)", env!("CARGO_PKG_VERSION"));
             } else {

@@ -1266,8 +1266,11 @@ export class BlameLensManager {
       const hasMessagesUrl = !!record?.messages_url;
 
       if (hasMessagesUrl) {
-        // Has messages_url but messages not loaded yet - CAS fetch in progress
-        md.appendMarkdown('*Loading prompt from cloud...*\n');
+        // Has messages_url but messages not loaded yet. The fetch goes through
+        // `autter show-prompt`, which resolves local-first (local cache -> local
+        // sync queue -> cloud), so this is usually served from disk, not the
+        // network. Keep the label source-agnostic.
+        md.appendMarkdown('*Loading prompt…*\n');
       } else if (metadata?.is_logged_in) {
         // Logged in but no prompt/messages_url - prompt wasn't saved
         md.appendMarkdown('*Prompt was not saved.* Prompt Storage is enabled. Future prompts will be saved.\n');
