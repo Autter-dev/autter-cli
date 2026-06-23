@@ -8,7 +8,7 @@ resolver = "3"
 
 [package]
 name = "autter"
-version = "1.6.3"
+version = "1.6.4"
 edition = "2024"
 default-run = "autter"
 
