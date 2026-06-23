@@ -1,0 +1,14 @@
+---
+source: tests/simple_additions.rs
+expression: blame
+---
+{
+    1: "Test User",
+    2: "cursor",
+    3: "Test User",
+    4: "Not Committed Yet",
+    5: "Test User",
+    6: "cursor",
+    7: "cursor",
+    8: "Not Committed Yet",
+}

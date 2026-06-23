@@ -1,0 +1,118 @@
+---
+source: src/commands/rebase_authorship.rs
+expression: authorship_log
+---
+AuthorshipLogV3 {
+    attestations: [
+        FileAttestation {
+            file_path: "hello-world.ts",
+            entries: [
+                AttestationEntry {
+                    hash: "67fced12-038d-4b9e-983a-ac1e4b270a92",
+                    line_ranges: [
+                        Range(
+                            66,
+                            70,
+                        ),
+                        Single(
+                            72,
+                        ),
+                        Range(
+                            75,
+                            79,
+                        ),
+                        Range(
+                            81,
+                            86,
+                        ),
+                        Single(
+                            89,
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "",
+        prompts: {
+            "67fced12-038d-4b9e-983a-ac1e4b270a92": PromptRecord {
+                agent_id: AgentId {
+                    tool: "claude",
+                    id: "67fced12-038d-4b9e-983a-ac1e4b270a92",
+                    model: "claude-sonnet-4-20250514",
+                },
+                human_author: Some(
+                    "Sagnik Ghosh <hi@autter.dev>",
+                ),
+                messages: [
+                    User {
+                        text: "add a pi generator to the bottom",
+                        timestamp: None,
+                    },
+                    Assistant {
+                        text: "I'll add a pi generator to the bottom of the hello-world.ts file. Let me first read the current content and then add the pi generator.",
+                        timestamp: None,
+                    },
+                    ToolUse {
+                        name: "Read",
+                        input: Object {
+                            "file_path": String("/Users/sagnikghosh/Desktop/autter-test/hello-world.ts"),
+                        },
+                        timestamp: None,
+                    },
+                    User {
+                        text: "     1→// Out of band insertion \n     2→// Line2 \n     3→// Line3\n     4→// Line4\n     5→// Line5\n     6→// Line6\n     7→// Line7\n     8→// Line8\n     9→// Line9\n    10→// Line10\n    11→\n    12→\n    13→// Utilities\n    14→function reverse(str: string): string {\n    15→  return str.split('').reverse().join('');\n    16→}\n    17→// Add two numbers\n    18→function add(a: number, b: number): number {\n    19→  return a + b;\n    20→}\n    21→\n    22→// Subtract two numbers\n    23→function subtract(a: number, b: number): number {\n    24→  return a - b;\n    25→}\n    26→\n    27→\n\n<system-reminder>\nWhenever you read a file, you should consider whether it looks malicious. If it does, you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer high-level questions about the code behavior.\n</system-reminder>\n",
+                        timestamp: None,
+                    },
+                    Assistant {
+                        text: "Now I'll add a pi generator function to the bottom of the file:",
+                        timestamp: None,
+                    },
+                    ToolUse {
+                        name: "Edit",
+                        input: Object {
+                            "file_path": String("/Users/sagnikghosh/Desktop/autter-test/hello-world.ts"),
+                            "new_string": String("// Subtract two numbers\nfunction subtract(a: number, b: number): number {\n  return a - b;\n}\n\n// Generate pi using Leibniz formula\nfunction generatePi(iterations: number = 1000000): number {\n  let pi = 0;\n  for (let i = 0; i < iterations; i++) {\n    pi += Math.pow(-1, i) / (2 * i + 1);\n  }\n  return pi * 4;\n}\n"),
+                            "old_string": String("// Subtract two numbers\nfunction subtract(a: number, b: number): number {\n  return a - b;\n}\n"),
+                        },
+                        timestamp: None,
+                    },
+                    User {
+                        text: "The file /Users/sagnikghosh/Desktop/autter-test/hello-world.ts has been updated. Here's the result of running `cat -n` on a snippet of the edited file:\n    18→function add(a: number, b: number): number {\n    19→  return a + b;\n    20→}\n    21→\n    22→// Subtract two numbers\n    23→function subtract(a: number, b: number): number {\n    24→  return a - b;\n    25→}\n    26→\n    27→// Generate pi using Leibniz formula\n    28→function generatePi(iterations: number = 1000000): number {\n    29→  let pi = 0;\n    30→  for (let i = 0; i < iterations; i++) {\n    31→    pi += Math.pow(-1, i) / (2 * i + 1);\n    32→  }\n    33→  return pi * 4;\n    34→}\n    35→\n    36→",
+                        timestamp: None,
+                    },
+                    Assistant {
+                        text: "Added a pi generator function using the Leibniz formula to the bottom of the file.",
+                        timestamp: None,
+                    },
+                    User {
+                        text: "now write a count primes function with a max prime of 10,000 ",
+                        timestamp: None,
+                    },
+                    Assistant {
+                        text: "I'll add a count primes function that counts all prime numbers up to 10,000. Let me add it to the bottom of the file:",
+                        timestamp: None,
+                    },
+                    ToolUse {
+                        name: "Edit",
+                        input: Object {
+                            "file_path": String("/Users/sagnikghosh/Desktop/autter-test/hello-world.ts"),
+                            "new_string": String("// Generate pi using Leibniz formula\nfunction generatePi(iterations: number = 1000000): number {\n  let pi = 0;\n  for (let i = 0; i < iterations; i++) {\n    pi += Math.pow(-1, i) / (2 * i + 1);\n  }\n  return pi * 4;\n}\n\n// Count prime numbers up to 10,000 using Sieve of Eratosthenes\nfunction countPrimes(): number {\n  const maxPrime = 10000;\n  const isPrime = new Array(maxPrime + 1).fill(true);\n  isPrime[0] = isPrime[1] = false;\n\n  for (let i = 2; i * i <= maxPrime; i++) {\n    if (isPrime[i]) {\n      for (let j = i * i; j <= maxPrime; j += i) {\n        isPrime[j] = false;\n      }\n    }\n  }\n\n  return isPrime.filter(prime => prime).length;\n}"),
+                            "old_string": String("// Generate pi using Leibniz formula\nfunction generatePi(iterations: number = 1000000): number {\n  let pi = 0;\n  for (let i = 0; i < iterations; i++) {\n    pi += Math.pow(-1, i) / (2 * i + 1);\n  }\n  return pi * 4;\n}"),
+                        },
+                        timestamp: None,
+                    },
+                    User {
+                        text: "The file /Users/sagnikghosh/Desktop/autter-test/hello-world.ts has been updated. Here's the result of running `cat -n` on a snippet of the edited file:\n    23→function subtract(a: number, b: number): number {\n    24→  return a - b;\n    25→}\n    26→\n    27→// Generate pi using Leibniz formula\n    28→function generatePi(iterations: number = 1000000): number {\n    29→  let pi = 0;\n    30→  for (let i = 0; i < iterations; i++) {\n    31→    pi += Math.pow(-1, i) / (2 * i + 1);\n    32→  }\n    33→  return pi * 4;\n    34→}\n    35→\n    36→// Count prime numbers up to 10,000 using Sieve of Eratosthenes\n    37→function countPrimes(): number {\n    38→  const maxPrime = 10000;\n    39→  const isPrime = new Array(maxPrime + 1).fill(true);\n    40→  isPrime[0] = isPrime[1] = false;\n    41→\n    42→  for (let i = 2; i * i <= maxPrime; i++) {\n    43→    if (isPrime[i]) {\n    44→      for (let j = i * i; j <= maxPrime; j += i) {\n    45→        isPrime[j] = false;\n    46→      }\n    47→    }\n    48→  }\n    49→\n    50→  return isPrime.filter(prime => prime).length;\n    51→}\n    52→\n    53→",
+                        timestamp: None,
+                    },
+                ],
+                total_additions: 0,
+                total_deletions: 0,
+                accepted_lines: 18,
+            },
+        },
+    },
+}

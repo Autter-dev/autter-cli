@@ -1,0 +1,54 @@
+# autter Plugin for OpenCode
+
+A plugin that integrates [autter](https://github.com/autter-dev/autter-cli) with [OpenCode](https://opencode.ai) to automatically track AI-generated code.
+
+## Overview
+
+This plugin hooks into OpenCode's tool execution lifecycle to create checkpoints that mark code changes as either human or AI-authored. It uses the `tool.execute.before` and `tool.execute.after` events to:
+
+1. Create a human checkpoint before AI edits (marking any intermediate changes as human-authored)
+2. Create an AI checkpoint after AI edits (marking the changes as AI-authored with model information)
+
+## Installation
+
+The plugin is automatically installed by `autter install-hooks`.
+
+Build `autter` (`cargo build`) and then run the `autter install-hooks` or `cargo run -- install-hooks` command to test the entire flow of installing and using the plugin.
+
+## Requirements
+
+- [autter](https://github.com/autter-dev/autter-cli) must be installed through `autter install-hooks`; the plugin uses the absolute binary path injected at install time
+- [OpenCode](https://opencode.ai) with plugin support
+
+## How It Works
+
+The plugin intercepts file editing operations (`edit`, `write`, `patch`, `multiedit`, and `apply_patch`) and:
+
+1. **Before AI edit**: Creates a human checkpoint to mark any changes since the last checkpoint as human-authored
+2. **After AI edit**: Creates an AI checkpoint with:
+   - Model information (provider/model ID)
+   - Session/conversation ID
+   - List of edited file paths
+
+If `autter` cannot be launched or the file is not in a git repository, the plugin gracefully skips checkpoint creation without breaking OpenCode functionality. Set `AUTTER_OPENCODE_DEBUG=1` or `AUTTER_DEBUG=1` before launching OpenCode to log skipped checkpoint details.
+
+## Development
+
+### Type Checking
+
+Run type checking:
+```bash
+npm run type-check
+```
+
+### Dependencies
+
+Install dependencies:
+```bash
+npm install
+```
+
+## See Also
+
+- [autter Documentation](https://github.com/autter-dev/autter-cli)
+- [OpenCode Plugin Documentation](https://opencode.ai/docs/plugins/)

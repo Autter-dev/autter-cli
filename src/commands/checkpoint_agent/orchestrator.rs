@@ -1,0 +1,535 @@
+use crate::authorship::authorship_log_serialization::generate_trace_id;
+use crate::authorship::working_log::{AgentId, CheckpointKind};
+use crate::commands::checkpoint_agent::presets::{
+    KnownHumanEdit, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
+    StreamSource, UntrackedEdit,
+};
+use crate::config;
+use crate::daemon::checkpoint::PreparedPathRole;
+use crate::error::AutterError;
+use crate::git::repo_state::{
+    git_dir_for_worktree, read_head_state_for_worktree, worktree_root_for_path,
+};
+use crate::git::repository::discover_repository_in_path_no_git_exec;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BaseCommit {
+    Sha(String),
+    Initial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointFile {
+    pub path: PathBuf,
+    pub content: Option<String>,
+    pub repo_work_dir: PathBuf,
+    pub base_commit: BaseCommit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRequest {
+    pub trace_id: String,
+    pub checkpoint_kind: CheckpointKind,
+    pub agent_id: Option<AgentId>,
+    pub files: Vec<CheckpointFile>,
+    pub path_role: PreparedPathRole,
+    pub stream_source: Option<StreamSource>,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct CheckpointDebugLogEntry<'a> {
+    timestamp: String,
+    preset_name: &'a str,
+    hook_input: &'a str,
+    trace_id: &'a str,
+    event_count: usize,
+    requests: &'a [CheckpointRequest],
+}
+
+struct RepoContext {
+    repo_work_dir: PathBuf,
+    base_commit: BaseCommit,
+    unmerged_paths: std::collections::HashSet<PathBuf>,
+}
+
+const MAX_CHECKPOINT_FILES: usize = 1000;
+
+fn has_active_merge_state(git_dir: &Path) -> bool {
+    git_dir.join("MERGE_HEAD").exists()
+        || git_dir.join("CHERRY_PICK_HEAD").exists()
+        || git_dir.join("rebase-merge").exists()
+        || git_dir.join("rebase-apply").exists()
+}
+
+fn get_unmerged_paths_via_git(repo_work_dir: &Path) -> std::collections::HashSet<PathBuf> {
+    use crate::git::repository::exec_git_allow_nonzero;
+    let args = vec![
+        "-C".to_string(),
+        repo_work_dir.to_string_lossy().to_string(),
+        "ls-files".to_string(),
+        "-u".to_string(),
+    ];
+    let output = match exec_git_allow_nonzero(&args) {
+        Ok(o) => o,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split('\t').nth(1))
+        .map(|path| repo_work_dir.join(path))
+        .collect()
+}
+
+fn build_checkpoint_files(file_paths: &[PathBuf]) -> Result<Vec<CheckpointFile>, AutterError> {
+    let perf = std::env::var("AUTTER_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
+
+    if file_paths.len() > MAX_CHECKPOINT_FILES {
+        tracing::warn!(
+            "build_checkpoint_files called with {} paths (max {}); truncating",
+            file_paths.len(),
+            MAX_CHECKPOINT_FILES,
+        );
+    }
+    let capped_paths = &file_paths[..file_paths.len().min(MAX_CHECKPOINT_FILES)];
+
+    let mut repo_cache: HashMap<PathBuf, RepoContext> = HashMap::new();
+    let mut files = Vec::new();
+
+    for path in capped_paths {
+        if !path.is_absolute() {
+            return Err(AutterError::PresetError(format!(
+                "file path must be absolute: {}",
+                path.display()
+            )));
+        }
+
+        let ctx = {
+            let t_discover = std::time::Instant::now();
+            let repo_work_dir = worktree_root_for_path(path).ok_or_else(|| {
+                AutterError::Generic(format!(
+                    "No git repository found for path: {}",
+                    path.display()
+                ))
+            })?;
+            if !repo_cache.contains_key(&repo_work_dir) {
+                let t_head = std::time::Instant::now();
+                let base_commit = match read_head_state_for_worktree(&repo_work_dir) {
+                    Some(state) => match state.head {
+                        Some(sha) => BaseCommit::Sha(sha),
+                        None => BaseCommit::Initial,
+                    },
+                    None => BaseCommit::Initial,
+                };
+                let head_ms = t_head.elapsed().as_secs_f64() * 1000.0;
+
+                let t_unmerged = std::time::Instant::now();
+                let unmerged_paths = if let Some(git_dir) = git_dir_for_worktree(&repo_work_dir)
+                    && has_active_merge_state(&git_dir)
+                {
+                    get_unmerged_paths_via_git(&repo_work_dir)
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let unmerged_ms = t_unmerged.elapsed().as_secs_f64() * 1000.0;
+
+                if perf {
+                    eprintln!(
+                        "[perf] build_checkpoint_files: discover={:.1}ms head={:.1}ms unmerged={:.1}ms (repo={})",
+                        t_discover.elapsed().as_secs_f64() * 1000.0,
+                        head_ms,
+                        unmerged_ms,
+                        repo_work_dir.display(),
+                    );
+                }
+
+                let key = repo_work_dir.clone();
+                repo_cache.insert(
+                    key,
+                    RepoContext {
+                        repo_work_dir: repo_work_dir.clone(),
+                        base_commit,
+                        unmerged_paths,
+                    },
+                );
+            }
+            repo_cache.get(&repo_work_dir).unwrap()
+        };
+
+        if ctx.unmerged_paths.contains(path) {
+            continue;
+        }
+
+        let t_read = std::time::Instant::now();
+        let content = if path.exists() {
+            fs::read_to_string(path).ok()
+        } else {
+            Some(String::new())
+        };
+        if perf {
+            eprintln!(
+                "[perf] build_checkpoint_files: read_file={:.1}ms (path={}, size={})",
+                t_read.elapsed().as_secs_f64() * 1000.0,
+                path.display(),
+                content.as_ref().map(|c| c.len()).unwrap_or(0),
+            );
+        }
+
+        files.push(CheckpointFile {
+            path: path.clone(),
+            content,
+            repo_work_dir: ctx.repo_work_dir.clone(),
+            base_commit: ctx.base_commit.clone(),
+        });
+    }
+
+    Ok(files)
+}
+
+pub fn execute_preset_checkpoint(
+    preset_name: &str,
+    hook_input: &str,
+) -> Result<Vec<CheckpointRequest>, AutterError> {
+    let perf = std::env::var("AUTTER_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let t0 = std::time::Instant::now();
+
+    let trace_id = generate_trace_id();
+    let preset = super::presets::resolve_preset(preset_name)?;
+    let events = preset.parse(hook_input, &trace_id)?;
+    let events_len = events.len();
+
+    if perf {
+        eprintln!(
+            "[perf] orchestrator: parse={:.1}ms (events={})",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            events_len,
+        );
+    }
+
+    let mut requests = Vec::new();
+    for event in events {
+        let t_event = std::time::Instant::now();
+        let event_name = format!("{:?}", std::mem::discriminant(&event));
+        let new_requests = execute_event(event, preset_name)?;
+        if perf {
+            eprintln!(
+                "[perf] orchestrator: execute_event({})={:.1}ms (requests={})",
+                event_name,
+                t_event.elapsed().as_secs_f64() * 1000.0,
+                new_requests.len(),
+            );
+        }
+        requests.extend(new_requests);
+    }
+
+    if config::Config::get()
+        .get_feature_flags()
+        .checkpoint_debug_log
+    {
+        write_checkpoint_debug_log(preset_name, hook_input, &trace_id, events_len, &requests);
+    }
+
+    Ok(requests)
+}
+
+fn write_checkpoint_debug_log(
+    preset_name: &str,
+    hook_input: &str,
+    trace_id: &str,
+    event_count: usize,
+    requests: &[CheckpointRequest],
+) {
+    let Some(internal_dir) = config::internal_dir_path() else {
+        return;
+    };
+
+    let log_dir = internal_dir.join("checkpoint-debug-logs");
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let log_path = log_dir.join(format!("{}.log", date));
+
+    if let Err(e) = fs::create_dir_all(&log_dir) {
+        eprintln!("[checkpoint_debug_log] failed to create dir: {}", e);
+        return;
+    }
+
+    cleanup_old_debug_logs(&log_dir);
+
+    let entry = CheckpointDebugLogEntry {
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        preset_name,
+        hook_input,
+        trace_id,
+        event_count,
+        requests,
+    };
+
+    let Ok(line) = serde_json::to_string(&entry) else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = file
+        .write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.flush());
+}
+
+fn cleanup_old_debug_logs(log_dir: &Path) {
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
+    };
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(file_date) = chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d")
+            && file_date < cutoff.date_naive()
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn execute_event(
+    event: ParsedHookEvent,
+    preset_name: &str,
+) -> Result<Vec<CheckpointRequest>, AutterError> {
+    match event {
+        ParsedHookEvent::PreFileEdit(e) => execute_pre_file_edit(e),
+        ParsedHookEvent::PostFileEdit(e) => execute_post_file_edit(e, preset_name),
+        ParsedHookEvent::PreBashCall(e) => execute_pre_bash_call(e),
+        ParsedHookEvent::PostBashCall(e) => execute_post_bash_call(e),
+        ParsedHookEvent::KnownHumanEdit(e) => execute_known_human_edit(e),
+        ParsedHookEvent::UntrackedEdit(e) => execute_untracked_edit(e),
+    }
+}
+
+fn split_files_into_requests(
+    all_files: Vec<CheckpointFile>,
+    trace_id: String,
+    checkpoint_kind: CheckpointKind,
+    agent_id: Option<AgentId>,
+    path_role: PreparedPathRole,
+    stream_source: Option<StreamSource>,
+    metadata: HashMap<String, String>,
+) -> Vec<CheckpointRequest> {
+    let mut by_repo: HashMap<PathBuf, Vec<CheckpointFile>> = HashMap::new();
+    for f in all_files {
+        by_repo.entry(f.repo_work_dir.clone()).or_default().push(f);
+    }
+
+    by_repo
+        .into_values()
+        .map(|files| CheckpointRequest {
+            trace_id: trace_id.clone(),
+            checkpoint_kind,
+            agent_id: agent_id.clone(),
+            files,
+            path_role,
+            stream_source: stream_source.clone(),
+            metadata: metadata.clone(),
+        })
+        .collect()
+}
+
+fn execute_pre_file_edit(e: PreFileEdit) -> Result<Vec<CheckpointRequest>, AutterError> {
+    let mut files = build_checkpoint_files(&e.file_paths)?;
+    if let Some(ref dirty) = e.dirty_files {
+        for f in &mut files {
+            if let Some(override_content) = dirty.get(&f.path) {
+                f.content = Some(override_content.clone());
+            }
+        }
+    }
+    let mut metadata = e.context.metadata;
+    if let Some(tuid) = e.tool_use_id {
+        metadata.entry("tool_use_id".to_string()).or_insert(tuid);
+    }
+    Ok(split_files_into_requests(
+        files,
+        e.context.trace_id,
+        CheckpointKind::Human,
+        Some(e.context.agent_id),
+        PreparedPathRole::WillEdit,
+        None,
+        metadata,
+    ))
+}
+
+fn execute_post_file_edit(
+    e: PostFileEdit,
+    preset_name: &str,
+) -> Result<Vec<CheckpointRequest>, AutterError> {
+    let mut files = build_checkpoint_files(&e.file_paths)?;
+    if let Some(ref dirty) = e.dirty_files {
+        for f in &mut files {
+            if let Some(override_content) = dirty.get(&f.path) {
+                f.content = Some(override_content.clone());
+            }
+        }
+    }
+    let checkpoint_kind = match preset_name {
+        "ai_tab" => CheckpointKind::AiTab,
+        _ => CheckpointKind::AiAgent,
+    };
+    let mut metadata = e.context.metadata;
+    if let Some(tuid) = e.tool_use_id {
+        metadata.entry("tool_use_id".to_string()).or_insert(tuid);
+    }
+    metadata
+        .entry("edit_kind".to_string())
+        .or_insert_with(|| "file_edit".to_string());
+    Ok(split_files_into_requests(
+        files,
+        e.context.trace_id,
+        checkpoint_kind,
+        Some(e.context.agent_id),
+        PreparedPathRole::Edited,
+        e.stream_source,
+        metadata,
+    ))
+}
+
+fn execute_known_human_edit(e: KnownHumanEdit) -> Result<Vec<CheckpointRequest>, AutterError> {
+    let mut files = build_checkpoint_files(&e.file_paths)?;
+    if let Some(ref dirty) = e.dirty_files {
+        for f in &mut files {
+            if let Some(override_content) = dirty.get(&f.path) {
+                f.content = Some(override_content.clone());
+            }
+        }
+    }
+    Ok(split_files_into_requests(
+        files,
+        e.trace_id,
+        CheckpointKind::KnownHuman,
+        None,
+        PreparedPathRole::Edited,
+        None,
+        e.editor_metadata,
+    ))
+}
+
+fn execute_untracked_edit(e: UntrackedEdit) -> Result<Vec<CheckpointRequest>, AutterError> {
+    let files = build_checkpoint_files(&e.file_paths)?;
+    Ok(split_files_into_requests(
+        files,
+        e.trace_id,
+        CheckpointKind::Human,
+        None,
+        PreparedPathRole::WillEdit,
+        None,
+        HashMap::new(),
+    ))
+}
+
+fn execute_pre_bash_call(e: PreBashCall) -> Result<Vec<CheckpointRequest>, AutterError> {
+    use crate::commands::checkpoint_agent::bash_tool;
+
+    let repo = discover_repository_in_path_no_git_exec(e.context.cwd.as_path())?;
+    let repo_work_dir = repo.workdir()?;
+
+    let dirty_paths = match bash_tool::handle_bash_pre_tool_use_with_context(
+        &repo_work_dir,
+        &e.context.external_session_id,
+        &e.tool_use_id,
+        &e.context.agent_id,
+        Some(&e.context.metadata),
+    ) {
+        Ok(result) => result.dirty_paths,
+        Err(error) => {
+            tracing::debug!(
+                "Bash pre-hook snapshot failed for {} session {}: {}",
+                e.context.agent_id.tool,
+                e.context.external_session_id,
+                error
+            );
+            return Ok(vec![]);
+        }
+    };
+
+    if dirty_paths.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let files = build_checkpoint_files(&dirty_paths)?;
+    let mut metadata = e.context.metadata;
+    metadata
+        .entry("tool_use_id".to_string())
+        .or_insert(e.tool_use_id);
+    Ok(split_files_into_requests(
+        files,
+        e.context.trace_id,
+        CheckpointKind::Human,
+        None,
+        PreparedPathRole::WillEdit,
+        None,
+        metadata,
+    ))
+}
+
+fn execute_post_bash_call(e: PostBashCall) -> Result<Vec<CheckpointRequest>, AutterError> {
+    use crate::commands::checkpoint_agent::bash_tool;
+
+    let repo = discover_repository_in_path_no_git_exec(e.context.cwd.as_path())?;
+    let repo_work_dir = repo.workdir()?;
+
+    let bash_result = bash_tool::handle_bash_post_tool_use(
+        &repo_work_dir,
+        &e.context.external_session_id,
+        &e.tool_use_id,
+    );
+
+    let file_paths: Vec<PathBuf> = match &bash_result {
+        Ok(result) => match &result.action {
+            bash_tool::BashCheckpointAction::Checkpoint(paths) => paths
+                .iter()
+                .map(|p| {
+                    let joined = repo_work_dir.join(p);
+                    fs::canonicalize(&joined).unwrap_or(joined)
+                })
+                .collect(),
+            _ => vec![],
+        },
+        Err(err) => {
+            tracing::debug!("Bash tool post-hook error: {}", err);
+            vec![]
+        }
+    };
+
+    let files = build_checkpoint_files(&file_paths)?;
+    let mut metadata = e.context.metadata;
+    metadata
+        .entry("tool_use_id".to_string())
+        .or_insert(e.tool_use_id);
+    metadata
+        .entry("edit_kind".to_string())
+        .or_insert_with(|| "bash".to_string());
+    Ok(split_files_into_requests(
+        files,
+        e.context.trace_id,
+        CheckpointKind::AiAgent,
+        Some(e.context.agent_id),
+        PreparedPathRole::Edited,
+        e.stream_source,
+        metadata,
+    ))
+}

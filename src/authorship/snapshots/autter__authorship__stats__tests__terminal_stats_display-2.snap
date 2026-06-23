@@ -1,0 +1,5 @@
+---
+source: src/authorship/stats.rs
+expression: ai_only_output
+---
+"you  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai\n     0%                                  100%\n"

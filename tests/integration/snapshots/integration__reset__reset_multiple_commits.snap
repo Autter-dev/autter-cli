@@ -1,0 +1,42 @@
+---
+source: tests/reset.rs
+expression: snapshot_checkpoints(&checkpoints)
+---
+[
+    SnapshotCheckpoint {
+        author: "ai",
+        has_agent: true,
+        agent_tool: Some(
+            "cursor",
+        ),
+        entries: [
+            SnapshotEntry {
+                file: "code.js",
+                added_lines: [
+                    Single(
+                        2,
+                    ),
+                ],
+                deleted_lines: [],
+            },
+        ],
+    },
+    SnapshotCheckpoint {
+        author: "ai",
+        has_agent: true,
+        agent_tool: Some(
+            "cursor",
+        ),
+        entries: [
+            SnapshotEntry {
+                file: "code.js",
+                added_lines: [
+                    Single(
+                        3,
+                    ),
+                ],
+                deleted_lines: [],
+            },
+        ],
+    },
+]

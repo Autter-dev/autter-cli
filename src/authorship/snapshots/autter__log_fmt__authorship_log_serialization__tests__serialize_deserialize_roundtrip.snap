@@ -1,0 +1,5 @@
+---
+source: src/log_fmt/authorship_log_serialization.rs
+expression: serialized
+---
+"src/file.xyz\n  xyzAbc 1,2,19-222\n  123456 400-405\nsrc/file2.xyz\n  123456 1-111,245,260\n---\n{\n  \"schema_version\": \"authorship/3.0.0\",\n  \"base_commit_sha\": \"abc123\",\n  \"prompts\": {}\n}"

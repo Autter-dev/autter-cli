@@ -1,0 +1,5 @@
+---
+source: src/log_fmt/authorship_log_2.rs
+expression: format_line_ranges(&ranges)
+---
+"1,2,19-222"

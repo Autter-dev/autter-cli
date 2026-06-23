@@ -1,0 +1,48 @@
+---
+source: tests/reset.rs
+expression: "(\"before\", snapshot_checkpoints(&checkpoints_before), \"after\",\nsnapshot_checkpoints(&checkpoints_after))"
+---
+(
+    "before",
+    [
+        SnapshotCheckpoint {
+            author: "ai_agent",
+            has_agent: true,
+            agent_tool: Some(
+                "cursor",
+            ),
+            entries: [
+                SnapshotEntry {
+                    file: "test.txt",
+                    added_lines: [
+                        Single(
+                            3,
+                        ),
+                    ],
+                    deleted_lines: [],
+                },
+            ],
+        },
+    ],
+    "after",
+    [
+        SnapshotCheckpoint {
+            author: "ai_agent",
+            has_agent: true,
+            agent_tool: Some(
+                "cursor",
+            ),
+            entries: [
+                SnapshotEntry {
+                    file: "test.txt",
+                    added_lines: [
+                        Single(
+                            3,
+                        ),
+                    ],
+                    deleted_lines: [],
+                },
+            ],
+        },
+    ],
+)

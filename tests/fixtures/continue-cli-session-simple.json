@@ -1,0 +1,119 @@
+{
+  "sessionId": "2dbfd673-096d-4773-b5f3-9023894a7355",
+  "title": "File Reading and Appending",
+  "workspaceDirectory": "/Users/svarlamov/projects/testing-git",
+  "history": [
+    {
+      "message": {
+        "role": "user",
+        "content": "Add another hello world line to @index.ts"
+      },
+      "contextItems": [],
+      "editorState": "Add another hello world line to @index.ts"
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "I'll read the file first to see its current contents, then add another hello world line.",
+        "toolCalls": [
+          {
+            "id": "toolu_017kkmwnG8dAndW8zbtbsS4H",
+            "type": "function",
+            "function": {
+              "name": "Read",
+              "arguments": "{\"filepath\":\"/Users/svarlamov/projects/testing-git/index.ts\"}"
+            }
+          }
+        ]
+      },
+      "contextItems": [],
+      "toolCallStates": [
+        {
+          "toolCallId": "toolu_017kkmwnG8dAndW8zbtbsS4H",
+          "toolCall": {
+            "id": "toolu_017kkmwnG8dAndW8zbtbsS4H",
+            "type": "function",
+            "function": {
+              "name": "Read",
+              "arguments": "{\"filepath\":\"/Users/svarlamov/projects/testing-git/index.ts\"}"
+            }
+          },
+          "status": "done",
+          "parsedArgs": {
+            "filepath": "/Users/svarlamov/projects/testing-git/index.ts"
+          },
+          "output": [
+            {
+              "content": "Content of /Users/svarlamov/projects/testing-git/index.ts:\n// hello world\nconsole.log('Bonjour');\n\n// comment1\nconsole.log('CLI initialized - starting number print sequence');\n\n// Print numbers 1 through 10\nfor (let i = 1; i <= 10; i++) {\n\tconsole.log(i);\n}\n\nconsole.log('hello world');\n\nconsole.log('hello from claude code');\n\nconsole.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');\n",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "toolu_01A5VynEbmpZhHTheifTMQMb",
+            "type": "function",
+            "function": {
+              "name": "MultiEdit",
+              "arguments": "{\"file_path\":\"/Users/svarlamov/projects/testing-git/index.ts\",\"edits\":[{\"old_string\":\"console.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\",\"new_string\":\"console.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\"}]}"
+            }
+          }
+        ]
+      },
+      "contextItems": [],
+      "toolCallStates": [
+        {
+          "toolCallId": "toolu_01A5VynEbmpZhHTheifTMQMb",
+          "toolCall": {
+            "id": "toolu_01A5VynEbmpZhHTheifTMQMb",
+            "type": "function",
+            "function": {
+              "name": "MultiEdit",
+              "arguments": "{\"file_path\":\"/Users/svarlamov/projects/testing-git/index.ts\",\"edits\":[{\"old_string\":\"console.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\",\"new_string\":\"console.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\\nconsole.log('hello world');\"}]}"
+            }
+          },
+          "status": "done",
+          "parsedArgs": {
+            "file_path": "/Users/svarlamov/projects/testing-git/index.ts",
+            "edits": [
+              {
+                "old_string": "console.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');",
+                "new_string": "console.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');\nconsole.log('hello world');"
+              }
+            ]
+          },
+          "output": [
+            {
+              "content": "Successfully edited /Users/svarlamov/projects/testing-git/index.ts with 1 edit\nDiff:\nIndex: /Users/svarlamov/projects/testing-git/index.ts\n===================================================================\n--- /Users/svarlamov/projects/testing-git/index.ts\n+++ /Users/svarlamov/projects/testing-git/index.ts\n@@ -17,3 +17,4 @@\n console.log('hello world');\n console.log('hello world');\n console.log('hello world');\n+console.log('hello world');\n",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "Done! I've added another `console.log('hello world');` line to index.ts."
+      },
+      "contextItems": []
+    }
+  ],
+  "usage": {
+    "totalCost": 0.002423,
+    "promptTokens": 1813,
+    "completionTokens": 305,
+    "promptTokensDetails": {
+      "cachedTokens": 4366,
+      "cacheWriteTokens": 2183
+    }
+  }
+}

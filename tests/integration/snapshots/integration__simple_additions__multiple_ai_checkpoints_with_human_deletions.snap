@@ -1,0 +1,43 @@
+---
+source: tests/simple_additions.rs
+expression: authorship_log
+---
+AuthorshipLogV3 {
+    attestations: [
+        FileAttestation {
+            file_path: "test.txt",
+            entries: [
+                AttestationEntry {
+                    hash: "b60a61e",
+                    line_ranges: [
+                        Range(
+                            2,
+                            3,
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "c0d2e8fadf955c94f15033f9d8a51ea1a2151014",
+        prompts: {
+            "b60a61e": PromptRecord {
+                agent_id: AgentId {
+                    tool: "openai",
+                    id: "test_session_fixed",
+                    model: "gpt-4",
+                },
+                human_author: Some(
+                    "Test User",
+                ),
+                messages: [],
+                total_additions: 2,
+                total_deletions: 0,
+                accepted_lines: 2,
+                overriden_lines: 0,
+            },
+        },
+    },
+}

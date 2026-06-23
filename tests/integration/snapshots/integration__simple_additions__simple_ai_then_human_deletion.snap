@@ -1,0 +1,12 @@
+---
+source: tests/simple_additions.rs
+expression: authorship_log
+---
+AuthorshipLogV3 {
+    attestations: [],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "fd8e89860a69ca38d30084d9580dbbf01f219f8f",
+        prompts: {},
+    },
+}

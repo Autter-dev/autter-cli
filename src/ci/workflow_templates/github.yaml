@@ -1,0 +1,26 @@
+name: Autter
+
+on:
+  pull_request:
+    types: [closed, synchronize]
+
+jobs:
+  autter:
+    if: github.event.pull_request.merged == true || github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Install autter
+        run: |
+          curl -fsSL https://autter.dev/install.sh | bash
+          echo "$HOME/.autter/bin" >> $GITHUB_PATH
+      - name: Run autter
+        id: run-autter
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          autter ci github run

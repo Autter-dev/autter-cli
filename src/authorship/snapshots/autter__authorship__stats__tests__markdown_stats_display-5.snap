@@ -1,0 +1,5 @@
+---
+source: src/authorship/stats.rs
+expression: deletion_only_output
+---
+"(no additions)\n"

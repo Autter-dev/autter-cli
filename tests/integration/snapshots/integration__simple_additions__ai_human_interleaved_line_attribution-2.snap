@@ -1,0 +1,11 @@
+---
+source: tests/simple_additions.rs
+expression: blame
+---
+{
+    1: "mock_ai",
+    2: "Test User",
+    3: "mock_ai",
+    4: "mock_ai",
+    5: "mock_ai",
+}

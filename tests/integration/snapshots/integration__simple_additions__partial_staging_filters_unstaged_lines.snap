@@ -1,0 +1,43 @@
+---
+source: tests/simple_additions.rs
+expression: authorship_log
+---
+AuthorshipLogV3 {
+    attestations: [
+        FileAttestation {
+            file_path: "partial.ts",
+            entries: [
+                AttestationEntry {
+                    hash: "1cee1d9",
+                    line_ranges: [
+                        Range(
+                            2,
+                            3,
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "264124f8d3a8d230b83c8622812d8f5ed4c3ce19",
+        prompts: {
+            "1cee1d9": PromptRecord {
+                agent_id: AgentId {
+                    tool: "cursor",
+                    id: "test_session_fixed",
+                    model: "claude-3-sonnet",
+                },
+                human_author: Some(
+                    "Test User",
+                ),
+                messages: [],
+                total_additions: 4,
+                total_deletions: 2,
+                accepted_lines: 4,
+                overriden_lines: 0,
+            },
+        },
+    },
+}

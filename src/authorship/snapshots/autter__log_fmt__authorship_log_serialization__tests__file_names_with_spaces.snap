@@ -1,0 +1,5 @@
+---
+source: src/log_fmt/authorship_log_serialization.rs
+expression: serialized
+---
+"\"src/my file.rs\"\n  c9883b0 1-10\n\"docs/README (copy).md\"\n  c9883b0 5\ntest/file-with-dashes.js\n  c9883b0 20-25\n---\n{\n  \"schema_version\": \"authorship/3.0.0\",\n  \"base_commit_sha\": \"\",\n  \"prompts\": {\n    \"c9883b0\": {\n      \"agent_id\": {\n        \"tool\": \"cursor\",\n        \"id\": \"session_123\",\n        \"model\": \"claude-3-sonnet\"\n      },\n      \"human_author\": null,\n      \"messages\": [],\n      \"total_additions\": 0,\n      \"total_deletions\": 0,\n      \"accepted_lines\": 0\n    }\n  }\n}"

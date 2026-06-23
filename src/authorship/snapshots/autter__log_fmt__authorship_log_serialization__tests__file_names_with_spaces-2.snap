@@ -1,0 +1,67 @@
+---
+source: src/log_fmt/authorship_log_serialization.rs
+expression: log
+---
+AuthorshipLogV3 {
+    attestations: [
+        FileAttestation {
+            file_path: "src/my file.rs",
+            entries: [
+                AttestationEntry {
+                    hash: "c9883b0",
+                    line_ranges: [
+                        Range(
+                            1,
+                            10,
+                        ),
+                    ],
+                },
+            ],
+        },
+        FileAttestation {
+            file_path: "docs/README (copy).md",
+            entries: [
+                AttestationEntry {
+                    hash: "c9883b0",
+                    line_ranges: [
+                        Single(
+                            5,
+                        ),
+                    ],
+                },
+            ],
+        },
+        FileAttestation {
+            file_path: "test/file-with-dashes.js",
+            entries: [
+                AttestationEntry {
+                    hash: "c9883b0",
+                    line_ranges: [
+                        Range(
+                            20,
+                            25,
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+    metadata: AuthorshipMetadata {
+        schema_version: "authorship/3.0.0",
+        base_commit_sha: "",
+        prompts: {
+            "c9883b0": PromptRecord {
+                agent_id: AgentId {
+                    tool: "cursor",
+                    id: "session_123",
+                    model: "claude-3-sonnet",
+                },
+                human_author: None,
+                messages: [],
+                total_additions: 0,
+                total_deletions: 0,
+                accepted_lines: 0,
+            },
+        },
+    },
+}
