@@ -10,12 +10,12 @@ const NO_AUTHORSHIP_DATA_MESSAGE: &str = "No authorship data found for this revi
 pub fn handle_show(args: &[String]) {
     if args.is_empty() {
         eprintln!("Error: show requires a revision or range");
-        std::process::exit(1);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
     if args.len() > 1 {
         eprintln!("Error: show accepts exactly one revision or range");
-        std::process::exit(1);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
     let repo = match find_repository(&Vec::<String>::new()) {

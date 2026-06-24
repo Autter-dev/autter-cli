@@ -13,7 +13,7 @@ pub fn handle_show_prompt(args: &[String]) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {}", e);
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     };
 
