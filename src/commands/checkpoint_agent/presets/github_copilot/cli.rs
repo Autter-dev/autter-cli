@@ -53,6 +53,12 @@ pub(super) fn parse_cli_hooks(
 
     let mut metadata = HashMap::new();
     metadata.insert("source".to_string(), "copilot-cli".to_string());
+    if let Some(path) = session_state_path.as_ref() {
+        metadata.insert(
+            "transcript_path".to_string(),
+            path.to_string_lossy().into_owned(),
+        );
+    }
 
     let context = PresetContext {
         agent_id: AgentId {

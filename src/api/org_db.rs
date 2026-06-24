@@ -154,7 +154,50 @@ CREATE TABLE IF NOT EXISTS file_change_counts (
     PRIMARY KEY (repo_url, file_path)
 );
 CREATE INDEX IF NOT EXISTS file_change_counts_repo_idx ON file_change_counts (repo_url);
-CREATE INDEX IF NOT EXISTS file_change_counts_count_idx ON file_change_counts (repo_url, change_count DESC);";
+CREATE INDEX IF NOT EXISTS file_change_counts_count_idx ON file_change_counts (repo_url, change_count DESC);
+CREATE TABLE IF NOT EXISTS commit_authorship_summaries (
+    commit_sha             TEXT PRIMARY KEY,
+    repo_url               TEXT,
+    branch                 TEXT,
+    base_commit_sha        TEXT,
+    human_author           TEXT,
+    git_diff_added_lines   BIGINT NOT NULL DEFAULT 0,
+    git_diff_deleted_lines BIGINT NOT NULL DEFAULT 0,
+    human_additions        BIGINT NOT NULL DEFAULT 0,
+    ai_additions           BIGINT NOT NULL DEFAULT 0,
+    ai_accepted            BIGINT NOT NULL DEFAULT 0,
+    unknown_additions      BIGINT NOT NULL DEFAULT 0,
+    human_percent          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ai_percent             DOUBLE PRECISION NOT NULL DEFAULT 0,
+    unknown_percent        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    tool_model_breakdown   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    prompts                JSONB NOT NULL DEFAULT '[]'::jsonb,
+    hunks                  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    distinct_id            TEXT,
+    uploaded_by            TEXT,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS repo_url TEXT;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS branch TEXT;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS base_commit_sha TEXT;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS human_author TEXT;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS git_diff_added_lines BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS git_diff_deleted_lines BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS human_additions BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS ai_additions BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS ai_accepted BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS unknown_additions BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS human_percent DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS ai_percent DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS unknown_percent DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS tool_model_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS prompts JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS hunks JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS distinct_id TEXT;
+ALTER TABLE commit_authorship_summaries ADD COLUMN IF NOT EXISTS uploaded_by TEXT;
+CREATE INDEX IF NOT EXISTS commit_authorship_summaries_repo_idx ON commit_authorship_summaries (repo_url);
+CREATE INDEX IF NOT EXISTS commit_authorship_summaries_updated_idx ON commit_authorship_summaries (updated_at);";
 
 /// Open a new TLS connection to `org_db_url` and ensure the schema exists.
 fn connect(org_db_url: &str) -> Result<Client, AutterError> {
@@ -503,6 +546,108 @@ pub fn insert_metrics(
         }
 
         Ok(errors)
+    })
+}
+
+/// Explicit per-commit authorship summary for cloud analytics.
+#[derive(Debug, Clone)]
+pub struct CommitAuthorshipSummaryRow {
+    pub commit_sha: String,
+    pub repo_url: Option<String>,
+    pub branch: Option<String>,
+    pub base_commit_sha: String,
+    pub human_author: String,
+    pub git_diff_added_lines: u64,
+    pub git_diff_deleted_lines: u64,
+    pub human_additions: u64,
+    pub ai_additions: u64,
+    pub ai_accepted: u64,
+    pub unknown_additions: u64,
+    pub human_percent: f64,
+    pub ai_percent: f64,
+    pub unknown_percent: f64,
+    pub tool_model_breakdown: serde_json::Value,
+    pub prompts: serde_json::Value,
+    pub hunks: serde_json::Value,
+}
+
+/// Upsert a query-friendly commit authorship summary into the org database.
+pub fn upsert_commit_authorship_summary(
+    identity: &OrgIdentity,
+    row: &CommitAuthorshipSummaryRow,
+    distinct_id: &str,
+) -> Result<(), AutterError> {
+    run(&identity.org_db_url, |client| {
+        client.execute(
+            "INSERT INTO commit_authorship_summaries (
+                commit_sha, repo_url, branch, base_commit_sha, human_author,
+                git_diff_added_lines, git_diff_deleted_lines,
+                human_additions, ai_additions, ai_accepted, unknown_additions,
+                human_percent, ai_percent, unknown_percent,
+                tool_model_breakdown, prompts, hunks, distinct_id, uploaded_by
+            )
+            VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7,
+                $8, $9, $10, $11,
+                $12, $13, $14,
+                $15, $16, $17, $18, $19
+            )
+            ON CONFLICT (commit_sha)
+            DO UPDATE SET
+                repo_url = EXCLUDED.repo_url,
+                branch = EXCLUDED.branch,
+                base_commit_sha = EXCLUDED.base_commit_sha,
+                human_author = EXCLUDED.human_author,
+                git_diff_added_lines = EXCLUDED.git_diff_added_lines,
+                git_diff_deleted_lines = EXCLUDED.git_diff_deleted_lines,
+                human_additions = EXCLUDED.human_additions,
+                ai_additions = EXCLUDED.ai_additions,
+                ai_accepted = EXCLUDED.ai_accepted,
+                unknown_additions = EXCLUDED.unknown_additions,
+                human_percent = EXCLUDED.human_percent,
+                ai_percent = EXCLUDED.ai_percent,
+                unknown_percent = EXCLUDED.unknown_percent,
+                tool_model_breakdown = EXCLUDED.tool_model_breakdown,
+                prompts = EXCLUDED.prompts,
+                hunks = EXCLUDED.hunks,
+                distinct_id = EXCLUDED.distinct_id,
+                uploaded_by = EXCLUDED.uploaded_by,
+                updated_at = now()",
+            &[
+                &row.commit_sha,
+                &row.repo_url,
+                &row.branch,
+                &row.base_commit_sha,
+                &row.human_author,
+                &(row.git_diff_added_lines as i64),
+                &(row.git_diff_deleted_lines as i64),
+                &(row.human_additions as i64),
+                &(row.ai_additions as i64),
+                &(row.ai_accepted as i64),
+                &(row.unknown_additions as i64),
+                &row.human_percent,
+                &row.ai_percent,
+                &row.unknown_percent,
+                &row.tool_model_breakdown,
+                &row.prompts,
+                &row.hunks,
+                &distinct_id,
+                &identity.user_id,
+            ],
+        )?;
+
+        record_push(
+            client,
+            identity,
+            Some(&row.commit_sha),
+            &serde_json::json!({
+                "kind": "commit_authorship_summary",
+                "distinct_id": distinct_id,
+            }),
+        );
+
+        Ok(())
     })
 }
 
