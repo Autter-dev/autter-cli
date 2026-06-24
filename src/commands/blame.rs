@@ -167,6 +167,14 @@ pub struct AutterBlameOptions {
     // When true, a single git blame hunk may be split into multiple hunks
     // if different lines were authored by different humans working with AI
     pub split_hunks_by_ai_author: bool,
+
+    // `--why <file>:<line>`: explain a single line by resolving the prompt that
+    // produced it. Holds the target line number; the file comes from the path arg.
+    pub why_line: Option<u32>,
+
+    // When set alongside `why_line`, also open the related issue/PR/prompt URL in
+    // the browser (`--why ... --open`).
+    pub why_open: bool,
 }
 
 impl Default for AutterBlameOptions {
@@ -213,6 +221,8 @@ impl Default for AutterBlameOptions {
             mark_unknown: false,
             show_prompt: false,
             split_hunks_by_ai_author: true,
+            why_line: None,
+            why_open: false,
         }
     }
 }
@@ -291,7 +301,9 @@ impl Repository {
             }
             opts.use_prompt_hashes_as_names = true;
             opts
-        } else if options.show_prompt {
+        } else if options.show_prompt || options.why_line.is_some() {
+            // For `--why` we need prompt hashes as the line author values so we can
+            // correlate the target line with its PromptRecord.
             let mut opts = options.clone();
             opts.use_prompt_hashes_as_names = true;
             opts
@@ -558,6 +570,20 @@ impl Repository {
         } = analysis;
 
         if request.options.no_output {
+            return Ok((line_authors, prompt_records));
+        }
+
+        // `--why <file>:<line>`: explain a single line and return early.
+        if let Some(why_line) = request.options.why_line {
+            output_why_format(
+                self,
+                why_line,
+                &line_authors,
+                &prompt_records,
+                &request.relative_file_path,
+                &lines,
+                &request.options,
+            )?;
             return Ok((line_authors, prompt_records));
         }
 
@@ -1889,6 +1915,180 @@ fn output_default_format(
     Ok(())
 }
 
+/// `autter blame --why <file>:<line>`: explain who/what produced a single line.
+///
+/// Resolves the line's prompt hash to its [`PromptRecord`], prints the agent,
+/// human author, stats, any issue/PR links from `custom_attributes`, and the
+/// resolved prompt transcript (from the local CAS cache / sync queue / cloud).
+/// With `--open`, also opens the most relevant URL in a browser.
+fn output_why_format(
+    _repo: &Repository,
+    why_line: u32,
+    line_authors: &HashMap<u32, String>,
+    prompt_records: &HashMap<String, PromptRecord>,
+    file_path: &str,
+    lines: &[&str],
+    options: &AutterBlameOptions,
+) -> Result<(), AutterError> {
+    if why_line == 0 || (why_line as usize) > lines.len() {
+        return Err(AutterError::Generic(format!(
+            "Line {} is out of range for {} ({} lines)",
+            why_line,
+            file_path,
+            lines.len()
+        )));
+    }
+    let line_index = (why_line - 1) as usize;
+    let line_content = lines.get(line_index).copied().unwrap_or("");
+
+    println!("{}:{}", file_path, why_line);
+    println!("  {}", line_content.trim_end());
+    println!();
+
+    // The line author is a prompt hash only for AI lines (see effective_blame_options).
+    let author = line_authors.get(&why_line);
+    let prompt = author.and_then(|a| prompt_records.get(a));
+
+    let Some(prompt) = prompt else {
+        // Not an AI line: either a known human, untracked, or unknown commit.
+        match author.map(String::as_str) {
+            Some(a) if a.starts_with("h_") => {
+                println!("This line was written by a human (no AI prompt to show).");
+            }
+            Some(a) => {
+                println!("Authored by: {a}");
+                println!("No AI prompt is associated with this line.");
+            }
+            None => {
+                println!("No authorship information is available for this line.");
+            }
+        }
+        return Ok(());
+    };
+
+    let hash = author.expect("prompt implies author present");
+
+    println!("Produced by AI");
+    println!("  agent:  {}", prompt.agent_id.tool);
+    if !prompt.agent_id.model.is_empty() {
+        println!("  model:  {}", prompt.agent_id.model);
+    }
+    if let Some(human) = &prompt.human_author {
+        println!("  human:  {human}");
+    }
+    println!("  prompt: {}", &hash[..hash.len().min(12)]);
+
+    // Surface issue/PR links and any other custom attributes.
+    if let Some(attrs) = &prompt.custom_attributes
+        && !attrs.is_empty()
+    {
+        println!();
+        println!("Links:");
+        let mut keys: Vec<&String> = attrs.keys().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(value) = attrs.get(key) {
+                println!("  {key}: {value}");
+            }
+        }
+    }
+
+    // Resolve and print the prompt transcript locally.
+    if let Some(messages_url) = &prompt.messages_url {
+        match crate::authorship::cas_bridge::resolve_cas_messages(messages_url) {
+            Ok(Some(messages)) if !messages.is_empty() => {
+                println!();
+                println!("Prompt:");
+                print_why_transcript(&messages);
+            }
+            Ok(_) => {
+                println!();
+                println!("Prompt transcript is not available locally ({messages_url}).");
+            }
+            Err(e) => {
+                println!();
+                println!("Could not resolve prompt transcript: {e}");
+            }
+        }
+    } else {
+        println!();
+        println!("No prompt transcript is associated with this line.");
+    }
+
+    // `--open`: open the most relevant URL in the browser.
+    if options.why_open {
+        if let Some(url) = why_open_url(prompt) {
+            eprintln!("Opening: {url}");
+            if let Err(e) = crate::commands::personal_dashboard::open_browser(&url) {
+                eprintln!("Could not open browser automatically ({e}). Visit:\n  {url}");
+            }
+        } else {
+            eprintln!("Nothing to open: no issue, PR, or web prompt URL for this line.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Pretty-print the user/assistant turns of a resolved prompt transcript.
+fn print_why_transcript(messages: &[crate::authorship::transcript::Message]) {
+    use crate::authorship::transcript::Message;
+    for message in messages {
+        match message {
+            Message::User { text, .. } => print_why_message("user", text),
+            Message::Assistant { text, .. } => print_why_message("assistant", text),
+            Message::Plan { text, .. } => print_why_message("plan", text),
+            // Thinking and tool-use turns are noise for a "why" explanation.
+            Message::Thinking { .. } | Message::ToolUse { .. } => {}
+        }
+    }
+}
+
+fn print_why_message(role: &str, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    println!("  [{role}]");
+    for line in trimmed.lines() {
+        println!("    {line}");
+    }
+}
+
+/// Pick the most relevant URL to open for a `--why ... --open` request:
+/// an explicit issue/PR link wins, then any other http(s) custom attribute,
+/// then an http(s) `messages_url`.
+fn why_open_url(prompt: &PromptRecord) -> Option<String> {
+    let is_http = |s: &str| s.starts_with("http://") || s.starts_with("https://");
+
+    if let Some(attrs) = &prompt.custom_attributes {
+        for key in ["issue", "pr", "pull_request", "url"] {
+            if let Some(value) = attrs.get(key)
+                && is_http(value)
+            {
+                return Some(value.clone());
+            }
+        }
+        let mut keys: Vec<&String> = attrs.keys().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(value) = attrs.get(key)
+                && is_http(value)
+            {
+                return Some(value.clone());
+            }
+        }
+    }
+
+    if let Some(url) = &prompt.messages_url
+        && is_http(url)
+    {
+        return Some(url.clone());
+    }
+
+    None
+}
+
 fn format_blame_date(author_time: i64, author_tz: &str, options: &AutterBlameOptions) -> String {
     let dt = DateTime::from_timestamp(author_time, 0)
         .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
@@ -2180,6 +2380,54 @@ pub fn parse_blame_args(args: &[String]) -> Result<(String, AutterBlameOptions),
             // Show prompt hashes inline
             "--show-prompt" => {
                 options.show_prompt = true;
+                i += 1;
+            }
+
+            // Explain a single line: --why <file>:<line>
+            "--why" => {
+                if i + 1 >= args.len() {
+                    return Err(AutterError::Generic(
+                        "--why requires an argument of the form <file>:<line>".to_string(),
+                    ));
+                }
+                let spec = &args[i + 1];
+                let (file_part, line_part) = spec.rsplit_once(':').ok_or_else(|| {
+                    AutterError::Generic(format!(
+                        "Invalid --why argument '{}': expected <file>:<line>",
+                        spec
+                    ))
+                })?;
+                if file_part.is_empty() {
+                    return Err(AutterError::Generic(format!(
+                        "Invalid --why argument '{}': missing file path",
+                        spec
+                    )));
+                }
+                let line_num: u32 = line_part.parse().map_err(|_| {
+                    AutterError::Generic(format!(
+                        "Invalid --why argument '{}': '{}' is not a valid line number",
+                        spec, line_part
+                    ))
+                })?;
+                if line_num == 0 {
+                    return Err(AutterError::Generic(
+                        "Invalid --why argument: line numbers start at 1".to_string(),
+                    ));
+                }
+                if file_path.is_none() {
+                    file_path = Some(file_part.to_string());
+                } else if file_path.as_deref() != Some(file_part) {
+                    return Err(AutterError::Generic(
+                        "Multiple file paths specified".to_string(),
+                    ));
+                }
+                options.why_line = Some(line_num);
+                i += 2;
+            }
+
+            // Open the related issue/PR/prompt URL in a browser (with --why)
+            "--open" => {
+                options.why_open = true;
                 i += 1;
             }
 

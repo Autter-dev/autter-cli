@@ -48,9 +48,9 @@ pub fn record_checkpoint_file(
 /// Top changed files for a repository key.
 pub fn top_changed_files(repo_key: &str, limit: usize) -> Result<Vec<FileChangeRow>, AutterError> {
     let db = FileChangesDatabase::global()?;
-    let lock = db.lock().map_err(|_| {
-        AutterError::Generic("file-changes database lock poisoned".to_string())
-    })?;
+    let lock = db
+        .lock()
+        .map_err(|_| AutterError::Generic("file-changes database lock poisoned".to_string()))?;
     lock.top_files(repo_key, limit)
 }
 

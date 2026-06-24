@@ -47,7 +47,10 @@ fn print_status() {
         "Anonymous telemetry: {}",
         if enabled { "ON" } else { "OFF" }
     );
-    println!("Install ID:          {}", config::get_or_create_distinct_id());
+    println!(
+        "Install ID:          {}",
+        config::get_or_create_distinct_id()
+    );
     if let Some(path) = log_path() {
         println!("Audit log:           {}", path.display());
     }
@@ -70,7 +73,10 @@ fn print_log(args: &[String]) {
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => {
-            println!("No telemetry has been sent yet (no log at {}).", path.display());
+            println!(
+                "No telemetry has been sent yet (no log at {}).",
+                path.display()
+            );
             return;
         }
     };
@@ -105,7 +111,9 @@ fn set_enabled(enabled: bool) {
                     println!("  Review what's sent anytime: {}", path.display());
                 }
             } else {
-                println!("\u{2713} Anonymous telemetry disabled. Nothing will be collected or sent.");
+                println!(
+                    "\u{2713} Anonymous telemetry disabled. Nothing will be collected or sent."
+                );
             }
         }
         Err(e) => {
@@ -119,7 +127,9 @@ fn print_help() {
     eprintln!("Usage: autter telemetry <command>");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  status            Show whether telemetry is on/off and the audit log path (default)");
+    eprintln!(
+        "  status            Show whether telemetry is on/off and the audit log path (default)"
+    );
     eprintln!("  log [-n N|--all]  Print the local audit log of data sent (default: last 50)");
     eprintln!("  enable, on        Turn anonymous telemetry on");
     eprintln!("  disable, off      Turn anonymous telemetry off");
