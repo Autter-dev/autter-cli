@@ -224,14 +224,17 @@ Community plugins surface this attribution directly in popular IDEs, color-coded
 
 <a href="https://cal.com/sagnik-autter/15min" target="_blank"><img src="assets/docs/buttons/get-early-access.svg" alt="Get early access" height="40" /></a>
 
-Autter for Teams rolls Autter out across an organization. Connect GitHub, GitLab, Bitbucket, or Azure DevOps to get aggregate insight across every repository, plus the full trace of each agent session — from the first prompt to production.
+**Autter for Teams** rolls Autter out across your whole organization. Connect GitHub, GitLab, Bitbucket, or Azure DevOps to get aggregate insight across every repository, plus the full trace of each agent session — from the first prompt to production.
 
-- See how much AI code actually reaches production.
-- Measure **% AI** and token cost by pull request, repo, team, and contributor.
-- Track and improve agent autonomy and token efficiency.
-- Measure AI-code durability and how much rework it needs before and after deploy.
-- Trace incidents back to the AI sessions that caused them.
-- Keep the prompt behind every generated hunk for harness engineering and review.
+- **Provenance** — line-level AI vs. human authorship across every repo, with the share of AI-written lines rolled up by pull request, repo, team, and contributor.
+- **Analytics** — measure **% AI** and token cost, and track agent autonomy, token efficiency, and how much rework AI code needs before and after deploy.
+- **Lifecycle** — follow AI code through your release pipelines and environments, see how much actually reaches production, and trace incidents back to the AI session that caused them.
+- **Codebase scans** — agent-driven security, dependency, secret-detection, and code-quality scans across your codebase.
+- **PR review & automation** — automatic AI pull-request reviews, generated PR descriptions, and after-review fix agents you can tune or build yourself.
+- **Repo wikis** — auto-generated, always-current documentation for every repository.
+- **Prompt store** — keep the prompt and full session behind every generated hunk for harness engineering and review.
+
+**Autter for Enterprise** runs entirely in your own cloud. Deploy into a customer-owned AWS account from versioned container images and Terraform modules — your VPC, data stores, object storage, KMS keys, and IAM roles — with audit logs and scoped access tokens. Nothing leaves your boundary.
 
 ## FAQs
 
@@ -262,7 +265,7 @@ No — Autter manages the agent hooks and checks them daily. To trigger that you
 Hundreds of engineering teams, including many in the Fortune 100, use Autter to understand their AI usage and make agents more effective in their codebases.
 
 #### What's the difference between the open source CLI and the [teams version](https://autter.dev)?
-The CLI accurately attributes AI code on every commit. The teams version adds a secure prompt store and joins data from across the SDLC — tying token spend to individual pull requests, computing % AI by PR, team, and repo, surfacing signals like rework during review, and even tracing incidents back to the AI session that caused them. Self-host it or run it in our cloud: connect your SCM for aggregate stats across thousands of repos plus full observability into everything your agents do.
+The CLI accurately attributes AI code on every commit. The teams version adds a secure prompt store and joins data from across the SDLC — tying token spend to individual pull requests, computing % AI by PR, team, and repo, surfacing signals like rework during review, and tracing incidents back to the AI session that caused them. It also layers on agent-driven workflows: codebase security scans, automatic PR reviews and descriptions, after-review fix agents, and auto-generated repo wikis. Connect your SCM for aggregate stats across thousands of repos plus full observability into everything your agents do. Run it in our cloud, or deploy Autter for Enterprise entirely inside your own AWS account so nothing leaves your boundary.
 
 #### What's supported, and what isn't?
 Autter provides line-level attribution for AI-generated code whether it was written through an edit tool or a bash command. During a history rewrite (`rebase`, `stash`, `squash --merge`, and so on) Autter moves and merges attributions so nothing is lost.
