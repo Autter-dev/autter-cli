@@ -1,11 +1,11 @@
-# autter   <a href="https://github.com/orgs/Autter-dev/discussions"><img alt="Discussions" src="https://img.shields.io/github/discussions/autter-dev/autter?style=flat-square" /></a>        
+# autter <a href="https://github.com/orgs/Autter-dev/discussions"><img alt="Discussions" src="https://img.shields.io/github/discussions/autter-dev/autter?style=flat-square" /></a>
 
 <img src="https://github.com/autter-dev/autter-cli/raw/main/assets/docs/autter.png" align="right"
      alt="Autter Logo" width="200" height="200">
 
-Autter is an open source git extension that tracks the AI-generated code in your repositories. After installing the extension, every line of AI code is linked to the **agent, model, and prompts** that generated it — so you never lose the intent, requirements, and architecture decisions behind your code.
+**Autter is an open source git extension that records which lines of your code were written by AI.** Once installed, every AI-authored line is tied to the **agent, model, and prompt** that produced it — keeping the reasoning, requirements, and design decisions attached to your code instead of lost in a chat window.
 
-**Just prompt and commit** — no workflow changes:
+There is nothing new to learn. **Write prompts and commit the way you already do.**
 
 `git commit`
 
@@ -31,7 +31,6 @@ fe2c4c8 (claude              2025-12-02  140)         DiffSpec::TwoCommit(s, e) 
 fe2c4c8 (claude              2025-12-02  141)             let from = resolve(repo, &s)?;
 ```
 
-
 ## Install
 
 **Mac, Linux, Windows (WSL)**
@@ -46,23 +45,23 @@ curl -sSL https://autter.dev/install.sh | bash
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://autter.dev/install.ps1 | iex"
 ```
 
-**No per-repo setup or git hooks required.** Commit with the Agent, git, or your favorite git client. Attribution will be linked to commits automatically.
+The installer is the only setup step. There are **no per-repo hooks to wire up and no git config to edit** — commit with the Agent, the git CLI, or any git client and attribution lands on the commit automatically.
 
-During install you'll be asked whether to run **local-only** or **connect to the Autter platform**. Login is optional: the open source CLI's attribution, blame, and stats features work locally without uploading code, prompts, or agent usage data. You can change modes any time with `autter onboard`.
+Installation lets you choose **local-only** mode or **connect to the Autter platform**, and the choice is reversible at any time with `autter onboard`. Local-only attribution, blame, and stats run entirely on your machine — no code, prompts, or usage data ever leave it.
 
-See the **[complete installation and setup guide](INSTALL.md)** for verification, local-only privacy controls, platform setup, everyday commands, and troubleshooting.
+For verification steps, privacy controls, everyday commands, and troubleshooting, read the **[full installation and setup guide](INSTALL.md)**.
 
 ## Connect to the Autter platform (optional)
 
-Local-only mode works without an account. Connecting links this machine to your Autter organization so attribution and prompt history can power cross-repository dashboards, prompt search, team/user analytics, and audit history.
+You never need an account to use Autter. Connecting simply links a machine to your Autter organization so attribution and prompt history can drive cross-repository dashboards, prompt search, team and contributor analytics, and audit history.
 
-The recommended login is the guided browser flow:
+Start with the guided browser flow:
 
 ```bash
 autter onboard
 ```
 
-Choose to connect and authorize the device in your browser. If onboarding does not work, create a **Personal Access Token (PAT)** under **Org Settings → Access Tokens**, then add it with:
+Pick "connect" and authorize the device in your browser. If that flow is unavailable, mint a **Personal Access Token (PAT)** under **Org Settings → Access Tokens** and register it directly:
 
 ```bash
 autter login --token autter_pat_xxxxxxxx
@@ -70,13 +69,13 @@ autter login --token autter_pat_xxxxxxxx
 autter whoami
 ```
 
-Once connected:
+Once a machine is connected:
 
-- **Authorship notes** (which lines are AI vs human, per commit) and **prompt transcripts** are written on commit straight to **your organization's own database** — never shared across orgs. The CLI connects to that database directly using the connection URL carried in your signed access token; there is no intermediate Autter server in the data path.
-- A token is scoped to your account; if you belong to multiple organizations, each push is automatically routed to the org that owns the repository (resolved from its git remote), falling back to your default org.
-- Manage and revoke tokens, and view CLI activity (token created, sign-in, data pushed), under **Settings → Access Tokens** in the dashboard.
+- **Authorship notes** (the AI-vs-human breakdown per commit) and **prompt transcripts** are written on commit straight into **your organization's own database**. They are never shared between organizations, and the CLI writes to that database directly using the connection URL embedded in your signed token — no Autter server sits in the data path.
+- A token is bound to your account. If you belong to more than one organization, each push is routed to whichever org owns the repository (resolved from its git remote), with your default org as the fallback.
+- Tokens can be managed or revoked, and CLI activity (token created, sign-in, data pushed) reviewed, under **Settings → Access Tokens** in the dashboard.
 
-To go back to local-only at any time:
+Return to local-only mode whenever you like:
 
 ```bash
 autter logout                 # clear stored credentials
@@ -85,7 +84,7 @@ autter onboard --local --force
 
 ### Configuration
 
-`autter` reads `~/.autter/config.json`. Defaults point at the hosted platform; override per machine (e.g. for self-hosting or CI):
+`autter` reads `~/.autter/config.json`. The defaults target the hosted platform; override them per machine for self-hosting or CI:
 
 | Field | Default | Purpose |
 |-------|---------|---------|
@@ -95,15 +94,15 @@ autter onboard --local --force
 | `prompt_storage` | `local` / `default` (connected) | `default` uploads prompts, `local` keeps them on-device |
 | `telemetry_oss` | `on` | `off` disables all anonymous usage analytics and error reporting |
 
-Env overrides: `AUTTER_API_BASE_URL`, `AUTTER_WEB_URL`, `AUTTER_NOTES_BACKEND_KIND`, `AUTTER_NOTES_BACKEND_URL`, `AUTTER_API_KEY` (for CI).
+Environment overrides: `AUTTER_API_BASE_URL`, `AUTTER_WEB_URL`, `AUTTER_NOTES_BACKEND_KIND`, `AUTTER_NOTES_BACKEND_URL`, `AUTTER_API_KEY` (for CI).
 
 ### Telemetry
 
-Autter sends **anonymous** usage analytics and error reports to help us improve the tool. Telemetry is **on by default** and you are asked to confirm during `autter onboard`. It is designed to be safe and fully transparent:
+Autter reports **anonymous** usage analytics and error data so the tool can improve. Telemetry is **on by default**, is confirmed during `autter onboard`, and is built to be safe and fully auditable:
 
-- **No personal data, ever** — no code, prompts, file paths, repo names, usernames, or IP addresses.
-- **Only anonymous, coarse data** is sent: a random install ID, device info (OS, CPU architecture, core count), the Autter version, and error/exception messages.
-- **Everything is mirrored locally** so you can audit exactly what left your machine, at `~/.autter/internal/telemetry.log` (one JSON object per event).
+- **Never any personal data** — no code, prompts, file paths, repo names, usernames, or IP addresses.
+- **Only coarse, anonymous signals** — a random install ID, device info (OS, CPU architecture, core count), the Autter version, and error/exception messages.
+- **A local mirror of everything sent** lives at `~/.autter/internal/telemetry.log` (one JSON object per event) so you can see exactly what left the machine.
 
 Inspect or change it anytime:
 
@@ -118,64 +117,55 @@ autter telemetry on          # re-enable telemetry
 You can also disable it by setting `"telemetry_oss": "off"` in `~/.autter/config.json`, or re-run the prompt with `autter onboard --force` (non-interactive installs accept `--telemetry` / `--no-telemetry`).
 
 **The [Autter standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) is supported by:**
-<table>
-<tr>
-<td align="center" width="20%"><img src="assets/docs/agents/gray/claude_code.png" alt="Claude Code" width="160" /></td>
-<td align="center" width="20%"><img src="assets/docs/agents/gray/codex-black.png" alt="Codex" width="160" /></td>
-<td align="center" width="20%"><img src="assets/docs/agents/gray/cursor.png" alt="Cursor" width="160" /></td>
-<td align="center" width="20%"><img src="assets/docs/agents/gray/copilot.png" alt="GitHub Copilot" width="160" /></td>
-<td align="center" width="20%"><img src="assets/docs/agents/gray/opencode.png" alt="OpenCode" width="160" /></td>
-</tr>
-<tr>
-<td align="center"><img src="assets/docs/agents/gray/pi.png" alt="Pi" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/windsurf.png" alt="Windsurf" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/droid.png" alt="Droid" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/amp.png" alt="Amp" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/gemini.png" alt="Gemini" width="160" /></td>
-</tr>
-<tr>
-<td align="center"><img src="assets/docs/agents/gray/continue.png" alt="Continue" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/junie_white.png" alt="Junie" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/rovodev.png" alt="Rovo Dev" width="160" /></td>
-<td align="center"><img src="assets/docs/agents/gray/firebender.png" alt="Firebender" width="160" /></td>
-<td align="center"><a href="https://autter.dev/docs/cli/add-your-agent">+ Add an Agent</a></td>
-</tr>
-</table>
 
+![Claude Code](https://img.shields.io/badge/Claude_Code-555?style=for-the-badge)
+![Codex](https://img.shields.io/badge/Codex-555?style=for-the-badge)
+![Cursor](https://img.shields.io/badge/Cursor-555?style=for-the-badge)
+![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-555?style=for-the-badge)
+![OpenCode](https://img.shields.io/badge/OpenCode-555?style=for-the-badge)
+![Pi](https://img.shields.io/badge/Pi-555?style=for-the-badge)
+![Windsurf](https://img.shields.io/badge/Windsurf-555?style=for-the-badge)
+![Droid](https://img.shields.io/badge/Droid-555?style=for-the-badge)
+![Amp](https://img.shields.io/badge/Amp-555?style=for-the-badge)
+![Gemini](https://img.shields.io/badge/Gemini-555?style=for-the-badge)
+![Continue](https://img.shields.io/badge/Continue-555?style=for-the-badge)
+![Junie](https://img.shields.io/badge/Junie-555?style=for-the-badge)
+![Rovo Dev](https://img.shields.io/badge/Rovo_Dev-555?style=for-the-badge)
+![Firebender](https://img.shields.io/badge/Firebender-555?style=for-the-badge)
+[![+ Add an Agent](https://img.shields.io/badge/+_Add_an_Agent-1f6feb?style=for-the-badge)](https://autter.dev/docs/cli/add-your-agent)
 
-## Our Choices
+## Why Autter
 
-- 🪄 **Transparent** — Autter requires no workflow changes. Just prompt and commit as you normally would and Autter automatically attaches attribution metadata to every commit. 
-- ⚡ **No performance overhead** — Autter does not rely on Git Hooks (slow + difficult to set up in every repo) and it does not wrap the Git binary. Your Git operations are just as fast as they were before Autter was installed. 
-- 💻 **Local-first** — Works offline, no login required.
-- 🔒 **Secure Prompt Storage** — Autter links each line of AI-code back to the prompt that generated it. These sessions are scanned and redacted, and saved outside of Git -- keeping repos lean, enabling fine-grained access control, and preventing PII or secrets from leaking. 
-- 🌐 **Git native and open standard** — Autter built the [open standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) for tracking AI-generated code with Git Notes.
+- 🪄 **Zero workflow change** — prompt and commit exactly as you do today; attribution metadata is attached to every commit for you.
+- ⚡ **No overhead** — Autter avoids Git hooks (slow and painful to set up per repo) and never wraps the git binary, so your git commands run at full speed.
+- 💻 **Local-first** — works offline and needs no login.
+- 🔒 **Safe prompt storage** — each AI line traces back to the prompt that produced it. Sessions are scanned, redacted, and stored outside git, keeping repos lean, enabling access control, and stopping PII or secrets from leaking.
+- 🌐 **Git-native and open** — Autter authored the [open standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) for tracking AI-generated code in Git Notes.
 
-Want to learn more? 
+Want a closer look?
 
-<a href="https://calendly.com/d/cxjh-z79-ktm/meeting-with-autter-authors" target="_blank"><img src="assets/docs/buttons/meet-the-maintainers.svg" alt="Meet the maintainers" height="40" /></a>
+<a href="https://cal.com/sagnik-autter/15min" target="_blank"><img src="assets/docs/buttons/meet-the-maintainers.svg" alt="Meet the maintainers" height="40" /></a>
 
-### Documentation  
+### Documentation
 
-- [CI Actions](https://autter.dev/docs/guides/ci-workflows) preserves attribution through Rebase and Merge & Square and Merge.
-- [How Autter Works](https://autter.dev/docs/cli/how-autter-works) 
-- [Stats command](https://autter.dev/docs/cli/commit-stats) - aggregate % AI stats across commits
-- [AI Blame](https://autter.dev/docs/cli/ai-blame) - 
-- [Config](https://autter.dev/docs/cli/configuration) - 
+- [CI Actions](https://autter.dev/docs/guides/ci-workflows) — preserve attribution through Rebase and Merge and Squash and Merge.
+- [How Autter Works](https://autter.dev/docs/cli/how-autter-works)
+- [Stats command](https://autter.dev/docs/cli/commit-stats) — aggregate % AI stats across commits.
+- [AI Blame](https://autter.dev/docs/cli/ai-blame)
+- [Config](https://autter.dev/docs/cli/configuration)
 - [Add support for an agent in Autter](https://autter.dev/docs/guides/add-your-agent)
-- Install Autter in Background Agents: [Claude Web](https://autter.dev/docs/cli/claude-web), [Codex Cloud](https://autter.dev/docs/cli/codex-cloud), [Cursor Agent](https://autter.dev/docs/cli/cursor-agent), and [Devin](https://autter.dev/docs/cli/devin).
+- Install Autter in background agents: [Claude Web](https://autter.dev/docs/cli/claude-web), [Codex Cloud](https://autter.dev/docs/cli/codex-cloud), [Cursor Agent](https://autter.dev/docs/cli/cursor-agent), and [Devin](https://autter.dev/docs/cli/devin).
 
 ## Attribution Stats
 
-Line-level AI-attribution let you track AI-code through the full SDLC. Track how much AI code gets accepted, committed, through code review, and into production — to identify which tools and practices work best.
+Line-level attribution lets you follow AI code across the whole SDLC. Measure how much AI code is accepted, committed, survives review, and reaches production — so you can tell which tools and practices actually work.
 
 ```bash
 autter stats --json
 autter stats <start_sha>..<end_sha> --json
 ```
 
-Calculates % AI-code, AI-lines generated vs committed, accepted rates, human overrides broken down by tool and model. Learn more: [Stats command reference docs](https://autter.dev/docs/cli/reference#stats). 
-
+It computes % AI code, AI lines generated vs committed, acceptance rates, and human overrides, broken down by tool and model. More in the [stats command reference](https://autter.dev/docs/cli/reference#stats).
 
 <details>
 <summary>Example JSON output</summary>
@@ -200,7 +190,7 @@ Calculates % AI-code, AI-lines generated vs committed, accepted rates, human ove
 
 ## AI Blame
 
-Autter blame is a drop-in replacement for `git blame` that shows AI attribution for each line. It supports [all standard `git blame` flags](https://git-scm.com/docs/git-blame).
+`autter blame` is a drop-in replacement for `git blame` that adds AI attribution to every line. It accepts [all standard `git blame` flags](https://git-scm.com/docs/git-blame).
 
 ```bash
 autter blame /src/log_fmt/authorship_log.rs
@@ -217,7 +207,7 @@ fe2c4c8 (claude         2025-12-02 19:25:13 -0500  140)         DiffSpec::TwoCom
 
 <img align="right" width="350" alt="Autter VS Code extension showing color-coded AI blame in the gutter" src="https://github.com/user-attachments/assets/94e332e7-5d96-4e5c-8757-63ac0e2f88e0" />
 
-There are community plugins that display AI-attribution in popular IDEs, color-coded by agent session. Hover over a line to see the raw prompt or summary.
+Community plugins surface this attribution directly in popular IDEs, color-coded by agent session. Hover a line to read the underlying prompt or its summary.
 
 **Supported Editors**
 
@@ -226,65 +216,58 @@ There are community plugins that display AI-attribution in popular IDEs, color-c
 - [Windsurf](https://marketplace.visualstudio.com/items?itemName=autter.autter-vscode)
 - [Antigravity](https://marketplace.visualstudio.com/items?itemName=autter.autter-vscode)
 - [Emacs magit](https://github.com/jwiegley/maautter)
-- *Built support for another editor? [Open a PR](https://github.com/autter-dev/autter-cli/pulls)*
+- *Added support for another editor? [Open a PR](https://github.com/autter-dev/autter-cli/pulls)*
 
 <br clear="all" />
 
 ## For teams and enterprises
 
-<a href="https://calendly.com/d/cxjh-z79-ktm/meeting-with-autter-authors" target="_blank"><img src="assets/docs/buttons/get-early-access.svg" alt="Get early access" height="40" /></a>
+<a href="https://cal.com/sagnik-autter/15min" target="_blank"><img src="assets/docs/buttons/get-early-access.svg" alt="Get early access" height="40" /></a>
 
-We built Autter for Teams to make it easy to roll out Autter across your organization. Just connect GitHub, GitLab, Bitbucket, or Azure DevOps and get aggregate insights across all your repositories, plus the full trace of every agent session—from prompt all the way to production.
+Autter for Teams rolls Autter out across an organization. Connect GitHub, GitLab, Bitbucket, or Azure DevOps to get aggregate insight across every repository, plus the full trace of each agent session — from the first prompt to production.
 
-- See how much AI-code makes it all the way to production
-- Measure **% AI** and token cost by Pull Request, Repo, Team, and Contributor
-- Measure and improve agent autonomy and token efficiency
-- Measure AI-code durability and how much rework AI-code requires before and after deployment
-- Tie incidents back to AI-sessions
-- Save prompts behind every generated hunk of code for harness engineering and code review
-
-<sub><i>▶ Watch the 2-minute demo</i></sub>
-
-https://github.com/user-attachments/assets/9c0d56a0-d6f6-4189-8d94-32155af33321
+- See how much AI code actually reaches production.
+- Measure **% AI** and token cost by pull request, repo, team, and contributor.
+- Track and improve agent autonomy and token efficiency.
+- Measure AI-code durability and how much rework it needs before and after deploy.
+- Trace incidents back to the AI sessions that caused them.
+- Keep the prompt behind every generated hunk for harness engineering and review.
 
 ## FAQs
 
 #### How does it work?
 
-1. Coding Agents call `autter checkpoint` whenever they write code or modify files with bash scripts. 
-1. On commit, Autter stores line-level attribution data in Git Notes, linking each line of AI-generated code to the agent, model, and session that created it. Run `git log --show-notes="ai"` to see them. 
-1. Autter moves and merges line-level attributions when you `squash`, `merge`, `reset`, `rebase`, `stash`, `cherry-pick`, etc. so your AI code is always accurately tracked.
+1. Coding agents call `autter checkpoint` whenever they write code or change files via bash scripts.
+1. On commit, Autter records line-level attribution in Git Notes, tying every AI line to the agent, model, and session behind it. Run `git log --show-notes="ai"` to view it.
+1. When you `squash`, `merge`, `reset`, `rebase`, `stash`, or `cherry-pick`, Autter moves and merges those attributions so tracking stays accurate.
 
-*Autter does not use AI or heuristics to "detect" AI code — the Agents report exactly which lines they wrote, providing the most accurate, explicit attribution possible.*
+*Autter never uses AI or heuristics to "guess" which code is AI — the agents report exactly which lines they wrote, giving the most accurate, explicit attribution possible.*
 
-#### Does the agent have to commit for Autter to attribute the code?
-No. Autter works no matter how you commit — your Git client, the Git CLI, and your own Git aliases are all supported.
+#### Does the agent have to commit for attribution to work?
+No. Autter works no matter how a commit is created — your git client, the git CLI, and your own git aliases are all supported.
 
-#### Autter notes are attached to commits — how are attributions preserved when I rebase, squash, stash, cherry-pick, etc.?
-Autter analyzes the final state of the code after the operation completes and copies/merges the attributions into a Git Note for any completed commits. It's eventually consistent. The note will be written 5-100ms after the operation completes.
+#### Notes attach to commits — how do attributions survive a rebase, squash, stash, or cherry-pick?
+Autter inspects the final state of the code once the operation finishes and copies or merges attributions into a Git Note for every resulting commit. It is eventually consistent: the note is written 5–100 ms after the operation completes.
 
-#### Can I use this on my own?
-Yes. Autter is free and open source, works locally, and requires no login or team setup.
+#### Can I use this solo?
+Yes. Autter is free and open source, runs locally, and needs no login or team setup.
 
 #### Is there a performance impact?
-No. Autter does not use Git hooks and it does not wrap Git, so you won't see any overhead on your Git commands.
+No. Autter uses no Git hooks and does not wrap git, so your git commands carry no added overhead.
 
-#### Do I have to set up agent hooks?
-Nope — Autter manages the agent hooks and checks/updates them daily. If you want to trigger this yourself (ie just installed a new agent) run `autter install-hooks`.
+#### Do I need to set up agent hooks?
+No — Autter manages the agent hooks and checks them daily. To trigger that yourself (for example after installing a new agent), run `autter install-hooks`.
 
 #### Who uses this?
-Hundreds of engineering teams (including many in the Fortune 100) use Autter to understand their AI usage and make agents more effective on their codebase.
+Hundreds of engineering teams, including many in the Fortune 100, use Autter to understand their AI usage and make agents more effective in their codebases.
 
 #### What's the difference between the open source CLI and the [teams version](https://autter.dev)?
-The CLI accurately attributes AI code on every commit. The teams version adds a secure prompt store and joins in data from across the SDLC — tying token spend to individual Pull Requests, calculating % AI by PR, team, and repo, and connecting signals like amount of rework during code review, and even tying incidents back to the AI session that caused them. Self-host it or run it in our cloud: connect your SCM and get aggregate stats across thousands of repos plus full observability into everything your coding agents do.
+The CLI accurately attributes AI code on every commit. The teams version adds a secure prompt store and joins data from across the SDLC — tying token spend to individual pull requests, computing % AI by PR, team, and repo, surfacing signals like rework during review, and even tracing incidents back to the AI session that caused them. Self-host it or run it in our cloud: connect your SCM for aggregate stats across thousands of repos plus full observability into everything your agents do.
 
-#### Who built this?
-Connect with the team at Autter [hi@autter.dev](mailto:hi@autter.dev).
+#### What's supported, and what isn't?
+Autter provides line-level attribution for AI-generated code whether it was written through an edit tool or a bash command. During a history rewrite (`rebase`, `stash`, `squash --merge`, and so on) Autter moves and merges attributions so nothing is lost.
 
-#### What are the capabilities and known limitations?
-Autter provides line-level attribution for AI-generated code - whether it is written with an edit tool or a bash command. When a Git rewrite operation is run (`rebase`, `stash`, `squash --merge`, etc) Autter will move and merge attributions so nothing is lost. 
-
-Here is a full breakdown of what is supported today: 
+Here is the full breakdown of what is supported today:
 
 | Capability                                                      | Status | Notes                                                                        |
 | --------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- |
@@ -302,7 +285,7 @@ Here is a full breakdown of what is supported today:
 | Formatters                                                      | ✅      | Formatting will not change attribution to human.                             |
 | Multi-repo root                                                 | ⚠️     | If you run an agent that edits multiple repos, Bash attributions only work when the agent runs each command with its cwd inside that repo. |
 
-Git Rewrite Operations:
+Git rewrite operations:
 
 | Operation                                                       | Status | Notes                                                                        |
 | --------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- |
@@ -322,16 +305,18 @@ Git Rewrite Operations:
 | `git filter-branch` / `git filter-repo`                        | ❌      | Bulk history rewrites are not tracked.                                        |
 | `git replace`                                                  | ❌      | Object replacements are not tracked.                                         |
 
-
 GitHub, GitLab, Bitbucket, Azure DevOps:
 
 | Capability                                                      | Status | Notes                                                                        |
 | --------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- |
-| Squash and Merge                                                | ✅      | Requires [Autter for Teams](https://calendly.com/d/cxjh-z79-ktm/meeting-with-autter-authors) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
-| Rebase and Merge                                                | ✅      | Requires [Autter for Teams](https://calendly.com/d/cxjh-z79-ktm/meeting-with-autter-authors) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
+| Squash and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
+| Rebase and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
 
+## Acknowledgments
 
+Autter builds on the foundation laid by the original authors of **[git-ai](https://github.com/git-ai-project/git-ai)**, who first showed that AI-code attribution could live natively inside a repository rather than in an external service. Their work is the starting point everything here grew from, and we're grateful for it.
 
+The key idea we carried forward and built on is **Git Notes**. Git Notes let you attach metadata to a commit *after* it already exists, without rewriting the commit or touching its tree — so attribution can be recorded, moved, and merged independently of the code itself. Autter stores its line-level authorship data in a dedicated `refs/notes/ai` namespace, which is what makes attribution survive `rebase`, `squash`, `stash`, `cherry-pick`, and the other history rewrites, and what lets the same data sync across machines and the platform. We took that primitive and extended it into the full [Autter standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) for tracking AI-generated code.
 
 ## License
 Apache 2.0
