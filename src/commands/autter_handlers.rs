@@ -395,12 +395,16 @@ fn handle_checkpoint(args: &[String]) {
                     } else if hook_input.as_ref().unwrap().trim().is_empty() {
                         // Usage error: caller passed `--hook-input` with an empty value.
                         eprintln!("Error: --hook-input requires a value");
+                        report_checkpoint_usage_error("--hook-input requires a value");
                         std::process::exit(1);
                     }
                     i += 2;
                 } else {
                     // Usage error: caller passed `--hook-input` with no value at all.
                     eprintln!("Error: --hook-input requires a value or 'stdin' to read from stdin");
+                    report_checkpoint_usage_error(
+                        "--hook-input requires a value or 'stdin' to read from stdin",
+                    );
                     std::process::exit(1);
                 }
             }
@@ -426,6 +430,7 @@ fn handle_checkpoint(args: &[String]) {
         // Usage error: caller named a preset that doesn't exist.
         eprintln!("Error: unknown checkpoint preset '{}'", args[0]);
         eprintln!("Usage: autter checkpoint <preset> [--hook-input <json|stdin>] [files...]");
+        report_checkpoint_usage_error(&format!("unknown checkpoint preset '{}'", args[0]));
         std::process::exit(1);
     } else {
         (args[0].as_str(), &args[1..])
@@ -561,6 +566,20 @@ fn handle_checkpoint(args: &[String]) {
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
+}
+
+/// Report a checkpoint usage/argument error to both telemetry backends
+/// (PostHog Error Tracking + the org database). These indicate a misconfigured
+/// caller (a script, CI job, or agent integration invoking `autter checkpoint`
+/// incorrectly), so surfacing them helps catch integration bugs.
+fn report_checkpoint_usage_error(message: &str) {
+    crate::observability::report_cli_error(
+        "checkpoint_usage_error",
+        message,
+        Some("checkpoint"),
+        None,
+        true,
+    );
 }
 
 fn strip_utf8_bom(input: String) -> String {

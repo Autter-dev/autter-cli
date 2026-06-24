@@ -1736,3 +1736,164 @@ mod session_event_tests {
         assert_eq!(OtelTraceValues::event_id() as u16, 6);
     }
 }
+
+/// Value positions for "cli_error" event.
+pub mod cli_error_pos {
+    pub const KIND: usize = 0; // String - stable error category (e.g. "git_proxy_panic_recovery")
+    pub const MESSAGE: usize = 1; // String - human-readable error message
+    pub const COMMAND: usize = 2; // String (nullable) - the autter/git subcommand involved
+    pub const CONTEXT: usize = 3; // String (nullable) - extra JSON-encoded context
+}
+
+/// Values for Event ID 7: cli_error
+///
+/// Recorded when the CLI hits a tracked error condition (a recovered panic in
+/// the git proxy, a checkpoint usage error, etc.). This lets errors land in the
+/// org database's generic `cli_metrics` table alongside the PostHog
+/// `$exception` event emitted for the same condition.
+///
+/// **Fields:**
+/// | Position | Name | Type |
+/// |----------|------|------|
+/// | 0 | kind | String |
+/// | 1 | message | String |
+/// | 2 | command | String (nullable) |
+/// | 3 | context | String (nullable) |
+#[derive(Debug, Clone, Default)]
+pub struct CliErrorValues {
+    pub kind: PosField<String>,
+    pub message: PosField<String>,
+    pub command: PosField<String>,
+    pub context: PosField<String>,
+}
+
+impl CliErrorValues {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn kind(mut self, value: impl Into<String>) -> Self {
+        self.kind = Some(Some(value.into()));
+        self
+    }
+
+    pub fn message(mut self, value: impl Into<String>) -> Self {
+        self.message = Some(Some(value.into()));
+        self
+    }
+
+    pub fn command(mut self, value: impl Into<String>) -> Self {
+        self.command = Some(Some(value.into()));
+        self
+    }
+
+    pub fn context(mut self, value: impl Into<String>) -> Self {
+        self.context = Some(Some(value.into()));
+        self
+    }
+}
+
+impl PosEncoded for CliErrorValues {
+    fn to_sparse(&self) -> SparseArray {
+        let mut map = SparseArray::new();
+        sparse_set(&mut map, cli_error_pos::KIND, string_to_json(&self.kind));
+        sparse_set(
+            &mut map,
+            cli_error_pos::MESSAGE,
+            string_to_json(&self.message),
+        );
+        sparse_set(
+            &mut map,
+            cli_error_pos::COMMAND,
+            string_to_json(&self.command),
+        );
+        sparse_set(
+            &mut map,
+            cli_error_pos::CONTEXT,
+            string_to_json(&self.context),
+        );
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        Self {
+            kind: sparse_get_string(arr, cli_error_pos::KIND),
+            message: sparse_get_string(arr, cli_error_pos::MESSAGE),
+            command: sparse_get_string(arr, cli_error_pos::COMMAND),
+            context: sparse_get_string(arr, cli_error_pos::CONTEXT),
+        }
+    }
+}
+
+impl EventValues for CliErrorValues {
+    fn event_id() -> MetricEventId {
+        MetricEventId::CliError
+    }
+
+    fn to_sparse(&self) -> SparseArray {
+        PosEncoded::to_sparse(self)
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        PosEncoded::from_sparse(arr)
+    }
+}
+
+#[cfg(test)]
+mod cli_error_tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn test_cli_error_values_event_id() {
+        assert_eq!(CliErrorValues::event_id(), MetricEventId::CliError);
+        assert_eq!(CliErrorValues::event_id() as u16, 7);
+    }
+
+    #[test]
+    fn test_cli_error_values_to_sparse() {
+        let values = CliErrorValues::new()
+            .kind("git_proxy_panic_recovery")
+            .message("panic: boom")
+            .command("commit");
+
+        let sparse = PosEncoded::to_sparse(&values);
+        assert_eq!(
+            sparse.get("0"),
+            Some(&Value::String("git_proxy_panic_recovery".to_string()))
+        );
+        assert_eq!(
+            sparse.get("1"),
+            Some(&Value::String("panic: boom".to_string()))
+        );
+        assert_eq!(sparse.get("2"), Some(&Value::String("commit".to_string())));
+        // context not set -> omitted
+        assert_eq!(sparse.get("3"), None);
+    }
+
+    #[test]
+    fn test_cli_error_values_roundtrip() {
+        let original = CliErrorValues::new()
+            .kind("checkpoint_usage_error")
+            .message("unknown preset 'foo'")
+            .command("checkpoint")
+            .context(r#"{"preset":"foo"}"#);
+
+        let sparse = PosEncoded::to_sparse(&original);
+        let restored = <CliErrorValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(
+            restored.kind,
+            Some(Some("checkpoint_usage_error".to_string()))
+        );
+        assert_eq!(
+            restored.message,
+            Some(Some("unknown preset 'foo'".to_string()))
+        );
+        assert_eq!(restored.command, Some(Some("checkpoint".to_string())));
+        assert_eq!(
+            restored.context,
+            Some(Some(r#"{"preset":"foo"}"#.to_string()))
+        );
+    }
+}

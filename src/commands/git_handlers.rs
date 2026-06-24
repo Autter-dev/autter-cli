@@ -80,7 +80,26 @@ pub fn handle_git(args: &[String]) {
     // `handle_git_inner` normally never returns -- it terminates the process via
     // `exit_with_status`/`proxy_to_git`. So we only reach here on a panic.
     if result.is_err() {
-        if GIT_CHILD_SPAWNED.load(Ordering::Relaxed) {
+        let git_already_ran = GIT_CHILD_SPAWNED.load(Ordering::Relaxed);
+
+        // Record the recovery in both telemetry backends (PostHog Error Tracking
+        // + the org database). The panic hook already emitted the raw `$exception`;
+        // this complements it with the *recovery outcome* so we can see how often
+        // the proxy degrades and on which subcommands. Best-effort and panic-safe.
+        let subcommand = best_effort_subcommand(args);
+        crate::observability::report_cli_error(
+            "git_proxy_panic_recovery",
+            if git_already_ran {
+                "panic after git ran; mirrored git's exit code"
+            } else {
+                "panic before git ran; degraded to passthrough"
+            },
+            subcommand.as_deref(),
+            None,
+            true,
+        );
+
+        if git_already_ran {
             // git already executed; surface its result rather than running it again.
             std::process::exit(GIT_CHILD_EXIT_CODE.load(Ordering::Relaxed));
         }
@@ -89,6 +108,15 @@ pub fn handle_git(args: &[String]) {
         let status = proxy_to_git(args, false, None);
         exit_with_status(status);
     }
+}
+
+/// Best-effort extraction of the git subcommand (e.g. `commit`, `rebase`) from a
+/// raw argv slice, without invoking the full parser. Used only for telemetry on
+/// the panic-recovery path, so it stays dependency-free and never panics.
+fn best_effort_subcommand(args: &[String]) -> Option<String> {
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.to_string())
 }
 
 fn handle_git_inner(args: &[String]) {
