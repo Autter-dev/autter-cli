@@ -312,5 +312,11 @@ GitHub, GitLab, Bitbucket, Azure DevOps:
 | Squash and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
 | Rebase and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
 
+## Acknowledgments
+
+Autter builds on the foundation laid by the original authors of **[git-ai](https://github.com/git-ai-project/git-ai)**, who first showed that AI-code attribution could live natively inside a repository rather than in an external service. Their work is the starting point everything here grew from, and we're grateful for it.
+
+The key idea we carried forward and built on is **Git Notes**. Git Notes let you attach metadata to a commit *after* it already exists, without rewriting the commit or touching its tree — so attribution can be recorded, moved, and merged independently of the code itself. Autter stores its line-level authorship data in a dedicated `refs/notes/ai` namespace, which is what makes attribution survive `rebase`, `squash`, `stash`, `cherry-pick`, and the other history rewrites, and what lets the same data sync across machines and the platform. We took that primitive and extended it into the full [Autter standard](https://github.com/autter-dev/autter-cli/blob/main/specs/autter_standard_v3.0.0.md) for tracking AI-generated code.
+
 ## License
 Apache 2.0
