@@ -14,13 +14,28 @@ struct FetchNotesJsonOutput {
 }
 
 pub fn handle_fetch_notes(args: &[String]) {
+    use crate::commands::arg_parser::{self, ScanMode};
+
+    let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if pp.flags.help {
+        arg_parser::print_command_help("fetch-notes");
+        return;
+    }
+    arg_parser::merge_global_flags(&pp.flags);
+
+    let args = &pp.rest;
+    let json_output = arg_parser::json();
     let mut remote: Option<String> = None;
-    let mut json_output = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--json" => json_output = true,
             "--remote" => {
                 i += 1;
                 if i >= args.len() {
@@ -32,10 +47,6 @@ pub fn handle_fetch_notes(args: &[String]) {
                     std::process::exit(1);
                 }
                 remote = Some(args[i].clone());
-            }
-            "--help" | "-h" => {
-                print_fetch_notes_help();
-                return;
             }
             other if other.starts_with('-') => {
                 eprintln!("Error: unknown option '{}'", other);
@@ -190,21 +201,4 @@ fn print_json_error(status: &str, message: &str, remote: Option<&str>) {
         "{}",
         serde_json::to_string(&output).expect("failed to serialize JSON")
     );
-}
-
-fn print_fetch_notes_help() {
-    eprintln!("autter fetch-notes - Synchronously fetch AI authorship notes from a remote");
-    eprintln!();
-    eprintln!("Usage: autter fetch-notes [options] [<remote>]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  <remote>           Remote to fetch from (default: upstream or origin)");
-    eprintln!("  --remote <name>    Explicit remote name");
-    eprintln!("  --json             Output result as JSON");
-    eprintln!("  -h, --help         Show this help message");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  autter fetch-notes              Fetch from default remote");
-    eprintln!("  autter fetch-notes upstream      Fetch from 'upstream' remote");
-    eprintln!("  autter fetch-notes --json        Fetch and output JSON result");
 }

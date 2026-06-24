@@ -10,7 +10,6 @@ use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profi
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::IsTerminal;
 use unicode_normalization::UnicodeNormalization;
 
 // ============================================================================
@@ -221,6 +220,11 @@ pub fn handle_diff(repo: &Repository, args: &[String]) -> Result<(), AutterError
 
 pub fn parse_diff_args(args: &[String]) -> Result<ParsedDiffArgs, AutterError> {
     let mut options = DiffCommandOptions::default();
+    // Honor a global `--json` (e.g. `autter diff --json <rev>`, where the shared
+    // pre-parser already stripped the leading `--json`).
+    if crate::commands::arg_parser::json() {
+        options.format = DiffFormat::Json;
+    }
     let mut positional_args: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1895,7 +1899,7 @@ pub fn format_annotated_diff(
     included_files: &HashSet<String>,
 ) -> Result<String, AutterError> {
     let sections = get_diff_sections_by_file(repo, from_commit, to_commit)?;
-    let use_color = std::io::stdout().is_terminal();
+    let use_color = crate::commands::arg_parser::use_color();
     let mut result = String::new();
 
     for (file_path, section_text) in sections {
