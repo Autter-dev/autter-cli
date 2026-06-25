@@ -53,7 +53,11 @@ pub fn handle_file_changes(args: &[String]) {
     }
 }
 
-fn run(repo: &crate::git::repository::Repository, limit: usize, json_output: bool) -> Result<(), AutterError> {
+fn run(
+    repo: &crate::git::repository::Repository,
+    limit: usize,
+    json_output: bool,
+) -> Result<(), AutterError> {
     let repo_key = resolve_repo_key(repo);
     let rows = top_changed_files(&repo_key, limit)?;
 

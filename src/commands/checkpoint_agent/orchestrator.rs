@@ -331,6 +331,11 @@ fn split_files_into_requests(
     stream_source: Option<StreamSource>,
     metadata: HashMap<String, String>,
 ) -> Vec<CheckpointRequest> {
+    // Normalize the agent id up front, before session ids are derived from
+    // (tool, id), so every checkpoint always carries a concrete tool and model
+    // (never empty / "unknown" / "default").
+    let agent_id = agent_id.map(AgentId::normalized);
+
     let mut by_repo: HashMap<PathBuf, Vec<CheckpointFile>> = HashMap::new();
     for f in all_files {
         by_repo.entry(f.repo_work_dir.clone()).or_default().push(f);

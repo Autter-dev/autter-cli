@@ -1174,13 +1174,22 @@ fn apply_blame_for_side(
                     .entry(session_key.to_string())
                     .or_insert_with(|| session_record.clone());
             } else {
-                // Fallback: convert PromptRecord back to SessionRecord
+                // Fallback: convert PromptRecord back to SessionRecord, carrying the
+                // prompt's counters into the session stats block (no per-file split
+                // available from a flat PromptRecord).
                 sessions
                     .entry(session_key.to_string())
                     .or_insert_with(|| SessionRecord {
                         agent_id: prompt_record.agent_id.clone(),
                         human_author: prompt_record.human_author.clone(),
                         messages_url: prompt_record.messages_url.clone(),
+                        stats: Some(crate::authorship::authorship_log::SessionStats {
+                            total_additions: prompt_record.total_additions,
+                            total_deletions: prompt_record.total_deletions,
+                            accepted_lines: prompt_record.accepted_lines,
+                            overriden_lines: prompt_record.overriden_lines,
+                            files: std::collections::BTreeMap::new(),
+                        }),
                         custom_attributes: prompt_record.custom_attributes.clone(),
                     });
             }

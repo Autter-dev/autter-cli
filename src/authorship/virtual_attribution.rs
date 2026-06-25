@@ -2,7 +2,7 @@ use crate::authorship::attribution_tracker::{
     Attribution, LineAttribution, line_attributions_to_attributions,
 };
 use crate::authorship::authorship_log::{HumanRecord, LineRange, PromptRecord, SessionRecord};
-use crate::authorship::working_log::CheckpointKind;
+use crate::authorship::working_log::{Checkpoint, CheckpointKind};
 use crate::commands::blame::{AutterBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::error::AutterError;
 use crate::git::repository::Repository;
@@ -10,6 +10,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
+
+/// Extract the session id (`s_<14hex>`) from an attestation author key of the form
+/// `s_<14hex>::t_<14hex>`. Returns `None` for human (`h_…`), legacy prompt, or the
+/// plain `"human"` author ids.
+fn session_id_from_author(author: &str) -> Option<String> {
+    let (session_id, _trace) = author.split_once("::")?;
+    if session_id.starts_with("s_") {
+        Some(session_id.to_string())
+    } else {
+        None
+    }
+}
 
 pub struct VirtualAttributions {
     repo: Repository,
@@ -465,6 +477,7 @@ impl VirtualAttributions {
                         agent_id: agent_id.clone(),
                         human_author: human_author.clone(),
                         messages_url: None,
+                        stats: None,
                         custom_attributes: None,
                     };
 
@@ -575,6 +588,15 @@ impl VirtualAttributions {
             &session_deletions,
         );
 
+        // Attach per-session (and per-file) line statistics to each session record.
+        Self::calculate_and_update_session_metrics(
+            &mut sessions,
+            &checkpoints,
+            &attributions,
+            &session_additions,
+            &session_deletions,
+        );
+
         Ok(VirtualAttributions {
             repo,
             base_commit,
@@ -664,6 +686,7 @@ impl VirtualAttributions {
                         agent_id: agent_id.clone(),
                         human_author: human_author.clone(),
                         messages_url: None,
+                        stats: None,
                         custom_attributes: None,
                     };
 
@@ -761,6 +784,15 @@ impl VirtualAttributions {
             &session_deletions,
         );
 
+        // Attach per-session (and per-file) line statistics to each session record.
+        Self::calculate_and_update_session_metrics(
+            &mut sessions,
+            &checkpoints,
+            &attributions,
+            &session_additions,
+            &session_deletions,
+        );
+
         Ok(VirtualAttributions {
             repo,
             base_commit,
@@ -851,6 +883,7 @@ impl VirtualAttributions {
                         agent_id: agent_id.clone(),
                         human_author: human_author.clone(),
                         messages_url: None,
+                        stats: None,
                         custom_attributes: None,
                     };
 
@@ -950,6 +983,15 @@ impl VirtualAttributions {
 
         Self::calculate_and_update_prompt_metrics(
             &mut prompts,
+            &attributions,
+            &session_additions,
+            &session_deletions,
+        );
+
+        // Attach per-session (and per-file) line statistics to each session record.
+        Self::calculate_and_update_session_metrics(
+            &mut sessions,
+            &checkpoints,
             &attributions,
             &session_additions,
             &session_deletions,
@@ -2287,6 +2329,107 @@ impl VirtualAttributions {
                 prompt_record.overriden_lines =
                     *session_overridden_lines.get(session_id).unwrap_or(&0);
             }
+        }
+    }
+
+    /// Calculate and attach per-session line statistics (additions, deletions,
+    /// accepted, overridden) plus a per-file breakdown onto each `SessionRecord`.
+    ///
+    /// - additions/deletions come from the pre-aggregated per-session counters
+    ///   (`session_additions`/`session_deletions`, sourced from checkpoint line stats),
+    ///   with the per-file split read from each working-log entry's `line_stats`.
+    /// - accepted/overridden are derived from the final line attributions: a line
+    ///   counts as "accepted" for the session that owns it in the committed state,
+    ///   and "overridden" for the session whose line was later overwritten.
+    pub fn calculate_and_update_session_metrics(
+        sessions: &mut BTreeMap<String, SessionRecord>,
+        checkpoints: &[Checkpoint],
+        attributions: &HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)>,
+        session_additions: &HashMap<String, u32>,
+        session_deletions: &HashMap<String, u32>,
+    ) {
+        use crate::authorship::authorship_log::{FileStats, SessionStats};
+
+        // Per-(session_id, file) additions/deletions from working-log entry stats.
+        let mut file_additions: HashMap<(String, String), u32> = HashMap::new();
+        let mut file_deletions: HashMap<(String, String), u32> = HashMap::new();
+        for checkpoint in checkpoints {
+            let Some(agent_id) = &checkpoint.agent_id else {
+                continue;
+            };
+            // Only session-format (trace_id present) AI checkpoints map to sessions.
+            if checkpoint.trace_id.is_none() {
+                continue;
+            }
+            let session_id = crate::authorship::authorship_log_serialization::generate_session_id(
+                &agent_id.id,
+                &agent_id.tool,
+            );
+            for entry in &checkpoint.entries {
+                if entry.line_stats.additions == 0 && entry.line_stats.deletions == 0 {
+                    continue;
+                }
+                let key = (session_id.clone(), entry.file.clone());
+                *file_additions.entry(key.clone()).or_insert(0) += entry.line_stats.additions;
+                *file_deletions.entry(key).or_insert(0) += entry.line_stats.deletions;
+            }
+        }
+
+        // Per-session and per-(session, file) accepted / overridden lines from the
+        // final attributions.
+        let mut accepted: HashMap<String, u32> = HashMap::new();
+        let mut accepted_file: HashMap<(String, String), u32> = HashMap::new();
+        let mut overridden: HashMap<String, u32> = HashMap::new();
+        let mut overridden_file: HashMap<(String, String), u32> = HashMap::new();
+        for (file_path, (_char_attrs, line_attrs)) in attributions {
+            for line_attr in line_attrs {
+                let count = line_attr.end_line.saturating_sub(line_attr.start_line) + 1;
+                if let Some(sid) = session_id_from_author(&line_attr.author_id) {
+                    *accepted.entry(sid.clone()).or_insert(0) += count;
+                    *accepted_file.entry((sid, file_path.clone())).or_insert(0) += count;
+                }
+                if let Some(overrode_id) = &line_attr.overrode
+                    && let Some(sid) = session_id_from_author(overrode_id)
+                {
+                    *overridden.entry(sid.clone()).or_insert(0) += count;
+                    *overridden_file.entry((sid, file_path.clone())).or_insert(0) += count;
+                }
+            }
+        }
+
+        for (session_id, record) in sessions.iter_mut() {
+            let mut stats = SessionStats {
+                total_additions: *session_additions.get(session_id).unwrap_or(&0),
+                total_deletions: *session_deletions.get(session_id).unwrap_or(&0),
+                accepted_lines: *accepted.get(session_id).unwrap_or(&0),
+                overriden_lines: *overridden.get(session_id).unwrap_or(&0),
+                files: BTreeMap::new(),
+            };
+
+            // Collect every file referenced for this session across all four maps.
+            let mut files: BTreeMap<String, FileStats> = BTreeMap::new();
+            for (sid, file) in file_additions
+                .keys()
+                .chain(file_deletions.keys())
+                .chain(accepted_file.keys())
+                .chain(overridden_file.keys())
+            {
+                if sid != session_id || files.contains_key(file) {
+                    continue;
+                }
+                let key = (session_id.clone(), file.clone());
+                files.insert(
+                    file.clone(),
+                    FileStats {
+                        total_additions: *file_additions.get(&key).unwrap_or(&0),
+                        total_deletions: *file_deletions.get(&key).unwrap_or(&0),
+                        accepted_lines: *accepted_file.get(&key).unwrap_or(&0),
+                        overriden_lines: *overridden_file.get(&key).unwrap_or(&0),
+                    },
+                );
+            }
+            stats.files = files;
+            record.stats = Some(stats);
         }
     }
 

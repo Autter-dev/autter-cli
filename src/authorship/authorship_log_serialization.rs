@@ -29,6 +29,10 @@ pub struct AuthorshipMetadata {
     pub schema_version: String,
     pub autter_version: Option<String>,
     pub base_commit_sha: String,
+    /// Branch this commit was created on (no `refs/heads/` prefix). Lets the backend
+    /// scope a note to a PR without a GitHub round-trip. Omitted for detached HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub prompts: BTreeMap<String, PromptRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub humans: BTreeMap<String, HumanRecord>,
@@ -42,6 +46,7 @@ impl AuthorshipMetadata {
             schema_version: AUTHORSHIP_LOG_VERSION.to_string(),
             autter_version: Some(AUTTER_VERSION.to_string()),
             base_commit_sha: String::new(),
+            branch: None,
             prompts: BTreeMap::new(),
             humans: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -1380,6 +1385,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 human_author: Some("dev@example.com".to_string()),
                 messages_url: None,
+                stats: None,
                 custom_attributes: None,
             },
         );

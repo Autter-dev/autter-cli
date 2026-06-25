@@ -32,6 +32,19 @@ pub struct FileLineStats {
     pub deletions_sloc: u32,
 }
 
+impl FileLineStats {
+    /// Convert to the persisted [`CheckpointLineStats`] shape for storage on a
+    /// [`WorkingLogEntry`].
+    pub fn to_checkpoint_line_stats(&self) -> crate::authorship::working_log::CheckpointLineStats {
+        crate::authorship::working_log::CheckpointLineStats {
+            additions: self.additions,
+            deletions: self.deletions,
+            additions_sloc: self.additions_sloc,
+            deletions_sloc: self.deletions_sloc,
+        }
+    }
+}
+
 /// Latest checkpoint state needed to process a file in the next checkpoint.
 #[derive(Debug, Clone)]
 struct PreviousFileState {
@@ -621,7 +634,8 @@ fn get_checkpoint_entry_for_file(
         }
 
         let stats = compute_file_line_stats(&previous_content, &current_content);
-        let entry = WorkingLogEntry::new(file_path, file_content_hash, Vec::new(), Vec::new());
+        let mut entry = WorkingLogEntry::new(file_path, file_content_hash, Vec::new(), Vec::new());
+        entry.line_stats = stats.to_checkpoint_line_stats();
         return Ok(Some((entry, stats)));
     }
 
@@ -1027,12 +1041,13 @@ fn make_entry_for_file(
         stats_start.elapsed()
     );
 
-    let entry = WorkingLogEntry::new(
+    let mut entry = WorkingLogEntry::new(
         file_path.to_string(),
         blob_sha.to_string(),
         new_attributions,
         line_attributions,
     );
+    entry.line_stats = line_stats.to_checkpoint_line_stats();
 
     Ok((entry, line_stats))
 }
