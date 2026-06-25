@@ -828,3 +828,127 @@ fn human_checkpoint_routes_to_nested_linked_worktree_when_cwd_is_main_repo() {
         &["worktree", "remove", "--force", linked_wt.to_str().unwrap()],
     );
 }
+
+// ── Worktree storage survives git slot-name churn ───────────────────────────
+//
+// Regression test for the bug where a linked worktree's AI storage was keyed by
+// git's INTERNAL worktree slot name (`<common>/worktrees/<name>`). Git derives
+// that name from the worktree's basename and recycles it when worktrees sharing
+// a basename are pruned and re-added. When many worktrees share a basename (the
+// common case for agent sandboxes that always check out into `.../<id>/repo`),
+// the slot name a worktree gets is NOT its basename, and could be reassigned —
+// so checkpoints written under one name were orphaned and post-commit note
+// generation found nothing, silently producing an empty authorship note.
+//
+// The fix keys storage by a stable hash of the worktree's absolute workdir path.
+// This test forces git to hand the target worktree a slot name that differs from
+// its basename (by occupying the basename slot with a decoy first), then asserts
+// the storage location is workdir-derived — independent of the slot name — and
+// that a checkpoint still round-trips into that location.
+#[test]
+fn worktree_storage_is_keyed_by_workdir_not_git_slot_name() {
+    let repo = crate::repos::test_repo::TestRepo::new();
+    let mut seed = repo.filename("seed.txt");
+    seed.set_contents(crate::lines!["seed".human()]);
+    repo.stage_all_and_commit("initial").unwrap();
+    let main_repo_root = repo.path().to_path_buf();
+
+    // Pick a shared basename and create two worktrees that both want it.
+    let mut rng = rand::rng();
+    let basename = format!("sandbox-{}", rng.random_range(0..10_000_000_000u64));
+    let decoy_wt = std::env::temp_dir().join("decoy").join(&basename);
+    let target_wt = std::env::temp_dir().join("target").join(&basename);
+    fs::create_dir_all(decoy_wt.parent().unwrap()).expect("create decoy parent");
+    fs::create_dir_all(target_wt.parent().unwrap()).expect("create target parent");
+
+    // The decoy claims the `<basename>` slot, so the target is forced onto a
+    // different slot (e.g. `<basename>1`) — exactly the slot/basename mismatch
+    // that the recycled-name keying got wrong.
+    // `--detach` avoids the auto-created branch (named after the basename) from
+    // colliding between the two same-basename worktrees; we only care about the
+    // directory basename driving git's slot-name assignment here.
+    run_git(
+        &main_repo_root,
+        &["worktree", "add", "--detach", decoy_wt.to_str().unwrap()],
+    );
+    run_git(
+        &main_repo_root,
+        &["worktree", "add", "--detach", target_wt.to_str().unwrap()],
+    );
+
+    let target_repo = AutterRepository::find_repository_in_path(target_wt.to_str().unwrap())
+        .expect("find target worktree repo");
+
+    // Git's actual slot name for the target worktree.
+    let target_git_dir = PathBuf::from(run_git_stdout(&target_wt, &["rev-parse", "--git-dir"]));
+    let slot_name = target_git_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_ne!(
+        slot_name, basename,
+        "decoy should have forced a slot name distinct from the basename"
+    );
+
+    // Storage lives under <common>/ai/worktrees and its key is derived from the
+    // workdir (basename prefix), NOT the git slot name.
+    let storage_key = target_repo
+        .storage
+        .working_logs
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .expect("storage key component");
+    assert_ne!(
+        storage_key, slot_name,
+        "storage must NOT be keyed by the recyclable git slot name"
+    );
+    assert!(
+        storage_key.starts_with(&format!("{}-", basename)),
+        "storage key should be <basename>-<hash>, got {storage_key}"
+    );
+
+    // Resolving the same worktree again yields the same storage — the property
+    // the recycled slot name failed to guarantee.
+    let target_repo_again = AutterRepository::find_repository_in_path(target_wt.to_str().unwrap())
+        .expect("re-find target worktree repo");
+    assert_eq!(
+        target_repo.storage.working_logs, target_repo_again.storage.working_logs,
+        "the same physical worktree must always resolve to the same storage"
+    );
+
+    // And a checkpoint written for a file in the target worktree round-trips into
+    // that workdir-keyed storage, where post-commit note generation will find it.
+    let wt_file = target_wt.join("feature.rs");
+    fs::write(&wt_file, "fn a() {}\nfn b() {}\n").expect("write wt file");
+    simulate_claude_post_tool_use(&repo, &target_wt, &wt_file).expect("checkpoint should succeed");
+
+    let head = target_repo
+        .head()
+        .expect("target HEAD")
+        .target()
+        .expect("HEAD resolves");
+    let working_log = target_repo
+        .storage
+        .working_log_for_base_commit(&head)
+        .expect("open target working log");
+    let checkpoints = working_log
+        .read_all_checkpoints()
+        .expect("read checkpoints");
+    assert!(
+        checkpoints
+            .iter()
+            .any(|cp| cp.kind == CheckpointKind::AiAgent),
+        "expected the AI checkpoint to land in the workdir-keyed storage despite the slot/basename mismatch"
+    );
+
+    run_git(
+        &main_repo_root,
+        &["worktree", "remove", "--force", decoy_wt.to_str().unwrap()],
+    );
+    run_git(
+        &main_repo_root,
+        &["worktree", "remove", "--force", target_wt.to_str().unwrap()],
+    );
+}
