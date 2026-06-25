@@ -100,6 +100,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_default_limit_is_positive() {
         assert!(DEFAULT_LIMIT > 0);
     }
