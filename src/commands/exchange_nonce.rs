@@ -49,6 +49,9 @@ fn exchange_nonce(nonce: &str, api_base: &str) -> Result<(), String> {
     let store = CredentialStore::new();
     store.store(&credentials)?;
 
-    eprintln!("\x1b[32m✓ Logged in automatically\x1b[0m");
+    eprintln!(
+        "{}",
+        crate::commands::arg_parser::paint_err("32", "✓ Logged in automatically")
+    );
     Ok(())
 }

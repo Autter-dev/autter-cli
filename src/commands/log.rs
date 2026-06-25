@@ -213,6 +213,14 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
     }
 
     if parsed.plain {
+        // `--plain` implies no autter-rendered color, consistent with the
+        // standard NO_COLOR / `--no-color` handling in `should_colorize()`.
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                no_color: true,
+                ..Default::default()
+            },
+        );
         return run_plain_log(&global_args, &parsed.git_log_args);
     }
 

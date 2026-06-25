@@ -159,16 +159,43 @@ pub fn quiet() -> bool {
     store().read().unwrap().quiet
 }
 
-/// Centralized color decision: honor `--no-color`, the `NO_COLOR` env var, and
-/// whether stdout is a TTY.
+/// Whether coloring is forced off regardless of the output stream: the
+/// `--no-color`/`--plain` global flag, or the standard `NO_COLOR` env var.
+fn color_forced_off() -> bool {
+    store().read().unwrap().no_color || std::env::var_os("NO_COLOR").is_some()
+}
+
+/// Centralized color decision for **stdout**: honor `--no-color`/`--plain`, the
+/// `NO_COLOR` env var, and whether stdout is a TTY. This is the project-wide
+/// `should_colorize()` for human-readable output written via `print!`/`println!`.
 pub fn use_color() -> bool {
-    if store().read().unwrap().no_color {
-        return false;
+    !color_forced_off() && std::io::stdout().is_terminal()
+}
+
+/// Same decision as [`use_color`] but keyed on **stderr**'s TTY, for color
+/// emitted via `eprint!`/`eprintln!` (warnings, notices, progress messages).
+pub fn use_color_stderr() -> bool {
+    !color_forced_off() && std::io::stderr().is_terminal()
+}
+
+/// Wrap `text` in the SGR `code` (e.g. `"1;32"`) when stdout coloring is
+/// enabled, otherwise return it unchanged. Keeps call sites readable while
+/// routing every color decision through [`use_color`].
+pub fn paint(code: &str, text: &str) -> String {
+    if use_color() {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    } else {
+        text.to_string()
     }
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
+}
+
+/// Like [`paint`] but keyed on stderr (for messages printed via `eprintln!`).
+pub fn paint_err(code: &str, text: &str) -> String {
+    if use_color_stderr() {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    } else {
+        text.to_string()
     }
-    std::io::stdout().is_terminal()
 }
 
 // ===========================================================================
