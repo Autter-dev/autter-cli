@@ -14,11 +14,20 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 #[cfg(unix)]
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Whether the real `git` child process has been spawned during this
+/// invocation. Used by the panic-recovery wrapper in [`handle_git`] so that a
+/// panic in autter's post-processing (after git already ran) does not cause us
+/// to re-run a potentially non-idempotent git command.
+static GIT_CHILD_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Exit code of the real `git` child once it has completed. Only meaningful
+/// when [`GIT_CHILD_SPAWNED`] is `true`. Defaults to `0`.
+static GIT_CHILD_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[cfg(unix)]
 extern "C" fn forward_signal_handler(sig: libc::c_int) {
@@ -52,7 +61,65 @@ fn uninstall_forwarding_handlers() {
     }
 }
 
+/// Git proxy entrypoint.
+///
+/// Wraps all of autter's pre/post bookkeeping in [`std::panic::catch_unwind`]
+/// so that a panic in our hot path can never abort the user's `git` command.
+/// On panic we degrade gracefully:
+///   * if the real `git` already ran, mirror its exit code (re-running could be
+///     destructive for non-idempotent commands like commit/rebase);
+///   * otherwise fall back to a transparent passthrough to the real `git`.
+///
+/// The panic itself is still reported via the installed panic hook before
+/// unwinding reaches us.
 pub fn handle_git(args: &[String]) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_git_inner(args);
+    }));
+
+    // `handle_git_inner` normally never returns -- it terminates the process via
+    // `exit_with_status`/`proxy_to_git`. So we only reach here on a panic.
+    if result.is_err() {
+        let git_already_ran = GIT_CHILD_SPAWNED.load(Ordering::Relaxed);
+
+        // Record the recovery in both telemetry backends (PostHog Error Tracking
+        // + the org database). The panic hook already emitted the raw `$exception`;
+        // this complements it with the *recovery outcome* so we can see how often
+        // the proxy degrades and on which subcommands. Best-effort and panic-safe.
+        let subcommand = best_effort_subcommand(args);
+        crate::observability::report_cli_error(
+            "git_proxy_panic_recovery",
+            if git_already_ran {
+                "panic after git ran; mirrored git's exit code"
+            } else {
+                "panic before git ran; degraded to passthrough"
+            },
+            subcommand.as_deref(),
+            None,
+            true,
+        );
+
+        if git_already_ran {
+            // git already executed; surface its result rather than running it again.
+            std::process::exit(GIT_CHILD_EXIT_CODE.load(Ordering::Relaxed));
+        }
+        // git never ran -- degrade to a plain passthrough so the user's command
+        // still works (without autter authorship tracking for this run).
+        let status = proxy_to_git(args, false, None);
+        exit_with_status(status);
+    }
+}
+
+/// Best-effort extraction of the git subcommand (e.g. `commit`, `rebase`) from a
+/// raw argv slice, without invoking the full parser. Used only for telemetry on
+/// the panic-recovery path, so it stays dependency-free and never panics.
+fn best_effort_subcommand(args: &[String]) -> Option<String> {
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.to_string())
+}
+
+fn handle_git_inner(args: &[String]) {
     // If we're being invoked from a shell completion context, bypass autter logic
     // and delegate directly to the real git so existing completion scripts work.
     if in_shell_completion_context() {
@@ -463,6 +530,9 @@ fn proxy_to_git(
                     Ok(())
                 });
             }
+            // Record that we're about to hand control to the real git so the
+            // panic-recovery wrapper in `handle_git` won't re-run it.
+            GIT_CHILD_SPAWNED.store(true, Ordering::Relaxed);
             // We return both the spawned child and whether we changed PGID
             match cmd.spawn() {
                 Ok(child) => Ok((child, should_setpgid)),
@@ -489,6 +559,9 @@ fn proxy_to_git(
                 }
             }
 
+            // Record that we're about to hand control to the real git so the
+            // panic-recovery wrapper in `handle_git` won't re-run it.
+            GIT_CHILD_SPAWNED.store(true, Ordering::Relaxed);
             cmd.spawn()
         }
     };
@@ -508,6 +581,7 @@ fn proxy_to_git(
             let status = child.wait();
             match status {
                 Ok(status) => {
+                    GIT_CHILD_EXIT_CODE.store(status.code().unwrap_or(0), Ordering::Relaxed);
                     #[cfg(unix)]
                     {
                         if setpgid {
@@ -545,6 +619,7 @@ fn proxy_to_git(
             let status = child.wait();
             match status {
                 Ok(status) => {
+                    GIT_CHILD_EXIT_CODE.store(status.code().unwrap_or(0), Ordering::Relaxed);
                     if exit_on_completion {
                         exit_with_status(status);
                     }

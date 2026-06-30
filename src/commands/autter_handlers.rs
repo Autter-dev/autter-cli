@@ -360,6 +360,14 @@ fn print_help() {
 }
 
 fn handle_checkpoint(args: &[String]) {
+    // Exit-code policy for `autter checkpoint`:
+    //   * Operational / hook conditions (a valid invocation that has nothing to
+    //     do, or hits a transient/environmental failure) exit 0 -- this command
+    //     is invoked by AI agent pre/post-edit hooks and must NEVER break the
+    //     agent's edit flow.
+    //   * Usage / argument errors (the caller invoked the command incorrectly:
+    //     missing flag value, unknown preset) exit non-zero, so scripts, CI, and
+    //     integration code can detect that they're calling it wrong.
     let perf = std::env::var("AUTTER_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
     let t0 = std::time::Instant::now();
 
@@ -374,22 +382,30 @@ fn handle_checkpoint(args: &[String]) {
                         let mut stdin = std::io::stdin();
                         let mut buffer = String::new();
                         if let Err(e) = stdin.read_to_string(&mut buffer) {
+                            // Operational (transient IO) condition: don't break the agent.
                             eprintln!("Failed to read stdin for hook input: {}", e);
                             std::process::exit(0);
                         }
                         if buffer.trim().is_empty() {
+                            // Operational: nothing to checkpoint -- valid, just a no-op.
                             eprintln!("No hook input provided (via --hook-input or stdin).");
                             std::process::exit(0);
                         }
                         hook_input = Some(strip_utf8_bom(buffer));
                     } else if hook_input.as_ref().unwrap().trim().is_empty() {
+                        // Usage error: caller passed `--hook-input` with an empty value.
                         eprintln!("Error: --hook-input requires a value");
-                        std::process::exit(0);
+                        report_checkpoint_usage_error("--hook-input requires a value");
+                        std::process::exit(1);
                     }
                     i += 2;
                 } else {
+                    // Usage error: caller passed `--hook-input` with no value at all.
                     eprintln!("Error: --hook-input requires a value or 'stdin' to read from stdin");
-                    std::process::exit(0);
+                    report_checkpoint_usage_error(
+                        "--hook-input requires a value or 'stdin' to read from stdin",
+                    );
+                    std::process::exit(1);
                 }
             }
             _ => {
@@ -411,8 +427,11 @@ fn handle_checkpoint(args: &[String]) {
         ("human", &args[1..])
     } else if crate::commands::checkpoint_agent::presets::resolve_preset(args[0].as_str()).is_err()
     {
+        // Usage error: caller named a preset that doesn't exist.
+        eprintln!("Error: unknown checkpoint preset '{}'", args[0]);
         eprintln!("Usage: autter checkpoint <preset> [--hook-input <json|stdin>] [files...]");
-        std::process::exit(0);
+        report_checkpoint_usage_error(&format!("unknown checkpoint preset '{}'", args[0]));
+        std::process::exit(1);
     } else {
         (args[0].as_str(), &args[1..])
     };
@@ -547,6 +566,20 @@ fn handle_checkpoint(args: &[String]) {
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
+}
+
+/// Report a checkpoint usage/argument error to both telemetry backends
+/// (PostHog Error Tracking + the org database). These indicate a misconfigured
+/// caller (a script, CI job, or agent integration invoking `autter checkpoint`
+/// incorrectly), so surfacing them helps catch integration bugs.
+fn report_checkpoint_usage_error(message: &str) {
+    crate::observability::report_cli_error(
+        "checkpoint_usage_error",
+        message,
+        Some("checkpoint"),
+        None,
+        true,
+    );
 }
 
 fn strip_utf8_bom(input: String) -> String {
