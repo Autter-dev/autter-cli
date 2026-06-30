@@ -1,4 +1,6 @@
-use crate::authorship::authorship_log_serialization::AuthorshipLog;
+use crate::authorship::authorship_log_serialization::{
+    AuthorshipLog, generate_session_id, generate_short_hash,
+};
 use crate::authorship::ignore::{
     build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
@@ -9,7 +11,7 @@ use crate::config::Config;
 use crate::error::AutterError;
 use crate::git::notes_api::write_note as notes_add;
 use crate::git::repository::Repository;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 
 /// Skip expensive post-commit stats when this threshold is exceeded.
@@ -298,6 +300,16 @@ pub fn post_commit_with_final_state(
             &human_author,
             &authorship_note_str,
             &computed,
+            &parent_working_log,
+            hunks_json.as_deref(),
+        );
+        upload_commit_authorship_summary(
+            repo,
+            &commit_sha,
+            &parent_sha,
+            &human_author,
+            &computed,
+            &authorship_log,
             &parent_working_log,
             hunks_json.as_deref(),
         );
@@ -607,9 +619,190 @@ fn record_commit_metrics(
     record(values, attrs);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn upload_commit_authorship_summary(
+    repo: &Repository,
+    commit_sha: &str,
+    parent_sha: &str,
+    human_author: &str,
+    stats: &crate::authorship::stats::CommitStats,
+    authorship_log: &AuthorshipLog,
+    checkpoints: &[Checkpoint],
+    hunks_json: Option<&str>,
+) {
+    use crate::api::client::{
+        ApiClient, ApiContext, access_token_for_org, resolve_org_for_repo_cached,
+    };
+    use crate::api::org_db::{self, CommitAuthorshipSummaryRow};
+
+    let repo_url = current_repo_url(repo);
+    let client = if let Some(repo_url) = repo_url.as_deref()
+        && let Some(org) = resolve_org_for_repo_cached(repo_url)
+    {
+        let Some(token) = access_token_for_org(&org) else {
+            return;
+        };
+        ApiClient::new(ApiContext::with_auth(None, token))
+    } else {
+        ApiClient::new(ApiContext::new(None))
+    };
+
+    if !client.is_logged_in() {
+        return;
+    }
+
+    let Ok(identity) = client.org_identity() else {
+        return;
+    };
+
+    let total = stats.git_diff_added_lines as f64;
+    let percent = |count: u32| {
+        if total <= 0.0 {
+            0.0
+        } else {
+            ((count as f64 / total) * 10000.0).round() / 100.0
+        }
+    };
+
+    let prompts = build_commit_prompt_summaries(authorship_log, checkpoints);
+    let hunks = hunks_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    let tool_model_breakdown =
+        serde_json::to_value(&stats.tool_model_breakdown).unwrap_or_else(|_| serde_json::json!({}));
+
+    let row = CommitAuthorshipSummaryRow {
+        commit_sha: commit_sha.to_string(),
+        repo_url,
+        branch: current_branch(repo),
+        base_commit_sha: parent_sha.to_string(),
+        human_author: human_author.to_string(),
+        git_diff_added_lines: stats.git_diff_added_lines as u64,
+        git_diff_deleted_lines: stats.git_diff_deleted_lines as u64,
+        human_additions: stats.human_additions as u64,
+        ai_additions: stats.ai_additions as u64,
+        ai_accepted: stats.ai_accepted as u64,
+        unknown_additions: stats.unknown_additions as u64,
+        human_percent: percent(stats.human_additions),
+        ai_percent: percent(stats.ai_accepted),
+        unknown_percent: percent(stats.unknown_additions),
+        tool_model_breakdown,
+        prompts,
+        hunks,
+    };
+
+    if let Err(e) = org_db::upsert_commit_authorship_summary(
+        &identity,
+        &row,
+        &crate::config::get_or_create_distinct_id(),
+    ) {
+        tracing::warn!(%e, commit_sha, "commit authorship summary upload failed");
+    }
+}
+
+fn current_repo_url(repo: &Repository) -> Option<String> {
+    repo.get_default_remote()
+        .ok()
+        .flatten()
+        .and_then(|remote_name| {
+            repo.remotes_with_urls()
+                .ok()
+                .and_then(|remotes| remotes.into_iter().find(|(name, _)| name == &remote_name))
+                .map(|(_, url)| url)
+        })
+        .and_then(|url| crate::repo_url::normalize_repo_url(&url).ok())
+}
+
+fn current_branch(repo: &Repository) -> Option<String> {
+    repo.head().ok().and_then(|head_ref| head_ref.shorthand().ok())
+}
+
+fn transcript_paths_by_prompt_key(checkpoints: &[Checkpoint]) -> HashMap<String, String> {
+    let mut transcript_paths = HashMap::new();
+    for checkpoint in checkpoints {
+        let (Some(agent_id), Some(metadata)) = (&checkpoint.agent_id, &checkpoint.agent_metadata)
+        else {
+            continue;
+        };
+        let Some(path) = metadata
+            .get("transcript_path")
+            .or_else(|| metadata.get("chat_session_path"))
+            .or_else(|| metadata.get("session_path"))
+        else {
+            continue;
+        };
+        transcript_paths.insert(
+            generate_short_hash(&agent_id.id, &agent_id.tool),
+            path.clone(),
+        );
+        transcript_paths.insert(
+            generate_session_id(&agent_id.id, &agent_id.tool),
+            path.clone(),
+        );
+    }
+    transcript_paths
+}
+
+fn first_user_prompts_by_path(paths: impl Iterator<Item = String>) -> HashMap<String, String> {
+    let mut prompts = HashMap::new();
+    for path in paths {
+        if prompts.contains_key(&path) {
+            continue;
+        }
+        if let Ok(Some(prompt)) =
+            crate::authorship::cas_bridge::first_user_prompt_from_transcript_file(&path)
+        {
+            prompts.insert(path, prompt);
+        }
+    }
+    prompts
+}
+
+fn build_commit_prompt_summaries(
+    authorship_log: &AuthorshipLog,
+    checkpoints: &[Checkpoint],
+) -> serde_json::Value {
+    let transcript_paths = transcript_paths_by_prompt_key(checkpoints);
+    let first_prompts = first_user_prompts_by_path(transcript_paths.values().cloned());
+    let mut rows = Vec::new();
+
+    for (prompt_id, prompt_record) in &authorship_log.metadata.prompts {
+        let transcript_path = transcript_paths.get(prompt_id);
+        rows.push(serde_json::json!({
+            "id": prompt_id,
+            "kind": "prompt",
+            "agent_id": prompt_record.agent_id,
+            "human_author": prompt_record.human_author,
+            "messages_url": prompt_record.messages_url,
+            "original_user_prompt": transcript_path.and_then(|path| first_prompts.get(path)),
+            "total_additions": prompt_record.total_additions,
+            "total_deletions": prompt_record.total_deletions,
+            "accepted_lines": prompt_record.accepted_lines,
+            "overriden_lines": prompt_record.overriden_lines,
+        }));
+    }
+
+    let sessions: BTreeMap<_, _> = authorship_log.metadata.sessions.iter().collect();
+    for (session_id, session_record) in sessions {
+        let transcript_path = transcript_paths.get(session_id);
+        rows.push(serde_json::json!({
+            "id": session_id,
+            "kind": "session",
+            "agent_id": session_record.agent_id,
+            "human_author": session_record.human_author,
+            "messages_url": session_record.messages_url,
+            "original_user_prompt": transcript_path.and_then(|path| first_prompts.get(path)),
+        }));
+    }
+
+    serde_json::Value::Array(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorship::authorship_log::SessionRecord;
+    use crate::authorship::working_log::AgentId;
 
     #[test]
     fn test_count_line_ranges_handles_scattered_and_contiguous_lines() {
@@ -756,5 +949,55 @@ mod tests {
             !should_skip_expensive_post_commit_stats(&all_zero),
             "All zero values should not skip"
         );
+    }
+
+    #[test]
+    fn test_build_commit_prompt_summaries_extracts_original_user_prompt() {
+        let temp = tempfile::NamedTempFile::new().expect("temp transcript");
+        std::fs::write(
+            temp.path(),
+            r#"{"type":"user","message":{"content":"Build me a todo app"},"timestamp":"2026-01-01T00:00:00Z"}
+{"type":"assistant","message":{"content":"Sure."},"timestamp":"2026-01-01T00:00:01Z"}
+"#,
+        )
+        .expect("write transcript");
+
+        let agent_id = AgentId {
+            tool: "claude".to_string(),
+            id: "session-123".to_string(),
+            model: "sonnet".to_string(),
+        };
+        let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
+
+        let mut authorship_log = AuthorshipLog::new();
+        authorship_log.metadata.sessions.insert(
+            session_id.clone(),
+            SessionRecord {
+                agent_id: agent_id.clone(),
+                human_author: Some("Alice <alice@example.com>".to_string()),
+                messages_url: Some("cas:test".to_string()),
+                custom_attributes: None,
+            },
+        );
+
+        let mut checkpoint = Checkpoint::new(
+            CheckpointKind::AiAgent,
+            "hash".to_string(),
+            "claude".to_string(),
+            Vec::new(),
+        );
+        checkpoint.agent_id = Some(agent_id);
+        checkpoint.agent_metadata = Some(HashMap::from([(
+            "transcript_path".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        )]));
+
+        let summaries = build_commit_prompt_summaries(&authorship_log, &[checkpoint]);
+        let rows = summaries.as_array().expect("summaries array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], session_id);
+        assert_eq!(rows[0]["kind"], "session");
+        assert_eq!(rows[0]["original_user_prompt"], "Build me a todo app");
+        assert_eq!(rows[0]["messages_url"], "cas:test");
     }
 }
