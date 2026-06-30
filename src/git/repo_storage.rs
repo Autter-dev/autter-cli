@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -417,16 +418,21 @@ impl PersistedWorkingLog {
             return Ok(Vec::new());
         }
 
-        let content = fs::read_to_string(&checkpoints_file)?;
+        // Stream the JSONL file line-by-line rather than loading the whole file
+        // into a single String. For large histories (hundreds of MB) the
+        // whole-file read was a major source of peak-memory amplification.
+        let file = fs::File::open(&checkpoints_file)?;
+        let reader = std::io::BufReader::new(file);
         let mut checkpoints = Vec::new();
 
         // Parse JSONL file - each line is a separate JSON object
-        for line in content.lines() {
+        for line in reader.lines() {
+            let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
 
-            let checkpoint: Checkpoint = serde_json::from_str(line)
+            let checkpoint: Checkpoint = serde_json::from_str(&line)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             if checkpoint.api_version != CHECKPOINT_API_VERSION {
@@ -452,39 +458,42 @@ impl PersistedWorkingLog {
             }
         }
 
-        // Step 2: Replace 7-char author_ids in all checkpoints' attributions and line_attributions
-        let mut migrated_checkpoints = Vec::new();
-        for mut checkpoint in checkpoints {
-            for entry in &mut checkpoint.entries {
-                // Replace author_ids in attributions
-                for attr in &mut entry.attributions {
-                    if attr.author_id.len() == 7
-                        && let Some(new_hash) = old_to_new_hash.get(&attr.author_id)
-                    {
-                        attr.author_id = new_hash.clone();
+        // Step 2: Replace 7-char author_ids in all checkpoints' attributions and
+        // line_attributions. Mutate in place rather than building a second Vec
+        // (the extra copy doubled peak memory on large histories). Skip entirely
+        // when there is nothing to migrate.
+        if !old_to_new_hash.is_empty() {
+            for checkpoint in &mut checkpoints {
+                for entry in &mut checkpoint.entries {
+                    // Replace author_ids in attributions
+                    for attr in &mut entry.attributions {
+                        if attr.author_id.len() == 7
+                            && let Some(new_hash) = old_to_new_hash.get(&attr.author_id)
+                        {
+                            attr.author_id = new_hash.clone();
+                        }
                     }
-                }
 
-                // Replace author_ids in line_attributions
-                for line_attr in &mut entry.line_attributions {
-                    if line_attr.author_id.len() == 7
-                        && let Some(new_hash) = old_to_new_hash.get(&line_attr.author_id)
-                    {
-                        line_attr.author_id = new_hash.clone();
-                    }
-                    // Also migrate the overrode field if it contains a 7-char hash
-                    if let Some(ref overrode_id) = line_attr.overrode
-                        && overrode_id.len() == 7
-                        && let Some(new_hash) = old_to_new_hash.get(overrode_id)
-                    {
-                        line_attr.overrode = Some(new_hash.clone());
+                    // Replace author_ids in line_attributions
+                    for line_attr in &mut entry.line_attributions {
+                        if line_attr.author_id.len() == 7
+                            && let Some(new_hash) = old_to_new_hash.get(&line_attr.author_id)
+                        {
+                            line_attr.author_id = new_hash.clone();
+                        }
+                        // Also migrate the overrode field if it contains a 7-char hash
+                        if let Some(ref overrode_id) = line_attr.overrode
+                            && overrode_id.len() == 7
+                            && let Some(new_hash) = old_to_new_hash.get(overrode_id)
+                        {
+                            line_attr.overrode = Some(new_hash.clone());
+                        }
                     }
                 }
             }
-            migrated_checkpoints.push(checkpoint);
         }
 
-        Ok(migrated_checkpoints)
+        Ok(checkpoints)
     }
 
     /// Remove char-level attributions from all but the most recent checkpoint per file.
@@ -522,20 +531,17 @@ impl PersistedWorkingLog {
     pub fn write_all_checkpoints(&self, checkpoints: &[Checkpoint]) -> Result<(), AutterError> {
         let checkpoints_file = self.dir.join("checkpoints.jsonl");
 
-        // Serialize all checkpoints to JSONL
-        let mut lines = Vec::new();
+        // Serialize each checkpoint straight to a buffered writer rather than
+        // collecting every line into a Vec<String> and join()-ing them into one
+        // giant String. On large histories that intermediate buffer (plus the
+        // joined copy) was a major peak-memory amplifier.
+        let file = fs::File::create(&checkpoints_file)?;
+        let mut writer = std::io::BufWriter::new(file);
         for checkpoint in checkpoints {
-            let json_line = serde_json::to_string(checkpoint)?;
-            lines.push(json_line);
+            serde_json::to_writer(&mut writer, checkpoint)?;
+            writer.write_all(b"\n")?;
         }
-
-        // Write all lines to file
-        let content = lines.join("\n");
-        if !content.is_empty() {
-            fs::write(&checkpoints_file, format!("{}\n", content))?;
-        } else {
-            fs::write(&checkpoints_file, "")?;
-        }
+        writer.flush()?;
 
         Ok(())
     }
