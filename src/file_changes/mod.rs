@@ -48,9 +48,9 @@ pub fn record_checkpoint_file(
 /// Top changed files for a repository key.
 pub fn top_changed_files(repo_key: &str, limit: usize) -> Result<Vec<FileChangeRow>, AutterError> {
     let db = FileChangesDatabase::global()?;
-    let lock = db.lock().map_err(|_| {
-        AutterError::Generic("file-changes database lock poisoned".to_string())
-    })?;
+    let lock = db
+        .lock()
+        .map_err(|_| AutterError::Generic("file-changes database lock poisoned".to_string()))?;
     lock.top_files(repo_key, limit)
 }
 
@@ -146,10 +146,8 @@ pub fn flush_pending_to_cloud() {
 
         match org_db::upsert_file_change_counts(&identity, &rows, &distinct_id) {
             Ok(failed) => {
-                let failed_keys: std::collections::HashSet<(String, String)> = failed
-                    .into_iter()
-                    .map(|(repo_url, file_path)| (repo_url, file_path))
-                    .collect();
+                let failed_keys: std::collections::HashSet<(String, String)> =
+                    failed.into_iter().collect();
 
                 let mut by_repo: std::collections::HashMap<String, Vec<String>> =
                     std::collections::HashMap::new();
@@ -199,7 +197,7 @@ fn mark_batch_failed(batch: &[db::PendingFileChangeRow], error: &str, retry_dela
         for row in batch {
             let _ = lock.mark_failed(
                 &row.repo_url,
-                &[row.file_path.clone()],
+                std::slice::from_ref(&row.file_path),
                 error,
                 retry_delay_secs,
             );

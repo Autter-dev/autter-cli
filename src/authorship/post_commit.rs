@@ -210,6 +210,33 @@ pub fn post_commit_with_final_state(
         );
     }
 
+    // Record the branch this commit was made on so the backend can scope a note to a
+    // PR without a GitHub round-trip. Detached HEAD resolves to "HEAD" -> store None.
+    authorship_log.metadata.branch = repo
+        .head()
+        .ok()
+        .and_then(|r| r.name().map(str::to_string))
+        .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_string))
+        .filter(|b| !b.is_empty());
+
+    // Mirror each session's stats into the documented `metadata.prompts` map so
+    // consumers that read prompts (rather than sessions) still get the per-session
+    // counters. Runs after custom-attribute injection and transcript bridging so the
+    // mirrored records carry the same custom_attributes/messages_url. Keyed by the
+    // session id (`s_…`), which never collides with legacy prompt hashes.
+    let mirrored_prompts: Vec<(String, _)> = authorship_log
+        .metadata
+        .sessions
+        .iter()
+        .map(|(session_id, record)| (session_id.clone(), record.to_prompt_record()))
+        .collect();
+    for (session_id, prompt_record) in mirrored_prompts {
+        authorship_log
+            .metadata
+            .prompts
+            .insert(session_id, prompt_record);
+    }
+
     let authorship_note_str = authorship_log
         .serialize_to_string()
         .map_err(|_| AutterError::Generic("Failed to serialize authorship log".to_string()))?;

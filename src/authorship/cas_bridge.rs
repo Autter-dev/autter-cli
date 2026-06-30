@@ -105,6 +105,12 @@ fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<Stri
         return Ok(None);
     };
 
+    // Normalize each agent's raw event format into typed transcript messages.
+    let messages: Vec<Message> = events.iter().flat_map(messages_from_event).collect();
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
     let cas_object = CasMessagesObject {
         messages: messages.clone(),
     };

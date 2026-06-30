@@ -4316,6 +4316,7 @@ fn build_note_from_conflict_wl(
                     agent_id: agent_id.clone(),
                     human_author: None,
                     messages_url: None,
+                    stats: None,
                     custom_attributes: None,
                 });
         } else {
