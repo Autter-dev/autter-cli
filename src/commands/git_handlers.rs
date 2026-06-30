@@ -52,6 +52,55 @@ fn uninstall_forwarding_handlers() {
     }
 }
 
+/// Emit a best-effort `[autter]`-prefixed diagnostic to stderr. Only shown in
+/// debug builds or when `AUTTER_DEBUG` is explicitly enabled, matching the
+/// debug-logging convention used elsewhere in the codebase.
+fn proxy_debug_log(message: &str) {
+    let enabled = cfg!(debug_assertions)
+        || std::env::var("AUTTER_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0");
+    if enabled {
+        eprintln!("[autter] {message}");
+    }
+}
+
+/// Test-only panic injection: when `AUTTER_TEST_PANIC_IN_HOOK` matches the given
+/// proxy hook phase, panic to exercise the `catch_unwind` guard. Compiled out of
+/// release builds so it can never fire in production.
+#[cfg(debug_assertions)]
+fn maybe_inject_test_panic(phase: &str) {
+    if std::env::var("AUTTER_TEST_PANIC_IN_HOOK").as_deref() == Ok(phase) {
+        panic!("injected test panic in git proxy '{phase}' hook");
+    }
+}
+
+/// Run a proxy-side instrumentation hook, swallowing any panic so a bug in our
+/// instrumentation can never abort the user's underlying git command. Returns
+/// `None` if the hook panicked.
+///
+/// The panic is still reported to telemetry/Sentry via the global panic hook
+/// installed in `main` (which runs during unwinding, before we catch it here),
+/// so we lose visibility into nothing -- we only prevent the abort from
+/// propagating into the user's git invocation.
+fn run_proxy_hook_guarded<F, R>(phase: &str, hook: F) -> Option<R>
+where
+    F: FnOnce() -> R,
+{
+    let guarded = std::panic::AssertUnwindSafe(move || {
+        #[cfg(debug_assertions)]
+        maybe_inject_test_panic(phase);
+        hook()
+    });
+    match std::panic::catch_unwind(guarded) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            proxy_debug_log(&format!(
+                "panic in git proxy '{phase}' hook; continuing to real git so the command still succeeds"
+            ));
+            None
+        }
+    }
+}
+
 pub fn handle_git(args: &[String]) {
     // If we're being invoked from a shell completion context, bypass autter logic
     // and delegate directly to the real git so existing completion scripts work.
@@ -114,38 +163,61 @@ pub fn handle_git(args: &[String]) {
         exit_with_status(exit_status);
     }
 
-    let repository = find_repository(&parsed.global_args).ok();
-    let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
+    // Everything below this point is best-effort instrumentation wrapped around
+    // the real git invocation. A bug (panic) in any of it must never abort the
+    // user's git command, so each phase runs under catch_unwind: on panic we
+    // log, let the global panic hook report it to telemetry/Sentry, and fall
+    // through to running real git unchanged.
+    let prepared = run_proxy_hook_guarded("pre_state", || {
+        let repository = find_repository(&parsed.global_args).ok();
+        let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
 
-    let pre_state = worktree
-        .as_deref()
-        .and_then(crate::git::repo_state::read_head_state_for_worktree);
-    let invocation_id = crate::uuid::generate_v4();
+        let pre_state = worktree
+            .as_deref()
+            .and_then(crate::git::repo_state::read_head_state_for_worktree);
+        let invocation_id = crate::uuid::generate_v4();
 
-    // Send pre-state BEFORE running git so it's available when the daemon
-    // processes the atexit trace event and starts the wrapper state timeout.
-    send_wrapper_pre_state_to_daemon(&invocation_id, worktree.as_deref(), &pre_state);
+        // Send pre-state BEFORE running git so it's available when the daemon
+        // processes the atexit trace event and starts the wrapper state timeout.
+        send_wrapper_pre_state_to_daemon(&invocation_id, worktree.as_deref(), &pre_state);
+
+        (repository, worktree, invocation_id)
+    });
+
+    // If pre-state preparation panicked we have no invocation_id to correlate
+    // wrapper state, so fall back to a plain passthrough proxy. Git still runs
+    // and the user's command succeeds exactly as if autter weren't installed.
+    let Some((repository, worktree, invocation_id)) = prepared else {
+        let exit_status = proxy_to_git(args, false, None);
+        exit_with_status(exit_status);
+    };
 
     let exit_status = proxy_to_git(args, false, Some(&invocation_id));
 
-    let post_state = worktree
-        .as_deref()
-        .and_then(crate::git::repo_state::read_head_state_for_worktree);
+    // Post-git instrumentation is likewise guarded: git has already run by this
+    // point, so a panic here must not change the exit code we hand back to the
+    // user. On panic we simply skip the remaining instrumentation and exit
+    // mirroring git's own status.
+    run_proxy_hook_guarded("post_state", || {
+        let post_state = worktree
+            .as_deref()
+            .and_then(crate::git::repo_state::read_head_state_for_worktree);
 
-    send_wrapper_post_state_to_daemon(&invocation_id, worktree.as_deref(), &post_state);
+        send_wrapper_post_state_to_daemon(&invocation_id, worktree.as_deref(), &post_state);
 
-    // After a successful commit, wait briefly for the daemon to produce an
-    // authorship note so we can show stats inline (same UX as plain wrapper mode).
-    if exit_status.success()
-        && parsed.command.as_deref() == Some("commit")
-        && let Some(repo) = repository.as_ref()
-    {
-        maybe_show_async_post_commit_stats(&parsed, repo);
-    }
+        // After a successful commit, wait briefly for the daemon to produce an
+        // authorship note so we can show stats inline (same UX as plain wrapper mode).
+        if exit_status.success()
+            && parsed.command.as_deref() == Some("commit")
+            && let Some(repo) = repository.as_ref()
+        {
+            maybe_show_async_post_commit_stats(&parsed, repo);
+        }
 
-    // Warn (loudly, once per process) if this CLI is below the platform's
-    // minimum required version. Reads the cached releases payload — no network.
-    crate::commands::upgrade::maybe_warn_below_min_version();
+        // Warn (loudly, once per process) if this CLI is below the platform's
+        // minimum required version. Reads the cached releases payload — no network.
+        crate::commands::upgrade::maybe_warn_below_min_version();
+    });
 
     exit_with_status(exit_status);
 }
