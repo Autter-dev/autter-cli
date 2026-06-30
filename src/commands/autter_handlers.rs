@@ -29,6 +29,47 @@ pub fn handle_autter(args: &[String]) {
         return;
     }
 
+    // Extract leading global flags (e.g. `autter -C <path> --json status`) that
+    // appear before the subcommand, matching git's `git -C <path> <cmd>` model.
+    // The git proxy path is separate and never reaches here; for unmigrated
+    // subcommands any non-leading flags simply pass through untouched in `rest`.
+    let leading = match commands::arg_parser::pre_parse(
+        args,
+        commands::arg_parser::ScanMode::LeadingOnly,
+        true,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if let Some(path) = leading.flags.change_dir.as_deref()
+        && let Err(e) = std::env::set_current_dir(path)
+    {
+        eprintln!("error: cannot change to '{}': {}", path, e);
+        std::process::exit(1);
+    }
+    commands::arg_parser::merge_global_flags(&leading.flags);
+
+    // `-h`/`--help` before any subcommand: overview, or per-command help when a
+    // command name follows (`autter --help status`).
+    if leading.flags.help {
+        match leading.rest.first() {
+            Some(cmd) => commands::arg_parser::print_command_help(cmd),
+            None => commands::arg_parser::print_overview(),
+        }
+        std::process::exit(0);
+    }
+
+    // Re-bind `args` to the post-leading-globals view: `args[0]` is now the
+    // subcommand regardless of any leading global flags.
+    let args: &[String] = &leading.rest;
+    if args.is_empty() {
+        commands::arg_parser::print_overview();
+        std::process::exit(0);
+    }
+
     // Initialize the global telemetry handle so that observability and CAS
     // events are routed over the control socket instead of being written to
     // per-PID log files.
@@ -81,7 +122,11 @@ pub fn handle_autter(args: &[String]) {
 
     match args[0].as_str() {
         "help" | "--help" | "-h" => {
-            print_help();
+            match args.get(1) {
+                Some(cmd) => commands::arg_parser::print_command_help(cmd),
+                None => commands::arg_parser::print_overview(),
+            }
+            std::process::exit(0);
         }
         "version" => {
             // Human-friendly release info. Keep `--version`/`-v` bare below so
@@ -274,94 +319,33 @@ fn handle_notes_subcommand(args: &[String]) {
 }
 
 fn print_help() {
-    eprintln!("autter - git proxy with AI authorship tracking");
-    eprintln!();
-    eprintln!("Usage: autter <command> [args...]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  checkpoint         Checkpoint working changes and attribute author");
-    eprintln!(
-        "    Presets: claude, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
-    );
-    eprintln!(
-        "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
-    );
-    eprintln!("    human [pathspecs...]             Untracked/legacy human checkpoint");
-    eprintln!("    mock_ai [pathspecs...]           Test preset accepting optional file pathspecs");
-    eprintln!("    mock_known_human [pathspecs...]  Test preset for KnownHuman checkpoints");
-    eprintln!("  log [args...]      Show commit log with AI authorship stats");
-    eprintln!("                        Use --raw or --notes to include raw authorship note data");
-    eprintln!("  blame <file>       Git blame with AI authorship overlay");
-    eprintln!("  diff <commit|range>  Show diff with AI authorship annotations");
-    eprintln!("    <commit>              Diff from commit's parent to commit");
-    eprintln!("    <commit1>..<commit2>  Diff between two commits");
-    eprintln!("    --json                 Output in JSON format");
-    eprintln!(
-        "    --include-stats        Include commit_stats in JSON output (single commit only)"
-    );
-    eprintln!(
-        "    --all-prompts          Include all prompts from commit note in JSON output (single commit only)"
-    );
-    eprintln!("  stats [commit]     Show AI authorship statistics for a commit");
-    eprintln!("    --json                 Output in JSON format");
-    eprintln!("  file-changes       Show the most frequently changed files in this repo");
-    eprintln!("    --json                 Output in JSON format");
-    eprintln!("    --limit, -n <n>        Number of files to show (default: 20)");
-    eprintln!("  status             Show uncommitted AI authorship status (debug)");
-    eprintln!("    --json                 Output in JSON format");
-    eprintln!("  show <rev|range>   Display authorship logs for a revision or range");
-    eprintln!("  show-prompt <id>   Display a prompt record by its ID");
-    eprintln!("    --commit <rev>        Look in a specific commit only");
-    eprintln!(
-        "    --offset <n>          Skip n occurrences (0 = most recent, mutually exclusive with --commit)"
-    );
-    eprintln!("  config             View and manage autter configuration");
-    eprintln!("                        Show all config as formatted JSON");
-    eprintln!("    <key>                 Show specific config value (supports dot notation)");
-    eprintln!("    set <key> <value>     Set a config value (arrays: single value = [value])");
-    eprintln!("    --add <key> <value>   Add to array or upsert into object");
-    eprintln!("    unset <key>           Remove config value (reverts to default)");
-    eprintln!("  debug              Print support/debug diagnostics");
-    eprintln!("  bg                 Run and control autter background service");
-    eprintln!("  install-hooks      Install git hooks for AI authorship tracking");
-    eprintln!("    --skills               Also install agent skill files");
-    eprintln!("    --visual-studio-extension");
-    eprintln!("                           Also install the Visual Studio extension on Windows");
-    eprintln!("  uninstall-hooks    Remove autter hooks from all detected tools");
-    eprintln!("  ci                 Continuous integration utilities");
-    eprintln!("    github                 GitHub CI helpers");
-    eprintln!("  squash-authorship  Generate authorship log for squashed commits");
-    eprintln!(
-        "    <base_branch> <new_sha> <old_sha>  Required: base branch, new commit SHA, old commit SHA"
-    );
-    eprintln!("    --dry-run             Show what would be done without making changes");
-    eprintln!("  git-path           Print the path to the underlying git executable");
-    eprintln!("  upgrade            Check for updates and install if available");
-    eprintln!("    --force               Reinstall latest version even if already up to date");
-    eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
-    eprintln!("    --remote <name>       Explicit remote name (default: upstream or origin)");
-    eprintln!("    --json                Output result as JSON");
-    eprintln!("  onboard            Set up Autter (connect to the platform or run local)");
-    eprintln!("    --connect              Connect to the Autter platform (runs login)");
-    eprintln!("    --local                Use local-only mode (no uploads)");
-    eprintln!("    --force                Re-run onboarding even if already completed");
-    eprintln!("  login              Open the dashboard to create a sign-in token");
-    eprintln!("    --token <token>        Complete sign-in with a token from the dashboard");
-    eprintln!("  logout             Clear stored credentials");
-    eprintln!("  whoami             Show auth state and login identity");
-    eprintln!("  telemetry          Inspect or change anonymous telemetry");
-    eprintln!("    status                 Show on/off state and the local audit log path");
-    eprintln!("    log [-n N|--all]       Print the local audit log of data sent");
-    eprintln!("    on | off               Enable or disable telemetry");
-    eprintln!("  version, -v, --version     Print the autter version");
-    eprintln!("  help, -h, --help           Show this help message");
-    eprintln!();
+    commands::arg_parser::print_overview();
     std::process::exit(0);
 }
 
 fn handle_checkpoint(args: &[String]) {
     let perf = std::env::var("AUTTER_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
     let t0 = std::time::Instant::now();
+
+    // LeadingOnly: the preset name is a positional, so global-flag scanning
+    // stops at it and never touches `--hook-input` or pathspecs that follow.
+    let pp = match commands::arg_parser::pre_parse(
+        args,
+        commands::arg_parser::ScanMode::LeadingOnly,
+        false,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(0);
+        }
+    };
+    if pp.flags.help {
+        commands::arg_parser::print_command_help("checkpoint");
+        return;
+    }
+    commands::arg_parser::merge_global_flags(&pp.flags);
+    let args = &pp.rest;
 
     let mut hook_input = None;
     let mut i = 0;
@@ -736,6 +720,27 @@ fn handle_push_authorship_notes_internal(args: &[String]) {
 }
 
 fn handle_ai_blame(args: &[String]) {
+    // LeadingOnly + no -C recognition: blame forwards git-style flags (e.g. `-C`
+    // means copy detection here). Any leading `-C <path>` was already consumed
+    // at the top level in handle_autter.
+    let pp = match commands::arg_parser::pre_parse(
+        args,
+        commands::arg_parser::ScanMode::LeadingOnly,
+        false,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if pp.flags.help {
+        commands::arg_parser::print_command_help("blame");
+        return;
+    }
+    commands::arg_parser::merge_global_flags(&pp.flags);
+    let args = &pp.rest;
+
     if args.is_empty() {
         eprintln!("Error: blame requires a file argument");
         std::process::exit(1);
@@ -762,6 +767,9 @@ fn handle_ai_blame(args: &[String]) {
             std::process::exit(1);
         }
     };
+    // Honor a global `--json` supplied before the file positional (stripped by
+    // the shared pre-parser) as well as blame's own trailing `--json`.
+    options.json = options.json || commands::arg_parser::json();
 
     // Auto-detect ignore-revs-file if not explicitly provided, not disabled via --no-ignore-revs-file,
     // and git version supports --ignore-revs-file (git >= 2.23)
@@ -824,6 +832,24 @@ fn handle_ai_blame(args: &[String]) {
 }
 
 fn handle_ai_diff(args: &[String]) {
+    let pp = match commands::arg_parser::pre_parse(
+        args,
+        commands::arg_parser::ScanMode::LeadingOnly,
+        false,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if pp.flags.help {
+        commands::arg_parser::print_command_help("diff");
+        return;
+    }
+    commands::arg_parser::merge_global_flags(&pp.flags);
+    let args = &pp.rest;
+
     let current_dir = env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .to_string_lossy()
@@ -843,6 +869,21 @@ fn handle_ai_diff(args: &[String]) {
 }
 
 fn handle_stats(args: &[String]) {
+    let pp =
+        match commands::arg_parser::pre_parse(args, commands::arg_parser::ScanMode::Full, false) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(2);
+            }
+        };
+    if pp.flags.help {
+        commands::arg_parser::print_command_help("stats");
+        return;
+    }
+    commands::arg_parser::merge_global_flags(&pp.flags);
+    let args = &pp.rest;
+
     // Find the git repository
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
@@ -852,7 +893,7 @@ fn handle_stats(args: &[String]) {
         }
     };
     // Parse stats-specific arguments
-    let mut json_output = false;
+    let json_output = commands::arg_parser::json();
     let mut commit_sha = None;
     let mut commit_range: Option<CommitRange> = None;
     let mut ignore_patterns: Vec<String> = Vec::new();
@@ -860,10 +901,6 @@ fn handle_stats(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--json" => {
-                json_output = true;
-                i += 1;
-            }
             "--ignore" => {
                 // Collect all arguments after --ignore until we hit another flag or commit SHA
                 // This supports shell glob expansion: `--ignore *.lock` expands to `--ignore Cargo.lock package.lock`

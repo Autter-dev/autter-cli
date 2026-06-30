@@ -7,13 +7,28 @@ use crate::git::find_repository;
 const DEFAULT_LIMIT: usize = 20;
 
 pub fn handle_file_changes(args: &[String]) {
-    let mut json_output = false;
+    use crate::commands::arg_parser::{self, ScanMode};
+
+    let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if pp.flags.help {
+        arg_parser::print_command_help("file-changes");
+        return;
+    }
+    arg_parser::merge_global_flags(&pp.flags);
+
+    let args = &pp.rest;
+    let json_output = arg_parser::json();
     let mut limit = DEFAULT_LIMIT;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--json" => json_output = true,
             "--limit" | "-n" => {
                 i += 1;
                 if i >= args.len() {

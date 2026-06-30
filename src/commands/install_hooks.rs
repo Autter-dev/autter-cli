@@ -1,3 +1,4 @@
+use crate::commands::arg_parser::{paint, paint_err};
 use crate::config;
 use crate::daemon::DaemonConfig;
 use crate::error::AutterError;
@@ -468,7 +469,7 @@ async fn async_run_install(
     let mut detailed_results: Vec<(String, InstallResult)> = Vec::new();
 
     // === Coding Agents ===
-    println!("\n\x1b[1mCoding Agents\x1b[0m");
+    println!("\n{}", paint("1", "Coding Agents"));
 
     let installers = get_all_installers();
     let mut installed_tools: HashSet<String> = HashSet::new();
@@ -650,9 +651,12 @@ async fn async_run_install(
     if !any_checked {
         println!("No compatible IDEs or agent configurations detected. Nothing to install.");
     } else if has_changes && options.dry_run {
-        println!("\n\x1b[33m⚠ Dry-run mode (default). No changes were made.\x1b[0m");
+        println!(
+            "\n{}",
+            paint("33", "⚠ Dry-run mode (default). No changes were made.")
+        );
         println!("To apply these changes, run:");
-        println!("\x1b[1m  autter install-hooks --dry-run=false\x1b[0m");
+        println!("{}", paint("1", "  autter install-hooks --dry-run=false"));
     }
 
     // Check for running agents that had hooks updated and warn about restart
@@ -665,14 +669,18 @@ async fn async_run_install(
             if !pids.is_empty() {
                 if !any_running {
                     println!(
-                        "\n\x1b[33m⚠ The following agents are currently running and must be restarted:\x1b[0m"
+                        "\n{}",
+                        paint(
+                            "33",
+                            "⚠ The following agents are currently running and must be restarted:"
+                        )
                     );
                     any_running = true;
                 }
                 let pid_list: Vec<String> = pids.iter().map(|(pid, _)| pid.to_string()).collect();
                 println!(
-                    "  \x1b[1m{}\x1b[0m (PID: {})",
-                    agent_name,
+                    "  {} (PID: {})",
+                    paint("1", agent_name),
                     pid_list.join(", ")
                 );
             }
@@ -681,7 +689,11 @@ async fn async_run_install(
         if any_running {
             println!();
             println!(
-                "\x1b[33mRestart the agents listed above for autter attribution to take effect.\x1b[0m"
+                "{}",
+                paint(
+                    "33",
+                    "Restart the agents listed above for autter attribution to take effect."
+                )
             );
             println!(
                 "Any work done before installing autter (or before restarting) will be attributed as human."
@@ -745,19 +757,40 @@ fn warn_if_git_version_too_old() {
             let (vmaj, vmin, vpatch) = v;
             eprintln!();
             eprintln!(
-                "\x1b[1;31m╔══════════════════════════════════════════════════════════════╗\x1b[0m"
+                "{}",
+                paint_err(
+                    "1;31",
+                    "╔══════════════════════════════════════════════════════════════╗"
+                )
             );
             eprintln!(
-                "\x1b[1;31m║  WARNING: git version too old — autter will not work         ║\x1b[0m"
+                "{}",
+                paint_err(
+                    "1;31",
+                    "║  WARNING: git version too old — autter will not work         ║"
+                )
             );
             eprintln!(
-                "\x1b[1;31m╚══════════════════════════════════════════════════════════════╝\x1b[0m"
+                "{}",
+                paint_err(
+                    "1;31",
+                    "╚══════════════════════════════════════════════════════════════╝"
+                )
             );
             eprintln!(
-                "\x1b[1;31mDetected git {}.{}.{} — autter requires git >= {}.{}.{}\x1b[0m",
-                vmaj, vmin, vpatch, maj, min, patch
+                "{}",
+                paint_err(
+                    "1;31",
+                    &format!(
+                        "Detected git {}.{}.{} — autter requires git >= {}.{}.{}",
+                        vmaj, vmin, vpatch, maj, min, patch
+                    )
+                )
             );
-            eprintln!("\x1b[33mPlease upgrade git before using autter:\x1b[0m");
+            eprintln!(
+                "{}",
+                paint_err("33", "Please upgrade git before using autter:")
+            );
             eprintln!("  macOS:   brew install git");
             eprintln!(
                 "  Ubuntu:  sudo add-apt-repository ppa:git-core/ppa && sudo apt-get update && sudo apt-get install git"
@@ -809,7 +842,7 @@ async fn async_run_uninstall(
     }
 
     // === Coding Agents ===
-    println!("\n\x1b[1mCoding Agents\x1b[0m");
+    println!("\n{}", paint("1", "Coding Agents"));
 
     let installers = get_all_installers();
 
@@ -898,9 +931,12 @@ async fn async_run_uninstall(
     if !any_checked {
         println!("No autter hooks found to uninstall.");
     } else if has_changes && dry_run {
-        println!("\n\x1b[33m⚠ Dry-run mode (default). No changes were made.\x1b[0m");
+        println!(
+            "\n{}",
+            paint("33", "⚠ Dry-run mode (default). No changes were made.")
+        );
         println!("To apply these changes, run:");
-        println!("\x1b[1m  autter uninstall-hooks --dry-run=false\x1b[0m");
+        println!("{}", paint("1", "  autter uninstall-hooks --dry-run=false"));
     } else if !has_changes {
         println!("All autter hooks have been removed.");
     }
