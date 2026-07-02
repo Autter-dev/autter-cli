@@ -33,7 +33,7 @@ pub fn handle_notes_migrate(args: &[String]) {
             other => {
                 eprintln!("error: unknown option '{}'", other);
                 eprintln!("Run 'autter notes migrate --help' for usage");
-                std::process::exit(1);
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
             }
         }
     }

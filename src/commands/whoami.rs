@@ -14,7 +14,7 @@ pub fn handle_whoami(args: &[String]) {
     if !args.is_empty() {
         eprintln!("Error: unknown whoami argument(s): {}", args.join(" "));
         print_help();
-        std::process::exit(1);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
     // Use Config::fresh() to support runtime config updates (daemon mode)

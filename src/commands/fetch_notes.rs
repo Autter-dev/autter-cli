@@ -25,11 +25,11 @@ pub fn handle_fetch_notes(args: &[String]) {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("Error: --remote requires a value");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
                 if remote.is_some() {
                     eprintln!("Error: remote specified more than once");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
                 remote = Some(args[i].clone());
             }
@@ -40,7 +40,7 @@ pub fn handle_fetch_notes(args: &[String]) {
             other if other.starts_with('-') => {
                 eprintln!("Error: unknown option '{}'", other);
                 eprintln!("Run 'autter fetch-notes --help' for usage");
-                std::process::exit(1);
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
             }
             // Positional argument treated as remote name
             _ => {
@@ -48,7 +48,7 @@ pub fn handle_fetch_notes(args: &[String]) {
                     remote = Some(args[i].clone());
                 } else {
                     eprintln!("Error: unexpected argument '{}'", args[i]);
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             }
         }

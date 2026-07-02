@@ -24,7 +24,7 @@ pub fn handle_squash_authorship(args: &[String]) {
                     old_sha = Some(args[i].clone());
                 } else {
                     eprintln!("Unknown squash-authorship argument: {}", args[i]);
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
                 i += 1;
             }
@@ -39,7 +39,7 @@ pub fn handle_squash_authorship(args: &[String]) {
             eprintln!(
                 "Usage: autter squash-authorship <base_branch> <new_sha> <old_sha> [--dry-run]"
             );
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     };
 
@@ -50,7 +50,7 @@ pub fn handle_squash_authorship(args: &[String]) {
             eprintln!(
                 "Usage: autter squash-authorship <base_branch> <new_sha> <old_sha> [--dry-run]"
             );
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     };
 
@@ -61,7 +61,7 @@ pub fn handle_squash_authorship(args: &[String]) {
             eprintln!(
                 "Usage: autter squash-authorship <base_branch> <new_sha> <old_sha> [--dry-run]"
             );
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     };
 
