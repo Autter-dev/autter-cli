@@ -18,19 +18,19 @@ pub fn handle_file_changes(args: &[String]) {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("error: --limit requires a value");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
                 limit = match args[i].parse::<usize>() {
                     Ok(n) if n > 0 => n,
                     _ => {
                         eprintln!("error: --limit must be a positive integer");
-                        std::process::exit(1);
+                        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                     }
                 };
             }
             other => {
                 eprintln!("error: unknown argument: {}", other);
-                std::process::exit(1);
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
             }
         }
         i += 1;

@@ -692,7 +692,7 @@ pub fn run_with_args(args: &[String]) {
             _ => {
                 eprintln!("Unknown argument: {}", arg);
                 eprintln!("Usage: autter upgrade [--force]");
-                std::process::exit(1);
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
             }
         }
     }

@@ -63,7 +63,7 @@ pub fn handle_daemon(args: &[String]) {
         _ => {
             eprintln!("Unknown subcommand: {}", args[0]);
             print_help();
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     }
 }

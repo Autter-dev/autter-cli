@@ -242,8 +242,8 @@ pub fn handle_autter(args: &[String]) {
             handle_notes_subcommand(&args[1..]);
         }
         _ => {
-            println!("Unknown autter command: {}", args[0]);
-            std::process::exit(1);
+            eprintln!("Unknown autter command: {}", args[0]);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     }
 }
@@ -268,7 +268,7 @@ fn handle_notes_subcommand(args: &[String]) {
         other => {
             eprintln!("Unknown autter notes subcommand: {}", other);
             eprintln!("Run 'autter notes --help' for usage.");
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     }
 }
@@ -359,6 +359,18 @@ fn print_help() {
     std::process::exit(0);
 }
 
+/// Run a checkpoint.
+///
+/// Unlike other user-invoked subcommands, `checkpoint` deliberately exits
+/// [`crate::commands::EXIT_SUCCESS`] (`0`) on *every* failure path — bad
+/// `--hook-input`, an unknown preset, empty stdin, an unreachable background
+/// worker, an excluded repository, etc. This is intentional: `checkpoint` is
+/// invoked from inside AI-agent editor hooks (and our own git proxy), where a
+/// non-zero exit would surface as an error in the user's editor or break the
+/// agent's edit flow. Attribution data is best-effort, so when we cannot record
+/// it we degrade silently rather than failing the host process. Do NOT change
+/// these to `1`/`2`; see `crate::commands` for the project-wide exit-code
+/// policy that governs the *other* (user-facing) subcommands.
 fn handle_checkpoint(args: &[String]) {
     let perf = std::env::var("AUTTER_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
     let t0 = std::time::Instant::now();
@@ -613,7 +625,7 @@ fn emit_machine_json_error(message: impl AsRef<str>) -> ! {
     } else {
         eprintln!(r#"{{"error":"failed to serialize error payload"}}"#);
     }
-    std::process::exit(1);
+    std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
 }
 
 fn print_machine_json(value: &serde_json::Value) {
@@ -738,7 +750,7 @@ fn handle_push_authorship_notes_internal(args: &[String]) {
 fn handle_ai_blame(args: &[String]) {
     if args.is_empty() {
         eprintln!("Error: blame requires a file argument");
-        std::process::exit(1);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
     // Find the git repository from current directory
@@ -759,7 +771,7 @@ fn handle_ai_blame(args: &[String]) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Failed to parse blame arguments: {}", e);
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     };
 
@@ -888,7 +900,7 @@ fn handle_stats(args: &[String]) {
                 }
                 if !found_pattern {
                     eprintln!("--ignore requires at least one pattern argument");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             }
             _ => {
@@ -916,7 +928,7 @@ fn handle_stats(args: &[String]) {
                             }
                         } else {
                             eprintln!("Invalid commit range format. Expected: <commit>..<commit>");
-                            std::process::exit(1);
+                            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                         }
                     } else {
                         commit_sha = Some(normalize_head_rev(arg));
@@ -924,7 +936,7 @@ fn handle_stats(args: &[String]) {
                     i += 1;
                 } else {
                     eprintln!("Unknown stats argument: {}", args[i]);
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             }
         }
@@ -1012,7 +1024,7 @@ fn handle_git_hooks(args: &[String]) {
                         status,
                         report.managed_hooks_path.to_string_lossy()
                     );
-                    std::process::exit(0);
+                    std::process::exit(crate::commands::EXIT_SUCCESS);
                 }
                 Err(e) => {
                     eprintln!("Failed to remove repo hooks: {}", e);
@@ -1023,7 +1035,7 @@ fn handle_git_hooks(args: &[String]) {
         _ => {
             eprintln!("The git core hooks feature has been sunset.");
             eprintln!("Usage: autter git-hooks remove");
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     }
 }

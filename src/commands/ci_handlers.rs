@@ -196,7 +196,7 @@ fn handle_ci_local(args: &[String]) {
                     return Some(event_args[i + 1].clone());
                 } else {
                     eprintln!("Missing value for flag {}", name);
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             }
             i += 1;
@@ -226,7 +226,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--merge-commit-sha is required");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -234,7 +234,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--base-ref is required (e.g., main)");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -243,7 +243,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--head-ref is required");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -251,7 +251,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--head-sha is required");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -259,7 +259,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--base-sha is required");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -308,7 +308,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--previous-head-sha is required");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -318,7 +318,7 @@ fn handle_ci_local(args: &[String]) {
                 Some(v) => v,
                 None => {
                     eprintln!("--head-sha is required");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
             };
 
@@ -331,7 +331,7 @@ fn handle_ci_local(args: &[String]) {
                         base_sha.clone()
                     } else {
                         eprintln!("--base-ref is required");
-                        std::process::exit(1);
+                        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                     }
                 }
             };
@@ -406,7 +406,7 @@ fn print_ci_help_and_exit() -> ! {
     eprintln!(
         "                            [--remote <name-or-url>] [--skip-fetch-notes] [--skip-fetch-sync-refs] [--skip-fetch] [--skip-push]"
     );
-    std::process::exit(1);
+    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
 }
 
 fn print_ci_local_help_and_exit() -> ! {
@@ -427,7 +427,7 @@ fn print_ci_local_help_and_exit() -> ! {
     eprintln!(
         "         [--remote <name-or-url>] [--skip-fetch-notes] [--skip-fetch-sync-refs] [--skip-fetch] [--skip-push]"
     );
-    std::process::exit(1);
+    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
 }
 
 fn print_ci_github_help_and_exit() -> ! {
@@ -439,7 +439,7 @@ fn print_ci_github_help_and_exit() -> ! {
     eprintln!("  run [--no-cleanup]   Run GitHub CI in current repo");
     eprintln!("                       --no-cleanup  Skip teardown after run");
     eprintln!("  install              Install/update workflow in current repo");
-    std::process::exit(1);
+    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
 }
 
 fn print_ci_gitlab_help_and_exit() -> ! {
@@ -451,5 +451,5 @@ fn print_ci_gitlab_help_and_exit() -> ! {
     eprintln!("  run [--no-cleanup]   Run GitLab CI in current repo");
     eprintln!("                       --no-cleanup  Skip teardown after run");
     eprintln!("  install              Print YAML snippet to add to .gitlab-ci.yml");
-    std::process::exit(1);
+    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
 }

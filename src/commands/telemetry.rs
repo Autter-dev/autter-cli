@@ -22,7 +22,7 @@ pub fn handle_telemetry(args: &[String]) {
         Some(other) => {
             eprintln!("Unknown telemetry subcommand: {other}");
             print_help();
-            std::process::exit(1);
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     }
 }

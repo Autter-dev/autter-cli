@@ -205,7 +205,7 @@ pub fn handle_diff(repo: &Repository, args: &[String]) -> Result<(), AutterError
         eprintln!("Error: diff requires a commit or commit range argument");
         eprintln!("Usage: autter diff <commit>");
         eprintln!("       autter diff <commit1>..<commit2>");
-        std::process::exit(1);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
     let parsed = parse_diff_args(args)?;
