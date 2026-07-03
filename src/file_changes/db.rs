@@ -10,8 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 const SCHEMA_VERSION: usize = 1;
 
-const MIGRATIONS: &[&str] = &[
-    r#"
+const MIGRATIONS: &[&str] = &[r#"
     CREATE TABLE IF NOT EXISTS file_change_counts (
         repo_url        TEXT NOT NULL,
         file_path       TEXT NOT NULL,
@@ -34,8 +33,7 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX IF NOT EXISTS idx_file_change_counts_pending
         ON file_change_counts (synced, next_retry_at) WHERE synced = 0;
-    "#,
-];
+    "#];
 
 static FILE_CHANGES_DB: OnceLock<Mutex<FileChangesDatabase>> = OnceLock::new();
 
@@ -264,7 +262,10 @@ impl FileChangesDatabase {
         Ok(results)
     }
 
-    pub fn dequeue_pending(&mut self, limit: usize) -> Result<Vec<PendingFileChangeRow>, AutterError> {
+    pub fn dequeue_pending(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<PendingFileChangeRow>, AutterError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -309,7 +310,11 @@ impl FileChangesDatabase {
         Ok(rows)
     }
 
-    pub fn mark_synced(&mut self, repo_url: &str, file_paths: &[String]) -> Result<(), AutterError> {
+    pub fn mark_synced(
+        &mut self,
+        repo_url: &str,
+        file_paths: &[String],
+    ) -> Result<(), AutterError> {
         if file_paths.is_empty() {
             return Ok(());
         }
@@ -389,9 +394,7 @@ mod tests {
         db.record_change("https://github.com/user/repo", "src/b.rs", 3, 0, 1002)
             .unwrap();
 
-        let top = db
-            .top_files("https://github.com/user/repo", 10)
-            .unwrap();
+        let top = db.top_files("https://github.com/user/repo", 10).unwrap();
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].file_path, "src/a.rs");
         assert_eq!(top[0].change_count, 2);

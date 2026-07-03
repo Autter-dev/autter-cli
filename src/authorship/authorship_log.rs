@@ -1,6 +1,6 @@
 use crate::authorship::working_log::AgentId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,14 @@ pub enum LineRange {
 }
 
 impl LineRange {
+    /// Number of lines this range covers (inclusive).
+    pub fn line_count(&self) -> u32 {
+        match self {
+            LineRange::Single(_) => 1,
+            LineRange::Range(start, end) => end.saturating_sub(*start) + 1,
+        }
+    }
+
     pub fn contains(&self, line: u32) -> bool {
         match self {
             LineRange::Single(l) => *l == line,
@@ -212,7 +220,46 @@ pub struct PromptRecord {
     pub custom_attributes: Option<HashMap<String, String>>,
 }
 
-/// Session record for lightweight session tracking without stats
+/// Per-file line statistics for a session. Mirrors the top-level session counters
+/// but scoped to a single file so the backend can render a per-file breakdown.
+///
+/// `total_additions` / `total_deletions` are the raw added/removed line counts the
+/// session produced in this file (post-commit coordinate space for additions). They
+/// give net change and churn that the attestation ranges (additions only) cannot.
+/// `accepted_lines` is how many of the session's lines survived to the committed
+/// state; `overriden_lines` is how many of this session's lines were later overwritten
+/// (by a human or another session). Field name `overriden_lines` keeps the existing
+/// (intentionally misspelled) schema convention used by [`PromptRecord`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FileStats {
+    #[serde(default)]
+    pub total_additions: u32,
+    #[serde(default)]
+    pub total_deletions: u32,
+    #[serde(default)]
+    pub accepted_lines: u32,
+    #[serde(default)]
+    pub overriden_lines: u32,
+}
+
+/// Aggregate line statistics for a session, plus a per-file breakdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SessionStats {
+    #[serde(default)]
+    pub total_additions: u32,
+    #[serde(default)]
+    pub total_deletions: u32,
+    #[serde(default)]
+    pub accepted_lines: u32,
+    #[serde(default)]
+    pub overriden_lines: u32,
+    /// Per-file breakdown keyed by repo-relative POSIX path. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, FileStats>,
+}
+
+/// Session record for session tracking. `stats` carries the per-session (and
+/// per-file) line statistics consumed by the backend's AI Metrics view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub agent_id: AgentId,
@@ -220,20 +267,25 @@ pub struct SessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SessionStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
 }
 
 impl SessionRecord {
-    /// Convert to a PromptRecord (with zeroed stats) for backwards-compatible lookup
+    /// Convert to a PromptRecord, surfacing the session's stats (if any) into the
+    /// flat prompt counters for backwards-compatible lookup and for mirroring into
+    /// the documented `metadata.prompts` map.
     pub fn to_prompt_record(&self) -> PromptRecord {
+        let stats = self.stats.clone().unwrap_or_default();
         PromptRecord {
             agent_id: self.agent_id.clone(),
             human_author: self.human_author.clone(),
             messages_url: self.messages_url.clone(),
-            total_additions: 0,
-            total_deletions: 0,
-            accepted_lines: 0,
-            overriden_lines: 0,
+            total_additions: stats.total_additions,
+            total_deletions: stats.total_deletions,
+            accepted_lines: stats.accepted_lines,
+            overriden_lines: stats.overriden_lines,
             custom_attributes: self.custom_attributes.clone(),
         }
     }

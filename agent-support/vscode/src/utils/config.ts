@@ -15,6 +15,12 @@ export class Config {
     return !!this.getRoot().get<boolean>("experiments.aiTabTracking");
   }
 
+  static isFileAiPercentEnabled(): boolean {
+    // Defaults to true when unset.
+    const value = this.getRoot().get<boolean>("showFileAiPercent");
+    return value === undefined ? true : value;
+  }
+
   static getBlameMode(): BlameMode {
     const mode = this.getRoot().get<string>("blameMode");
     if (mode === 'off' || mode === 'line' || mode === 'all') {

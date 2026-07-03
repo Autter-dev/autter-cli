@@ -53,7 +53,11 @@ pub fn handle_file_changes(args: &[String]) {
     }
 }
 
-fn run(repo: &crate::git::repository::Repository, limit: usize, json_output: bool) -> Result<(), AutterError> {
+fn run(
+    repo: &crate::git::repository::Repository,
+    limit: usize,
+    json_output: bool,
+) -> Result<(), AutterError> {
     let repo_key = resolve_repo_key(repo);
     let rows = top_changed_files(&repo_key, limit)?;
 
@@ -96,6 +100,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_default_limit_is_positive() {
         assert!(DEFAULT_LIMIT > 0);
     }

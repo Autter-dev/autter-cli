@@ -18,7 +18,7 @@ pub fn handle_personal_dashboard(_args: &[String]) {
 }
 
 /// Attempt to open a URL in the system's default browser
-fn open_browser(url: &str) -> Result<(), String> {
+pub(crate) fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")

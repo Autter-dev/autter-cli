@@ -116,7 +116,9 @@ fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<Stri
         return Ok(None);
     }
 
-    let cas_object = CasMessagesObject { messages: messages.clone() };
+    let cas_object = CasMessagesObject {
+        messages: messages.clone(),
+    };
     let mut payload = serde_json::to_value(&cas_object)
         .map_err(|e| AutterError::Generic(format!("Failed to serialize transcript: {e}")))?;
 
