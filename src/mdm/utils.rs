@@ -798,6 +798,47 @@ pub fn get_current_binary_path() -> Result<PathBuf, AutterError> {
     Ok(clean_path(canonical))
 }
 
+/// Path where the installer places the stable autter binary, if present.
+pub fn stable_install_binary_path() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "autter.exe"
+    } else {
+        "autter"
+    };
+    let path = home_dir().join(".autter").join("bin").join(name);
+    path.is_file().then_some(path)
+}
+
+/// True when `path` points inside a cargo build directory
+/// (`target/debug` or `target/release`).
+pub fn is_cargo_build_artifact(path: &Path) -> bool {
+    let comps: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    comps
+        .windows(2)
+        .any(|w| w[0] == "target" && (w[1] == "debug" || w[1] == "release"))
+}
+
+/// Binary path to persist into agent hook configs.
+///
+/// Hook configs outlive the process that wrote them, so a cargo build
+/// artifact (e.g. a `target/debug` binary in a temporary worktree) must not
+/// be written into them — once that directory is deleted, every hook
+/// invocation silently fails and checkpoints stop being captured. When the
+/// current executable is a cargo artifact and a stable installed binary
+/// exists, prefer the stable one.
+pub fn resolve_hook_binary_path() -> Result<PathBuf, AutterError> {
+    let current = get_current_binary_path()?;
+    if is_cargo_build_artifact(&current)
+        && let Some(stable) = stable_install_binary_path()
+    {
+        return Ok(clean_path(stable));
+    }
+    Ok(current)
+}
+
 /// Update VS Code chat hook settings in a settings.json/jsonc file.
 ///
 /// Ensures `"chat.useHooks"` is set to `true`.
@@ -951,6 +992,29 @@ mod tests {
         // Claude Code 1.x should fail
         let old_claude = parse_version("1.9.9").unwrap();
         assert!(!version_meets_requirement(old_claude, MIN_CLAUDE_VERSION));
+    }
+
+    #[test]
+    fn test_is_cargo_build_artifact() {
+        assert!(is_cargo_build_artifact(Path::new(
+            "/Users/dev/worktrees/foo/autter-cli/target/debug/autter"
+        )));
+        assert!(is_cargo_build_artifact(Path::new(
+            "/home/dev/autter-cli/target/release/autter"
+        )));
+        #[cfg(windows)]
+        assert!(is_cargo_build_artifact(Path::new(
+            r"C:\dev\autter-cli\target\debug\autter.exe"
+        )));
+
+        assert!(!is_cargo_build_artifact(Path::new(
+            "/Users/dev/.autter/bin/autter"
+        )));
+        assert!(!is_cargo_build_artifact(Path::new("/usr/local/bin/autter")));
+        // "target" not immediately followed by debug/release
+        assert!(!is_cargo_build_artifact(Path::new(
+            "/opt/target/tools/autter"
+        )));
     }
 
     #[test]

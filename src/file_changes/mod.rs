@@ -66,6 +66,26 @@ pub fn flush_pending_to_cloud() {
         None => return,
     };
 
+    // Cheap local check first: with nothing queued, skip building the API
+    // client entirely (constructing it can trigger a token refresh).
+    let db = match FileChangesDatabase::global() {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(%e, "file-changes: failed to get DB");
+            return;
+        }
+    };
+    let pending_count = {
+        let Ok(lock) = db.lock() else {
+            tracing::warn!("file-changes: DB lock poisoned");
+            return;
+        };
+        lock.count_pending().unwrap_or(0)
+    };
+    if pending_count == 0 {
+        return;
+    }
+
     let default_client = ApiClient::new(crate::api::client::ApiContext::new(Some(
         backend_url.clone(),
     )));
@@ -73,23 +93,17 @@ pub fn flush_pending_to_cloud() {
         return;
     }
 
-    let pending = match FileChangesDatabase::global() {
-        Ok(db) => match db.lock() {
-            Ok(mut lock) => match lock.dequeue_pending(100) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!(%e, "file-changes: failed to dequeue pending rows");
-                    return;
-                }
-            },
+    let pending = {
+        let Ok(mut lock) = db.lock() else {
+            tracing::warn!("file-changes: DB lock poisoned");
+            return;
+        };
+        match lock.dequeue_pending(100) {
+            Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!("file-changes: DB lock poisoned: {}", e);
+                tracing::warn!(%e, "file-changes: failed to dequeue pending rows");
                 return;
             }
-        },
-        Err(e) => {
-            tracing::warn!(%e, "file-changes: failed to get DB");
-            return;
         }
     };
 

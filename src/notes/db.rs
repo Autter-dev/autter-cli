@@ -342,6 +342,18 @@ impl NotesDatabase {
 
     // ----- Queue operations -----
 
+    /// Number of notes still waiting to be uploaded (excluding rows that
+    /// exhausted their retry budget). Cheap gate for the daemon flush loop so
+    /// an empty queue never triggers an auth check.
+    pub fn count_pending(&self) -> Result<i64, AutterError> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM notes WHERE synced = 0 AND attempts < 6",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Lock and return a batch of pending notes for upload.
     ///
     /// Sets `processing_started_at` on selected rows so concurrent workers do not

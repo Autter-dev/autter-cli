@@ -5,7 +5,7 @@ use crate::mdm::agents::get_all_installers;
 use crate::mdm::hook_installer::HookInstallerParams;
 use crate::mdm::skills_installer;
 use crate::mdm::spinner::{Spinner, print_diff};
-use crate::mdm::utils::get_current_binary_path;
+use crate::mdm::utils::resolve_hook_binary_path;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -318,8 +318,9 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
         let _ = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
     }
 
-    // Get absolute path to the current binary
-    let binary_path = get_current_binary_path()?;
+    // Hook configs need a binary path that outlives this process; prefer the
+    // stable installed binary when running from a cargo build directory.
+    let binary_path = resolve_hook_binary_path()?;
     persist_install_config(&binary_path, options.dry_run)?;
     let params = HookInstallerParams { binary_path };
 
@@ -448,8 +449,9 @@ pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterE
         }
     }
 
-    // Get absolute path to the current binary
-    let binary_path = get_current_binary_path()?;
+    // Match the path resolution used at install time so uninstall targets the
+    // same hook entries.
+    let binary_path = resolve_hook_binary_path()?;
     let params = HookInstallerParams { binary_path };
 
     // Run async operations with smol and convert result

@@ -58,14 +58,6 @@ impl TelemetryBuffer {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.errors.is_empty()
-            && self.performances.is_empty()
-            && self.messages.is_empty()
-            && self.metrics.is_empty()
-            && self.cas_records.is_empty()
-    }
-
     fn ingest_envelopes(&mut self, envelopes: Vec<TelemetryEnvelope>) {
         for envelope in envelopes {
             match envelope {
@@ -264,11 +256,14 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
     loop {
         ticker.tick().await;
 
+        // Take whatever in-memory telemetry accumulated this tick (possibly
+        // nothing). The flush must still run on an empty buffer: the durable
+        // queues (CAS transcripts, authorship notes, file-change aggregates)
+        // are drained inside flush_telemetry_batch, and gating them on
+        // in-memory activity left them stranded whenever the daemon was
+        // otherwise idle.
         let snapshot = {
             let mut buf = buffer.lock().await;
-            if buf.is_empty() {
-                continue;
-            }
             buf.take()
         };
 
@@ -285,7 +280,6 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
 
 fn flush_telemetry_batch(batch: TelemetryBuffer) {
     let config = Config::get();
-    let distinct_id = get_or_create_distinct_id();
 
     // Flush metrics (always processed — uploaded or stored in SQLite)
     if !batch.metrics.is_empty() {
@@ -297,6 +291,7 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
         !batch.errors.is_empty() || !batch.performances.is_empty() || !batch.messages.is_empty();
 
     if has_sentry_or_posthog {
+        let distinct_id = get_or_create_distinct_id();
         flush_sentry_and_posthog(
             config,
             &distinct_id,
@@ -311,15 +306,74 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
         flush_cas(batch.cas_records);
     }
 
-    // Drain the durable CAS queue (the post-commit transcript bridge enqueues
-    // here). This reads directly from the internal DB, mirroring flush_notes.
-    flush_cas_queue();
+    // Drain the durable queues. Skipped while the auth backoff is active so an
+    // expired login doesn't trigger a token-refresh network call on every tick.
+    if !durable_sync_auth_backoff_active() {
+        // Drain the durable CAS queue (the post-commit transcript bridge enqueues
+        // here). This reads directly from the internal DB, mirroring flush_notes.
+        flush_cas_queue();
 
-    // Flush pending notes (reads directly from notes-db; no-op when kind != Http).
-    flush_notes();
+        // Flush pending notes (reads directly from notes-db; no-op when kind != Http).
+        flush_notes();
 
-    // Flush pending file change aggregates to the org database.
-    crate::file_changes::flush_pending_to_cloud();
+        // Flush pending file change aggregates to the org database.
+        crate::file_changes::flush_pending_to_cloud();
+    }
+}
+
+// ----- Durable-queue auth backoff -------------------------------------------
+//
+// The durable queues (CAS transcripts, authorship notes, file-change
+// aggregates) are drained on every flush tick, even when no in-memory
+// telemetry accumulated. Each drain attempt can trigger a token-refresh
+// network call, so after an unauthenticated attempt we back off instead of
+// retrying every 3 seconds — and emit a rate-limited warning so a stalled
+// sync is visible in the daemon log. (This used to be a debug-level message,
+// which let queued transcripts and notes sit pending for weeks unnoticed
+// after a login expired.)
+
+/// Unix timestamp before which auth-gated durable-queue flushes are skipped.
+static DURABLE_SYNC_AUTH_RETRY_AFTER: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+/// Unix timestamp of the last "sync blocked" warning, to rate-limit it.
+static DURABLE_SYNC_LAST_AUTH_WARN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+const DURABLE_SYNC_AUTH_RETRY_SECS: i64 = 300;
+const DURABLE_SYNC_AUTH_WARN_SECS: i64 = 1800;
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn durable_sync_auth_backoff_active() -> bool {
+    unix_now_secs() < DURABLE_SYNC_AUTH_RETRY_AFTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record that a durable-queue flush found pending work but no valid auth.
+/// Arms the retry backoff and emits a rate-limited warning.
+fn note_durable_sync_unauthenticated(queue: &str, pending: i64) {
+    let now = unix_now_secs();
+    DURABLE_SYNC_AUTH_RETRY_AFTER.store(
+        now + DURABLE_SYNC_AUTH_RETRY_SECS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let last_warn = DURABLE_SYNC_LAST_AUTH_WARN.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last_warn >= DURABLE_SYNC_AUTH_WARN_SECS {
+        DURABLE_SYNC_LAST_AUTH_WARN.store(now, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            queue,
+            pending,
+            "sync blocked: not authenticated; queued data will stay local until `autter login` succeeds"
+        );
+    }
+}
+
+/// Record a successful auth check so the backoff clears immediately.
+fn note_durable_sync_authenticated() {
+    DURABLE_SYNC_AUTH_RETRY_AFTER.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn flush_metrics(events: &[MetricEvent]) {
@@ -567,32 +621,48 @@ pub fn flush_notes() {
             return;
         }
     };
+
+    // Cheap local check first: with nothing queued, skip building the API
+    // client entirely (constructing it can trigger a token refresh).
+    let notes_db = match crate::notes::db::NotesDatabase::global() {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(%e, "notes: failed to get notes DB");
+            return;
+        }
+    };
+    let pending_count = {
+        let Ok(lock) = notes_db.lock() else {
+            tracing::warn!("notes: DB lock poisoned");
+            return;
+        };
+        lock.count_pending().unwrap_or(0)
+    };
+    if pending_count == 0 {
+        return;
+    }
+
     let context = ApiContext::new(Some(backend_url.clone()));
     let client = ApiClient::new(context);
 
     if !client.is_logged_in() && !client.has_api_key() {
-        tracing::debug!("notes: skipping flush, not authenticated");
+        note_durable_sync_unauthenticated("notes", pending_count);
         return;
     }
+    note_durable_sync_authenticated();
 
     // Dequeue up to 50 pending notes.
-    let pending = match crate::notes::db::NotesDatabase::global() {
-        Ok(db) => match db.lock() {
-            Ok(mut lock) => match lock.dequeue_pending(50) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!(%e, "notes: failed to dequeue pending rows");
-                    return;
-                }
-            },
+    let pending = {
+        let Ok(mut lock) = notes_db.lock() else {
+            tracing::warn!("notes: DB lock poisoned");
+            return;
+        };
+        match lock.dequeue_pending(50) {
+            Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!("notes: DB lock poisoned: {}", e);
+                tracing::warn!(%e, "notes: failed to dequeue pending rows");
                 return;
             }
-        },
-        Err(e) => {
-            tracing::warn!(%e, "notes: failed to get notes DB");
-            return;
         }
     };
 
@@ -785,15 +855,29 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
 /// that fail to upload stay locked as `processing` and are recovered to
 /// `pending` by `dequeue_cas_batch`'s stale-lock sweep on a later tick.
 fn flush_cas_queue() {
-    // Don't lock records as `processing` if we can't upload them anyway — that
-    // would just churn the queue through the 10-minute stale-lock recovery.
-    if !cas_client().1 {
-        return;
-    }
-
     let Ok(db) = crate::authorship::internal_db::InternalDatabase::global() else {
         return;
     };
+
+    // Cheap local check first: with nothing queued, skip building the API
+    // client entirely (constructing it can trigger a token refresh).
+    let pending = {
+        let Ok(db_lock) = db.lock() else {
+            return;
+        };
+        db_lock.count_pending_cas().unwrap_or(0)
+    };
+    if pending == 0 {
+        return;
+    }
+
+    // Don't lock records as `processing` if we can't upload them anyway — that
+    // would just churn the queue through the 10-minute stale-lock recovery.
+    if !cas_client().1 {
+        note_durable_sync_unauthenticated("cas_transcripts", pending);
+        return;
+    }
+    note_durable_sync_authenticated();
 
     // Bound the number of batches per tick so a large backlog can't monopolize
     // the flush loop; the remainder is picked up on subsequent ticks.
