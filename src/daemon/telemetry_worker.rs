@@ -360,6 +360,9 @@ fn note_durable_sync_unauthenticated(queue: &str, pending: i64) {
         now + DURABLE_SYNC_AUTH_RETRY_SECS,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // Persist the blocked state so interactive commands can remind the user
+    // (see auth::notice::maybe_warn_logged_out).
+    crate::auth::notice::record_sync_auth_blocked();
     let last_warn = DURABLE_SYNC_LAST_AUTH_WARN.load(std::sync::atomic::Ordering::Relaxed);
     if now - last_warn >= DURABLE_SYNC_AUTH_WARN_SECS {
         DURABLE_SYNC_LAST_AUTH_WARN.store(now, std::sync::atomic::Ordering::Relaxed);
@@ -374,6 +377,7 @@ fn note_durable_sync_unauthenticated(queue: &str, pending: i64) {
 /// Record a successful auth check so the backoff clears immediately.
 fn note_durable_sync_authenticated() {
     DURABLE_SYNC_AUTH_RETRY_AFTER.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::auth::notice::clear_sync_auth_blocked();
 }
 
 fn flush_metrics(events: &[MetricEvent]) {

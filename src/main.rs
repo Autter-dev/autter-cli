@@ -1,3 +1,4 @@
+use autter::auth;
 use autter::commands;
 use autter::utils::{SuperuserCheckResult, check_superuser_guard, print_superuser_warning};
 use clap::Parser;
@@ -93,6 +94,17 @@ fn main() {
         // warning would be noise or redundant.
         if !is_superuser_exempt_command(&cli.args) {
             commands::upgrade::maybe_warn_below_min_version();
+        }
+        // Remind the user when their login has expired (cloud sync paused),
+        // except on commands where it would be noise or redundant.
+        let first_arg = cli.args.first().map(String::as_str);
+        if !is_superuser_exempt_command(&cli.args)
+            && !matches!(
+                first_arg,
+                Some("login" | "logout" | "onboard" | "checkpoint")
+            )
+        {
+            auth::notice::maybe_warn_logged_out();
         }
         commands::autter_handlers::handle_autter(&cli.args);
         std::process::exit(0);
