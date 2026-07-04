@@ -1357,8 +1357,9 @@ fn parse_notes_backend_kind(value: &str) -> Result<NotesBackendKind, String> {
     match value.trim().to_lowercase().as_str() {
         "git_notes" | "git-notes" => Ok(NotesBackendKind::GitNotes),
         "http" => Ok(NotesBackendKind::Http),
+        "both" => Ok(NotesBackendKind::Both),
         _ => Err(format!(
-            "Invalid notes_backend.kind '{}'. Expected 'git_notes' or 'http'",
+            "Invalid notes_backend.kind '{}'. Expected 'git_notes', 'http', or 'both'",
             value
         )),
     }

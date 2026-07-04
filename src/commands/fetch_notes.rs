@@ -93,8 +93,15 @@ pub fn handle_fetch_notes(args: &[String]) {
     let start = Instant::now();
 
     // When the HTTP notes backend is enabled, warm the local notes-db cache
-    // from the HTTP backend instead of fetching refs/notes/ai.
-    if crate::config::Config::get().notes_backend_kind() == NotesBackendKind::Http {
+    // from the HTTP backend. For the pure Http backend this replaces the git
+    // fetch; for the Both backend it runs in addition to it.
+    let backend_kind = crate::config::Config::get().notes_backend_kind();
+    if backend_kind == NotesBackendKind::Both
+        && let Err(e) = crate::git::notes_api::warm_cache_for_remote(&repo, &remote_name)
+    {
+        tracing::warn!(%e, "both backend: cloud cache warm failed; continuing with git fetch");
+    }
+    if backend_kind == NotesBackendKind::Http {
         match crate::git::notes_api::warm_cache_for_remote(&repo, &remote_name) {
             Ok(()) => {
                 let elapsed = start.elapsed();

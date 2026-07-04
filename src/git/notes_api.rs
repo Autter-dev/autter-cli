@@ -19,12 +19,37 @@ pub use crate::git::refs::CommitAuthorship;
 // --- Writes ---
 
 pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<(), AutterError> {
-    match Config::get().notes_backend_kind() {
+    write_note_with_kind(
+        Config::get().notes_backend_kind(),
+        repo,
+        commit_sha,
+        content,
+    )
+}
+
+fn write_note_with_kind(
+    kind: NotesBackendKind,
+    repo: &Repository,
+    commit_sha: &str,
+    content: &str,
+) -> Result<(), AutterError> {
+    match kind {
         NotesBackendKind::Http => {
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
             http_write_note(commit_sha, content, repo_url.as_deref())
         }
         NotesBackendKind::GitNotes => crate::git::refs::notes_add(repo, commit_sha, content),
+        NotesBackendKind::Both => {
+            // Git notes are the durable local copy; write them first. The
+            // HTTP enqueue is best-effort — a failure must not lose the git
+            // note, and the cloud copy can be backfilled with notes-migrate.
+            let git_result = crate::git::refs::notes_add(repo, commit_sha, content);
+            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
+            if let Err(e) = http_write_note(commit_sha, content, repo_url.as_deref()) {
+                tracing::warn!(%e, commit_sha, "both backend: cloud note enqueue failed");
+            }
+            git_result
+        }
     }
 }
 
@@ -41,6 +66,14 @@ pub fn write_notes_batch(
             http_write_batch(entries, repo_url.as_deref())
         }
         NotesBackendKind::GitNotes => crate::git::refs::notes_add_batch(repo, entries),
+        NotesBackendKind::Both => {
+            let git_result = crate::git::refs::notes_add_batch(repo, entries);
+            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
+            if let Err(e) = http_write_batch(entries, repo_url.as_deref()) {
+                tracing::warn!(%e, count = entries.len(), "both backend: cloud notes enqueue failed");
+            }
+            git_result
+        }
     }
 }
 
@@ -51,6 +84,10 @@ pub fn read_note(repo: &Repository, commit_sha: &str) -> Option<String> {
         NotesBackendKind::Http => http_read_note(commit_sha)
             .or_else(|| crate::git::refs::show_authorship_note(repo, commit_sha)),
         NotesBackendKind::GitNotes => crate::git::refs::show_authorship_note(repo, commit_sha),
+        // Local git notes are authoritative; the cloud cache covers commits
+        // whose notes only exist remotely (e.g. written by cloud-only teammates).
+        NotesBackendKind::Both => crate::git::refs::show_authorship_note(repo, commit_sha)
+            .or_else(|| http_read_note(commit_sha)),
     }
 }
 
@@ -90,6 +127,31 @@ pub fn read_notes_batch(
             Ok(notes)
         }
         NotesBackendKind::GitNotes => crate::git::refs::notes_for_commits(repo, commit_shas),
+        NotesBackendKind::Both => {
+            // Local git notes first, then the cloud cache/API for commits
+            // whose notes only exist remotely.
+            let mut notes = crate::git::refs::notes_for_commits(repo, commit_shas)?;
+
+            let missing_after_git: Vec<String> = commit_shas
+                .iter()
+                .filter(|sha| !notes.contains_key(*sha))
+                .cloned()
+                .collect();
+            if !missing_after_git.is_empty() {
+                notes.extend(http_read_notes(&missing_after_git));
+            }
+
+            let missing_after_cache: Vec<String> = commit_shas
+                .iter()
+                .filter(|sha| !notes.contains_key(*sha))
+                .cloned()
+                .collect();
+            if !missing_after_cache.is_empty() {
+                notes.extend(http_fetch_and_cache_notes(&missing_after_cache));
+            }
+
+            Ok(notes)
+        }
     }
 }
 
@@ -106,6 +168,14 @@ pub fn read_authorship(repo: &Repository, commit_sha: &str) -> Option<Authorship
             }
         }
         NotesBackendKind::GitNotes => crate::git::refs::get_authorship(repo, commit_sha),
+        NotesBackendKind::Both => {
+            crate::git::refs::get_authorship(repo, commit_sha).or_else(|| {
+                let content = http_read_note(commit_sha)?;
+                AuthorshipLog::deserialize_from_string(&content)
+                    .map_err(|e| tracing::debug!("notes deserialization error: {}", e))
+                    .ok()
+            })
+        }
     }
 }
 
@@ -125,6 +195,20 @@ pub fn read_authorship_v3(
         }
         NotesBackendKind::GitNotes => {
             crate::git::refs::get_reference_as_authorship_log_v3(repo, commit_sha)
+        }
+        NotesBackendKind::Both => {
+            match crate::git::refs::get_reference_as_authorship_log_v3(repo, commit_sha) {
+                Ok(log) => Ok(log),
+                Err(git_err) => {
+                    if let Some(content) = http_read_note(commit_sha) {
+                        AuthorshipLog::deserialize_from_string(&content).map_err(|e| {
+                            AutterError::Generic(format!("notes deserialization error: {}", e))
+                        })
+                    } else {
+                        Err(git_err)
+                    }
+                }
+            }
         }
     }
 }
@@ -162,7 +246,10 @@ pub fn read_note_blob_oids(
         // For Http, notes are in notes-db not in git — no blob OIDs exist.
         // Return an empty map; callers handle this as "no notes in git".
         NotesBackendKind::Http => Ok(HashMap::new()),
-        NotesBackendKind::GitNotes => {
+        // For Both, notes are written to git refs, so real blob OIDs exist
+        // and the fast paths work. Commits without a local note degrade to
+        // slow-path reads, which consult the cloud cache.
+        NotesBackendKind::GitNotes | NotesBackendKind::Both => {
             crate::git::refs::note_blob_oids_for_commits(repo, commit_shas)
         }
     }
@@ -191,6 +278,21 @@ pub fn commits_with_notes(
         NotesBackendKind::GitNotes => {
             crate::git::refs::commits_with_authorship_notes(repo, commit_shas)
         }
+        NotesBackendKind::Both => {
+            // Git notes first; the cloud cache covers commits whose notes
+            // only exist remotely.
+            let from_git = crate::git::refs::commits_with_authorship_notes(repo, commit_shas)?;
+            if from_git.len() == commit_shas.len() {
+                return Ok(from_git);
+            }
+            let missing: Vec<String> = commit_shas
+                .iter()
+                .filter(|sha| !from_git.contains(*sha))
+                .cloned()
+                .collect();
+            let cached = http_check_exists(&missing);
+            Ok(from_git.into_iter().chain(cached).collect())
+        }
     }
 }
 
@@ -199,7 +301,7 @@ pub fn filter_commits_with_notes(
     commit_shas: &[String],
 ) -> Result<Vec<CommitAuthorship>, AutterError> {
     match Config::get().notes_backend_kind() {
-        NotesBackendKind::Http => {
+        NotesBackendKind::Http | NotesBackendKind::Both => {
             // `CommitAuthorship` requires a git_author that is only available from
             // `git rev-list`. Call the underlying git function which handles author
             // lookup, then patch in cache hits for commits whose `authorship_log`
@@ -207,7 +309,8 @@ pub fn filter_commits_with_notes(
             //
             // The git function calls `get_authorship(repo, sha)` (refs.rs, not
             // notes_api), so for Http the results will be `CommitAuthorship::NoLog`
-            // for all commits. We promote any commit that has a cache entry to
+            // for all commits (and for Both, any commit without a local git
+            // note). We promote any commit that has a cache entry to
             // `CommitAuthorship::Log`.
             let cached_map = http_read_notes(commit_shas);
 
@@ -718,7 +821,7 @@ mod tests {
         let kind = crate::config::Config::fresh().notes_backend_kind();
         let result: Result<HashMap<String, String>, _> = match kind {
             crate::config::NotesBackendKind::Http => Ok(HashMap::new()),
-            crate::config::NotesBackendKind::GitNotes => {
+            crate::config::NotesBackendKind::GitNotes | crate::config::NotesBackendKind::Both => {
                 crate::git::refs::note_blob_oids_for_commits(
                     tmp.autter_repo(),
                     &["abc".to_string()],
@@ -792,6 +895,65 @@ mod tests {
             result.is_err(),
             "git notes --ref=ai show should fail (note not in git) for Http backend"
         );
+
+        unsafe {
+            env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
+        }
+    }
+
+    /// Integration test: the `Both` backend writes the note to git refs AND
+    /// queues it in notes-db for cloud upload.
+    #[test]
+    #[serial_test::serial(notes_db_env)]
+    fn integration_both_write_note_goes_to_git_and_db() {
+        use crate::git::repository::exec_git;
+        use crate::git::test_utils::TmpRepo;
+        use std::env;
+
+        // Isolated notes-db for this test.
+        let tmp_db = tempfile::NamedTempFile::new().expect("tmp db file");
+        let db_path = tmp_db.path().to_str().unwrap().to_string();
+        unsafe {
+            env::set_var("AUTTER_TEST_NOTES_DB_PATH", &db_path);
+        }
+
+        let repo = TmpRepo::new().expect("TmpRepo::new");
+
+        repo.write_file("a.txt", "hello", false)
+            .expect("write file");
+        let sha = repo.commit_all("msg").expect("commit");
+
+        write_note_with_kind(
+            NotesBackendKind::Both,
+            repo.autter_repo(),
+            &sha,
+            "dual-note-content",
+        )
+        .expect("both write");
+
+        // Confirm it is queued in notes-db for cloud upload.
+        let db = crate::notes::db::NotesDatabase::global().expect("global db");
+        let mut lock = db.lock().expect("lock");
+        let note_in_db = lock.get_note(&sha).expect("get note");
+        assert_eq!(note_in_db, Some("dual-note-content".to_string()));
+        let pending = lock.dequeue_pending(10).expect("dequeue");
+        assert!(
+            pending.iter().any(|p| p.commit_sha == sha),
+            "note should be pending in notes-db for the Both backend"
+        );
+        drop(lock);
+
+        // Confirm the note ALSO exists in git refs/notes/ai.
+        let mut args = repo.autter_repo().global_args_for_exec();
+        args.extend([
+            "notes".to_string(),
+            "--ref=ai".to_string(),
+            "show".to_string(),
+            sha.clone(),
+        ]);
+        let output = exec_git(&args).expect("git notes show should succeed for Both backend");
+        let shown = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(shown.trim(), "dual-note-content");
 
         unsafe {
             env::remove_var("AUTTER_TEST_NOTES_DB_PATH");

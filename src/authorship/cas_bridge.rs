@@ -178,7 +178,7 @@ pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, 
     }
 
     let cfg = config::Config::fresh();
-    let dataplane_url = if cfg.notes_backend_kind() == config::NotesBackendKind::Http {
+    let dataplane_url = if cfg.notes_backend_kind().uses_http() {
         cfg.notes_backend_url().map(|s| s.to_string())
     } else {
         None

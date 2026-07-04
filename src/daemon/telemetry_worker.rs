@@ -606,11 +606,10 @@ fn flush_sentry_and_posthog(
 /// - Not authenticated (no API key and not logged in)
 pub fn flush_notes() {
     use crate::api::types::{NoteEntry, NotesUploadRequest};
-    use crate::config::NotesBackendKind;
 
     let cfg = Config::fresh();
-    if cfg.notes_backend_kind() != NotesBackendKind::Http {
-        tracing::debug!("notes: skipping flush, backend is not Http");
+    if !cfg.notes_backend_kind().uses_http() {
+        tracing::debug!("notes: skipping flush, backend does not use Http");
         return;
     }
 
@@ -778,7 +777,7 @@ pub fn flush_notes() {
 /// otherwise fall back to the API base URL (legacy behavior).
 fn cas_client() -> (ApiClient, bool) {
     let cfg = Config::fresh();
-    let dataplane_url = if cfg.notes_backend_kind() == crate::config::NotesBackendKind::Http {
+    let dataplane_url = if cfg.notes_backend_kind().uses_http() {
         cfg.notes_backend_url().map(|s| s.to_string())
     } else {
         None

@@ -10,7 +10,7 @@
 
 use crate::api::client::{ApiClient, ApiContext};
 use crate::api::types::{NoteEntry, NotesUploadRequest};
-use crate::config::{Config, NotesBackendKind};
+use crate::config::Config;
 use crate::error::AutterError;
 use crate::git::find_repository;
 use crate::notes::db::NotesDatabase;
@@ -38,11 +38,11 @@ pub fn handle_notes_migrate(args: &[String]) {
         }
     }
 
-    // 1. Refuse to run unless notes_backend.kind == http.
+    // 1. Refuse to run unless the backend syncs notes over HTTP.
     let cfg = Config::fresh();
-    if cfg.notes_backend_kind() != NotesBackendKind::Http {
+    if !cfg.notes_backend_kind().uses_http() {
         eprintln!(
-            "error: `autter notes migrate` requires notes_backend.kind = http.\n\
+            "error: `autter notes migrate` requires notes_backend.kind = http (or both).\n\
              Current backend: {}\n\
              \n\
              To enable cloud sync, run:\n\
