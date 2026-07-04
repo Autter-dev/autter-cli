@@ -22,6 +22,7 @@ pub enum MetricEventId {
     Checkpoint = 4,
     SessionEvent = 5,
     OtelTrace = 6,
+    CliError = 7,
 }
 
 /// Trait for event-specific values.

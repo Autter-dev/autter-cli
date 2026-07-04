@@ -20,6 +20,57 @@ fn submit_telemetry_envelope(envelopes: Vec<crate::daemon::TelemetryEnvelope>) {
     }
 }
 
+/// Report a tracked CLI error to *both* telemetry backends:
+///
+/// 1. **PostHog Error Tracking** (when `report_to_posthog` is set): emitted as a
+///    `TelemetryEnvelope::Error`, which the daemon forwards as a `$exception`.
+/// 2. **The org's own database**: emitted as a `CliError` metric event, which
+///    flows through the metrics rail into the generic `cli_metrics` table (and
+///    falls back to the local SQLite queue when offline / logged out).
+///
+/// Both paths are consent-gated and best-effort -- nothing here can fail the
+/// caller. `report_to_posthog` exists so callers that already surface the error
+/// to PostHog by another route (e.g. the panic hook, which always emits the
+/// `$exception`) can record *only* the org-DB metric and avoid double-counting.
+///
+/// `kind` is a stable, low-cardinality category (e.g.
+/// `"git_proxy_panic_recovery"`, `"checkpoint_usage_error"`). `command` is the
+/// autter/git subcommand involved, when known.
+pub fn report_cli_error(
+    kind: &str,
+    message: &str,
+    command: Option<&str>,
+    context: Option<&str>,
+    report_to_posthog: bool,
+) {
+    // 1. Org database, via the metrics rail.
+    let mut values = crate::metrics::CliErrorValues::new()
+        .kind(kind)
+        .message(message);
+    if let Some(command) = command {
+        values = values.command(command);
+    }
+    if let Some(context) = context {
+        values = values.context(context);
+    }
+    let attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
+    crate::metrics::record(values, attrs);
+
+    // 2. PostHog Error Tracking, via the error rail.
+    if report_to_posthog {
+        let envelope = crate::daemon::TelemetryEnvelope::Error {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message: format!("{kind}: {message}"),
+            context: Some(serde_json::json!({
+                "kind": kind,
+                "command": command,
+                "context": context,
+            })),
+        };
+        submit_telemetry_envelope(vec![envelope]);
+    }
+}
+
 /// Log an error to Sentry (via daemon telemetry worker)
 pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Value>) {
     let envelope = crate::daemon::TelemetryEnvelope::Error {
