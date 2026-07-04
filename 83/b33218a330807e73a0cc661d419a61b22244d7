@@ -1,0 +1,84 @@
+src/daemon/telemetry_worker.rs
+  s_1b1091ab33f54a::t_987d1a6c7f3f07 363-365,380
+src/commands/git_handlers.rs
+  s_1b1091ab33f54a::t_ac4ce516f06605 276-278
+src/main.rs
+  s_1b1091ab33f54a::t_ac4ce516f06605 98-108
+  s_1b1091ab33f54a::t_252632d9f22d25 1
+src/auth/notice.rs
+  s_1b1091ab33f54a::t_d3f38566d5dc25 132-135,139
+  s_1b1091ab33f54a::t_b2dd032aadd26a 24-29,37-72
+  s_1b1091ab33f54a::t_52dffefc5177ed 1-23,30-36,73-131,136-138,140-181
+src/auth/mod.rs
+  s_1b1091ab33f54a::t_2808eb5d6030d9 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.6.7",
+  "base_commit_sha": "83b33218a330807e73a0cc661d419a61b22244d7",
+  "branch": "posthog-code/fix-prompt-session-storage",
+  "prompts": {
+    "s_1b1091ab33f54a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019f2dca-c09f-744a-8929-a96eab8bf26c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:75fa565016356480a594f81b17e49b5104e72f0b3f013737ed0998f500ac1775",
+      "total_additions": 200,
+      "total_deletions": 2,
+      "accepted_lines": 201,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_1b1091ab33f54a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019f2dca-c09f-744a-8929-a96eab8bf26c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:75fa565016356480a594f81b17e49b5104e72f0b3f013737ed0998f500ac1775",
+      "stats": {
+        "total_additions": 200,
+        "total_deletions": 2,
+        "accepted_lines": 201,
+        "overriden_lines": 0,
+        "files": {
+          "src/auth/mod.rs": {
+            "total_additions": 1,
+            "total_deletions": 0,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "src/auth/notice.rs": {
+            "total_additions": 183,
+            "total_deletions": 2,
+            "accepted_lines": 181,
+            "overriden_lines": 0
+          },
+          "src/commands/git_handlers.rs": {
+            "total_additions": 3,
+            "total_deletions": 0,
+            "accepted_lines": 3,
+            "overriden_lines": 0
+          },
+          "src/daemon/telemetry_worker.rs": {
+            "total_additions": 4,
+            "total_deletions": 0,
+            "accepted_lines": 4,
+            "overriden_lines": 0
+          },
+          "src/main.rs": {
+            "total_additions": 9,
+            "total_deletions": 0,
+            "accepted_lines": 12,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
