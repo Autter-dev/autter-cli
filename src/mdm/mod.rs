@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod claude_config_registry;
 pub mod hook_installer;
 pub mod jetbrains;
 pub mod skills_installer;
