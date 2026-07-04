@@ -11,7 +11,9 @@ export class BlameLensManager {
   private currentDocumentUri: string | null = null;
   private pendingBlameRequest: Promise<BlameResult | null> | null = null;
   private statusBarItem: vscode.StatusBarItem;
-  
+  // Separate status bar item showing the file-level AI percentage
+  private fileStatsBarItem: vscode.StatusBarItem;
+
   // Current blame mode (persisted via settings)
   private blameMode: BlameMode = 'line';
   
@@ -111,6 +113,16 @@ export class BlameLensManager {
     this.statusBarItem.text = '🧑‍💻';
     this.statusBarItem.tooltip = 'Human-authored code (click to toggle AI highlighting)';
     // Status bar starts hidden - only shown after blame loads
+
+    // Create a second status bar item showing the file-level AI percentage.
+    // Higher priority places it to the left of the per-line model indicator.
+    this.fileStatsBarItem = vscode.window.createStatusBarItem(
+      vscode.StatusBarAlignment.Right,
+      501
+    );
+    this.fileStatsBarItem.name = 'autter (file AI %)';
+    this.fileStatsBarItem.command = 'autter.toggleAICode';
+    // Stays hidden until blame is available for the active file
   }
 
   public activate(): void {
@@ -186,14 +198,19 @@ export class BlameLensManager {
       })
     );
 
-    // Add status bar item to context subscriptions for proper cleanup
+    // Add status bar items to context subscriptions for proper cleanup
     this.context.subscriptions.push(this.statusBarItem);
+    this.context.subscriptions.push(this.fileStatsBarItem);
 
     // Listen for configuration changes to blame mode
     this.context.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration('autter.blameMode')) {
           this.handleBlameModeChange();
+        }
+        // Toggle the file-level AI percentage indicator on/off live
+        if (event.affectsConfiguration('autter.showFileAiPercent')) {
+          this.updateFileStatsBar();
         }
         // Rebuild color decorations if workbench color customizations change
         if (event.affectsConfiguration('workbench.colorCustomizations')) {
@@ -464,6 +481,7 @@ export class BlameLensManager {
         this.clearColoredBorders(editor);
       }
       this.statusBarItem.hide();
+      this.fileStatsBarItem.hide();
       this.clearAfterTextDecoration();
     } else if (newMode === 'all') {
       // Switching to all: request full file blame
@@ -511,6 +529,7 @@ export class BlameLensManager {
         this.clearColoredBorders(editor);
       }
       this.statusBarItem.hide();
+      this.fileStatsBarItem.hide();
       this.clearAfterTextDecoration();
     } else if (newMode === 'all') {
       // Switching to all: request full file blame
@@ -619,6 +638,27 @@ export class BlameLensManager {
   }
 
   /**
+   * Update the file-level AI percentage status bar item.
+   * Shows what fraction of the file's lines are AI-authored based on the
+   * current blame result. Hidden when blame is off or unavailable.
+   */
+  private updateFileStatsBar(): void {
+    if (this.blameMode === 'off' || !this.currentBlameResult || !Config.isFileAiPercentEnabled()) {
+      this.fileStatsBarItem.hide();
+      return;
+    }
+
+    const totalLines = this.currentBlameResult.totalLines;
+    // lineAuthors only contains AI-authored lines, so its size is the AI count.
+    const aiLines = this.currentBlameResult.lineAuthors.size;
+    const percent = totalLines > 0 ? Math.round((aiLines / totalLines) * 100) : 0;
+
+    this.fileStatsBarItem.text = `🤖 ${percent}% AI`;
+    this.fileStatsBarItem.tooltip = `${aiLines} of ${totalLines} ${totalLines === 1 ? 'line' : 'lines'} AI-authored in this file (${percent}%)`;
+    this.fileStatsBarItem.show();
+  }
+
+  /**
    * Update status bar based on the current cursor position.
    * Shows model name if the current line is AI-authored, otherwise shows human icon.
    * Text color matches the gutter highlight color for the current prompt.
@@ -626,6 +666,7 @@ export class BlameLensManager {
   private async updateStatusBar(editor: vscode.TextEditor | undefined): Promise<void> {
     if (!editor) {
       this.statusBarItem.hide();
+      this.fileStatsBarItem.hide();
       this.clearAfterTextDecoration();
       return;
     }
@@ -641,6 +682,7 @@ export class BlameLensManager {
       // The debounce callback will handle it after typing stops.
       if (this.documentChangeTimer) {
         this.statusBarItem.hide();
+        this.fileStatsBarItem.hide();
         this.clearAfterTextDecoration();
         return;
       }
@@ -677,6 +719,7 @@ export class BlameLensManager {
       
       // Hide status bar and after-text while loading
       this.statusBarItem.hide();
+      this.fileStatsBarItem.hide();
       this.clearAfterTextDecoration();
       return;
     }
@@ -734,6 +777,9 @@ export class BlameLensManager {
     
     // Make sure the status bar is visible (may have been hidden during loading)
     this.statusBarItem.show();
+
+    // Refresh the file-level AI percentage indicator
+    this.updateFileStatsBar();
   }
 
   /**
@@ -1646,6 +1692,7 @@ export class BlameLensManager {
     this.casFetchInProgress.clear();
     this.blameService.dispose();
     this.statusBarItem.dispose();
+    this.fileStatsBarItem.dispose();
     this._onDidChangeVirtualDocument.dispose();
     
     // Clear markdown content store

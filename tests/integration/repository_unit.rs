@@ -199,41 +199,64 @@ index 0000000..abc1234 100644
 }
 
 #[test]
-fn worktree_storage_ai_dir_keeps_full_relative_worktree_path() {
+fn worktree_storage_ai_dir_is_stable_across_slot_name_churn() {
+    // The same physical worktree (same workdir) must resolve to the SAME storage
+    // dir even when git reassigns its internal slot name (e.g. `autter-cli` ->
+    // `autter-cli4` after a sibling worktree is pruned and re-added). Keying by
+    // the workdir path — not the recycled slot name — guarantees this and is the
+    // crux of the orphaned-checkpoint fix.
     let temp = tempfile::tempdir().expect("tempdir");
     let common_dir = temp.path().join("repo.git");
-    let linked_git_dir = common_dir.join("worktrees").join("feature").join("nested");
+    let workdir = temp.path().join("checkout").join("autter-cli");
 
-    fs::create_dir_all(&linked_git_dir).expect("create linked git dir");
+    let git_dir_a = common_dir.join("worktrees").join("autter-cli");
+    let git_dir_b = common_dir.join("worktrees").join("autter-cli4");
+    fs::create_dir_all(&git_dir_a).expect("create slot a");
+    fs::create_dir_all(&git_dir_b).expect("create slot b");
 
-    let ai_dir = worktree_storage_ai_dir(&linked_git_dir, &common_dir);
+    let ai_a = worktree_storage_ai_dir(&git_dir_a, &common_dir, &workdir);
+    let ai_b = worktree_storage_ai_dir(&git_dir_b, &common_dir, &workdir);
+
     assert_eq!(
-        ai_dir,
-        common_dir
-            .join("ai")
-            .join("worktrees")
-            .join("feature")
-            .join("nested")
+        ai_a, ai_b,
+        "slot-name churn must not change storage location"
+    );
+    assert!(ai_a.starts_with(common_dir.join("ai").join("worktrees")));
+    // The human-recognizable basename is preserved as a prefix of the key.
+    let key = ai_a.file_name().unwrap().to_string_lossy();
+    assert!(key.starts_with("autter-cli-"), "unexpected key: {key}");
+}
+
+#[test]
+fn worktree_storage_ai_dir_distinguishes_different_workdirs() {
+    // Two different physical worktrees that happen to share a git slot name
+    // (the churn hazard) must NOT collide on storage.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let common_dir = temp.path().join("repo.git");
+    let git_dir = common_dir.join("worktrees").join("autter-cli");
+    fs::create_dir_all(&git_dir).expect("create slot");
+
+    let workdir_one = temp.path().join("alpha").join("autter-cli");
+    let workdir_two = temp.path().join("beta").join("autter-cli");
+
+    let ai_one = worktree_storage_ai_dir(&git_dir, &common_dir, &workdir_one);
+    let ai_two = worktree_storage_ai_dir(&git_dir, &common_dir, &workdir_two);
+
+    assert_ne!(
+        ai_one, ai_two,
+        "distinct worktrees must get distinct storage"
     );
 }
 
 #[test]
-fn worktree_storage_ai_dir_fallback_uses_git_dir_leaf_name() {
+fn worktree_storage_ai_dir_main_worktree_uses_common_ai() {
     let temp = tempfile::tempdir().expect("tempdir");
     let common_dir = temp.path().join("repo.git");
-    let detached_git_dir = temp.path().join("somewhere").join("linked-worktree");
-
     fs::create_dir_all(&common_dir).expect("create common dir");
-    fs::create_dir_all(&detached_git_dir).expect("create detached git dir");
+    let workdir = temp.path().join("checkout");
 
-    let ai_dir = worktree_storage_ai_dir(&detached_git_dir, &common_dir);
-    assert_eq!(
-        ai_dir,
-        common_dir
-            .join("ai")
-            .join("worktrees")
-            .join("linked-worktree")
-    );
+    let ai_dir = worktree_storage_ai_dir(&common_dir, &common_dir, &workdir);
+    assert_eq!(ai_dir, common_dir.join("ai"));
 }
 
 #[test]

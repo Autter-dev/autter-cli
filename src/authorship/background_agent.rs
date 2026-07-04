@@ -137,15 +137,36 @@ pub fn fill_unattributed_lines(
         return false;
     }
 
+    // Background agents rarely expose a model; normalize so we still emit a concrete
+    // tool-default model rather than the "unknown" bucket.
     let agent_id = AgentId {
         tool: tool.clone(),
         id: id.clone(),
-        model: "unknown".to_string(),
-    };
+        model: String::new(),
+    }
+    .normalized();
 
     let session_key = generate_session_id(&id, &tool);
     let trace_id = generate_trace_id();
     let attestation_hash = format!("{}::{}", session_key, trace_id);
+
+    // Every line we attribute here is both an addition and an accepted line for this
+    // (hole-filling) session, so record matching per-session and per-file stats.
+    let mut stats = crate::authorship::authorship_log::SessionStats::default();
+    for (file_path, line_ranges) in &unattributed_hunks {
+        let count: u32 = line_ranges.iter().map(|r| r.line_count()).sum();
+        stats.total_additions += count;
+        stats.accepted_lines += count;
+        stats.files.insert(
+            file_path.clone(),
+            crate::authorship::authorship_log::FileStats {
+                total_additions: count,
+                total_deletions: 0,
+                accepted_lines: count,
+                overriden_lines: 0,
+            },
+        );
+    }
 
     authorship_log.metadata.sessions.insert(
         session_key,
@@ -153,6 +174,7 @@ pub fn fill_unattributed_lines(
             agent_id,
             human_author: Some(human_author.to_string()),
             messages_url: None,
+            stats: Some(stats),
             custom_attributes: None,
         },
     );

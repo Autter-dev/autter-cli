@@ -34,6 +34,12 @@
           "default": false,
           "description": "Enable tracking for AI tab completion detection (experimental)."
         },
+        "autter.showFileAiPercent": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Show the file-level AI percentage in the status bar."
+        },
         "autter.blameMode": {
           "type": "string",
           "enum": [

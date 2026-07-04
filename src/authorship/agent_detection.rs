@@ -113,11 +113,14 @@ pub fn simulate_agent_authorship(
         0
     };
 
+    // Real model is unknown for simulated (email-detected) authorship; normalize so
+    // we still emit a concrete tool-default model instead of the "unknown" bucket.
     let agent_id = AgentId {
         tool: tool.to_string(),
         id: commit_sha.to_string(),
-        model: "unknown".to_string(),
-    };
+        model: String::new(),
+    }
+    .normalized();
 
     let prompt_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
 

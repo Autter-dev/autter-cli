@@ -14,6 +14,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use gix_index::entry::Stage;
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2079,7 +2080,7 @@ pub fn find_repository(global_args: &[String]) -> Result<Repository, AutterError
         ))
     })?;
 
-    let worktree_ai_dir = worktree_storage_ai_dir(&git_dir, &git_common_dir);
+    let worktree_ai_dir = worktree_storage_ai_dir(&git_dir, &git_common_dir, &canonical_workdir);
     let storage = if worktree_ai_dir == git_dir.join("ai") {
         RepoStorage::for_repo_path(&git_dir, &workdir)?
     } else {
@@ -2136,20 +2137,28 @@ pub fn resolve_command_base_dir(global_args: &[String]) -> Result<PathBuf, Autte
     }
 }
 
+/// Compute the directory that holds a worktree's AI working-log storage.
+///
+/// For the main worktree this is `<common>/ai`. For a *linked* worktree the
+/// storage is keyed by a STABLE hash of the worktree's canonical working
+/// directory path — NOT git's internal worktree slot name.
+///
+/// Git derives a linked worktree's slot name (`<common>/worktrees/<name>`) from
+/// the basename of the worktree path and recycles that name when a worktree
+/// sharing the same basename is pruned and another is added. Keying AI storage
+/// by that recycled name meant checkpoints written under one name were orphaned
+/// once the name got reassigned, so post-commit note generation found no working
+/// log and silently produced an empty authorship note. Hashing the absolute
+/// workdir path instead gives each physical worktree a stable home that survives
+/// slot-name churn.
 #[doc(hidden)]
-pub fn worktree_storage_ai_dir(git_dir: &Path, git_common_dir: &Path) -> PathBuf {
+pub fn worktree_storage_ai_dir(
+    git_dir: &Path,
+    git_common_dir: &Path,
+    canonical_workdir: &Path,
+) -> PathBuf {
     if git_dir == git_common_dir {
         return git_common_dir.join("ai");
-    }
-
-    let worktrees_root = git_common_dir.join("worktrees");
-    if let Ok(relative_worktree_path) = git_dir.strip_prefix(&worktrees_root)
-        && !relative_worktree_path.as_os_str().is_empty()
-    {
-        return git_common_dir
-            .join("ai")
-            .join("worktrees")
-            .join(relative_worktree_path);
     }
 
     let canonical_git_dir = git_dir
@@ -2163,25 +2172,45 @@ pub fn worktree_storage_ai_dir(git_dir: &Path, git_common_dir: &Path) -> PathBuf
         return git_common_dir.join("ai");
     }
 
-    let canonical_worktrees_root = canonical_common_dir.join("worktrees");
-    if let Ok(relative_worktree_path) = canonical_git_dir.strip_prefix(&canonical_worktrees_root)
-        && !relative_worktree_path.as_os_str().is_empty()
-    {
-        return git_common_dir
-            .join("ai")
-            .join("worktrees")
-            .join(relative_worktree_path);
-    }
-
-    let fallback_name = git_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "default".to_string());
     git_common_dir
         .join("ai")
         .join("worktrees")
-        .join(fallback_name)
+        .join(stable_worktree_key(canonical_workdir))
+}
+
+/// Derive a stable, filesystem-safe storage key for a linked worktree from the
+/// canonical absolute path of its working directory. The key is
+/// `<sanitized-basename>-<sha256(path)[..16]>` so it stays human-recognizable
+/// while remaining unique and stable across git worktree slot-name reuse.
+fn stable_worktree_key(canonical_workdir: &Path) -> String {
+    let path_str = canonical_workdir.to_string_lossy();
+    let mut hasher = Sha256::new();
+    hasher.update(path_str.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+
+    let basename = canonical_workdir
+        .file_name()
+        .map(|name| sanitize_storage_component(&name.to_string_lossy()))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "wt".to_string());
+
+    format!("{}-{}", basename, &hash[..16])
+}
+
+/// Reduce an arbitrary path component to a conservative, filesystem-safe slug
+/// (ASCII alphanumerics plus `-`, `_`, `.`), bounded in length so the basename
+/// portion can't blow up the resulting path.
+fn sanitize_storage_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect()
 }
 
 struct DiscoveredRepositoryPaths {
@@ -2396,7 +2425,7 @@ pub fn from_bare_repository(git_dir: &Path) -> Result<Repository, AutterError> {
 
     let canonical_workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
 
-    let worktree_ai_dir = worktree_storage_ai_dir(git_dir, git_dir);
+    let worktree_ai_dir = worktree_storage_ai_dir(git_dir, git_dir, &canonical_workdir);
     let storage = if worktree_ai_dir == git_dir.join("ai") {
         RepoStorage::for_repo_path(git_dir, &workdir)?
     } else {
@@ -2453,7 +2482,7 @@ fn repository_from_discovered_paths(
         ))
     })?;
 
-    let worktree_ai_dir = worktree_storage_ai_dir(git_dir, git_common_dir);
+    let worktree_ai_dir = worktree_storage_ai_dir(git_dir, git_common_dir, &canonical_workdir);
     let storage = if worktree_ai_dir == git_dir.join("ai") {
         RepoStorage::for_repo_path(git_dir, workdir)?
     } else {

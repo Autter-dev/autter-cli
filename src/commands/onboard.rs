@@ -145,7 +145,9 @@ fn configure_telemetry(cfg: &mut config::FileConfig, flag: Option<bool>) -> bool
 
     eprintln!();
     if enabled {
-        eprintln!("  \u{2713} Telemetry enabled. Thank you \u{2014} you can review what's sent at:");
+        eprintln!(
+            "  \u{2713} Telemetry enabled. Thank you \u{2014} you can review what's sent at:"
+        );
         eprintln!("      {local_log}");
     } else {
         eprintln!("  \u{2713} Telemetry disabled. Nothing will be collected or sent.");

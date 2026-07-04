@@ -4178,3 +4178,53 @@ fn daemon_self_heals_after_socket_deletion() {
         thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Regression test for the panic-safe git proxy: a panic in the proxy's
+/// instrumentation hooks must never abort the user's underlying git command.
+///
+/// We force wrapper mode so the autter binary acts as the git proxy and the
+/// instrumented pre/post-state hooks (with their `catch_unwind` guards) actually
+/// run, then inject a panic into a hook via `AUTTER_TEST_PANIC_IN_HOOK` and
+/// assert the commit still lands and the proxy exits successfully.
+fn assert_proxy_survives_hook_panic(phase: &str) {
+    let repo = TestRepo::new_with_mode(GitTestMode::WrapperDaemon);
+
+    let repo_root = repo.canonical_path();
+    fs::write(repo_root.join("initial.txt"), "first\n").expect("write initial file");
+    repo.stage_all_and_commit("Initial commit")
+        .expect("initial commit should succeed");
+    let before = current_head_sha(&repo);
+
+    // Stage a change, then commit with a panic injected into the proxy hook.
+    fs::write(repo_root.join("change.txt"), "second\n").expect("write change file");
+    repo.git(&["add", "-A"]).expect("git add should succeed");
+
+    let result = repo.git_with_env(
+        &["commit", "-m", "Commit despite hook panic"],
+        &[("AUTTER_TEST_PANIC_IN_HOOK", phase)],
+        None,
+    );
+
+    // The proxy must exit 0 and the commit must land, regardless of the panic.
+    assert!(
+        result.is_ok(),
+        "git commit should succeed even though the '{phase}' proxy hook panicked: {result:?}"
+    );
+    let after = current_head_sha(&repo);
+    assert_ne!(
+        before, after,
+        "a new commit should have been created despite the '{phase}' hook panic"
+    );
+}
+
+#[test]
+#[serial]
+fn wrapper_proxy_survives_panic_in_pre_state_hook() {
+    assert_proxy_survives_hook_panic("pre_state");
+}
+
+#[test]
+#[serial]
+fn wrapper_proxy_survives_panic_in_post_state_hook() {
+    assert_proxy_survives_hook_panic("post_state");
+}

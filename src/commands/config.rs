@@ -175,7 +175,7 @@ pub fn handle_config(args: &[String]) {
         eprintln!("Error: --add requires <key> <value>");
         eprintln!("Usage: autter config --add <key> <value>");
         eprintln!("   or: autter config set <key> <value> --add");
-        std::process::exit(1);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
     match filtered_args[0].as_str() {
@@ -183,7 +183,7 @@ pub fn handle_config(args: &[String]) {
             if filtered_args.len() < 3 {
                 eprintln!("Error: set requires <key> <value>");
                 eprintln!("Usage: autter config set <key> <value>");
-                std::process::exit(1);
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
             }
             let key = filtered_args[1].as_str();
             let value = filtered_args[2].as_str();
@@ -201,7 +201,7 @@ pub fn handle_config(args: &[String]) {
             if filtered_args.len() < 2 {
                 eprintln!("Error: unset requires <key>");
                 eprintln!("Usage: autter config unset <key>");
-                std::process::exit(1);
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
             }
             let key = filtered_args[1].as_str();
             if let Err(e) = unset_config_value(key) {
@@ -215,7 +215,7 @@ pub fn handle_config(args: &[String]) {
                 if filtered_args.len() < 2 {
                     eprintln!("Error: --add requires <key> <value>");
                     eprintln!("Usage: autter config --add <key> <value>");
-                    std::process::exit(1);
+                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
                 let value = filtered_args[1].as_str();
                 if let Err(e) = set_config_value(key, value, true) {
