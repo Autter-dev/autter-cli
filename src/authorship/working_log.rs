@@ -19,6 +19,10 @@ pub struct WorkingLogEntry {
     pub attributions: Vec<Attribution>,
     #[serde(default)]
     pub line_attributions: Vec<LineAttribution>,
+    /// Per-file line statistics for the checkpoint that produced this entry. Used to
+    /// derive per-session, per-file additions/deletions in the authorship note.
+    #[serde(default)]
+    pub line_stats: CheckpointLineStats,
 }
 
 impl WorkingLogEntry {
@@ -34,6 +38,7 @@ impl WorkingLogEntry {
             blob_sha,
             attributions,
             line_attributions,
+            line_stats: CheckpointLineStats::default(),
         }
     }
 }
@@ -43,6 +48,54 @@ pub struct AgentId {
     pub tool: String, // e.g., "cursor", "windsurf"
     pub id: String,   // id in their domain
     pub model: String,
+}
+
+/// A concrete, tool-qualified model id to use when the real model cannot be
+/// extracted. We deliberately avoid the bare placeholders `"unknown"`/`"default"`
+/// (which the backend buckets as "unknown") and instead emit a value scoped to the
+/// tool, so analytics group the session under its tool rather than a generic bucket.
+pub fn default_model_for_tool(tool: &str) -> String {
+    let tool = tool.trim();
+    if tool.is_empty() {
+        // Should not happen after normalization, but keep a stable, non-empty value.
+        "unknown-tool/unknown-model".to_string()
+    } else {
+        format!("{tool}/unknown-model")
+    }
+}
+
+/// Returns true when a model string is a placeholder we should replace with a
+/// concrete tool-default (empty, "unknown", or "default", case-insensitive).
+fn is_placeholder_model(model: &str) -> bool {
+    let m = model.trim();
+    m.is_empty() || m.eq_ignore_ascii_case("unknown") || m.eq_ignore_ascii_case("default")
+}
+
+impl AgentId {
+    /// Normalize `tool` and `model` so the resulting attestation always carries a
+    /// concrete tool and a concrete model. Real, extracted models are left intact;
+    /// only placeholder/empty values are replaced with a tool-default.
+    ///
+    /// IMPORTANT: this must run before session ids are derived from `(tool, id)` so
+    /// the session id and the stored record stay consistent.
+    pub fn normalize(&mut self) {
+        if self.tool.trim().is_empty() {
+            self.tool = "unknown".to_string();
+        } else if self.tool != self.tool.trim() {
+            self.tool = self.tool.trim().to_string();
+        }
+        if is_placeholder_model(&self.model) {
+            self.model = default_model_for_tool(&self.tool);
+        } else if self.model != self.model.trim() {
+            self.model = self.model.trim().to_string();
+        }
+    }
+
+    /// Consuming form of [`AgentId::normalize`].
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
