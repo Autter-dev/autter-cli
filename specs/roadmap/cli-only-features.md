@@ -7,10 +7,13 @@ CLI fully scriptable, and add self-diagnostics.
 > Conventions used below: file paths are relative to the repo root. "Proxy path" = the
 > `argv[0] == "git"` dispatch (`commands::git_handlers::handle_git`); "direct path" = the
 > `argv[0] == "autter"` dispatch (`commands::autter_handlers::handle_autter`).
+>
+> **Status checkboxes:** `[x]` = shipped in the CLI today; `[ ]` = not yet implemented (may be
+> partially started — see the section body).
 
 ---
 
-## C1 — Correct exit codes for direct subcommands
+## [x] C1 — Correct exit codes for direct subcommands
 
 **What & why.** Today several error paths in direct subcommands call `std::process::exit(0)`
 (e.g. `handle_checkpoint` in `src/commands/autter_handlers.rs`: bad `--hook-input`, unknown
@@ -34,7 +37,7 @@ calls on error/usage paths are the bug.
 
 ---
 
-## C2 — Panic-safe git proxy
+## [x] C2 — Panic-safe git proxy
 
 **What & why.** There are ~2,500 `.unwrap()`/`.expect()` calls in `src/`. A panic on the proxy
 or checkpoint hot path can abort a user's `git commit`. The proxy must **always** fall through to
@@ -56,7 +59,7 @@ real `git` rather than panic.
 
 ---
 
-## C3 — Close attribution data-gaps (`overrode`, line-stats, known-human rebase)  ⭐ foundational
+## [ ] C3 — Close attribution data-gaps (`overrode`, line-stats, known-human rebase)  ⭐ foundational
 
 **What & why.** Three open TODOs in core silently lose or fail to persist attribution detail that
 the best analytics features (survival, churn, defect rate) need:
@@ -90,7 +93,7 @@ C3, those features can only approximate from the local working log, which doesn'
 
 ---
 
-## C4 — Unified argument & global-flag parsing
+## [ ] C4 — Unified argument & global-flag parsing
 
 **What & why.** Every handler hand-rolls a `while i < args.len()` loop (see `handle_checkpoint`,
 `handle_status`). This is why flags are inconsistent and undiscoverable: `--json` exists on ~13
@@ -110,7 +113,7 @@ commands, `--plain` on 6, `--quiet` on 1, `--no-color` on 2. There's no per-subc
 
 ---
 
-## C5 — Universal, stable `--json` output
+## [ ] C5 — Universal, stable `--json` output
 
 **What & why.** `status` and `blame` already emit structured output (`StatusOutput` in
 `src/commands/status.rs`; `JsonBlameOutput` in `src/commands/blame.rs:1273`). Automation and the
@@ -129,7 +132,7 @@ IDE extensions need a consistent machine-readable contract across **all** read c
 
 ---
 
-## C6 — `NO_COLOR` / TTY-aware coloring
+## [ ] C6 — `NO_COLOR` / TTY-aware coloring
 
 **What & why.** Color/`--plain` handling is ad hoc. Honor the standard `NO_COLOR` env var and
 auto-disable color when stdout is not a TTY, project-wide.
@@ -144,7 +147,7 @@ auto-disable color when stdout is not a TTY, project-wide.
 
 ---
 
-## C7 — `autter doctor` diagnostics  ⭐ quick win
+## [ ] C7 — `autter doctor` diagnostics  ⭐ quick win
 
 **What & why.** A single command that tells a user (and support) exactly why something isn't
 working. Directly attacks the class of bug behind the v1.6.3 "Prompt was not saved" issue — today
@@ -167,7 +170,7 @@ there's no way to see that the sync queue is stuck.
 
 ---
 
-## C8 — Sync-state surfaced in `autter status`  ⭐ quick win
+## [ ] C8 — Sync-state surfaced in `autter status`  ⭐ quick win
 
 **What & why.** Turn a silent failure mode into a visible one. Add a one-line sync summary to
 `autter status`: e.g. `sync: 0 prompts / 2 notes pending, last flush 8s ago`.
@@ -184,7 +187,7 @@ there's no way to see that the sync queue is stuck.
 
 ---
 
-## C9 — `autter sync --backfill`
+## [ ] C9 — `autter sync --backfill`
 
 **What & why.** Repos onboarded late have local notes that never reached the cloud
 (`authorship_notes`), and historical agent-authored commits may have no notes at all. Give users a
@@ -205,7 +208,7 @@ for synthesizing attribution from recognized agent emails/usernames.
 
 ---
 
-## C10 — Batch git subprocess calls in hot paths
+## [ ] C10 — Batch git subprocess calls in hot paths
 
 **What & why.** The rebase path already learned this: `RebaseNoteCache`
 (`src/authorship/rebase_authorship.rs:25`) pre-loads **all** notes in one batch instead of
@@ -225,7 +228,7 @@ elsewhere and is real latency on large files (the codebase explicitly flags "lar
 
 ---
 
-## C11 — Proxy fast-path for hookless commands
+## [x] C11 — Proxy fast-path for hookless commands
 
 **What & why.** Every `git` invocation pays the proxy's pre/post-hook setup. Read-only commands
 with no AI relevance (`git status`, `git log`, `git diff`, `git rev-parse`, completion queries)
@@ -245,7 +248,7 @@ against `wrapper.pre_state`/`wrapper.post_state` usage.
 
 ---
 
-## C12 — `autter blame --why <file>:<line>`  ⭐ quick win
+## [x] C12 — `autter blame --why <file>:<line>`  ⭐ quick win
 
 **What & why.** Jump from a line straight to the prompt/PR/issue that produced it.
 
@@ -264,7 +267,7 @@ against `wrapper.pre_state`/`wrapper.post_state` usage.
 
 ---
 
-## C13 — `autter report --since <ref>`  ⭐ quick win
+## [ ] C13 — `autter report --since <ref>`  ⭐ quick win
 
 **What & why.** Aggregate attestations across a commit range into a per-module AI% report —
 useful for release notes, standups, and the compliance story. Pure local read; no backend.
@@ -285,9 +288,9 @@ useful for release notes, standups, and the compliance story. Pure local read; n
 
 ## Suggested CLI-only delivery order
 
-1. **C1 + C2** — reliability floor (correct exit codes, panic-safe proxy).
+1. ~~**C1 + C2**~~ — reliability floor (correct exit codes, panic-safe proxy). **Done.**
 2. **C7 + C8** — self-diagnostics + visible sync health (kills the #1 support issue).
 3. **C4 + C5 + C6** — DX consistency (unified parsing, universal JSON, color hygiene).
 4. **C3** — close the data-gaps (also unblocks the best platform analytics).
-5. **C12 + C13** — user-facing quick wins.
-6. **C10 + C11 + C9** — performance + recovery tooling.
+5. ~~**C12**~~ + **C13** — user-facing quick wins (**C12 done**).
+6. **C10** + ~~**C11**~~ + **C9** — performance + recovery tooling (**C11 done**).
