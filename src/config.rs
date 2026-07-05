@@ -32,6 +32,10 @@ pub enum NotesBackendKind {
     GitNotes,
     /// HTTP backend: queue writes to notes-db, flush via daemon, reads from cache
     Http,
+    /// Dual write: store notes in git refs/notes/ai AND sync them to the HTTP
+    /// backend. Local notes travel with the repo (offline, team-shareable via
+    /// push/fetch); the cloud copy powers hosted features.
+    Both,
 }
 
 impl NotesBackendKind {
@@ -39,7 +43,18 @@ impl NotesBackendKind {
         match self {
             NotesBackendKind::GitNotes => "git_notes",
             NotesBackendKind::Http => "http",
+            NotesBackendKind::Both => "both",
         }
+    }
+
+    /// Notes are written to (and synced through) git refs/notes/ai.
+    pub fn uses_git_notes(&self) -> bool {
+        matches!(self, NotesBackendKind::GitNotes | NotesBackendKind::Both)
+    }
+
+    /// Notes are queued to notes-db and uploaded to the HTTP backend.
+    pub fn uses_http(&self) -> bool {
+        matches!(self, NotesBackendKind::Http | NotesBackendKind::Both)
     }
 }
 
@@ -628,7 +643,7 @@ impl Config {
         if let Some(url) = self.notes_backend.backend_url.as_deref() {
             return Some(url);
         }
-        if self.notes_backend.kind == NotesBackendKind::Http {
+        if self.notes_backend.kind.uses_http() {
             return Some(DEFAULT_NOTES_BACKEND_URL);
         }
         None
@@ -636,7 +651,7 @@ impl Config {
 
     /// Returns true when the HTTP notes backend is active.
     pub fn notes_backend_enabled(&self) -> bool {
-        matches!(self.notes_backend.kind, NotesBackendKind::Http)
+        self.notes_backend.kind.uses_http()
     }
 
     pub fn transcript_streaming_lookback_days(&self) -> Option<u32> {
@@ -1143,6 +1158,7 @@ fn build_config() -> Config {
         .and_then(|s| match s.as_str() {
             "http" => Some(NotesBackendKind::Http),
             "git_notes" | "git-notes" => Some(NotesBackendKind::GitNotes),
+            "both" => Some(NotesBackendKind::Both),
             _ => None,
         });
     let url_from_env = env::var("AUTTER_NOTES_BACKEND_URL").ok();

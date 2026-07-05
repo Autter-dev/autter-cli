@@ -21,6 +21,23 @@ impl ClaudeCodeInstaller {
         claude_config_dir().join("settings.json")
     }
 
+    /// The primary settings file plus the settings file of every registered
+    /// Claude-compatible harness config directory (CLIs built on the Claude
+    /// Agent SDK that run hooks through their own `CLAUDE_CONFIG_DIR`).
+    /// Keeping these in sync means a harness whose hook binary path went
+    /// stale gets repaired on the next install/update run instead of
+    /// silently dropping checkpoints forever.
+    fn all_settings_paths() -> Vec<PathBuf> {
+        let mut paths = vec![Self::settings_path()];
+        for dir in crate::mdm::claude_config_registry::registered_config_dirs() {
+            let candidate = dir.join("settings.json");
+            if !paths.contains(&candidate) {
+                paths.push(candidate);
+            }
+        }
+        paths
+    }
+
     /// Returns `(hooks_installed, hooks_up_to_date)` from a parsed settings value.
     /// `hooks_installed` = autter checkpoint command exists in ANY matcher block.
     /// `hooks_up_to_date` = autter checkpoint command exists in the `"*"` catch-all block.
@@ -312,8 +329,11 @@ impl HookInstaller for ClaudeCodeInstaller {
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_binary = binary_exists("claude");
         let has_dotfiles = claude_config_dir().exists();
+        // Harnesses built on the Claude Agent SDK count as an installation
+        // even without the `claude` binary or `~/.claude` present.
+        let has_harness = !crate::mdm::claude_config_registry::registered_config_dirs().is_empty();
 
-        if !has_binary && !has_dotfiles {
+        if !has_binary && !has_dotfiles && !has_harness {
             return Ok(HookCheckResult {
                 tool_installed: false,
                 hooks_installed: false,
@@ -361,7 +381,30 @@ impl HookInstaller for ClaudeCodeInstaller {
         params: &HookInstallerParams,
         dry_run: bool,
     ) -> Result<Option<String>, AutterError> {
-        Self::install_hooks_at(&Self::settings_path(), params, dry_run)
+        let mut diffs: Vec<String> = Vec::new();
+        for (idx, path) in Self::all_settings_paths().iter().enumerate() {
+            if idx == 0 {
+                // Primary settings file: errors are fatal, as before.
+                if let Some(diff) = Self::install_hooks_at(path, params, dry_run)? {
+                    diffs.push(diff);
+                }
+            } else {
+                // Registered harness configs are best-effort: one harness's
+                // malformed settings must not fail the whole install.
+                match Self::install_hooks_at(path, params, dry_run) {
+                    Ok(Some(diff)) => diffs.push(diff),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), %e, "claude: failed to update harness hook config");
+                    }
+                }
+            }
+        }
+        if diffs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(diffs.join("\n")))
+        }
     }
 
     fn uninstall_hooks(
@@ -369,7 +412,27 @@ impl HookInstaller for ClaudeCodeInstaller {
         _params: &HookInstallerParams,
         dry_run: bool,
     ) -> Result<Option<String>, AutterError> {
-        Self::uninstall_hooks_at(&Self::settings_path(), dry_run)
+        let mut diffs: Vec<String> = Vec::new();
+        for (idx, path) in Self::all_settings_paths().iter().enumerate() {
+            if idx == 0 {
+                if let Some(diff) = Self::uninstall_hooks_at(path, dry_run)? {
+                    diffs.push(diff);
+                }
+            } else {
+                match Self::uninstall_hooks_at(path, dry_run) {
+                    Ok(Some(diff)) => diffs.push(diff),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), %e, "claude: failed to clean harness hook config");
+                    }
+                }
+            }
+        }
+        if diffs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(diffs.join("\n")))
+        }
     }
 }
 

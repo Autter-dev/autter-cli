@@ -273,6 +273,9 @@ fn handle_git_inner(args: &[String]) {
         // Warn (loudly, once per process) if this CLI is below the platform's
         // minimum required version. Reads the cached releases payload — no network.
         crate::commands::upgrade::maybe_warn_below_min_version();
+
+        // Remind the user when their login has expired and cloud sync is paused.
+        crate::auth::notice::maybe_warn_logged_out();
     });
 
     exit_with_status(exit_status);

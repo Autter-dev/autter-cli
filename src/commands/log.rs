@@ -3,7 +3,7 @@ use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::stats::{
     stats_for_commit_stats_with_parent_and_authorship, write_stats_to_terminal,
 };
-use crate::config::{Config, NotesBackendKind};
+use crate::config::Config;
 use crate::error::AutterError;
 use crate::git::repository::Repository;
 use crossterm::{
@@ -231,9 +231,10 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
 }
 
 fn run_plain_log(global_args: &[String], git_log_args: &[String]) -> Result<ExitStatus, LogError> {
-    if Config::get().notes_backend_kind() != NotesBackendKind::GitNotes {
+    if !Config::get().notes_backend_kind().uses_git_notes() {
         return Err(LogError::Message(
-            "plain git log --notes=ai only supports the git_notes backend".to_string(),
+            "plain git log --notes=ai only supports backends that store notes in git refs"
+                .to_string(),
         ));
     }
 

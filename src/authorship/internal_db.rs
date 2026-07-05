@@ -423,6 +423,18 @@ impl InternalDatabase {
         Ok(records)
     }
 
+    /// Number of CAS objects still waiting to be uploaded (excluding rows that
+    /// exhausted their retry budget). Cheap gate for the daemon flush loop so
+    /// an empty queue never triggers an auth check.
+    pub fn count_pending_cas(&self) -> Result<i64, AutterError> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM cas_sync_queue WHERE attempts < 6",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Delete a CAS sync record (on successful sync)
     pub fn delete_cas_sync_record(&mut self, id: i64) -> Result<(), AutterError> {
         self.conn

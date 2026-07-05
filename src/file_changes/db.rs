@@ -262,6 +262,17 @@ impl FileChangesDatabase {
         Ok(results)
     }
 
+    /// Number of rows still waiting to be uploaded. Cheap gate for the daemon
+    /// flush loop so an empty queue never triggers an auth check.
+    pub fn count_pending(&self) -> Result<i64, AutterError> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     pub fn dequeue_pending(
         &mut self,
         limit: usize,

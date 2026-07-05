@@ -48,6 +48,12 @@ impl AgentPreset for ClaudePreset {
             ));
         }
 
+        // This process runs inside the agent's environment: when a harness
+        // built on the Claude Agent SDK routes hooks through its own
+        // CLAUDE_CONFIG_DIR, record that directory so install/update runs
+        // keep its hooks maintained too.
+        crate::mdm::claude_config_registry::register_active_config_dir();
+
         let cwd = parse::required_str(&data, "cwd")?;
         let transcript_path = parse::required_str(&data, "transcript_path")?;
 
