@@ -901,6 +901,37 @@ fn commit_parent_head_for_capture(repo: &Repository, commit_sha: &str) -> Option
     commit.parent(0).ok().map(|parent| parent.id().to_string())
 }
 
+/// Wrap a carryover-capture failure with the context the call site already has
+/// in hand — the git command, its exit code, and which resolution stage failed —
+/// so the swallowed error is diagnosable from telemetry alone. The leading,
+/// low-cardinality `stage`/`command` keep PostHog Error Tracking grouping useful
+/// while the inner error preserves the specific cause. (argv and root_sid are
+/// logged as separate structured fields at the call site.)
+fn carryover_capture_stage_error(
+    stage: &str,
+    command: &str,
+    exit_code: i32,
+    error: AutterError,
+) -> AutterError {
+    AutterError::Generic(format!(
+        "carryover snapshot capture failed at stage={stage} command={command} exit_code={exit_code}: {error}"
+    ))
+}
+
+/// Resolve the worktree's current HEAD commit OID as a last-resort stable head
+/// for carryover capture. History-mutating commands such as `commit` and
+/// `reset` leave HEAD pointing at the post-command position, so reading it
+/// directly is a safe fallback when neither the reflog ref-change delta nor the
+/// captured `post_repo` head are available. Returns `None` for unborn branches
+/// or any resolution failure.
+fn repo_head_oid_for_capture(repo: &Repository) -> Option<String> {
+    repo.revparse_single("HEAD")
+        .and_then(|object| object.peel_to_commit())
+        .map(|commit| commit.id())
+        .ok()
+        .filter(|oid| is_valid_oid(oid) && !is_zero_oid(oid))
+}
+
 fn stable_carryover_heads_for_command(
     repo: &Repository,
     input: &CarryoverCaptureInput<'_>,
@@ -928,6 +959,7 @@ fn stable_carryover_heads_for_command(
                 .as_ref()
                 .map(|(_, new_head)| new_head.clone())
                 .or_else(|| post_head.clone())
+                .or_else(|| repo_head_oid_for_capture(repo))
                 .ok_or_else(|| {
                     AutterError::Generic(format!(
                         "commit missing stable post-head for carryover capture sid={}",
@@ -949,21 +981,31 @@ fn stable_carryover_heads_for_command(
                 .unwrap_or_else(|| "initial".to_string());
             Some((old_head, new_head))
         }
-        "rebase" | "pull" => ActorDaemonCoordinator::stable_rebase_heads_from_worktree(
-            repo,
-            input.worktree,
-            input.argv,
-            rebase_start_target_hint.as_deref(),
-        )?
-        .map(|(old_head, new_head, _onto_head)| (old_head, new_head))
-        .or_else(|| {
-            ref_head_change.clone().or_else(|| {
-                let new_head = post_head.clone()?;
-                let old_head =
-                    stable_old_head_from_worktree_head_reflog(input.worktree, &new_head)?;
-                Some((old_head, new_head))
+        "rebase" | "pull" => {
+            // Prefer the precise rebase-segment resolution, but don't let a
+            // failure there (e.g. an unreadable rewrite log or an ambiguous
+            // segment) propagate as a hard error — fall through to the
+            // ref-change / reflog / HEAD fallbacks so the common case still
+            // produces a usable carryover head pair.
+            let from_segment = ActorDaemonCoordinator::stable_rebase_heads_from_worktree(
+                repo,
+                input.worktree,
+                input.argv,
+                rebase_start_target_hint.as_deref(),
+            )
+            .unwrap_or(None)
+            .map(|(old_head, new_head, _onto_head)| (old_head, new_head));
+            from_segment.or_else(|| {
+                ref_head_change.clone().or_else(|| {
+                    let new_head = post_head
+                        .clone()
+                        .or_else(|| repo_head_oid_for_capture(repo))?;
+                    let old_head =
+                        stable_old_head_from_worktree_head_reflog(input.worktree, &new_head)?;
+                    Some((old_head, new_head))
+                })
             })
-        }),
+        }
         "checkout" | "switch" => {
             let is_merge = parsed.has_command_flag("--merge") || parsed.has_command_flag("-m");
             if !is_merge {
@@ -986,6 +1028,7 @@ fn stable_carryover_heads_for_command(
                 let new_head = post_head
                     .clone()
                     .or_else(|| stable_new_head_from_ref_changes(input.ref_changes))
+                    .or_else(|| repo_head_oid_for_capture(repo))
                     .ok_or_else(|| {
                         AutterError::Generic(format!(
                             "reset missing stable head for carryover capture sid={}",
@@ -4896,30 +4939,54 @@ impl ActorDaemonCoordinator {
             return Ok(None);
         }
 
-        let repo = discover_repository_in_path_no_git_exec(input.worktree)?;
-        let stable_heads = stable_carryover_heads_for_command(&repo, &input, &parsed)?;
+        // Attach the context we already have in hand to any failure below so the
+        // swallowed error is diagnosable from telemetry alone: which git command,
+        // its exit code, and which resolution stage failed. (argv and root_sid
+        // are logged as structured fields at the call site.) The leading
+        // `command=` keeps the message low-cardinality so PostHog Error Tracking
+        // still groups occurrences usefully.
+        let with_stage = |stage: &str, error: AutterError| {
+            carryover_capture_stage_error(stage, command, input.exit_code, error)
+        };
+
+        let repo = discover_repository_in_path_no_git_exec(input.worktree)
+            .map_err(|error| with_stage("repo_discovery", error))?;
+        let stable_heads = stable_carryover_heads_for_command(&repo, &input, &parsed)
+            .map_err(|error| with_stage("stable_heads", error))?;
 
         let mut file_paths = HashSet::new();
         match command {
             "commit" => {
                 let (old_head, _) = stable_heads.clone().ok_or_else(|| {
-                    AutterError::Generic(format!(
-                        "commit missing stable carryover heads sid={}",
-                        input.root_sid
-                    ))
+                    with_stage(
+                        "stable_heads",
+                        AutterError::Generic(format!(
+                            "commit missing stable carryover heads sid={}",
+                            input.root_sid
+                        )),
+                    )
                 })?;
-                file_paths.extend(tracked_working_log_files(&repo, &old_head)?);
+                file_paths.extend(
+                    tracked_working_log_files(&repo, &old_head)
+                        .map_err(|error| with_stage("tracked_working_log_files", error))?,
+                );
             }
             "rebase" | "pull" => {
                 if let Some((old_head, new_head)) = stable_heads.clone() {
                     if !old_head.is_empty() && !new_head.is_empty() && old_head != new_head {
-                        file_paths.extend(tracked_working_log_files(&repo, &old_head)?);
+                        file_paths.extend(
+                            tracked_working_log_files(&repo, &old_head)
+                                .map_err(|error| with_stage("tracked_working_log_files", error))?,
+                        );
                     }
                 } else if command == "rebase" {
-                    return Err(AutterError::Generic(format!(
-                        "rebase missing stable carryover heads sid={}",
-                        input.root_sid
-                    )));
+                    return Err(with_stage(
+                        "stable_heads",
+                        AutterError::Generic(format!(
+                            "rebase missing stable carryover heads sid={}",
+                            input.root_sid
+                        )),
+                    ));
                 }
             }
             "checkout" | "switch" => {
@@ -4930,7 +4997,10 @@ impl ActorDaemonCoordinator {
                     && !new_head.is_empty()
                     && old_head != new_head
                 {
-                    file_paths.extend(tracked_working_log_files(&repo, &old_head)?);
+                    file_paths.extend(
+                        tracked_working_log_files(&repo, &old_head)
+                            .map_err(|error| with_stage("tracked_working_log_files", error))?,
+                    );
                 }
             }
             "reset" => {
@@ -4938,7 +5008,10 @@ impl ActorDaemonCoordinator {
                     && let Some((old_head, _new_head)) = stable_heads.clone()
                     && !old_head.is_empty()
                 {
-                    file_paths.extend(tracked_working_log_files(&repo, &old_head)?);
+                    file_paths.extend(
+                        tracked_working_log_files(&repo, &old_head)
+                            .map_err(|error| with_stage("tracked_working_log_files", error))?,
+                    );
                     let pathspecs = parsed.pathspecs();
                     if !pathspecs.is_empty() {
                         file_paths.retain(|file| matches_any_pathspec(file, &pathspecs));
@@ -5745,6 +5818,8 @@ impl ActorDaemonCoordinator {
                             root_sid = %root,
                             %sid,
                             ?effective_argv,
+                            exit_code = terminal_exit_code.unwrap_or(0),
+                            primary_command = effective_primary.as_deref().unwrap_or("<none>"),
                             %error,
                             "carryover snapshot capture failed"
                         );
@@ -9087,6 +9162,28 @@ mod tests {
             std::path::PathBuf::from("src/main.rs")
         );
         assert_eq!(request.files[0].content.as_deref(), Some("fn main() {}\n"));
+    }
+
+    #[test]
+    fn carryover_capture_stage_error_embeds_command_exit_and_stage_context() {
+        let wrapped = carryover_capture_stage_error(
+            "stable_heads",
+            "rebase",
+            1,
+            AutterError::Generic("rebase missing stable carryover heads sid=abc".to_string()),
+        );
+
+        let message = wrapped.to_string();
+        // The diagnosable context the call site has in hand must survive into the
+        // error that gets logged-and-swallowed: stage, command, and exit code.
+        assert!(message.contains("stage=stable_heads"), "{message}");
+        assert!(message.contains("command=rebase"), "{message}");
+        assert!(message.contains("exit_code=1"), "{message}");
+        // The underlying cause is preserved verbatim.
+        assert!(
+            message.contains("rebase missing stable carryover heads sid=abc"),
+            "{message}"
+        );
     }
 
     #[test]
