@@ -1,0 +1,57 @@
+install.sh
+  s_9a7b811394f1af::t_5ba1995756ffed 264-315
+install.ps1
+  s_9a7b811394f1af::t_82be1ec5672a4c 343-383
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.6.7",
+  "base_commit_sha": "e19e3fd7ef445c191e2ae0d5b10d27c0af827fc9",
+  "branch": "posthog-code/install-script-ping",
+  "prompts": {
+    "s_9a7b811394f1af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ff1f9-61ac-7688-894f-18d20d58e65c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:df1727b50dad105c1212305adb0d3b674a7e3e7d2133fb6fc7e16a0354cd78aa",
+      "total_additions": 94,
+      "total_deletions": 0,
+      "accepted_lines": 94,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_9a7b811394f1af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ff1f9-61ac-7688-894f-18d20d58e65c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:df1727b50dad105c1212305adb0d3b674a7e3e7d2133fb6fc7e16a0354cd78aa",
+      "stats": {
+        "total_additions": 94,
+        "total_deletions": 0,
+        "accepted_lines": 94,
+        "overriden_lines": 0,
+        "files": {
+          "install.ps1": {
+            "total_additions": 42,
+            "total_deletions": 0,
+            "accepted_lines": 42,
+            "overriden_lines": 0
+          },
+          "install.sh": {
+            "total_additions": 52,
+            "total_deletions": 0,
+            "accepted_lines": 52,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
