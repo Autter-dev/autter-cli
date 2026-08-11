@@ -1,0 +1,99 @@
+src/commands/login.rs
+  s_65caebe722c0b5::t_1898ff3de67756 44,47,56-73
+src/ui.rs
+  s_65caebe722c0b5::t_15801bd2711eb1 1-99,105-192,197-206
+  s_65caebe722c0b5::t_198c6755a81f83 100-104,193-196
+install.ps1
+  s_65caebe722c0b5::t_7e1b4441e7043a 608-613
+src/mdm/spinner.rs
+  s_65caebe722c0b5::t_7c98ec457dafc8 37-42
+src/lib.rs
+  s_65caebe722c0b5::t_e4bd4c1bf1822d 23
+src/commands/onboard.rs
+  s_65caebe722c0b5::t_198c6755a81f83 179,183-185,289-297,299-301
+  s_65caebe722c0b5::t_5a0a2acb3dfd21 3-5,24-26,34,41,82,106-110,118-132,143-148,155-165,181,215,221,224,259,265,269,271,273-274,276,280-288,298,302-304
+install.sh
+  s_65caebe722c0b5::t_e2d2462f834cf4 426-429,431-435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.6.7",
+  "base_commit_sha": "a9e41efa95047dff512fceb9167073c6ba2a3096",
+  "branch": "posthog-code/interactive-onboarding",
+  "prompts": {
+    "s_65caebe722c0b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ff053-84bf-74b9-9084-74d816fab025",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:06de37ad1f51e23db35b13915d58a6ab1aa8285c934fb0d9d7a4195734eed447",
+      "total_additions": 346,
+      "total_deletions": 71,
+      "accepted_lines": 338,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_65caebe722c0b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ff053-84bf-74b9-9084-74d816fab025",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:06de37ad1f51e23db35b13915d58a6ab1aa8285c934fb0d9d7a4195734eed447",
+      "stats": {
+        "total_additions": 346,
+        "total_deletions": 71,
+        "accepted_lines": 338,
+        "overriden_lines": 0,
+        "files": {
+          "install.ps1": {
+            "total_additions": 6,
+            "total_deletions": 0,
+            "accepted_lines": 6,
+            "overriden_lines": 0
+          },
+          "install.sh": {
+            "total_additions": 9,
+            "total_deletions": 2,
+            "accepted_lines": 9,
+            "overriden_lines": 0
+          },
+          "src/commands/login.rs": {
+            "total_additions": 20,
+            "total_deletions": 12,
+            "accepted_lines": 20,
+            "overriden_lines": 0
+          },
+          "src/commands/onboard.rs": {
+            "total_additions": 96,
+            "total_deletions": 55,
+            "accepted_lines": 90,
+            "overriden_lines": 0
+          },
+          "src/lib.rs": {
+            "total_additions": 1,
+            "total_deletions": 0,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "src/mdm/spinner.rs": {
+            "total_additions": 6,
+            "total_deletions": 0,
+            "accepted_lines": 6,
+            "overriden_lines": 0
+          },
+          "src/ui.rs": {
+            "total_additions": 208,
+            "total_deletions": 2,
+            "accepted_lines": 206,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
