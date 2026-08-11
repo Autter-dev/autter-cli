@@ -331,6 +331,20 @@ fn is_trace_payload(payload: &Value) -> bool {
     payload.get("event").and_then(Value::as_str).is_some()
 }
 
+/// Returns true when the error indicates the git working directory vanished
+/// mid-operation. Git reports this as exit code 128 with a stderr such as
+/// "cannot change to '.../T/.tmpXXXX': No such file or directory", typically
+/// when a temp/test repo is cleaned up while an async side effect is still in
+/// flight. These are benign races, so the daemon skips the side effect quietly
+/// rather than reporting a generic "command side effect failed" exception.
+fn is_missing_working_dir_error(error: &AutterError) -> bool {
+    matches!(
+        error,
+        AutterError::GitCliError { code: Some(128), stderr, .. }
+            if stderr.contains("No such file or directory")
+    )
+}
+
 fn trace_root_sid(sid: &str) -> &str {
     sid.split('/').next().unwrap_or(sid)
 }
@@ -7081,6 +7095,33 @@ impl ActorDaemonCoordinator {
         family: Option<&str>,
         applied: &crate::daemon::domain::AppliedCommand,
     ) -> Result<(), AutterError> {
+        match self
+            .maybe_apply_side_effects_for_applied_command_inner(family, applied)
+            .await
+        {
+            // A working directory that vanished mid-operation (e.g. a temp repo
+            // cleaned up while this async side effect was still in flight) makes
+            // git commands fail with exit 128 / "No such file or directory".
+            // That is a benign race, not a real fault, so skip quietly instead
+            // of surfacing a reported "command side effect failed" error.
+            Err(error) if is_missing_working_dir_error(&error) => {
+                tracing::debug!(
+                    %error,
+                    ?family,
+                    seq = applied.seq,
+                    "skipping side effects: working directory no longer exists (benign race)"
+                );
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    async fn maybe_apply_side_effects_for_applied_command_inner(
+        &self,
+        family: Option<&str>,
+        applied: &crate::daemon::domain::AppliedCommand,
+    ) -> Result<(), AutterError> {
         // Test-only: allow inducing a panic in the side-effect pipeline to verify
         // that the daemon's catch_unwind recovery keeps the process alive.
         // Uses a file-based flag so the test can remove the file between commands.
@@ -9076,6 +9117,41 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn missing_working_dir_error_detects_exit_128_enoent() {
+        let error = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: cannot change to '/tmp/.tmpeiMf5P': No such file or directory"
+                .to_string(),
+            args: vec!["ls-tree".to_string(), "HEAD".to_string()],
+        };
+        assert!(is_missing_working_dir_error(&error));
+    }
+
+    #[test]
+    fn missing_working_dir_error_ignores_other_git_failures() {
+        // Exit 128 but a different cause is a real error, not a vanished dir.
+        let bad_object = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: not a valid object name HEAD".to_string(),
+            args: vec!["ls-tree".to_string(), "HEAD".to_string()],
+        };
+        assert!(!is_missing_working_dir_error(&bad_object));
+
+        // Wrong exit code, even with matching stderr text.
+        let other_code = AutterError::GitCliError {
+            code: Some(1),
+            stderr: "No such file or directory".to_string(),
+            args: vec![],
+        };
+        assert!(!is_missing_working_dir_error(&other_code));
+
+        // Non-git errors never qualify.
+        assert!(!is_missing_working_dir_error(&AutterError::Generic(
+            "No such file or directory".to_string()
+        )));
+    }
 
     struct EnvVarGuard {
         key: &'static str,
