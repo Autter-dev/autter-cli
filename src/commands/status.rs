@@ -29,17 +29,22 @@ struct StatusOutput {
 }
 
 pub fn handle_status(args: &[String]) {
-    let mut json_output = false;
+    use crate::commands::arg_parser::{self, ScanMode};
 
-    let mut i = 0;
-    while i < args.len() {
-        if args[i].as_str() == "--json" {
-            json_output = true;
+    let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
         }
-        i += 1;
+    };
+    if pp.flags.help {
+        arg_parser::print_command_help("status");
+        return;
     }
+    arg_parser::merge_global_flags(&pp.flags);
 
-    if let Err(e) = run_status(json_output) {
+    if let Err(e) = run_status(arg_parser::json()) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -70,7 +75,7 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             };
             let json_str = serde_json::to_string(&output)?;
             println!("{}", json_str);
-        } else {
+        } else if !crate::commands::arg_parser::quiet() {
             eprintln!(
                 "No checkpoints recorded since last commit ({})",
                 &head_sha[..7]
@@ -184,7 +189,7 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             cp.time_ago, add_str, del_str, cp.tool_model
         );
 
-        if cp.is_human {
+        if cp.is_human && crate::commands::arg_parser::use_color() {
             println!("\x1b[90m{}\x1b[0m", line);
         } else {
             println!("{}", line);

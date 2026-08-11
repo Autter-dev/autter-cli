@@ -83,14 +83,21 @@ pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> Str
     // Set maximum bar width to 40 characters
     let bar_width: usize = 40;
 
+    // Honor the project-wide color decision (NO_COLOR / --no-color / non-TTY).
+    let colorize = crate::commands::arg_parser::use_color();
+
     // Handle deletion-only commits (no additions)
     if stats.git_diff_added_lines == 0 && stats.git_diff_deleted_lines > 0 {
         // Show gray bar for deletion-only commit
         let mut progress_bar = String::new();
         progress_bar.push_str("you  ");
-        progress_bar.push_str("\x1b[90m"); // Gray color
+        if colorize {
+            progress_bar.push_str("\x1b[90m"); // Gray color
+        }
         progress_bar.push_str(&" ".repeat(bar_width)); // Gray bar
-        progress_bar.push_str("\x1b[0m"); // Reset color
+        if colorize {
+            progress_bar.push_str("\x1b[0m"); // Reset color
+        }
         progress_bar.push_str(" ai");
 
         output.push_str(&progress_bar);
@@ -100,7 +107,11 @@ pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> Str
         }
 
         // Show "(no additions)" message below the bar
-        let no_additions_msg = format!("     \x1b[90m{:^40}\x1b[0m", "(no additions)");
+        let no_additions_msg = if colorize {
+            format!("     \x1b[90m{:^40}\x1b[0m", "(no additions)")
+        } else {
+            format!("     {:^40}", "(no additions)")
+        };
         output.push_str(&no_additions_msg);
         output.push('\n');
         if is_interactive {
@@ -188,7 +199,7 @@ pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> Str
         // supporting terminals (iTerm2, Warp, etc.). Spaces are constructed manually —
         // not via format-width padding on the label — so that invisible escape bytes do
         // not misalign the output.
-        let untracked_label = if is_interactive {
+        let untracked_label = if is_interactive && colorize {
             "\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\\x1b[4muntracked\x1b[24m\x1b]8;;\x1b\\"
                 .to_string()
         } else {
