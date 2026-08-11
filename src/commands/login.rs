@@ -41,10 +41,10 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     // Display instructions
     eprintln!("To authorize this device:");
     eprintln!("  1. Open this URL in your browser:");
-    eprintln!("     {}", display_url);
+    eprintln!("     \x1b[36m{}\x1b[0m", display_url);
     eprintln!();
     eprintln!("  2. Enter this code when prompted:");
-    eprintln!("     {}", auth_response.user_code);
+    eprintln!("     \x1b[1m{}\x1b[0m", auth_response.user_code);
     eprintln!();
 
     // Try to open browser automatically
@@ -53,16 +53,24 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
         eprintln!();
     }
 
-    eprintln!("Waiting for authorization...");
-
-    // Poll for token
-    let creds = client
-        .poll_for_token(
-            &auth_response.device_code,
-            auth_response.interval,
-            auth_response.expires_in,
-        )
-        .map_err(|e| format!("Authorization failed: {}", e))?;
+    // Poll for token, with a spinner so the wait doesn't look like a hang.
+    // (indicatif draws on stderr, matching the rest of this flow.)
+    let spinner = crate::mdm::spinner::Spinner::new("Waiting for you to authorize in the browser…");
+    let creds = match client.poll_for_token(
+        &auth_response.device_code,
+        auth_response.interval,
+        auth_response.expires_in,
+    ) {
+        Ok(creds) => {
+            spinner.stop();
+            eprintln!("\x1b[1;32m✓ Device authorized.\x1b[0m");
+            creds
+        }
+        Err(e) => {
+            spinner.stop();
+            return Err(format!("Authorization failed: {}", e));
+        }
+    };
 
     // Store credentials (non-fatal on failure)
     if let Err(e) = store.store(&creds) {

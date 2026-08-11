@@ -1,6 +1,8 @@
 //! First-run onboarding flow (`autter onboard`).
 //!
-//! After installation, autter walks the user through a one-time choice:
+//! After installation, autter walks the user through a one-time guided setup:
+//! an arrow-key choice between the two modes, a telemetry consent choice, and
+//! a "you're all set" summary with the first commands to try.
 //!
 //! - **Local mode** — everything stays on the machine (git notes + local
 //!   storage). Nothing is uploaded. The user is told they will not get the
@@ -19,6 +21,9 @@
 //!
 //! The chosen mode is recorded in `~/.autter/config.json` via
 //! `onboarding_completed`, so re-running an installer does not nag the user.
+//! Non-interactive shells never see prompts: `--connect`/`--local` and
+//! `--telemetry`/`--no-telemetry` drive scripted installs, and with no flags
+//! the flow defers itself until the user has a real terminal.
 //!
 //! Note: the full authorship-note → Postgres dual-write (keeping local git
 //! notes while also uploading the note itself) is delivered alongside the
@@ -26,13 +31,14 @@
 //! prompt/usage data via the existing CAS upload path.
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 
 use serde_json::json;
 
 use crate::auth::{AuthState, collect_auth_status};
 use crate::commands::login::run_device_login;
 use crate::config::{self, NotesBackendConfig, NotesBackendKind};
+use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem};
 
 /// Entry point for the `autter onboard` command.
 pub fn handle_onboard(args: &[String]) {
@@ -73,7 +79,7 @@ pub fn handle_onboard(args: &[String]) {
         // without prompting.
         true
     } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        prompt_yes_no("Connect this machine to the Autter platform?", false)
+        prompt_mode_choice()
     } else {
         // Non-interactive shell with no explicit choice: don't block automated
         // installs and don't guess — leave onboarding incomplete so the user can
@@ -97,14 +103,31 @@ pub fn handle_onboard(args: &[String]) {
         eprintln!("Warning: could not save onboarding state: {e}");
     }
 
+    // Reflect the mode actually configured: a connect attempt can fall back
+    // to local if the device login fails.
+    let connected = file_config.prompt_storage.as_deref() != Some("local");
+    print_finished(connected);
+
     // Fire a one-off install/onboard event so we can count installs by version
     // and platform. Only when the user just opted in.
     if telemetry_enabled {
-        // Reflect the mode actually configured: a connect attempt can fall back
-        // to local if the device login fails.
-        let connected = file_config.prompt_storage.as_deref() != Some("local");
         record_install_event(connected);
     }
+}
+
+/// The interactive connected-vs-local choice, as an arrow-key selector.
+fn prompt_mode_choice() -> bool {
+    let items = [
+        SelectItem::new(
+            "Connected — link this machine to your Autter org (recommended)",
+            "Powers prompt search, team dashboards, and PR authorship views. Sign-in opens in your browser.",
+        ),
+        SelectItem::new(
+            "Local only — everything stays on this machine",
+            "No account needed. Switch anytime with `autter onboard --connect`.",
+        ),
+    ];
+    ui::select("How should Autter run on this machine?", &items, 0) == 0
 }
 
 /// Ask whether to enable anonymous telemetry + error tracking and persist the
@@ -117,22 +140,29 @@ fn configure_telemetry(cfg: &mut config::FileConfig, flag: Option<bool>) -> bool
         .unwrap_or_else(|| "~/.autter/internal/telemetry.log".to_string());
 
     eprintln!();
-    eprintln!("  Help improve Autter with anonymous usage analytics and error reporting?");
-    eprintln!();
-    eprintln!("  \u{2022} No personal data is ever collected \u{2014} no code, prompts, file");
-    eprintln!("    paths, repo names, usernames, or IP addresses.");
-    eprintln!("  \u{2022} We capture only a random install ID and coarse device info");
-    eprintln!("    (OS, CPU architecture, core count) plus the Autter version.");
-    eprintln!("  \u{2022} Everything we send is mirrored to a local log you can inspect:");
-    eprintln!("      {local_log}");
-    eprintln!("  \u{2022} You can change this anytime with `autter onboard --force`.");
+    eprintln!("  {DIM}One last thing — anonymous usage analytics and error reporting.");
+    eprintln!("  No personal data is ever collected: no code, prompts, file paths,");
+    eprintln!("  repo names, usernames, or IP addresses. Only a random install ID,");
+    eprintln!("  coarse device info (OS, CPU architecture, core count) and the");
+    eprintln!("  Autter version. Everything sent is mirrored to a local log:");
+    eprintln!("      {local_log}{RESET}");
     eprintln!();
 
     let enabled = match flag {
         Some(value) => value,
         None => {
             if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-                prompt_yes_no("Enable anonymous telemetry and error tracking?", true)
+                let items = [
+                    SelectItem::new(
+                        "Enable — help improve Autter",
+                        "Audit every event in the local log, or turn it off anytime with `autter telemetry off`.",
+                    ),
+                    SelectItem::new(
+                        "Disable — send nothing",
+                        "You can opt in later with `autter telemetry on`.",
+                    ),
+                ];
+                ui::select("Enable anonymous telemetry and error tracking?", &items, 0) == 0
             } else {
                 // Non-interactive and no explicit flag: default to disabled so we
                 // never collect data the user didn't actively agree to.
@@ -146,11 +176,13 @@ fn configure_telemetry(cfg: &mut config::FileConfig, flag: Option<bool>) -> bool
     eprintln!();
     if enabled {
         eprintln!(
-            "  \u{2713} Telemetry enabled. Thank you \u{2014} you can review what's sent at:"
+            "  {GREEN}\u{2713}{RESET} Telemetry enabled. Thank you — you can review what's sent at:"
         );
-        eprintln!("      {local_log}");
+        eprintln!("      {DIM}{local_log}{RESET}");
     } else {
-        eprintln!("  \u{2713} Telemetry disabled. Nothing will be collected or sent.");
+        eprintln!(
+            "  {GREEN}\u{2713}{RESET} Telemetry disabled. Nothing will be collected or sent."
+        );
     }
 
     enabled
@@ -180,16 +212,16 @@ fn setup_local(cfg: &mut config::FileConfig) {
     });
 
     eprintln!();
-    eprintln!("\u{2713} Autter is set up in local mode.");
+    eprintln!("{GREEN}{BOLD}\u{2713} Autter is set up in local mode.{RESET}");
     eprintln!();
     eprintln!("  \u{2022} Attribution, blame, and stats run entirely on your machine.");
     eprintln!("  \u{2022} Data stays in this repo's git notes (refs/notes/ai) and local storage.");
     eprintln!("  \u{2022} Nothing is uploaded to the Autter platform.");
     eprintln!();
-    eprintln!("  Heads up: in local mode you will NOT have access to the Autter platform's");
+    eprintln!("  {DIM}Heads up: in local mode you will NOT have access to the Autter platform's");
     eprintln!("  detailed prompt usage and team/user usage dashboards.");
     eprintln!();
-    eprintln!("  Run `autter onboard --connect` anytime to link your Autter account.");
+    eprintln!("  Run `autter onboard --connect` anytime to link your Autter account.{RESET}");
 }
 
 /// Log the user in (if needed) and configure connected mode.
@@ -224,25 +256,52 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
         .unwrap_or_else(|| "your Autter account".to_string());
 
     eprintln!();
-    eprintln!("\u{2713} Connected to the Autter platform as {who}.");
+    eprintln!("{GREEN}{BOLD}\u{2713} Connected to the Autter platform as {who}.{RESET}");
     eprintln!();
     eprintln!("  \u{2022} Attribution is still written locally to git notes (refs/notes/ai).");
     eprintln!("  \u{2022} Prompt and usage data also sync to your org's Autter dashboard,");
     eprintln!("    so you get detailed prompt usage and team/user analytics.");
     eprintln!();
-    eprintln!("  Manage your account with `autter whoami` / `autter logout`.");
+    eprintln!("  {DIM}Manage your account with `autter whoami` / `autter logout`.{RESET}");
 }
 
 fn print_welcome() {
+    let version = env!("CARGO_PKG_VERSION");
     eprintln!();
-    eprintln!("  Welcome to Autter \u{1F9A6}");
+    eprintln!("  {BOLD}Welcome to Autter{RESET} \u{1F9A6}  {DIM}v{version}{RESET}");
     eprintln!();
-    eprintln!("  Autter tracks which lines of code were written by AI agents and links");
-    eprintln!("  them to the agent, model, and prompts behind them.");
+    eprintln!("  Autter records which lines of your code were written by AI \u{2014} tied to");
+    eprintln!("  the agent, model, and prompts behind them \u{2014} right in Git itself.");
     eprintln!();
-    eprintln!("  You can connect this machine to the Autter platform for detailed prompt");
-    eprintln!("  usage and team/user analytics, or run fully local \u{2014} your choice.");
+    eprintln!("  {DIM}Setup takes about a minute: two quick choices and you're done.{RESET}");
     eprintln!();
+}
+
+/// Closing summary: confirmation that nothing else is required, plus the first
+/// commands worth trying.
+fn print_finished(connected: bool) {
+    eprintln!();
+    eprintln!("{GREEN}{BOLD}\u{2713} You're all set!{RESET}");
+    eprintln!();
+    eprintln!("  Just keep coding \u{2014} authorship is recorded automatically on every commit.");
+    eprintln!();
+    eprintln!("  Try it on any repo:");
+    eprintln!(
+        "    {CYAN}autter stats{RESET}          {DIM}AI vs human share of your latest commit{RESET}"
+    );
+    eprintln!(
+        "    {CYAN}autter blame <file>{RESET}   {DIM}who \u{2014} you or an agent \u{2014} wrote each line{RESET}"
+    );
+    eprintln!(
+        "    {CYAN}autter log{RESET}            {DIM}git log with AI authorship stats{RESET}"
+    );
+    if connected {
+        eprintln!(
+            "    {CYAN}autter dash{RESET}           {DIM}open your personal dashboard{RESET}"
+        );
+    }
+    eprintln!();
+    eprintln!("  {DIM}All commands: `autter help` \u{2022} Docs: https://autter.dev/docs{RESET}");
 }
 
 fn print_status_summary() {
@@ -288,23 +347,5 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
         eprintln!("  {local_log}");
     } else {
         eprintln!("Anonymous telemetry is OFF.");
-    }
-}
-
-/// Prompt a yes/no question on stderr and read the answer from stdin.
-fn prompt_yes_no(question: &str, default_yes: bool) -> bool {
-    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
-    eprint!("{question} {hint} ");
-    let _ = std::io::stderr().flush();
-
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
-        return default_yes;
-    }
-
-    match input.trim().to_lowercase().as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        _ => default_yes,
     }
 }

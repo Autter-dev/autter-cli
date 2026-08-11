@@ -423,6 +423,13 @@ printf '%b\n' "${YELLOW}Close and reopen your terminal and IDE sessions to use a
 
 # Walk the user through onboarding: choose local-only vs connecting to the
 # Autter platform. When the user opts to connect, this also handles login.
-# Skips itself gracefully in non-interactive installs (e.g. `curl | bash`).
+# Under `curl | sh` stdin is the pipe, not the terminal, so hand onboarding
+# the real terminal when one is available — the guided prompts then run
+# inline instead of asking the user to remember `autter onboard` later.
+# Skips itself gracefully in truly non-interactive installs (CI, MDM).
 echo ""
-${INSTALL_DIR}/autter onboard || true
+if [ -r /dev/tty ]; then
+    ${INSTALL_DIR}/autter onboard </dev/tty || true
+else
+    ${INSTALL_DIR}/autter onboard || true
+fi

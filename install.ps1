@@ -605,3 +605,9 @@ if ($needLogin) {
     Write-Host 'Launching login...'
     & $finalExe login
 }
+
+# Walk the user through onboarding: choose local-only vs connecting to the
+# Autter platform, plus telemetry consent. The CLI skips itself gracefully
+# when the console isn't interactive (CI, scripted installs).
+Write-Host ''
+& $finalExe onboard
