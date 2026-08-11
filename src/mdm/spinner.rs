@@ -35,6 +35,12 @@ impl Spinner {
         smol::Timer::after(std::time::Duration::from_millis(duration_ms)).await;
     }
 
+    /// Clear the spinner without printing a status line, for callers that
+    /// print their own outcome (e.g. to stderr instead of stdout).
+    pub fn stop(&self) {
+        self.pb.finish_and_clear();
+    }
+
     pub fn success(&self, message: &str) {
         // Clear spinner and show success with green checkmark and bold green text
         self.pb.finish_and_clear();
