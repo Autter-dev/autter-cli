@@ -83,7 +83,11 @@ fn transcript_paths_from_checkpoints(checkpoints: &[Checkpoint]) -> HashMap<Stri
         let (Some(agent_id), Some(meta)) = (&cp.agent_id, &cp.agent_metadata) else {
             continue;
         };
-        if let Some(path) = meta.get("transcript_path") {
+        if let Some(path) = meta
+            .get("transcript_path")
+            .or_else(|| meta.get("chat_session_path"))
+            .or_else(|| meta.get("session_path"))
+        {
             let short_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
             let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
             transcript_paths.insert(short_hash, path.clone());
@@ -97,18 +101,9 @@ fn transcript_paths_from_checkpoints(checkpoints: &[Checkpoint]) -> HashMap<Stri
 /// Returns the canonical content hash on success, or `None` when there is
 /// nothing worth storing (file gone, empty, or unparseable).
 fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<String>, AutterError> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        // Transcript file no longer present (e.g. cleaned up by the agent).
+    let Some(messages) = messages_from_transcript_file(path)? else {
         return Ok(None);
     };
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let events = parse_transcript_events(&raw);
-    if events.is_empty() {
-        return Ok(None);
-    }
 
     // Normalize each agent's raw event format into typed transcript messages.
     let messages: Vec<Message> = events.iter().flat_map(messages_from_event).collect();
@@ -145,6 +140,43 @@ fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<Stri
     }
 
     Ok(Some(cas_hash))
+}
+
+/// Read, normalize, and redact messages from a transcript file.
+pub fn messages_from_transcript_file(path: &str) -> Result<Option<Vec<Message>>, AutterError> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        // Transcript file no longer present (e.g. cleaned up by the agent).
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let events = parse_transcript_events(&raw);
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    let messages: Vec<Message> = events.iter().flat_map(messages_from_event).collect();
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    let payload = serde_json::to_value(CasMessagesObject { messages })
+        .map_err(|e| AutterError::Generic(format!("Failed to serialize transcript: {e}")))?;
+    let redacted = crate::daemon::transcript_redaction::redact_json_secrets(payload);
+    extract_messages_from_cas_value(&redacted).map(Some)
+}
+
+/// Return the earliest user message from a transcript file, after redaction.
+pub fn first_user_prompt_from_transcript_file(path: &str) -> Result<Option<String>, AutterError> {
+    let Some(messages) = messages_from_transcript_file(path)? else {
+        return Ok(None);
+    };
+    Ok(messages.into_iter().find_map(|message| match message {
+        Message::User { text, .. } => Some(text),
+        _ => None,
+    }))
 }
 
 /// Resolve transcript messages from a `cas:<hash>` URL.
