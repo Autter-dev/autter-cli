@@ -1,0 +1,91 @@
+Cargo.lock
+  s_2963cb765012f7::t_d60dc30e42e233 272
+src/mdm/utils.rs
+  s_2963cb765012f7::t_08467522b8d4d8 622-627,635,637,639-641,644-666
+Cargo.toml
+  s_2963cb765012f7::t_288ec238bb22ef 11
+install.sh
+  s_2963cb765012f7::t_61a2395519ebf5 67-70,73,78,83
+  s_2963cb765012f7::t_d6d3f61a73ca02 196
+  s_2963cb765012f7::t_5c936a6452d04f 422
+src/mdm/agents/vscode.rs
+  s_2963cb765012f7::t_6f448fcc72f14e 166
+changelog/quiet-installer-output.md
+  s_2963cb765012f7::t_dfdd5a3e053e10 1-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.6.7",
+  "base_commit_sha": "5946ab2b2b9b59293d3b37c28963263fb203cba7",
+  "branch": "main",
+  "prompts": {
+    "s_2963cb765012f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ff023-4396-740c-95fc-eeec0b618cd8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:f2064b152ccf5c479098e1c1a0db03e094fffe67a9631638fb9f20c808e85b3b",
+      "total_additions": 77,
+      "total_deletions": 15,
+      "accepted_lines": 77,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_2963cb765012f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019ff023-4396-740c-95fc-eeec0b618cd8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:f2064b152ccf5c479098e1c1a0db03e094fffe67a9631638fb9f20c808e85b3b",
+      "stats": {
+        "total_additions": 77,
+        "total_deletions": 15,
+        "accepted_lines": 77,
+        "overriden_lines": 0,
+        "files": {
+          "Cargo.lock": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "Cargo.toml": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "changelog/quiet-installer-output.md": {
+            "total_additions": 31,
+            "total_deletions": 0,
+            "accepted_lines": 31,
+            "overriden_lines": 0
+          },
+          "install.sh": {
+            "total_additions": 9,
+            "total_deletions": 5,
+            "accepted_lines": 9,
+            "overriden_lines": 0
+          },
+          "src/mdm/agents/vscode.rs": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "src/mdm/utils.rs": {
+            "total_additions": 34,
+            "total_deletions": 7,
+            "accepted_lines": 34,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
