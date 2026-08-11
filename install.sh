@@ -64,19 +64,23 @@ PINNED_VERSION="__VERSION_PLACEHOLDER__"
 # When set to __CHECKSUMS_PLACEHOLDER__, checksum verification is skipped
 EMBEDDED_CHECKSUMS="__CHECKSUMS_PLACEHOLDER__"
 
+# Print helpers use printf, not `echo -e`: when this script is run with
+# `curl … | sh` the shebang is bypassed, and POSIX-mode shells (dash,
+# macOS /bin/sh) print `echo -e`'s "-e" literally.
+
 # Function to print error messages
 error() {
-    echo -e "${RED}Error: $1${NC}" >&2
+    printf '%b\n' "${RED}Error: $1${NC}" >&2
     exit 1
 }
 
 warn() {
-    echo -e "${YELLOW}Warning: $1${NC}" >&2
+    printf '%b\n' "${YELLOW}Warning: $1${NC}" >&2
 }
 
 # Function to print success messages
 success() {
-    echo -e "${GREEN}$1${NC}"
+    printf '%b\n' "${GREEN}$1${NC}"
 }
 
 # Function to verify checksum of downloaded binary
@@ -189,7 +193,7 @@ if [ "$(id -u)" = "0" ] && [ "${AUTTER_ALLOW_SUPERUSER:-}" != "1" ]; then
 
     if [ "$IS_CI_OR_MDM" = "false" ]; then
         echo ""
-        echo -e "${YELLOW}Warning: installing autter as root/sudo is not recommended.${NC}"
+        printf '%b\n' "${YELLOW}Warning: installing autter as root/sudo is not recommended.${NC}"
         echo ""
         echo "Running with elevated privileges creates files owned by root that become"
         echo "inaccessible to your normal user account, causing persistent daemon lock"
@@ -415,7 +419,7 @@ if [ "$(id -u)" = "0" ] && [ -n "$INSTALL_USER" ]; then
 fi
 
 echo ""
-echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use autter.${NC}"
+printf '%b\n' "${YELLOW}Close and reopen your terminal and IDE sessions to use autter.${NC}"
 
 # Walk the user through onboarding: choose local-only vs connecting to the
 # Autter platform. When the user opts to connect, this also handles login.

@@ -619,7 +619,12 @@ pub fn is_vsc_editor_extension_installed(
     )))
 }
 
-/// Install a VS Code extension
+/// Install a VS Code extension.
+///
+/// The editor CLI's stdout/stderr are captured, not inherited: the raw output
+/// (Node deprecation warnings, red "Extension not found" errors) is scary
+/// installer noise, and the caller already prints a clean one-line status.
+/// Captured output is surfaced via `tracing::debug!` and the returned error.
 pub fn install_vsc_editor_extension(
     cli: &EditorCliCommand,
     id_or_vsix: &str,
@@ -627,16 +632,38 @@ pub fn install_vsc_editor_extension(
     // NOTE: We try up to 3 times, because the editor CLI can be flaky (throws intermittent JS errors)
     let mut last_error_message: Option<String> = None;
     for attempt in 1..=3 {
-        let cmd_status = cli
+        let cmd_output = cli
             .command(&["--install-extension", id_or_vsix, "--force"])
-            .status();
+            .output();
 
-        match cmd_status {
-            Ok(status) => {
-                if status.success() {
+        match cmd_output {
+            Ok(output) => {
+                if output.status.success() {
                     return Ok(());
                 }
-                last_error_message = Some(format!("{} extension install failed", cli.program));
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                tracing::debug!(
+                    "{} --install-extension {} failed (attempt {attempt}): {}",
+                    cli.program,
+                    id_or_vsix,
+                    combined.trim()
+                );
+                let message = combined
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.to_ascii_lowercase().contains("not found"))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{} extension install failed", cli.program));
+                // "Extension not found" means the editor's marketplace doesn't
+                // carry the extension — deterministic, so retrying is pointless.
+                if message.to_ascii_lowercase().contains("not found") {
+                    return Err(AutterError::Generic(message));
+                }
+                last_error_message = Some(message);
             }
             Err(e) => {
                 last_error_message = Some(e.to_string());
