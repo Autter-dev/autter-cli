@@ -261,6 +261,58 @@ else
     DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}"
 fi
 
+# ============================================================
+# Anonymous install ping.
+# One fire-and-forget event so we can count installs. Contains only:
+# OS, CPU architecture, requested release tag, and whether this run
+# is a fresh install or a daemon self-upgrade. No hostname, username,
+# paths, or any personal data. Disable with AUTTER_NO_INSTALL_PING=1.
+# The API key is a public write-only project token (same one baked
+# into release builds for opt-in telemetry).
+# ============================================================
+INSTALL_PING_API_KEY="phc_aWveMd1bPhuEYtFnCS1G2IHgln3iGQqjfIdkfnuolxI"
+INSTALL_PING_HOST="https://us.i.posthog.com"
+
+report_install_ping() {
+    # Respect opt-out, and don't count local dev installs
+    if [ "${AUTTER_NO_INSTALL_PING:-}" = "1" ] || [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || return 0
+
+    local trigger="install"
+    if [ -n "${AUTTER_DAEMON_UPGRADE:-}" ]; then
+        trigger="upgrade"
+    fi
+
+    # Random, unlinkable ID for this ping only
+    local ping_id=""
+    if command -v uuidgen >/dev/null 2>&1; then
+        ping_id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+    fi
+    if [ -z "$ping_id" ]; then
+        ping_id=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
+    fi
+    [ -z "$ping_id" ] && ping_id="unknown"
+
+    # RELEASE_TAG can come from an env var; sanitize before embedding in JSON
+    local safe_tag
+    safe_tag=$(printf '%s' "$RELEASE_TAG" | tr -cd 'A-Za-z0-9._-')
+
+    # Keep daemon self-upgrades quiet; tell interactive installers what is sent
+    if [ "$trigger" = "install" ]; then
+        echo "Counting this install with an anonymous ping (OS, architecture, and version only)."
+        echo "Set AUTTER_NO_INSTALL_PING=1 to disable."
+    fi
+
+    curl --silent --max-time 5 --output /dev/null \
+        --header 'Content-Type: application/json' \
+        --data "{\"api_key\":\"${INSTALL_PING_API_KEY}\",\"event\":\"install_script_run\",\"distinct_id\":\"${ping_id}\",\"properties\":{\"os\":\"${OS}\",\"arch\":\"${ARCH}\",\"release_tag\":\"${safe_tag}\",\"trigger\":\"${trigger}\",\"source\":\"install.sh\"}}" \
+        "${INSTALL_PING_HOST}/capture/" >/dev/null 2>&1 &
+}
+
+report_install_ping
+
 # Install into the user's bin directory ~/.autter/bin
 INSTALL_DIR="$HOME/.autter/bin"
 
