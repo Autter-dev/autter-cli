@@ -340,6 +340,48 @@ if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
 }
 
 # ============================================================
+# Anonymous install ping.
+# One fire-and-forget event so we can count installs. Contains only:
+# OS, CPU architecture, requested release tag, and whether this run
+# is a fresh install or a daemon self-upgrade. No hostname, username,
+# paths, or any personal data. Disable with AUTTER_NO_INSTALL_PING=1.
+# The API key is a public write-only project token (same one baked
+# into release builds for opt-in telemetry).
+# ============================================================
+function Send-InstallPing {
+    if ($env:AUTTER_NO_INSTALL_PING -eq '1' -or -not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) { return }
+
+    $trigger = if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_DAEMON_UPGRADE)) { 'upgrade' } else { 'install' }
+
+    # Keep daemon self-upgrades quiet; tell interactive installers what is sent
+    if ($trigger -eq 'install') {
+        Write-Host 'Counting this install with an anonymous ping (OS, architecture, and version only).'
+        Write-Host 'Set AUTTER_NO_INSTALL_PING=1 to disable.'
+    }
+
+    # releaseTag can come from an env var; sanitize before embedding
+    $safeTag = ($releaseTag -replace '[^A-Za-z0-9._-]', '')
+    $payload = @{
+        api_key     = 'phc_aWveMd1bPhuEYtFnCS1G2IHgln3iGQqjfIdkfnuolxI'
+        event       = 'install_script_run'
+        distinct_id = [guid]::NewGuid().ToString()
+        properties  = @{
+            os          = $os
+            arch        = $arch
+            release_tag = $safeTag
+            trigger     = $trigger
+            source      = 'install.ps1'
+        }
+    } | ConvertTo-Json -Compress
+
+    try {
+        $null = Invoke-RestMethod -Uri 'https://us.i.posthog.com/capture/' -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 5
+    } catch { }
+}
+
+Send-InstallPing
+
+# ============================================================
 # Warn when installing as Administrator (not recommended).
 # Running elevated creates files that normal-user processes
 # cannot access, causing persistent daemon lock failures.
