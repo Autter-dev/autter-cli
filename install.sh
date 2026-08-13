@@ -234,6 +234,28 @@ case $OS in
     "linux")
         OS="linux"
         ;;
+    mingw*|msys*|cygwin*)
+        # Git Bash / MSYS2 / Cygwin: there is no build for these environments,
+        # and a bare "unsupported OS" error leaves Windows users stranded —
+        # spell out the two supported paths instead.
+        printf '%b\n' "${RED}Error: this installer cannot run in Git Bash (or MSYS2/Cygwin).${NC}" >&2
+        echo "" >&2
+        echo "Install autter on Windows in one of two ways:" >&2
+        echo "" >&2
+        echo "  Native Windows - run the PowerShell installer. It works from PowerShell," >&2
+        echo "  Command Prompt, and Git Bash, and 'autter' is available in all of them" >&2
+        echo "  afterwards:" >&2
+        echo "" >&2
+        echo "    powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://api.autter.dev/install.ps1 | iex\"" >&2
+        echo "" >&2
+        echo "  WSL - open a WSL terminal and re-run this same command there." >&2
+        echo "" >&2
+        echo "Install autter in the environment where your coding agents run: agents" >&2
+        echo "launched from Windows need the native install, agents inside WSL need" >&2
+        echo "the WSL install. If you copied this command from the Autter dashboard," >&2
+        echo "switch the OS tab to Windows to keep the automatic sign-in." >&2
+        exit 1
+        ;;
     *)
         error "Unsupported operating system: $OS"
         ;;

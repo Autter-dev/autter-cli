@@ -36,14 +36,18 @@ fe2c4c8 (claude              2025-12-02  141)             let from = resolve(rep
 **Mac, Linux, Windows (WSL)**
 
 ```bash
-curl -sSL https://autter.dev/install.sh | bash
+curl -fsSL https://api.autter.dev/install.sh | bash
 ```
 
-**Windows**
+**Windows (PowerShell, Command Prompt, or Git Bash)**
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://autter.dev/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://api.autter.dev/install.ps1 | iex"
 ```
+
+> **Git Bash is not WSL.** The bash installer needs a real Linux environment, so on Windows it only runs inside [WSL](https://learn.microsoft.com/windows/wsl/about) — in Git Bash it exits with instructions. Use the Windows command instead (it works from Git Bash too), and install the CLI where your coding agents actually run: agents launched from Windows need the native install, agents inside WSL need the WSL install.
+
+Signed in to Autter? [**Settings → CLI setup**](https://app.autter.dev/cli/install) in the dashboard generates a single-use command that runs this same installer **and signs the machine in automatically** via a short-lived signed token — no separate login step.
 
 The installer is the only setup step. There are **no per-repo hooks to wire up and no git config to edit** — commit with the Agent, the git CLI, or any git client and attribution lands on the commit automatically.
 

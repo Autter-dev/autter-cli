@@ -11,16 +11,20 @@ Connecting to the platform is optional. The CLI's local authorship tracking, bla
 Run:
 
 ```bash
-curl -sSL https://autter.dev/install.sh | bash
+curl -fsSL https://api.autter.dev/install.sh | bash
 ```
 
-### Windows (PowerShell)
+### Windows (PowerShell, Command Prompt, or Git Bash)
 
-Open PowerShell and run:
+Run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://autter.dev/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://api.autter.dev/install.ps1 | iex"
 ```
+
+> **Git Bash is not WSL.** The bash installer only runs on macOS, Linux, and WSL; in Git Bash it exits with instructions instead of installing. Use the Windows command above (it also works from Git Bash), and install Autter in the environment where your coding agents run — agents inside WSL need the WSL install.
+
+Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autter.dev/cli/install) generates a single-use command that runs this same installer and signs the machine in automatically.
 
 The installer downloads Autter into `~/.autter/bin`, adds it to your user `PATH`, configures supported coding agents and editors, and starts the background service. On macOS, Linux, and WSL it then starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later.
 
