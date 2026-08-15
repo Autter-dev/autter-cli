@@ -1,0 +1,99 @@
+src/commands/git_handlers.rs
+  s_49f631bca27456::t_0238bab0a8c57c 676-680,705-709
+src/commands/debug.rs
+  s_49f631bca27456::t_38a374c9faa019 323
+  s_49f631bca27456::t_68108f2da353f0 1595-1615
+  s_49f631bca27456::t_766cc8128c3890 678-682
+  s_49f631bca27456::t_a1d248b4526b7e 754-758
+  s_49f631bca27456::t_ceab747301e43a 327-330
+src/commands/mod.rs
+  s_49f631bca27456::t_ccf4518bc3ad5e 53-64
+src/commands/autter_handlers.rs
+  s_49f631bca27456::t_9313831dfb43ad 219
+  s_49f631bca27456::t_509d9af9fb7f37 110
+  s_49f631bca27456::t_d117dc8b9fe08d 231
+src/diagnostics.rs
+  s_49f631bca27456::t_f5724423d482a2 501-502
+  s_49f631bca27456::t_fa7677a77f2652 310-311
+  s_49f631bca27456::t_5256f4f35af9d6 360
+  s_49f631bca27456::t_b870b8476ce0ee 293-294
+  s_49f631bca27456::t_974d60a3be7e5d 579-580,590-591
+  s_49f631bca27456::t_a9d1ad8ac9fdd0 193-194,206-207
+  s_49f631bca27456::t_0bdd906c67deb7 81-83,98,113,124,132-134
+  s_49f631bca27456::t_3baf628fe33744 32-40
+  s_49f631bca27456::t_a097b86f8ed16b 569
+  s_49f631bca27456::t_d2fce1d6d1d94e 166-167
+  s_49f631bca27456::t_47c1ac7e5f00d7 471
+  s_49f631bca27456::t_659a7e2c567530 326-327
+  s_49f631bca27456::t_5a472f7fd9b74a 266
+  s_49f631bca27456::t_8301732cbb12e6 274
+  s_49f631bca27456::t_5df3b600b54d04 235-236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.6.7",
+  "base_commit_sha": "7d3c499f4c506f3163ac455964777f83c9114ac8",
+  "branch": "posthog/debug-fix-lines-and-routing",
+  "prompts": {
+    "s_49f631bca27456": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a005ab-1387-76cf-9551-a0848bd090ce",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 107,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_49f631bca27456": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a005ab-1387-76cf-9551-a0848bd090ce",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "stats": {
+        "total_additions": 0,
+        "total_deletions": 0,
+        "accepted_lines": 107,
+        "overriden_lines": 0,
+        "files": {
+          "src/commands/autter_handlers.rs": {
+            "total_additions": 0,
+            "total_deletions": 0,
+            "accepted_lines": 3,
+            "overriden_lines": 0
+          },
+          "src/commands/debug.rs": {
+            "total_additions": 0,
+            "total_deletions": 0,
+            "accepted_lines": 37,
+            "overriden_lines": 0
+          },
+          "src/commands/git_handlers.rs": {
+            "total_additions": 0,
+            "total_deletions": 0,
+            "accepted_lines": 10,
+            "overriden_lines": 0
+          },
+          "src/commands/mod.rs": {
+            "total_additions": 0,
+            "total_deletions": 0,
+            "accepted_lines": 12,
+            "overriden_lines": 0
+          },
+          "src/diagnostics.rs": {
+            "total_additions": 0,
+            "total_deletions": 0,
+            "accepted_lines": 45,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
