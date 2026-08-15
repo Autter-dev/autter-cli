@@ -320,9 +320,14 @@ fn build_debug_report(options: DebugOptions) -> String {
         }
         AuthState::RefreshExpired => {
             let _ = writeln!(out, "Status: credentials expired (refresh token expired)");
+            let _ = writeln!(out, "  fix: run `autter login` to sign in again");
         }
         AuthState::Error(err) => {
             let _ = writeln!(out, "Status: <error: {}>", err);
+            let _ = writeln!(
+                out,
+                "  fix: run `autter login` to refresh stored credentials"
+            );
         }
     }
     if let Some(expires_at) = auth_info.access_token_expires_at {
@@ -670,6 +675,11 @@ fn append_diagnostic_check(
         check.status.as_str(),
         check.summary
     );
+    if check.status == crate::diagnostics::DiagnosticStatus::Failed
+        && let Some(remediation) = &check.remediation
+    {
+        let _ = writeln!(out, "    fix: {}", remediation);
+    }
     for detail in &check.details {
         let _ = writeln!(out, "    {}", detail);
     }
@@ -740,6 +750,11 @@ fn append_git_version_check(out: &mut String, label: &str, version_output: &str)
                 out,
                 "{}: ERROR: detected Git version {} is below minimum version {}",
                 label, version, MIN_GIT_VERSION_DISPLAY
+            );
+            let _ = writeln!(
+                out,
+                "  fix: upgrade git to {} or newer, then re-run `autter debug`",
+                MIN_GIT_VERSION_DISPLAY
             );
         }
         None => {
@@ -1574,6 +1589,28 @@ mod tests {
     fn test_parse_debug_options_rejects_unknown_arg() {
         let err = parse_debug_options(&["--wat".to_string()]).unwrap_err();
         assert!(err.contains("unknown debug argument: --wat"), "{err}");
+    }
+
+    #[test]
+    fn test_append_diagnostic_check_renders_fix_line_only_when_failed() {
+        let failed = DiagnosticCheckResult::failed(
+            "trace2 global config is not configured",
+            vec!["ERROR: trace2 is not configured".to_string()],
+            Vec::new(),
+        )
+        .with_remediation("run `autter install` to write the required trace2 settings");
+
+        let mut out = String::new();
+        append_diagnostic_check(&mut out, "Trace2 config check", &failed, false);
+        assert!(
+            out.contains("    fix: run `autter install` to write the required trace2 settings"),
+            "{out}"
+        );
+
+        let skipped = DiagnosticCheckResult::skipped("trace2 check skipped", Vec::new());
+        let mut out = String::new();
+        append_diagnostic_check(&mut out, "Trace2 config check", &skipped, false);
+        assert!(!out.contains("fix:"), "{out}");
     }
 
     #[test]

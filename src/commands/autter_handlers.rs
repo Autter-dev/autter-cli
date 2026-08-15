@@ -107,6 +107,7 @@ pub fn handle_autter(args: &[String]) {
                     "error: failed to connect to autter background service: {}",
                     err
                 );
+                commands::suggest_autter_debug();
                 if args[0].as_str() == "checkpoint" {
                     std::process::exit(0);
                 }
@@ -215,6 +216,7 @@ pub fn handle_autter(args: &[String]) {
             }
             Err(e) => {
                 eprintln!("Install hooks failed: {}", e);
+                commands::suggest_autter_debug();
                 std::process::exit(1);
             }
         },
@@ -226,6 +228,7 @@ pub fn handle_autter(args: &[String]) {
             }
             Err(e) => {
                 eprintln!("Uninstall hooks failed: {}", e);
+                commands::suggest_autter_debug();
                 std::process::exit(1);
             }
         },

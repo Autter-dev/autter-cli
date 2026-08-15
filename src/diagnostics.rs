@@ -29,6 +29,15 @@ const DEBUG_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+// Remediation strings surfaced as `fix:` lines in the debug report. Keep them
+// to concrete next commands a stuck user can run without support.
+const REMEDIATION_DAEMON_PATHS: &str = "check that your home directory is set and writable (HOME on macOS/Linux, USERPROFILE on Windows), then re-run `autter debug`";
+const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install` and then `autter debug`";
+const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter debug`";
+const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install` to write the required trace2 settings to your global git config, then re-run `autter debug`";
+const REMEDIATION_ATTRIBUTION: &str = "run `autter daemon restart`, then re-run `autter debug`; if the trace2 config check for this git also failed, run `autter install` first -- attribution depends on it";
+const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter debug`; if the trace2 config check also failed, run `autter install`";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticStatus {
     Passed,
@@ -69,6 +78,9 @@ pub struct DiagnosticCheckResult {
     pub details: Vec<String>,
     pub commands: Vec<CommandRecord>,
     pub trace2_json: Option<String>,
+    /// Plain-language fix for a failed check: the exact command(s) to run or
+    /// setting to change so the user can resolve it without support.
+    pub remediation: Option<String>,
 }
 
 impl DiagnosticCheckResult {
@@ -83,6 +95,7 @@ impl DiagnosticCheckResult {
             details,
             commands,
             trace2_json: None,
+            remediation: None,
         }
     }
 
@@ -97,6 +110,7 @@ impl DiagnosticCheckResult {
             details,
             commands,
             trace2_json: None,
+            remediation: None,
         }
     }
 
@@ -107,11 +121,17 @@ impl DiagnosticCheckResult {
             details,
             commands: Vec::new(),
             trace2_json: None,
+            remediation: None,
         }
     }
 
     fn with_trace2_json(mut self, trace2_json: Option<String>) -> Self {
         self.trace2_json = trace2_json;
+        self
+    }
+
+    pub(crate) fn with_remediation(mut self, remediation: impl Into<String>) -> Self {
+        self.remediation = Some(remediation.into());
         self
     }
 }
@@ -143,7 +163,8 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
                 "daemon readiness could not be inspected",
                 vec![format!("failed to determine daemon paths: {}", err)],
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_DAEMON_PATHS);
         }
     };
 
@@ -169,7 +190,8 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
                 "daemon readiness check failed",
                 details,
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_DAEMON_FAILED);
         }
         restarted = true;
         probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
@@ -181,7 +203,8 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
                 "daemon readiness check failed",
                 details,
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_DAEMON_FAILED);
         }
         probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
     }
@@ -209,7 +232,8 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
                     "daemon readiness check failed",
                     details,
                     commands,
-                );
+                )
+                .with_remediation(REMEDIATION_DAEMON_FAILED);
             }
             restarted = true;
 
@@ -239,6 +263,7 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
                         details,
                         commands,
                     )
+                    .with_remediation(REMEDIATION_DAEMON_FAILED)
                 }
             }
         }
@@ -246,6 +271,7 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
             details.push(format!("trace2 daemon ingestion probe failed: {}", err));
             details.push(format!("daemon restarted: {}", restarted));
             DiagnosticCheckResult::failed("daemon readiness check failed", details, commands)
+                .with_remediation(REMEDIATION_DAEMON_FAILED)
         }
     }
 }
@@ -264,7 +290,8 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
                     None,
                 ),
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_DAEMON_PATHS);
         }
     };
 
@@ -280,7 +307,8 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
                 "trace2 global config could not be inspected",
                 trace2_config_failure_details(&err, Some(&expected_target), None, None),
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_TRACE2_CONFIG_INSPECT);
         }
     };
     let event_nesting = match event_nesting {
@@ -295,7 +323,8 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
                     None,
                 ),
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_TRACE2_CONFIG_INSPECT);
         }
     };
 
@@ -328,6 +357,7 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
         ),
         commands,
     )
+    .with_remediation(REMEDIATION_TRACE2_CONFIG_MISSING)
 }
 
 pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
@@ -438,6 +468,7 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
                 );
             }
             DiagnosticCheckResult::failed("attribution self-check failed", details, commands)
+                .with_remediation(REMEDIATION_ATTRIBUTION)
         }
     }
 }
@@ -467,7 +498,8 @@ pub fn run_trace2_file_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
                 "trace2 file self-check failed",
                 vec![err],
                 commands,
-            );
+            )
+            .with_remediation(REMEDIATION_TRACE2_FILE);
         }
     };
 
@@ -534,6 +566,7 @@ pub fn run_trace2_file_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
             details.push(format!("restore failed: {}", restore_err));
             DiagnosticCheckResult::failed("trace2 file self-check failed", details, commands)
                 .with_trace2_json(Some(trace2_json))
+                .with_remediation(REMEDIATION_TRACE2_FILE)
         }
         (Err(err), Ok(())) => DiagnosticCheckResult::failed(
             "trace2 file self-check failed",
@@ -543,7 +576,8 @@ pub fn run_trace2_file_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
                 err,
             ],
             commands,
-        ),
+        )
+        .with_remediation(REMEDIATION_TRACE2_FILE),
         (Err(err), Err(restore_err)) => DiagnosticCheckResult::failed(
             "trace2 file self-check failed",
             vec![
@@ -553,7 +587,8 @@ pub fn run_trace2_file_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
                 format!("restore failed: {}", restore_err),
             ],
             commands,
-        ),
+        )
+        .with_remediation(REMEDIATION_TRACE2_FILE),
     }
 }
 

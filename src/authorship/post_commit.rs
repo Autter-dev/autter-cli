@@ -714,7 +714,9 @@ fn current_repo_url(repo: &Repository) -> Option<String> {
 }
 
 fn current_branch(repo: &Repository) -> Option<String> {
-    repo.head().ok().and_then(|head_ref| head_ref.shorthand().ok())
+    repo.head()
+        .ok()
+        .and_then(|head_ref| head_ref.shorthand().ok())
 }
 
 fn transcript_paths_by_prompt_key(checkpoints: &[Checkpoint]) -> HashMap<String, String> {
@@ -976,6 +978,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 human_author: Some("Alice <alice@example.com>".to_string()),
                 messages_url: Some("cas:test".to_string()),
+                stats: None,
                 custom_attributes: None,
             },
         );

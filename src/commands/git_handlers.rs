@@ -673,6 +673,11 @@ fn proxy_to_git(
         }
         Err(e) => {
             eprintln!("Failed to execute git command: {}", e);
+            // Only nudge humans: scripts and tools parsing proxied git stderr
+            // must see git's output unchanged.
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                crate::commands::suggest_autter_debug();
+            }
             std::process::exit(1);
         }
     }
@@ -697,6 +702,11 @@ fn proxy_to_git(
         }
         Err(e) => {
             eprintln!("Failed to execute git command: {}", e);
+            // Only nudge humans: scripts and tools parsing proxied git stderr
+            // must see git's output unchanged.
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                crate::commands::suggest_autter_debug();
+            }
             std::process::exit(1);
         }
     }
