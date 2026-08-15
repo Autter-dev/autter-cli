@@ -513,8 +513,8 @@ pub fn print_overview() {
     for e in HELP_REGISTRY {
         eprintln!("  {:<18} {}", e.name, e.summary);
     }
-    eprintln!("  {:<18} {}", "version, -v", "Print the autter version");
-    eprintln!("  {:<18} {}", "help, -h", "Show this help message");
+    eprintln!("  {:<18} Print the autter version", "version, -v");
+    eprintln!("  {:<18} Show this help message", "help, -h");
     eprintln!();
     eprintln!("Run 'autter <command> --help' for command-specific help.");
 }
