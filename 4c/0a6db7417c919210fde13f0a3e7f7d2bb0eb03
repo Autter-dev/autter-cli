@@ -1,0 +1,94 @@
+src/authorship/post_commit.rs
+  s_49f631bca27456::t_1ed51e03766b71 981
+  s_49f631bca27456::t_ceab747301e43a 717-719
+src/commands/arg_parser.rs
+  s_49f631bca27456::t_e619fd380b2ee4 516-517
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "development:1.6.7",
+  "base_commit_sha": "4c0a6db7417c919210fde13f0a3e7f7d2bb0eb03",
+  "branch": "posthog/debug-fix-lines-and-routing",
+  "prompts": {
+    "s_49f631bca27456": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a005ab-1387-76cf-9551-a0848bd090ce",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:b8b6864dc073b683e49f344379da135e231541ea86b6933e80efee81ae6ea50a",
+      "total_additions": 114,
+      "total_deletions": 17,
+      "accepted_lines": 113,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_49f631bca27456": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a005ab-1387-76cf-9551-a0848bd090ce",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:b8b6864dc073b683e49f344379da135e231541ea86b6933e80efee81ae6ea50a",
+      "stats": {
+        "total_additions": 114,
+        "total_deletions": 17,
+        "accepted_lines": 113,
+        "overriden_lines": 0,
+        "files": {
+          "src/authorship/cas_bridge.rs": {
+            "total_additions": 0,
+            "total_deletions": 3,
+            "accepted_lines": 0,
+            "overriden_lines": 0
+          },
+          "src/authorship/post_commit.rs": {
+            "total_additions": 4,
+            "total_deletions": 1,
+            "accepted_lines": 4,
+            "overriden_lines": 0
+          },
+          "src/commands/arg_parser.rs": {
+            "total_additions": 2,
+            "total_deletions": 2,
+            "accepted_lines": 2,
+            "overriden_lines": 0
+          },
+          "src/commands/autter_handlers.rs": {
+            "total_additions": 3,
+            "total_deletions": 0,
+            "accepted_lines": 3,
+            "overriden_lines": 0
+          },
+          "src/commands/debug.rs": {
+            "total_additions": 38,
+            "total_deletions": 1,
+            "accepted_lines": 37,
+            "overriden_lines": 0
+          },
+          "src/commands/git_handlers.rs": {
+            "total_additions": 10,
+            "total_deletions": 0,
+            "accepted_lines": 10,
+            "overriden_lines": 0
+          },
+          "src/commands/mod.rs": {
+            "total_additions": 12,
+            "total_deletions": 0,
+            "accepted_lines": 12,
+            "overriden_lines": 0
+          },
+          "src/diagnostics.rs": {
+            "total_additions": 45,
+            "total_deletions": 10,
+            "accepted_lines": 45,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
