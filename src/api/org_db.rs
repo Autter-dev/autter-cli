@@ -215,13 +215,17 @@ fn connect(org_db_url: &str) -> Result<Client, AutterError> {
 /// Get the cached client for `org_db_url`, connecting (and provisioning) lazily.
 fn get_or_connect(org_db_url: &str) -> Result<Arc<Mutex<Client>>, AutterError> {
     {
-        let map = CONNECTIONS.lock().expect("connection cache poisoned");
+        let map = CONNECTIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(client) = map.get(org_db_url) {
             return Ok(client.clone());
         }
     }
     let client = Arc::new(Mutex::new(connect(org_db_url)?));
-    let mut map = CONNECTIONS.lock().expect("connection cache poisoned");
+    let mut map = CONNECTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Another thread may have connected while we were dialing — keep theirs.
     Ok(map.entry(org_db_url.to_string()).or_insert(client).clone())
 }
@@ -234,26 +238,35 @@ fn get_or_connect(org_db_url: &str) -> Result<Arc<Mutex<Client>>, AutterError> {
 /// failure: the notes/CAS closures count per-row errors internally rather than
 /// propagating them, so a dead socket would otherwise look like an all-rows
 /// failure instead of triggering a reconnect.
+///
+/// A poisoned client mutex is handled the same way. The daemon caches the client
+/// for its whole life, so a single op that panicked mid-query would otherwise
+/// poison the mutex forever and turn every later upload into a panic. We recover
+/// instead: a mid-query panic can leave the Postgres protocol state out of sync,
+/// so we discard the connection and redial rather than reuse the same socket.
 fn run<T>(
     org_db_url: &str,
     op: impl FnOnce(&mut Client) -> Result<T, postgres::Error>,
 ) -> Result<T, AutterError> {
     let arc = get_or_connect(org_db_url)?;
+
+    // Reuse the cached connection only if we can lock it and it still round-trips.
+    if let Ok(mut guard) = arc.lock()
+        && guard.is_valid(Duration::from_secs(5)).is_ok()
     {
-        let mut guard = arc.lock().expect("org client mutex poisoned");
-        if guard.is_valid(Duration::from_secs(5)).is_err() {
-            // Cached connection is stale — drop it so the next get reconnects.
-            drop(guard);
-            CONNECTIONS
-                .lock()
-                .expect("connection cache poisoned")
-                .remove(org_db_url);
-            let fresh = get_or_connect(org_db_url)?;
-            let mut guard = fresh.lock().expect("org client mutex poisoned");
-            return op(&mut guard).map_err(map_db_err);
-        }
-        op(&mut guard).map_err(map_db_err)
+        return op(&mut guard).map_err(map_db_err);
     }
+
+    // Cached connection is stale or poisoned — drop it so we dial a fresh one.
+    CONNECTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(org_db_url);
+    let fresh = get_or_connect(org_db_url)?;
+    let mut guard = fresh
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    op(&mut guard).map_err(map_db_err)
 }
 
 fn map_db_err(e: postgres::Error) -> AutterError {
