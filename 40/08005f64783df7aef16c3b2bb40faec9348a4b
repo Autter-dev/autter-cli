@@ -1,0 +1,108 @@
+changelog/installer-path-npm-and-stale-url-fixes.md
+  s_4b50dacd3d0dd0::t_e42d059370e57c 23-24
+  s_4b50dacd3d0dd0::t_09600b2cde84af 37
+npm/package.json
+  s_4b50dacd3d0dd0::t_37d20d1df0a367 2
+npm/README.md
+  s_4b50dacd3d0dd0::t_6d68ae5cee7584 1
+  s_4b50dacd3d0dd0::t_c755b134fec0a8 10,17,20
+CHANGELOG.md
+  s_4b50dacd3d0dd0::t_9a5d3d2cffec70 14
+INSTALL.md
+  s_4b50dacd3d0dd0::t_cfe22236f8c44f 28
+  s_4b50dacd3d0dd0::t_3b4ebe0f8d0b2c 32
+npm/install.js
+  s_4b50dacd3d0dd0::t_a78c96ee503f6c 15
+.github/workflows/release.yml
+  s_4b50dacd3d0dd0::t_85f3238e793382 216
+README.md
+  s_4b50dacd3d0dd0::t_1bf2e2d05a4fb4 51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "4008005f64783df7aef16c3b2bb40faec9348a4b",
+  "branch": "posthog/installer-path-npm-and-url-fixes",
+  "prompts": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:31c7a1991ce3e7723260009f02c086918fefbabec694c23136a58428e8de9491",
+      "total_additions": 14,
+      "total_deletions": 14,
+      "accepted_lines": 14,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:31c7a1991ce3e7723260009f02c086918fefbabec694c23136a58428e8de9491",
+      "stats": {
+        "total_additions": 14,
+        "total_deletions": 14,
+        "accepted_lines": 14,
+        "overriden_lines": 0,
+        "files": {
+          ".github/workflows/release.yml": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "CHANGELOG.md": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "INSTALL.md": {
+            "total_additions": 2,
+            "total_deletions": 2,
+            "accepted_lines": 2,
+            "overriden_lines": 0
+          },
+          "README.md": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "changelog/installer-path-npm-and-stale-url-fixes.md": {
+            "total_additions": 3,
+            "total_deletions": 3,
+            "accepted_lines": 3,
+            "overriden_lines": 0
+          },
+          "npm/README.md": {
+            "total_additions": 4,
+            "total_deletions": 4,
+            "accepted_lines": 4,
+            "overriden_lines": 0
+          },
+          "npm/install.js": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "npm/package.json": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
