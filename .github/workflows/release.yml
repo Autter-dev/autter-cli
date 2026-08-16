@@ -1,17 +1,19 @@
 name: Release
 
 # Builds the `autter` binary for every supported platform, publishes them as a
-# GitHub Release, and attaches a version-pinned install.sh (placeholders filled
-# in with the real repo, version, and SHA256 checksums).
+# GitHub Release, and attaches version-pinned install.sh/install.ps1 copies
+# (placeholders filled in with the real repo, version, and SHA256 checksums).
 #
 # Trigger:
 #   - pushing a tag matching `v*` (e.g. v1.5.9) publishes a release
 #   - manual run via the Actions tab (workflow_dispatch) builds the binaries
 #     for validation but does NOT publish (no tag to release against)
 #
-# Asset names match what install.sh expects: autter-<os>-<arch>
+# Asset names match what install.sh / install.ps1 expect: autter-<os>-<arch>
 #   macos/arm64 -> autter-macos-arm64    macos/x64 -> autter-macos-x64
 #   linux/x64   -> autter-linux-x64      linux/arm64 -> autter-linux-arm64
+#   windows/x64 -> autter-windows-x64.exe
+#   windows/arm64 -> autter-windows-arm64.exe
 
 on:
   push:
@@ -61,6 +63,18 @@ jobs:
             os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             tool: cross
+          - asset: autter-windows-x64.exe
+            # No OpenSSL needed on Windows: TLS goes through native-tls/SChannel,
+            # and the only C build is the bundled SQLite (handled by cc + MSVC).
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            tool: cargo
+          - asset: autter-windows-arm64.exe
+            # Cross-compile ARM64 on the x64 runner: the preinstalled VS 2022
+            # toolchain includes the ARM64 MSVC compiler and libraries.
+            os: windows-2022
+            target: aarch64-pc-windows-msvc
+            tool: cargo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,7 +110,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/autter" "dist/${{ matrix.asset }}"
+          src="target/${{ matrix.target }}/release/autter"
+          if [[ "${{ matrix.target }}" == *-windows-* ]]; then
+            src="${src}.exe"
+          fi
+          cp "${src}" "dist/${{ matrix.asset }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -126,16 +144,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          assets="autter-macos-arm64 autter-macos-x64 autter-linux-x64 autter-linux-arm64 autter-windows-x64.exe autter-windows-arm64.exe"
           # download-artifact nests each artifact under its own directory
-          for asset in autter-macos-arm64 autter-macos-x64 autter-linux-x64 autter-linux-arm64; do
+          for asset in ${assets}; do
             cp "artifacts/${asset}/${asset}" "dist/${asset}"
             chmod +x "dist/${asset}"
           done
 
-          # Build the checksums file and the pipe-separated string install.sh embeds.
+          # Build the checksums file and the pipe-separated string the install
+          # scripts embed.
           : > dist/checksums.txt
           CHECKSUMS=""
-          for asset in autter-macos-arm64 autter-macos-x64 autter-linux-x64 autter-linux-arm64; do
+          for asset in ${assets}; do
             line="$(cd dist && sha256sum "${asset}")"
             echo "${line}" >> dist/checksums.txt
             CHECKSUMS="${CHECKSUMS:+${CHECKSUMS}|}${line}"
@@ -143,12 +163,17 @@ jobs:
           echo "Checksums:"
           cat dist/checksums.txt
 
-          # Fill the install.sh placeholders for the version-pinned release copy.
+          # Fill the install script placeholders for the version-pinned release
+          # copies (bash and PowerShell).
           python3 scripts/fill-install-template.py install.sh dist/install.sh \
             --repo "${GITHUB_REPOSITORY}" \
             --version "${GITHUB_REF_NAME}" \
             --checksums "${CHECKSUMS}"
           chmod +x dist/install.sh
+          python3 scripts/fill-install-template.py install.ps1 dist/install.ps1 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --version "${GITHUB_REF_NAME}" \
+            --checksums "${CHECKSUMS}"
 
       - name: Create GitHub Release
         env:
@@ -162,5 +187,8 @@ jobs:
             dist/autter-macos-x64 \
             dist/autter-linux-x64 \
             dist/autter-linux-arm64 \
+            dist/autter-windows-x64.exe \
+            dist/autter-windows-arm64.exe \
             dist/install.sh \
+            dist/install.ps1 \
             dist/checksums.txt

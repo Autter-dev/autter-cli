@@ -47,22 +47,27 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
-# GitHub repository details
-# Replaced during release builds with the actual repository (e.g., "autter-dev/autter-cli")
-# When set to __REPO_PLACEHOLDER__, defaults to "autter-dev/autter-cli"
+# Release-fill placeholders. The release workflow blindly string-replaces each
+# placeholder token EVERYWHERE in this file, so the guards below compare
+# against *_SENTINEL values built by concatenation — those survive the fill.
+# Comparing against the literal token would self-destruct on fill: the pinned
+# copy would ignore its version pin and skip checksum verification.
+
+# Repository ("owner/repo"); the sentinel defaults to the canonical repo.
 REPO="__REPO_PLACEHOLDER__"
-if [ "$REPO" = "__REPO_PLACEHOLDER__" ]; then
+REPO_SENTINEL='__REPO_''PLACEHOLDER__'
+if [ "$REPO" = "$REPO_SENTINEL" ]; then
     REPO="autter-dev/autter-cli"
 fi
 
-# Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")
-# When set to __VERSION_PLACEHOLDER__, defaults to "latest"
+# Version pin (e.g. "v1.6.8") in release copies; the sentinel means "latest".
 PINNED_VERSION="__VERSION_PLACEHOLDER__"
+VERSION_SENTINEL='__VERSION_''PLACEHOLDER__'
 
-# Embedded checksums - replaced during release builds with actual SHA256 checksums
-# Format: "hash  filename|hash  filename|..." (pipe-separated)
-# When set to __CHECKSUMS_PLACEHOLDER__, checksum verification is skipped
+# Pipe-separated "sha256  filename" entries in release copies; checksum
+# verification is skipped when left as the sentinel.
 EMBEDDED_CHECKSUMS="__CHECKSUMS_PLACEHOLDER__"
+CHECKSUMS_SENTINEL='__CHECKSUMS_''PLACEHOLDER__'
 
 # Print helpers use printf, not `echo -e`: when this script is run with
 # `curl … | sh` the shebang is bypassed, and POSIX-mode shells (dash,
@@ -89,7 +94,7 @@ verify_checksum() {
     local binary_name="$2"
 
     # Skip verification if no checksums are embedded
-    if [ "$EMBEDDED_CHECKSUMS" = "__CHECKSUMS_PLACEHOLDER__" ]; then
+    if [ "$EMBEDDED_CHECKSUMS" = "$CHECKSUMS_SENTINEL" ]; then
         return 0
     fi
 
@@ -269,7 +274,7 @@ BINARY_NAME="autter-${OS}-${ARCH}"
 if [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
     RELEASE_TAG="local"
     DOWNLOAD_URL=""
-elif [ "$PINNED_VERSION" != "__VERSION_PLACEHOLDER__" ]; then
+elif [ "$PINNED_VERSION" != "$VERSION_SENTINEL" ]; then
     # Version-pinned install script from a release
     RELEASE_TAG="$PINNED_VERSION"
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
