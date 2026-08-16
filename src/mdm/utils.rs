@@ -649,10 +649,12 @@ pub fn settings_paths_for_products(product_names: &[&str]) -> Vec<PathBuf> {
     paths
 }
 
-/// Check if a VS Code extension is installed
+/// Check if a VS Code extension is installed, by exact ID match against
+/// `--list-extensions` output (one bare ID per line) so an unrelated extension
+/// whose ID merely contains ours doesn't count as installed.
 pub fn is_vsc_editor_extension_installed(
     cli: &EditorCliCommand,
-    id_or_vsix: &str,
+    extension_id: &str,
 ) -> Result<bool, AutterError> {
     // NOTE: We try up to 3 times, because the editor CLI can be flaky (throws intermittent JS errors)
     let mut last_error_message: Option<String> = None;
@@ -665,7 +667,9 @@ pub fn is_vsc_editor_extension_installed(
                     last_error_message = Some(String::from_utf8_lossy(&output.stderr).to_string());
                 } else {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    return Ok(stdout.contains(id_or_vsix));
+                    return Ok(stdout
+                        .lines()
+                        .any(|line| line.trim().eq_ignore_ascii_case(extension_id)));
                 }
             }
             Err(e) => {
@@ -804,15 +808,39 @@ fn download_extension_vsix(extension_id: &str) -> Result<PathBuf, AutterError> {
     Ok(path)
 }
 
+/// A zero exit from `--install-extension` doesn't guarantee the extension
+/// actually landed (the editor CLI is flaky and can be a shim for a different
+/// install), so a reported success is only trusted once the extension shows up
+/// in `--list-extensions`. Only a definitive "not listed" overrules the
+/// install's exit code — if the check itself errors, the exit code is trusted.
+fn confirm_extension_listed(cli: &EditorCliCommand, extension_id: &str) -> Result<(), AutterError> {
+    match is_vsc_editor_extension_installed(cli, extension_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AutterError::Generic(format!(
+            "{} exited successfully, but '{extension_id}' is missing from its extension list",
+            cli.program
+        ))),
+        Err(check_err) => {
+            tracing::debug!(
+                "{}: could not verify '{extension_id}' after install ({check_err}); trusting the install exit code",
+                cli.program
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Install an extension, falling back to a direct Open VSX `.vsix` download when
 /// the editor's marketplace can't resolve it by ID. This makes onboarding install
-/// the extension regardless of which gallery a given editor is wired to.
+/// the extension regardless of which gallery a given editor is wired to. Success
+/// is only reported after the extension is confirmed present in the editor's
+/// extension list.
 pub fn install_vsc_editor_extension_with_vsix_fallback(
     cli: &EditorCliCommand,
     extension_id: &str,
 ) -> Result<(), AutterError> {
     let id_err = match install_vsc_editor_extension(cli, extension_id) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return confirm_extension_listed(cli, extension_id),
         Err(e) => e,
     };
 
@@ -833,7 +861,8 @@ pub fn install_vsc_editor_extension_with_vsix_fallback(
         AutterError::Generic(format!(
             "marketplace install failed ({id_err}); .vsix fallback install also failed: {vsix_err}"
         ))
-    })
+    })?;
+    confirm_extension_listed(cli, extension_id)
 }
 
 /// Strip the Windows extended-length path prefix (`\\?\`) if present.
@@ -1807,5 +1836,21 @@ mod tests {
         // A path with no parent component should not error
         let path = Path::new("standalone_file.txt");
         ensure_parent_dir(path).unwrap();
+    }
+
+    #[test]
+    fn test_confirm_extension_listed_trusts_exit_code_when_check_fails() {
+        // A broken/unresolvable CLI must not overrule the install's exit code.
+        let cli = EditorCliCommand::from_path("autter-nonexistent-editor-cli");
+        assert!(confirm_extension_listed(&cli, "autter.autter-vscode").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_confirm_extension_listed_rejects_missing_extension() {
+        // `true` exits 0 with empty output: a definitive "not listed".
+        let cli = EditorCliCommand::from_path("true");
+        let err = confirm_extension_listed(&cli, "autter.autter-vscode").unwrap_err();
+        assert!(err.to_string().contains("missing from its extension list"));
     }
 }

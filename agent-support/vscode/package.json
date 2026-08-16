@@ -9,12 +9,22 @@
     "type": "git",
     "url": "https://github.com/autter-dev/autter-cli"
   },
+  "license": "Apache-2.0",
   "engines": {
     "vscode": ">=1.99.3",
     "node": ">=20.18.1"
   },
   "categories": [
+    "AI",
+    "SCM Providers",
     "Other"
+  ],
+  "keywords": [
+    "ai",
+    "attribution",
+    "authorship",
+    "git",
+    "tracking"
   ],
   "activationEvents": [
     "onStartupFinished"
