@@ -19,7 +19,7 @@ curl -fsSL https://api.autter.dev/install.sh | bash
 Run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://api.autter.dev/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
 ```
 
 > **Git Bash is not WSL.** The bash installer only runs on macOS, Linux, and WSL; in Git Bash it exits with instructions instead of installing. Use the Windows command above (it also works from Git Bash), and install Autter in the environment where your coding agents run — agents inside WSL need the WSL install.

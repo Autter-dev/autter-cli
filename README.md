@@ -42,7 +42,7 @@ curl -fsSL https://api.autter.dev/install.sh | bash
 **Windows (PowerShell, Command Prompt, or Git Bash)**
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://api.autter.dev/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
 ```
 
 > **Git Bash is not WSL.** The bash installer needs a real Linux environment, so on Windows it only runs inside [WSL](https://learn.microsoft.com/windows/wsl/about) — in Git Bash it exits with instructions. Use the Windows command instead (it works from Git Bash too), and install the CLI where your coding agents actually run: agents launched from Windows need the native install, agents inside WSL need the WSL install.
