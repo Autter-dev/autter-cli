@@ -571,6 +571,30 @@ pub fn stats_for_commit_stats_from_hunks(
         lines.dedup();
     }
 
+    // A commit with no authorship note whose author email matches a known AI
+    // agent (e.g. Codex cloud, Claude web) gets all added lines attributed to
+    // that agent — the same fallback `autter blame` applies per hunk.
+    let simulated_log;
+    let authorship_log = if authorship_log.is_none()
+        && !is_merge_commit
+        && !added_lines_by_file.is_empty()
+        && let Some(tool) = commit_obj
+            .author_email()
+            .ok()
+            .as_deref()
+            .and_then(crate::authorship::agent_detection::match_email_to_agent)
+    {
+        simulated_log =
+            crate::authorship::agent_detection::simulate_agent_authorship_for_added_lines(
+                commit_sha,
+                tool,
+                &added_lines_by_file,
+            );
+        Some(&simulated_log)
+    } else {
+        authorship_log
+    };
+
     let (ai_accepted, known_human_accepted, ai_accepted_by_tool) =
         accepted_lines_from_attestations(authorship_log, &added_lines_by_file, is_merge_commit);
 

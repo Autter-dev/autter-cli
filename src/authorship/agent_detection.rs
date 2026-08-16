@@ -22,6 +22,10 @@ const AGENT_EMAIL_MAPPINGS: &[(&str, &str)] = &[
     ),
     ("noreply@anthropic.com", "claude-web"),
     ("noreply@openai.com", "codex-cloud"),
+    (
+        "+chatgpt-codex-connector[bot]@users.noreply.github.com",
+        "codex-cloud",
+    ),
     ("roomote@roocode.com", "roo-background"),
 ];
 
@@ -30,6 +34,7 @@ const AGENT_USERNAME_MAPPINGS: &[(&str, &str)] = &[
     ("copilot-swe-agent[bot]", "github-copilot-agent"),
     ("devin-ai-integration[bot]", "devin"),
     ("cursor[bot]", "cursor-agent"),
+    ("chatgpt-codex-connector[bot]", "codex-cloud"),
 ];
 
 /// Match a commit author email to a known AI agent tool name.
@@ -155,6 +160,65 @@ pub fn simulate_agent_authorship(
     };
 
     (log, prompt_hash)
+}
+
+/// Simulate an `AuthorshipLog` for an entire commit made by a known AI agent
+/// that has no explicit authorship note, attributing every added line in the
+/// commit to that agent.
+///
+/// `added_lines_by_file` maps file paths to sorted, deduplicated added line
+/// numbers from the commit's diff.
+pub fn simulate_agent_authorship_for_added_lines(
+    commit_sha: &str,
+    tool: &str,
+    added_lines_by_file: &std::collections::HashMap<String, Vec<u32>>,
+) -> AuthorshipLog {
+    use crate::authorship::authorship_log::LineRange;
+
+    let total_lines: u32 = added_lines_by_file
+        .values()
+        .map(|lines| lines.len() as u32)
+        .sum();
+
+    let agent_id = AgentId {
+        tool: tool.to_string(),
+        id: commit_sha.to_string(),
+        model: String::new(),
+    }
+    .normalized();
+
+    let prompt_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
+
+    let prompt_record = PromptRecord {
+        agent_id,
+        human_author: None,
+        total_additions: total_lines,
+        total_deletions: 0,
+        accepted_lines: total_lines,
+        overriden_lines: 0,
+        custom_attributes: None,
+        messages_url: None,
+    };
+
+    let mut metadata = AuthorshipMetadata::new();
+    metadata.base_commit_sha = commit_sha.to_string();
+    metadata.prompts.insert(prompt_hash.clone(), prompt_record);
+
+    let mut log = AuthorshipLog {
+        attestations: Vec::new(),
+        metadata,
+    };
+
+    for (file_path, added_lines) in added_lines_by_file {
+        if added_lines.is_empty() {
+            continue;
+        }
+        let ranges = LineRange::compress_lines(added_lines);
+        log.get_or_create_file(file_path)
+            .add_entry(AttestationEntry::new(prompt_hash.clone(), ranges));
+    }
+
+    log
 }
 
 #[cfg(test)]
@@ -340,5 +404,39 @@ mod tests {
 
         // Different tools should produce different hashes
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_match_email_codex_connector_bot() {
+        assert_eq!(
+            match_email_to_agent("12345+chatgpt-codex-connector[bot]@users.noreply.github.com"),
+            Some("codex-cloud")
+        );
+    }
+
+    #[test]
+    fn test_match_username_codex_connector() {
+        assert_eq!(
+            match_username_to_platform("chatgpt-codex-connector[bot]"),
+            Some("codex-cloud")
+        );
+    }
+
+    #[test]
+    fn test_simulate_agent_authorship_for_added_lines() {
+        use std::collections::HashMap;
+
+        let mut added: HashMap<String, Vec<u32>> = HashMap::new();
+        added.insert("src/a.rs".to_string(), vec![1, 2, 3, 7]);
+        added.insert("src/b.rs".to_string(), vec![10]);
+
+        let log = simulate_agent_authorship_for_added_lines("sha123", "codex-cloud", &added);
+
+        assert_eq!(log.metadata.base_commit_sha, "sha123");
+        assert_eq!(log.attestations.len(), 2);
+        let prompt = log.metadata.prompts.values().next().unwrap();
+        assert_eq!(prompt.agent_id.tool, "codex-cloud");
+        assert_eq!(prompt.accepted_lines, 5);
+        assert_eq!(prompt.total_additions, 5);
     }
 }

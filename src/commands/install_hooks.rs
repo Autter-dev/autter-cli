@@ -477,6 +477,7 @@ async fn async_run_install(
     let mut installed_tools: HashSet<String> = HashSet::new();
     // Track agents whose hooks were updated (name, process_names) for restart warnings
     let mut updated_agents: Vec<(String, Vec<String>)> = Vec::new();
+    let mut not_detected: Vec<&str> = Vec::new();
 
     for installer in &installers {
         let name = installer.name();
@@ -492,6 +493,7 @@ async fn async_run_install(
                 if !check_result.tool_installed {
                     statuses.insert(id.to_string(), InstallStatus::NotFound);
                     detailed_results.push((id.to_string(), InstallResult::not_found()));
+                    not_detected.push(name);
                     continue;
                 }
 
@@ -635,6 +637,13 @@ async fn async_run_install(
                 detailed_results.push((id.to_string(), InstallResult::failed(error_msg)));
             }
         }
+    }
+
+    if !not_detected.is_empty() {
+        println!(
+            "{}",
+            paint("2", &format!("  Not detected: {}", not_detected.join(", ")))
+        );
     }
 
     if options.install_skills {
