@@ -10,6 +10,7 @@ import { Config } from "./utils/config";
 import { BlameLensManager, registerBlameLensCommands } from "./blame-lens-manager";
 import { initBinaryResolver } from "./utils/binary-path";
 import { KnownHumanCheckpointManager } from "./known-human-checkpoint-manager";
+import { checkNativeHooksHealth } from "./native-hooks-health";
 
 function getDistinctId(): string {
   try {
@@ -125,6 +126,9 @@ export function activate(context: vscode.ExtensionContext) {
       );
     } else {
       console.log('[autter] VS Code has native Copilot hooks; skipping legacy extension checkpoint listeners');
+      // We just stood down from AI-edit capture — verify the native chain we
+      // are deferring to is actually configured, and tell the user if not.
+      checkNativeHooksHealth();
     }
   }
 

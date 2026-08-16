@@ -109,6 +109,8 @@ fn build_debug_report(options: DebugOptions) -> String {
     let platform_info = collect_platform_info();
     let hardware_info = collect_hardware_info();
     let repository_info = collect_repository_info();
+    debug_progress("checking AI agent hook status");
+    let agent_capture_lines = collect_agent_capture_info();
     let git_committer_identity = collect_git_committer_identity_info(&repository_info);
     let auth_info = collect_auth_status();
     let git_environment = collect_git_environment();
@@ -286,6 +288,12 @@ fn build_debug_report(options: DebugOptions) -> String {
     append_git_diagnostics(&mut out, &daemon_diagnostics, &git_diagnostics);
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "== AI Agent Capture ==");
+    for line in &agent_capture_lines {
+        let _ = writeln!(out, "{}", line);
+    }
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "== Git Config ==");
     let _ = writeln!(out, "Command: {}", git_config.command);
     match git_config.output {
@@ -401,6 +409,217 @@ fn build_debug_report(options: DebugOptions) -> String {
     }
 
     out
+}
+
+/// Per-agent hook status plus the VS Code native-hooks chain. This is the
+/// capture-side counterpart to the git-side diagnostics: `install-hooks`
+/// only verifies its own writes, so this section answers "would an edit made
+/// right now actually checkpoint?" per agent surface.
+fn collect_agent_capture_info() -> Vec<String> {
+    use crate::mdm::agents::get_all_installers;
+    use crate::mdm::hook_installer::HookInstallerParams;
+
+    let mut lines = Vec::new();
+
+    let binary_path = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("autter"));
+    let params = HookInstallerParams { binary_path };
+
+    lines.push("Hooks status by agent (managed by `autter install-hooks`):".to_string());
+    for installer in get_all_installers() {
+        let name = installer.name();
+        match installer.check_hooks(&params) {
+            Ok(result) => {
+                let status = if !result.tool_installed {
+                    "not detected".to_string()
+                } else if installer.id() == "vscode" {
+                    // VS Code has no config-file hooks; hooks_installed
+                    // reflects the autter extension, which carries both
+                    // manual-edit (known_human) and legacy AI capture.
+                    if result.hooks_installed {
+                        "detected, autter extension installed".to_string()
+                    } else {
+                        "detected, autter extension NOT installed — manual edits and (on older VS Code) Copilot edits are not captured".to_string()
+                    }
+                } else if !result.hooks_installed {
+                    "detected, hooks NOT installed — run `autter install-hooks`".to_string()
+                } else if result.hooks_up_to_date {
+                    "detected, hooks installed (up to date)".to_string()
+                } else {
+                    "detected, hooks installed (update available — run `autter install-hooks`)"
+                        .to_string()
+                };
+                lines.push(format!("  {}: {}", name, status));
+            }
+            Err(err) => {
+                lines.push(format!("  {}: <error: {}>", name, err));
+            }
+        }
+    }
+    lines.push(String::new());
+
+    lines.extend(collect_vscode_native_hooks_chain());
+    lines.push(String::new());
+
+    lines.push("Capture boundary (what checkpoints, and what it requires):".to_string());
+    lines.push(
+        "  - VS Code built-in Copilot agent (agent mode): VS Code >= 1.109.3 fires native agent hooks (Preview) which run autter; older VS Code uses the autter extension's built-in detection. Restart VS Code after `autter install-hooks`."
+            .to_string(),
+    );
+    lines.push("  - GitHub Copilot CLI: captured via ~/.copilot/hooks/autter.json.".to_string());
+    lines.push(
+        "  - VS Code inline/tab completions: experimental and OFF by default (VS Code setting `autter.experiments.aiTabTracking`)."
+            .to_string(),
+    );
+    lines.push(
+        "  - Manual (human) edits: captured on save by the autter editor extensions (VS Code family, JetBrains, Visual Studio). Edits made without an autter extension are committed as untracked."
+            .to_string(),
+    );
+    lines.push(
+        "  - Remote dev (SSH/WSL/devcontainers): agents and hooks run on the remote host — install autter and run `autter install-hooks` there too."
+            .to_string(),
+    );
+    lines
+}
+
+/// Walk the chain VS Code's built-in Copilot agent needs for AI edits to
+/// checkpoint on VS Code >= 1.109.3: the autter extension stands down there
+/// and capture only happens if VS Code loads ~/.copilot/hooks/autter.json.
+fn collect_vscode_native_hooks_chain() -> Vec<String> {
+    use crate::mdm::utils::{
+        MIN_VSCODE_NATIVE_HOOKS_VERSION, VSCODE_USER_COPILOT_HOOKS_LOCATION, get_editor_version,
+        home_dir, parse_version_triple, resolve_editor_cli, settings_paths_for_products,
+    };
+
+    let mut lines = Vec::new();
+    lines.push("VS Code built-in Copilot agent chain:".to_string());
+
+    let Some(cli) = resolve_editor_cli("code") else {
+        lines.push("  VS Code CLI not found; skipping chain checks".to_string());
+        return lines;
+    };
+
+    let version_str = match get_editor_version(&cli) {
+        Ok(v) => v,
+        Err(err) => {
+            lines.push(format!("  VS Code version: <error: {}>", err));
+            return lines;
+        }
+    };
+    let first_line = version_str.lines().next().unwrap_or("").trim().to_string();
+    lines.push(format!("  VS Code version: {}", first_line));
+
+    let (min_major, min_minor, min_patch) = MIN_VSCODE_NATIVE_HOOKS_VERSION;
+    let native_mode = parse_version_triple(&version_str)
+        .map(|v| v >= MIN_VSCODE_NATIVE_HOOKS_VERSION)
+        .unwrap_or(false);
+
+    if !native_mode {
+        lines.push(format!(
+            "  Capture mode: autter extension detection (VS Code predates native agent hooks, added in {}.{}.{})",
+            min_major, min_minor, min_patch
+        ));
+        return lines;
+    }
+
+    lines.push(format!(
+        "  Capture mode: native agent hooks (VS Code >= {}.{}.{}; the autter extension defers AI-edit capture to VS Code)",
+        min_major, min_minor, min_patch
+    ));
+
+    let hooks_file = home_dir()
+        .join(".copilot")
+        .join("hooks")
+        .join("autter.json");
+    let hooks_file_present = hooks_file.exists();
+    lines.push(format!(
+        "  Hook file {}: {}",
+        hooks_file.display(),
+        if hooks_file_present {
+            "present"
+        } else {
+            "MISSING"
+        }
+    ));
+
+    let mut any_location_enabled = false;
+    for settings_path in settings_paths_for_products(&["Code", "Code - Insiders"]) {
+        if !settings_path.exists() {
+            continue;
+        }
+        let (use_hooks, copilot_location) = read_chat_hook_settings(&settings_path);
+        lines.push(format!("  Settings {}:", settings_path.display()));
+        lines.push(format!(
+            "    chat.useHooks: {}",
+            format_setting_bool(use_hooks)
+        ));
+        lines.push(format!(
+            "    chat.hookFilesLocations[\"{}\"]: {}",
+            VSCODE_USER_COPILOT_HOOKS_LOCATION,
+            format_setting_bool(copilot_location)
+        ));
+        if copilot_location == Some(true) {
+            any_location_enabled = true;
+        }
+    }
+
+    if hooks_file_present && any_location_enabled {
+        lines.push(
+            "  Chain status: OK — Copilot agent-mode edits should checkpoint (restart VS Code if hooks were just installed)"
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "  Chain status: INCOMPLETE — Copilot agent-mode edits are likely NOT being captured; run `autter install-hooks` and restart VS Code"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// Read `chat.useHooks` and the `~/.copilot/hooks` entry of
+/// `chat.hookFilesLocations` from a VS Code settings.json (JSONC tolerated).
+fn read_chat_hook_settings(settings_path: &Path) -> (Option<bool>, Option<bool>) {
+    use crate::mdm::utils::VSCODE_USER_COPILOT_HOOKS_LOCATION;
+    use jsonc_parser::ParseOptions;
+    use jsonc_parser::cst::CstRootNode;
+
+    let Ok(content) = fs::read_to_string(settings_path) else {
+        return (None, None);
+    };
+    let parse_input = if content.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        content
+    };
+    let Ok(root) = CstRootNode::parse(&parse_input, &ParseOptions::default()) else {
+        return (None, None);
+    };
+    let Some(object) = root.object_value() else {
+        return (None, None);
+    };
+
+    let use_hooks = object
+        .get("chat.useHooks")
+        .and_then(|prop| prop.value())
+        .and_then(|value| value.as_boolean_lit())
+        .map(|lit| lit.value());
+
+    let copilot_location = object
+        .object_value("chat.hookFilesLocations")
+        .and_then(|locations| locations.get(VSCODE_USER_COPILOT_HOOKS_LOCATION))
+        .and_then(|prop| prop.value())
+        .and_then(|value| value.as_boolean_lit())
+        .map(|lit| lit.value());
+
+    (use_hooks, copilot_location)
+}
+
+fn format_setting_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "<not set>",
+    }
 }
 
 struct GitDebugDiagnostics {

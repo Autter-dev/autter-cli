@@ -4,6 +4,22 @@ import { spawn } from "child_process";
 import { getAutterBinary } from "./utils/binary-path";
 import { getGitRepoRoot } from "./utils/git-api";
 
+// One-time (per session) user-visible warning when the autter binary can't be
+// spawned. Without it, human-edit tracking dies silently and manual edits are
+// committed as untracked even though the rest of the setup looks healthy.
+let hasShownSpawnErrorMessage = false;
+
+function showSpawnErrorOnce(detail: string): void {
+  if (hasShownSpawnErrorMessage) {
+    return;
+  }
+  hasShownSpawnErrorMessage = true;
+  vscode.window.showWarningMessage(
+    `autter: failed to run the autter binary (${detail}). Manual edits are NOT being tracked and will show as untracked. ` +
+      "Install autter (https://autter.dev) or restart your editor after installing."
+  );
+}
+
 /**
  * Fires a `autter checkpoint known_human --hook-input stdin` whenever a
  * document is saved. Debounces per repo root over a 500ms window so that
@@ -132,6 +148,7 @@ export class KnownHumanCheckpointManager {
 
     proc.on("error", (err) => {
       console.error("[autter] KnownHumanCheckpointManager: Spawn error:", err.message);
+      showSpawnErrorOnce(err.message);
     });
 
     proc.on("close", (code) => {

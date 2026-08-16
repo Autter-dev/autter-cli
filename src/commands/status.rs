@@ -88,6 +88,10 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             eprintln!();
             eprintln!("  autter install-hooks");
             eprintln!();
+            eprintln!(
+                "If hooks are already installed, run `autter debug` and check the 'AI Agent Capture' section to see whether each agent/editor is actually able to checkpoint."
+            );
+            eprintln!();
         }
         return Ok(());
     }

@@ -283,6 +283,19 @@ The CLI accurately attributes AI code on every commit. The teams version adds a 
 #### What's supported, and what isn't?
 Autter provides line-level attribution for AI-generated code whether it was written through an edit tool or a bash command. During a history rewrite (`rebase`, `stash`, `squash --merge`, and so on) Autter moves and merges attributions so nothing is lost.
 
+**Which agents and editors checkpoint, and what does each path require?**
+
+| Capture surface                                                  | How it's captured | Requirements / notes                                                          |
+| ---------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- |
+| CLI / terminal agents (Claude Code, Codex, Gemini, Amp, OpenCode, Droid, Pi, Continue, Copilot CLI, ...) | Agent hook configs written by `autter install-hooks` | Re-run `autter install-hooks` after installing a new agent. |
+| VS Code built-in Copilot agent (agent mode)                      | VS Code ≥ 1.109.3: VS Code's native agent hooks (Preview) run autter from `~/.copilot/hooks/autter.json`; older VS Code: the autter extension detects agent edits itself | `autter install-hooks` writes the hook file and enables `~/.copilot/hooks` in the `chat.hookFilesLocations` setting. Restart VS Code afterwards. |
+| Cursor / Windsurf / other agent IDEs                             | Their own hook configs written by `autter install-hooks` | |
+| AI inline/tab completions in VS Code                             | autter extension (experimental) | OFF by default — enable the `autter.experiments.aiTabTracking` setting; without it, accepted completions count as untracked. |
+| Manual (human) edits                                             | autter editor extensions (VS Code family, JetBrains, Visual Studio) fire a `known_human` checkpoint on save | Requires the extension. Edits made without an autter extension (e.g. vim, `sed`) are committed as untracked — still counted as non-AI, just not explicitly human-attested. |
+| Remote dev (SSH / WSL / devcontainers / Codespaces)              | Same as above, but everything runs on the remote host | Install autter **on the remote host** and run `autter install-hooks` there; a local-only install looks healthy while capturing nothing. |
+
+Run `autter debug` and read the **AI Agent Capture** section to see, per agent, whether the capture chain on this machine is complete.
+
 Here is the full breakdown of what is supported today:
 
 | Capability                                                      | Status | Notes                                                                        |
