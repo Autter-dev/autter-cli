@@ -433,13 +433,30 @@ impl CiContext {
                     Some(previous_base_sha) if !previous_base_sha.is_empty() => {
                         previous_base_sha.clone()
                     }
-                    _ => self
+                    _ => match self
                         .repo
-                        .merge_base(previous_head_sha.clone(), base_target.to_string())?,
+                        .merge_base(previous_head_sha.clone(), base_target.to_string())?
+                    {
+                        Some(base) => base,
+                        None => {
+                            println!(
+                                "Skipping PR sync authorship rewrite: previous PR head {} shares no history with {}",
+                                previous_head_sha, base_target
+                            );
+                            return Ok(CiRunResult::SkippedNonRebaseSync);
+                        }
+                    },
                 };
-                let resolved_base_sha = self
+                let Some(resolved_base_sha) = self
                     .repo
-                    .merge_base(head_sha.clone(), base_target.to_string())?;
+                    .merge_base(head_sha.clone(), base_target.to_string())?
+                else {
+                    println!(
+                        "Skipping PR sync authorship rewrite: current PR head is not based on {}",
+                        base_target
+                    );
+                    return Ok(CiRunResult::SkippedNonRebaseSync);
+                };
                 let resolved_base_target_sha = self.repo.revparse_single(base_target)?.id();
 
                 if resolved_base_sha != resolved_base_target_sha {
@@ -688,7 +705,8 @@ impl CiContext {
         let merge_base = self
             .repo
             .merge_base(head_sha.to_string(), base_ref.to_string())
-            .ok();
+            .ok()
+            .flatten();
 
         if let Some(ref base) = merge_base
             && let Ok(mut commits) =

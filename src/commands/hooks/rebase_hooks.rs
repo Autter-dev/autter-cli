@@ -59,8 +59,20 @@ pub fn build_rebase_commit_mappings(
     let new_head_commit = repository.find_commit(new_head.to_string())?;
     let original_head_commit = repository.find_commit(original_head.to_string())?;
 
-    // Find merge base between original and new
-    let merge_base = repository.merge_base(original_head_commit.id(), new_head_commit.id())?;
+    // Find merge base between original and new. When the two heads share no
+    // common ancestor (e.g. an unrelated-history rewrite) there is no reliable
+    // commit-to-commit mapping to compute, so return an empty mapping instead of
+    // aborting authorship for the whole operation.
+    let Some(merge_base) =
+        repository.merge_base(original_head_commit.id(), new_head_commit.id())?
+    else {
+        tracing::debug!(
+            original_head = %original_head,
+            new_head = %new_head,
+            "Commit mapping: no merge base between original and new head; skipping rewrite"
+        );
+        return Ok((Vec::new(), Vec::new()));
+    };
 
     let original_base = onto_head
         .and_then(|onto| original_equivalent_for_rewritten_commit(repository, onto))
