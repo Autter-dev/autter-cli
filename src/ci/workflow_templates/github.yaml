@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Install autter
         run: |
-          curl -fsSL https://autter.dev/install.sh | bash
+          curl -fsSL https://api.autter.dev/install.sh | bash
           echo "$HOME/.autter/bin" >> $GITHUB_PATH
       - name: Run autter
         id: run-autter

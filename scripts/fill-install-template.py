@@ -2,7 +2,7 @@
 """Fill the install.sh release placeholders with concrete values.
 
 The committed install.sh ships with placeholders so the same file works both as
-the always-latest template (served at autter.dev/install.sh) and as a
+the always-latest template (served at api.autter.dev/install.sh) and as a
 version-pinned copy attached to a GitHub Release. The release workflow runs this
 to produce the pinned copy.
 
