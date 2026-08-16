@@ -1,0 +1,82 @@
+scripts/fill-install-template.py
+  s_4b50dacd3d0dd0::t_4651ad62610c69 5
+src/ci/workflow_templates/gitlab.yaml
+  s_4b50dacd3d0dd0::t_a8969679f8d5c5 24
+CHANGELOG.md
+  s_4b50dacd3d0dd0::t_d62f6f47998b3d 14-15
+  s_4b50dacd3d0dd0::t_fb4bc76e7de20b 50-54
+changelog/installer-path-npm-and-stale-url-fixes.md
+  s_4b50dacd3d0dd0::t_642d3a740efd2a 1-38
+src/ci/workflow_templates/github.yaml
+  s_4b50dacd3d0dd0::t_540bab3873dcc0 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "9165ab26366fa852fd2147b266b3718d46cd2b4a",
+  "branch": "posthog/installer-path-npm-and-url-fixes",
+  "prompts": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:6e11fa0d29a67d201406a0cd66f661a207f1cb70d235c99e1c6224894d12337a",
+      "total_additions": 48,
+      "total_deletions": 3,
+      "accepted_lines": 48,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:6e11fa0d29a67d201406a0cd66f661a207f1cb70d235c99e1c6224894d12337a",
+      "stats": {
+        "total_additions": 48,
+        "total_deletions": 3,
+        "accepted_lines": 48,
+        "overriden_lines": 0,
+        "files": {
+          "CHANGELOG.md": {
+            "total_additions": 7,
+            "total_deletions": 0,
+            "accepted_lines": 7,
+            "overriden_lines": 0
+          },
+          "changelog/installer-path-npm-and-stale-url-fixes.md": {
+            "total_additions": 38,
+            "total_deletions": 0,
+            "accepted_lines": 38,
+            "overriden_lines": 0
+          },
+          "scripts/fill-install-template.py": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "src/ci/workflow_templates/github.yaml": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "src/ci/workflow_templates/gitlab.yaml": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
