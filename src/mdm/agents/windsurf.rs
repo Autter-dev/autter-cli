@@ -347,8 +347,6 @@ impl HookInstaller for WindsurfInstaller {
                             message: "Windsurf: Pending extension install".to_string(),
                         });
                     } else {
-                        println!("Installing extensions...");
-                        println!("\tInstalling extension 'autter.autter-vscode'...");
                         match install_vsc_editor_extension_with_vsix_fallback(
                             &cli,
                             "autter.autter-vscode",
@@ -357,7 +355,7 @@ impl HookInstaller for WindsurfInstaller {
                                 results.push(InstallResult {
                                     changed: true,
                                     diff: None,
-                                    message: "\tExtension 'autter.autter-vscode' was successfully installed.".to_string(),
+                                    message: "Windsurf: Extension installed".to_string(),
                                 });
                             }
                             Err(e) => {
@@ -368,7 +366,7 @@ impl HookInstaller for WindsurfInstaller {
                                 results.push(InstallResult {
                                     changed: false,
                                     diff: None,
-                                    message: "Windsurf: Unable to automatically install extension. Please cmd+click on the following link to install: windsurf:extension/autter.autter-vscode (or search for 'autter-vscode' in the Windsurf extensions tab)".to_string(),
+                                    message: format!("Windsurf: Unable to automatically install extension ({}). Please cmd+click on the following link to install: windsurf:extension/autter.autter-vscode (or search for 'autter-vscode' in the Windsurf extensions tab)", e),
                                 });
                             }
                         }

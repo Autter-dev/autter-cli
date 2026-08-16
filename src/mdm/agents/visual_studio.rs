@@ -134,7 +134,7 @@ impl HookInstaller for VisualStudioInstaller {
                         ),
                     });
                 }
-                Ok(false) | Err(_) => {
+                Ok(false) => {
                     results.push(InstallResult {
                         changed: false,
                         diff: None,
@@ -142,6 +142,17 @@ impl HookInstaller for VisualStudioInstaller {
                             "Visual Studio {}: Unable to automatically install extension. \
                              Please install manually from: {}",
                             inst.display_version, MARKETPLACE_URL
+                        ),
+                    });
+                }
+                Err(e) => {
+                    results.push(InstallResult {
+                        changed: false,
+                        diff: None,
+                        message: format!(
+                            "Visual Studio {}: Unable to automatically install extension ({}). \
+                             Please install manually from: {}",
+                            inst.display_version, e, MARKETPLACE_URL
                         ),
                     });
                 }
