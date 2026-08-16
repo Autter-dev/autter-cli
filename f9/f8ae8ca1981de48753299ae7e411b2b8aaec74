@@ -1,0 +1,8 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "f9f8ae8ca1981de48753299ae7e411b2b8aaec74",
+  "branch": "posthog/codex-cloud-stats-attribution",
+  "prompts": {}
+}
