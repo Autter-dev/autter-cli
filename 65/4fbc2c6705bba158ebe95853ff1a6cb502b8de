@@ -1,0 +1,77 @@
+tests/e2e/installer-shell-detection.bats
+  s_4b50dacd3d0dd0::t_c2b738482c9bb1 256,259,262-263,266-269,272,276-285
+  s_4b50dacd3d0dd0::t_636bca534511c2 327-328,330,332,334,336,343,345-347
+  s_4b50dacd3d0dd0::t_f99403dad4b7d3 293-296,300-303
+  s_4b50dacd3d0dd0::t_0b4597fc2d6219 363,365,367,369-370,376,378-379
+  s_4b50dacd3d0dd0::t_34a41f2104c32b 46-50,53-54
+  s_4b50dacd3d0dd0::t_70ce5befbc9ae8 182,186,189-191,193
+INSTALL.md
+  s_4b50dacd3d0dd0::t_2ec0934978e020 31-37
+  s_4b50dacd3d0dd0::t_43c77032757619 185-191,194
+install.sh
+  s_4b50dacd3d0dd0::t_7db4599dd51918 530-532
+  s_4b50dacd3d0dd0::t_cd619dd6d1635f 185-220
+  s_4b50dacd3d0dd0::t_0b407245c89a42 562-582
+  s_4b50dacd3d0dd0::t_1516d8dbb0fd32 454-456,463-466,468,476,478,484-488
+  s_4b50dacd3d0dd0::t_fa51fcfe7027a8 552-555,557
+  s_4b50dacd3d0dd0::t_4c01bd36b12d79 498-507
+  s_4b50dacd3d0dd0::t_66d4141c158ab0 140-144,147-148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "654fbc2c6705bba158ebe95853ff1a6cb502b8de",
+  "branch": "posthog/installer-path-npm-and-url-fixes",
+  "prompts": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:77051bd9d227506ef11615fe6b5d126fcd2c228b2bff4299f62125ae2d74a8f2",
+      "total_additions": 172,
+      "total_deletions": 81,
+      "accepted_lines": 172,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:77051bd9d227506ef11615fe6b5d126fcd2c228b2bff4299f62125ae2d74a8f2",
+      "stats": {
+        "total_additions": 172,
+        "total_deletions": 81,
+        "accepted_lines": 172,
+        "overriden_lines": 0,
+        "files": {
+          "INSTALL.md": {
+            "total_additions": 15,
+            "total_deletions": 3,
+            "accepted_lines": 15,
+            "overriden_lines": 0
+          },
+          "install.sh": {
+            "total_additions": 97,
+            "total_deletions": 29,
+            "accepted_lines": 97,
+            "overriden_lines": 0
+          },
+          "tests/e2e/installer-shell-detection.bats": {
+            "total_additions": 60,
+            "total_deletions": 49,
+            "accepted_lines": 60,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
