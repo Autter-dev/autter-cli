@@ -2344,7 +2344,7 @@ fn test_diff_json_mixed_format_commit_separates_prompts_and_sessions() {
         breakdown.keys().collect::<Vec<_>>()
     );
     assert!(
-        breakdown.contains_key("mock_ai::unknown"),
+        breakdown.contains_key("mock_ai::mock_ai/unknown-model"),
         "breakdown should have new-format tool::model, got: {:?}",
         breakdown.keys().collect::<Vec<_>>()
     );

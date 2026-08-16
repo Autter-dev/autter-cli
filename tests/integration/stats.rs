@@ -154,7 +154,7 @@ fn test_authorship_log_stats() {
     assert_eq!(
         stats
             .tool_model_breakdown
-            .get("mock_ai::unknown")
+            .get("mock_ai::mock_ai/unknown-model")
             .unwrap()
             .ai_additions,
         5
@@ -162,7 +162,7 @@ fn test_authorship_log_stats() {
     assert_eq!(
         stats
             .tool_model_breakdown
-            .get("mock_ai::unknown")
+            .get("mock_ai::mock_ai/unknown-model")
             .unwrap()
             .ai_accepted,
         5
