@@ -7517,6 +7517,51 @@ impl ActorDaemonCoordinator {
             }
         }
 
+        // A squash merge performed on the hosting provider (GitHub/GitLab merge
+        // button) creates the squash commit server-side, so no local hook ever
+        // writes an authorship note for it and its lines degrade to untracked.
+        // After a pull we can reconstruct those notes from the local source
+        // branch. This runs after the notes fetch above (commits whose notes
+        // already exist remotely are skipped) and after the rewrite side
+        // effects (rebased local commits already have their notes by now).
+        if saw_pull_event
+            && config::Config::get().feature_flags().squash_recovery
+            && let Some(worktree) = cmd.worktree.as_ref()
+        {
+            let (old_head, new_head) = Self::resolve_heads_for_command(cmd);
+            if is_valid_oid(&old_head)
+                && !is_zero_oid(&old_head)
+                && is_valid_oid(&new_head)
+                && !is_zero_oid(&new_head)
+                && old_head != new_head
+                && let Ok(repo) = find_repository_in_path(&worktree.to_string_lossy())
+            {
+                match crate::authorship::squash_recovery::recover_squashed_authorship_after_pull(
+                    &repo, &old_head, &new_head,
+                ) {
+                    Ok(recovered) if recovered > 0 => {
+                        tracing::info!(
+                            recovered,
+                            %old_head,
+                            %new_head,
+                            "post-pull squash authorship recovery completed"
+                        );
+                    }
+                    Ok(_) => {}
+                    // Best-effort: a recovery failure must never disturb pull
+                    // processing or the other side effects that already ran.
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            %old_head,
+                            %new_head,
+                            "post-pull squash authorship recovery failed"
+                        );
+                    }
+                }
+            }
+        }
+
         for trigger in transcript_sweep_triggers_for_events(events) {
             if trigger == crate::daemon::stream_worker::SweepTrigger::PostPush
                 && crate::git::cli_parser::is_dry_run(&parsed_invocation.command_args)

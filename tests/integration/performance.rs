@@ -20,6 +20,7 @@ fn setup() {
         transcript_streaming: true,
         transcript_sweep: true,
         checkpoint_debug_log: false,
+        squash_recovery: true,
     };
 
     autter::config::Config::set_test_feature_flags(test_flags.clone());
