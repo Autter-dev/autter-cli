@@ -16,6 +16,7 @@ pub mod prompt_utils;
 pub mod range_authorship;
 pub mod rebase_authorship;
 pub mod secrets;
+pub mod squash_recovery;
 pub mod stats;
 pub mod transcript;
 pub mod virtual_attribution;
