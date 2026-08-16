@@ -1,0 +1,51 @@
+{
+  "name": "@autter/cli",
+  "version": "0.0.0-dev",
+  "description": "Git-native AI authorship tracking: records which lines were written by AI agents and links them to the agent, model, and prompt. This package is a thin bootstrapper that installs the native autter binary.",
+  "license": "Apache-2.0",
+  "homepage": "https://autter.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Autter-dev/autter-cli.git",
+    "directory": "npm"
+  },
+  "bugs": "https://github.com/Autter-dev/autter-cli/issues",
+  "keywords": [
+    "ai",
+    "git",
+    "authorship",
+    "attribution",
+    "blame",
+    "coding-agents",
+    "claude",
+    "copilot",
+    "cursor",
+    "codex"
+  ],
+  "bin": {
+    "autter": "bin/autter.js"
+  },
+  "files": [
+    "bin/autter.js",
+    "install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

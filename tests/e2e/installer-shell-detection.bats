@@ -43,11 +43,15 @@ extract_detect_all_shells_function() {
 # Returns shell configurations in format: "shell_name|config_file" (one per line)
 detect_all_shells() {
     local shells=""
-    
-    # Check for bash configs (prefer .bashrc over .bash_profile)
+
+    # Check for bash configs. Interactive non-login shells read ~/.bashrc while
+    # login shells (macOS Terminal/iTerm, SSH sessions) read ~/.bash_profile,
+    # so configure BOTH when both exist -- the env file they source guards
+    # against duplicate PATH entries, making the double-source harmless.
     if [ -f "$HOME/.bashrc" ]; then
         shells="${shells}bash|$HOME/.bashrc\n"
-    elif [ -f "$HOME/.bash_profile" ]; then
+    fi
+    if [ -f "$HOME/.bash_profile" ]; then
         shells="${shells}bash|$HOME/.bash_profile\n"
     fi
     
@@ -175,19 +179,18 @@ run_detect_all_shells() {
     ! echo "$output" | grep -q "fish|"
 }
 
-@test "detect_all_shells: prefers .bashrc over .bash_profile" {
+@test "detect_all_shells: configures both .bashrc and .bash_profile when both exist" {
     # Create both bash config files
     touch "$HOME/.bashrc"
     touch "$HOME/.bash_profile"
-    
+
     run run_detect_all_shells
     [ "$status" -eq 0 ]
-    
-    # Should use .bashrc (not .bash_profile)
+
+    # Login shells (macOS Terminal, SSH) read .bash_profile while interactive
+    # non-login shells read .bashrc, so both must be configured.
     echo "$output" | grep -q "bash|$HOME/.bashrc"
-    
-    # Should NOT contain .bash_profile
-    ! echo "$output" | grep -q ".bash_profile"
+    echo "$output" | grep -q "bash|$HOME/.bash_profile"
 }
 
 @test "detect_all_shells: uses .bash_profile when .bashrc doesn't exist" {
@@ -250,24 +253,36 @@ run_detect_all_shells() {
 # ============================================================================
 
 @test "PATH configuration: does not duplicate entries on re-run" {
-    # Create a mock config file with existing PATH entry
+    # Create a mock config file with existing env-file source line
     INSTALL_DIR="$HOME/.autter/bin"
     mkdir -p "$INSTALL_DIR"
-    
+
     touch "$HOME/.bashrc"
     echo "# Added by autter installer on Mon Jan 1 00:00:00 UTC 2024" >> "$HOME/.bashrc"
-    echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$HOME/.bashrc"
-    
+    echo '. "$HOME/.autter/env"' >> "$HOME/.bashrc"
+
     # Count lines before
     lines_before=$(wc -l < "$HOME/.bashrc")
-    
-    # The check in the installer uses grep -qsF to detect existing entry
-    grep -qsF "$INSTALL_DIR" "$HOME/.bashrc"
-    
+
+    # The installer skips the append when either grep matches
+    grep -qsF "$INSTALL_DIR" "$HOME/.bashrc" || grep -qsF '.autter/env' "$HOME/.bashrc"
+
     # Count lines after (should be same since we didn't add anything)
     lines_after=$(wc -l < "$HOME/.bashrc")
-    
+
     [ "$lines_before" -eq "$lines_after" ]
+}
+
+@test "PATH configuration: recognizes legacy raw-export lines from older installers" {
+    # Older installers appended the expanded PATH export directly; a re-run of
+    # the new installer must treat those files as already configured.
+    INSTALL_DIR="$HOME/.autter/bin"
+    mkdir -p "$INSTALL_DIR"
+
+    touch "$HOME/.bashrc"
+    echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$HOME/.bashrc"
+
+    grep -qsF "$INSTALL_DIR" "$HOME/.bashrc" || grep -qsF '.autter/env' "$HOME/.bashrc"
 }
 
 # ============================================================================
@@ -275,21 +290,17 @@ run_detect_all_shells() {
 # ============================================================================
 
 @test "PATH syntax: generates correct fish syntax" {
-    INSTALL_DIR="/home/testuser/.autter/bin"
-    
-    # Fish syntax should use fish_add_path
-    expected_fish_cmd="fish_add_path -g \"$INSTALL_DIR\""
-    
-    [ "$expected_fish_cmd" = "fish_add_path -g \"$INSTALL_DIR\"" ]
+    # Fish configs source the fish env file with $HOME kept literal
+    expected_fish_cmd='source "$HOME/.autter/env.fish"'
+
+    [ "$expected_fish_cmd" = 'source "$HOME/.autter/env.fish"' ]
 }
 
 @test "PATH syntax: generates correct bash/zsh syntax" {
-    INSTALL_DIR="/home/testuser/.autter/bin"
-    
-    # Bash/Zsh syntax should use export PATH
-    expected_bash_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
-    
-    [ "$expected_bash_cmd" = "export PATH=\"$INSTALL_DIR:\$PATH\"" ]
+    # Bash/zsh configs source the POSIX env file with $HOME kept literal
+    expected_bash_cmd='. "$HOME/.autter/env"'
+
+    [ "$expected_bash_cmd" = '. "$HOME/.autter/env"' ]
 }
 
 # ============================================================================
@@ -313,27 +324,27 @@ run_detect_all_shells() {
     SHELLS_CONFIGURED=""
     while IFS='|' read -r shell_name config_file; do
         [ -z "$shell_name" ] && continue
-        
-        # Generate shell-appropriate PATH command
+
+        # Generate shell-appropriate env-file source line
         if [ "$shell_name" = "fish" ]; then
-            path_cmd="fish_add_path -g \"$INSTALL_DIR\""
+            path_cmd='source "$HOME/.autter/env.fish"'
         else
-            path_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
+            path_cmd='. "$HOME/.autter/env"'
         fi
-        
+
         # Append if not already present
-        if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
+        if ! grep -qsF "$INSTALL_DIR" "$config_file" && ! grep -qsF '.autter/env' "$config_file"; then
             echo "" >> "$config_file"
             echo "# Added by autter installer" >> "$config_file"
             echo "$path_cmd" >> "$config_file"
             SHELLS_CONFIGURED="${SHELLS_CONFIGURED}${config_file}\n"
         fi
     done <<< "$(detect_all_shells)"
-    
+
     # Verify all three configs were updated
-    grep -q "export PATH=\"$INSTALL_DIR:\$PATH\"" "$HOME/.bashrc"
-    grep -q "export PATH=\"$INSTALL_DIR:\$PATH\"" "$HOME/.zshrc"
-    grep -q "fish_add_path -g \"$INSTALL_DIR\"" "$HOME/.config/fish/config.fish"
+    grep -qF '. "$HOME/.autter/env"' "$HOME/.bashrc"
+    grep -qF '. "$HOME/.autter/env"' "$HOME/.zshrc"
+    grep -qF 'source "$HOME/.autter/env.fish"' "$HOME/.config/fish/config.fish"
 }
 
 @test "integration: only configures existing shell configs" {
@@ -349,23 +360,23 @@ run_detect_all_shells() {
     # Simulate the installer's PATH configuration loop
     while IFS='|' read -r shell_name config_file; do
         [ -z "$shell_name" ] && continue
-        
+
         if [ "$shell_name" = "fish" ]; then
-            path_cmd="fish_add_path -g \"$INSTALL_DIR\""
+            path_cmd='source "$HOME/.autter/env.fish"'
         else
-            path_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
+            path_cmd='. "$HOME/.autter/env"'
         fi
-        
-        if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
+
+        if ! grep -qsF "$INSTALL_DIR" "$config_file" && ! grep -qsF '.autter/env' "$config_file"; then
             echo "" >> "$config_file"
             echo "# Added by autter installer" >> "$config_file"
             echo "$path_cmd" >> "$config_file"
         fi
     done <<< "$(detect_all_shells)"
-    
+
     # Verify only zsh was configured
-    grep -q "export PATH=\"$INSTALL_DIR:\$PATH\"" "$HOME/.zshrc"
-    
+    grep -qF '. "$HOME/.autter/env"' "$HOME/.zshrc"
+
     # Verify bash and fish were NOT created
     [ ! -f "$HOME/.bashrc" ]
     [ ! -f "$HOME/.config/fish/config.fish" ]

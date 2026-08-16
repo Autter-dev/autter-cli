@@ -22,13 +22,28 @@ Run:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
 ```
 
+### npm (any platform, Node.js 18+)
+
+```bash
+npm install -g @autter/cli
+autter onboard
+```
+
+The npm package is a thin bootstrapper that downloads the same release binary into `~/.autter/bin` and verifies its checksum against the GitHub release, then exposes `autter` through the npm global bin directory. Hooks, the background service, and `autter upgrade` work identically to the script installs. One-shot bootstrap without a global install: `npx @autter/cli onboard`.
+
 > **Git Bash is not WSL.** The bash installer only runs on macOS, Linux, and WSL; in Git Bash it exits with instructions instead of installing. Use the Windows command above (it also works from Git Bash), and install Autter in the environment where your coding agents run — agents inside WSL need the WSL install.
 
 Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autter.dev/cli/install) generates a single-use command that runs this same installer and signs the machine in automatically.
 
 The installer downloads Autter into `~/.autter/bin`, adds it to your user `PATH`, configures supported coding agents and editors, and starts the background service. On macOS, Linux, and WSL it then starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later.
 
-Close and reopen your terminal and IDE after installation, then verify the CLI is available:
+On macOS, Linux, and WSL, make `autter` available in the terminal you already have open (the installer prints this command at the end too):
+
+```bash
+source "$HOME/.autter/env"   # fish: source "$HOME/.autter/env.fish"
+```
+
+New terminals pick it up automatically. Restart your IDE (not just its terminal tab) so IDE terminals and coding agents see it too. Then verify the CLI is available:
 
 ```bash
 autter --version
@@ -176,10 +191,16 @@ Start with the [contribution guide](CONTRIBUTING.md), read the [agent integratio
 
 ### `autter: command not found`
 
-Close and reopen the terminal so the installer-added `PATH` entry is loaded. If shell detection could not update your profile on macOS, Linux, or WSL, add this line to your shell configuration and restart the shell:
+In an already-open terminal on macOS, Linux, or WSL, load the PATH entry directly:
 
 ```bash
-export PATH="$HOME/.autter/bin:$PATH"
+source "$HOME/.autter/env"   # fish: source "$HOME/.autter/env.fish"
+```
+
+New terminals load it automatically via your shell configuration. If the command is still not found in a fresh terminal, shell detection could not update your profile — add this line to your shell configuration (for fish, use the `env.fish` variant) and restart the shell:
+
+```bash
+. "$HOME/.autter/env"
 ```
 
 ### An agent or editor installed after Autter is not detected
