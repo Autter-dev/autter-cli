@@ -213,7 +213,7 @@ jobs:
       # The npm package is a thin bootstrapper that downloads the binaries
       # published by the release job above, so it must publish AFTER the
       # GitHub Release exists. Stamps the package with the tag's version so
-      # `npm i -g autter@X.Y.Z` maps 1:1 onto release vX.Y.Z. Skips (rather
+      # `npm i -g @autter/cli@X.Y.Z` maps 1:1 onto release vX.Y.Z. Skips (rather
       # than fails) when the NPM_TOKEN secret is not configured, so a release
       # never blocks on npm.
       - name: Publish to npm

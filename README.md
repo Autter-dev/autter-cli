@@ -48,7 +48,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.aut
 **npm (any platform, Node.js 18+)**
 
 ```bash
-npm install -g autter
+npm install -g @autter/cli
 autter onboard
 ```
 

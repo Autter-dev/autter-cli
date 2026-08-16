@@ -25,11 +25,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.aut
 ### npm (any platform, Node.js 18+)
 
 ```bash
-npm install -g autter
+npm install -g @autter/cli
 autter onboard
 ```
 
-The npm package is a thin bootstrapper that downloads the same release binary into `~/.autter/bin` and verifies its checksum against the GitHub release, then exposes `autter` through the npm global bin directory. Hooks, the background service, and `autter upgrade` work identically to the script installs. One-shot bootstrap without a global install: `npx autter onboard`.
+The npm package is a thin bootstrapper that downloads the same release binary into `~/.autter/bin` and verifies its checksum against the GitHub release, then exposes `autter` through the npm global bin directory. Hooks, the background service, and `autter upgrade` work identically to the script installs. One-shot bootstrap without a global install: `npx @autter/cli onboard`.
 
 > **Git Bash is not WSL.** The bash installer only runs on macOS, Linux, and WSL; in Git Bash it exits with instructions instead of installing. Use the Windows command above (it also works from Git Bash), and install Autter in the environment where your coding agents run — agents inside WSL need the WSL install.
 

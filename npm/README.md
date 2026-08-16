@@ -1,4 +1,4 @@
-# autter
+# @autter/cli
 
 **[Autter](https://autter.dev) is an open source git extension that records which lines of your code were written by AI** — tied to the agent, model, and prompt that produced them.
 
@@ -7,17 +7,17 @@ This package is a thin bootstrapper: it downloads the official native `autter` b
 ## Install
 
 ```bash
-npm install -g autter
+npm install -g @autter/cli
 autter onboard
 ```
 
 Or bootstrap without a global install:
 
 ```bash
-npx autter onboard
+npx @autter/cli onboard
 ```
 
-The package version matches the CLI release, so `npm install -g autter@<version>` installs that exact release.
+The package version matches the CLI release, so `npm install -g @autter/cli@<version>` installs that exact release.
 
 ## Environment variables
 

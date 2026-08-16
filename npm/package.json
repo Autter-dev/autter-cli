@@ -1,5 +1,5 @@
 {
-  "name": "autter",
+  "name": "@autter/cli",
   "version": "0.0.0-dev",
   "description": "Git-native AI authorship tracking: records which lines were written by AI agents and links them to the agent, model, and prompt. This package is a thin bootstrapper that installs the native autter binary.",
   "license": "Apache-2.0",

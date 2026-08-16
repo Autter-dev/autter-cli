@@ -12,7 +12,7 @@
 // command via bin/autter.js.
 //
 // The package version is stamped to the CLI release tag at publish time, so
-// `npm i -g autter@1.7.0` fetches the v1.7.0 binaries. The in-repo placeholder
+// `npm i -g @autter/cli@1.7.0` fetches the v1.7.0 binaries. The in-repo placeholder
 // version (0.0.0-dev) resolves to the latest release instead.
 //
 // Escape hatches:
