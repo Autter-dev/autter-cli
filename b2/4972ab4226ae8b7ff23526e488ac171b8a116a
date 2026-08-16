@@ -1,0 +1,101 @@
+INSTALL.md
+  s_43a5b1d9f685c1::t_4d72c2274c3cc5 22
+install.sh
+  s_43a5b1d9f685c1::t_f6441660de0d56 277
+  s_43a5b1d9f685c1::t_451f82d19b3bf9 97
+  s_43a5b1d9f685c1::t_a4c86eb11d241b 50-56,58-59,63,65,67-68,70
+install.ps1
+  s_43a5b1d9f685c1::t_71989f9e45af22 221-227,229-230,234,236,238-239,241
+  s_43a5b1d9f685c1::t_e5782dcc9a9289 177
+  s_43a5b1d9f685c1::t_c0b766681d5ff7 523-533
+  s_43a5b1d9f685c1::t_2aff3a9dde3320 325-331
+  s_43a5b1d9f685c1::t_b05522a2171d2c 341
+  s_43a5b1d9f685c1::t_95abe938b91468 471-474,491-501
+  s_43a5b1d9f685c1::t_ec8037f8808874 249-259,261,265-266
+.github/workflows/release.yml
+  s_43a5b1d9f685c1::t_9f41abf01ebcc1 66-77
+  s_43a5b1d9f685c1::t_3f71fc934bfde5 113-117
+  s_43a5b1d9f685c1::t_cf671bc69fef58 190-191,193
+  s_43a5b1d9f685c1::t_f99641d9ba91a7 4-5,12,15-16
+  s_43a5b1d9f685c1::t_753a2298ff37c5 147,149,154-155,158,166-167,173-176
+README.md
+  s_43a5b1d9f685c1::t_89b0e2b2f4d713 45
+changelog/windows-release-and-installer-fixes.md
+  s_43a5b1d9f685c1::t_27b87d44c1a01f 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "b24972ab4226ae8b7ff23526e488ac171b8a116a",
+  "branch": "posthog/windows-release-and-installer-fixes",
+  "prompts": {
+    "s_43a5b1d9f685c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b1d-4cc6-703e-adc7-650ee25975b3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:8d3d7c56bf917171eacd404591943e14355c226ca734c89d80532786226b5a0d",
+      "total_additions": 161,
+      "total_deletions": 43,
+      "accepted_lines": 161,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_43a5b1d9f685c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b1d-4cc6-703e-adc7-650ee25975b3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:8d3d7c56bf917171eacd404591943e14355c226ca734c89d80532786226b5a0d",
+      "stats": {
+        "total_additions": 161,
+        "total_deletions": 43,
+        "accepted_lines": 161,
+        "overriden_lines": 0,
+        "files": {
+          ".github/workflows/release.yml": {
+            "total_additions": 36,
+            "total_deletions": 8,
+            "accepted_lines": 36,
+            "overriden_lines": 0
+          },
+          "INSTALL.md": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "README.md": {
+            "total_additions": 1,
+            "total_deletions": 1,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "changelog/windows-release-and-installer-fixes.md": {
+            "total_additions": 44,
+            "total_deletions": 0,
+            "accepted_lines": 44,
+            "overriden_lines": 0
+          },
+          "install.ps1": {
+            "total_additions": 63,
+            "total_deletions": 22,
+            "accepted_lines": 63,
+            "overriden_lines": 0
+          },
+          "install.sh": {
+            "total_additions": 16,
+            "total_deletions": 11,
+            "accepted_lines": 16,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
