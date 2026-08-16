@@ -1,0 +1,49 @@
+.github/workflows/ci.yml
+  s_43a5b1d9f685c1::t_1d33a1d818af67 1-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "df394f3a5bef51145108a045848ecfd7a8edea03",
+  "branch": "posthog/add-pr-ci",
+  "prompts": {
+    "s_43a5b1d9f685c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b1d-4cc6-703e-adc7-650ee25975b3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:48bc6e1c28ebed051ff87605765982bafcdc1872cae67f3714ba64fe36e5f746",
+      "total_additions": 37,
+      "total_deletions": 0,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_43a5b1d9f685c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b1d-4cc6-703e-adc7-650ee25975b3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:48bc6e1c28ebed051ff87605765982bafcdc1872cae67f3714ba64fe36e5f746",
+      "stats": {
+        "total_additions": 37,
+        "total_deletions": 0,
+        "accepted_lines": 37,
+        "overriden_lines": 0,
+        "files": {
+          ".github/workflows/ci.yml": {
+            "total_additions": 37,
+            "total_deletions": 0,
+            "accepted_lines": 37,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
