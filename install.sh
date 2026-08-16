@@ -137,11 +137,15 @@ verify_checksum() {
 # Returns shell configurations in format: "shell_name|config_file" (one per line)
 detect_all_shells() {
     local shells=""
-    
-    # Check for bash configs (prefer .bashrc over .bash_profile)
+
+    # Check for bash configs. Interactive non-login shells read ~/.bashrc while
+    # login shells (macOS Terminal/iTerm, SSH sessions) read ~/.bash_profile,
+    # so configure BOTH when both exist -- the env file they source guards
+    # against duplicate PATH entries, making the double-source harmless.
     if [ -f "$HOME/.bashrc" ]; then
         shells="${shells}bash|$HOME/.bashrc\n"
-    elif [ -f "$HOME/.bash_profile" ]; then
+    fi
+    if [ -f "$HOME/.bash_profile" ]; then
         shells="${shells}bash|$HOME/.bash_profile\n"
     fi
     
@@ -176,6 +180,42 @@ detect_all_shells() {
     
     # Remove trailing newline and output
     printf '%b' "$shells" | sed '/^$/d'
+}
+
+# Write the sourceable env files that shell rc lines point at. Sourcing one of
+# these is the single reliable way to make autter available in an already-open
+# shell, regardless of which rc file the installer edited or what the user's
+# rc files do to PATH afterwards. Written unconditionally so upgrades from
+# older installs (which appended a raw `export PATH=...` line) get them too.
+write_env_files() {
+    # POSIX sh version, sourced by bash/zsh (and safe under dash).
+    cat > "$HOME/.autter/env" << 'ENV_EOF'
+#!/bin/sh
+# autter shell setup: prepends ~/.autter/bin to PATH once per shell.
+# Sourced by shell rc files; safe to source repeatedly.
+case ":${PATH}:" in
+    *:"$HOME/.autter/bin":*)
+        ;;
+    *)
+        export PATH="$HOME/.autter/bin:$PATH"
+        # Forget cached command lookups so shells that hash PATH results
+        # (bash) resolve autter immediately after sourcing this file.
+        hash -r 2>/dev/null || true
+        ;;
+esac
+ENV_EOF
+
+    # Fish version. fish_add_path is itself idempotent (fish >= 3.2); the
+    # fallback covers older fish releases.
+    cat > "$HOME/.autter/env.fish" << 'ENV_FISH_EOF'
+# autter shell setup: prepends ~/.autter/bin to PATH.
+# Sourced by config.fish; safe to source repeatedly.
+if type -q fish_add_path
+    fish_add_path -g "$HOME/.autter/bin"
+else if not contains -- "$HOME/.autter/bin" $PATH
+    set -gx PATH "$HOME/.autter/bin" $PATH
+end
+ENV_FISH_EOF
 }
 
 # ============================================================
@@ -411,17 +451,21 @@ else
     success "Successfully set up IDE/agent hooks"
 fi
 
-# Add to PATH in all detected shell configurations
+# Write the env files and point every detected shell configuration at them
+write_env_files
+
 SHELLS_CONFIGURED=""
 SHELLS_ALREADY_CONFIGURED=""
 CREATED_SHELL_PATHS=""
 
 while IFS='|' read -r shell_name config_file; do
     [ -z "$shell_name" ] && continue
-    
-    # Generate shell-appropriate PATH command
+
+    # Generate shell-appropriate env-file source line. $HOME is kept literal
+    # (single-quoted here) so the rc line survives home-directory moves and
+    # dotfile syncing across machines.
     if [ "$shell_name" = "fish" ]; then
-        path_cmd="fish_add_path -g \"$INSTALL_DIR\""
+        path_cmd='source "$HOME/.autter/env.fish"'
         # Create fish config directory if it doesn't exist (for fallback case)
         config_dir="$(dirname "$config_file")"
         if [ ! -d "$config_dir" ]; then
@@ -429,17 +473,19 @@ while IFS='|' read -r shell_name config_file; do
             CREATED_SHELL_PATHS="${CREATED_SHELL_PATHS}${config_dir}\n"
         fi
     else
-        path_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
+        path_cmd='. "$HOME/.autter/env"'
     fi
-    
+
     # Create config file if it doesn't exist (for fallback case when no configs found)
     if [ ! -f "$config_file" ]; then
         CREATED_SHELL_PATHS="${CREATED_SHELL_PATHS}${config_file}\n"
     fi
     touch "$config_file"
-    
-    # Append if not already present
-    if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
+
+    # Append if not already present. The first grep matches PATH lines written
+    # by older installers (expanded install dir); the second matches the
+    # env-file source lines written here.
+    if ! grep -qsF "$INSTALL_DIR" "$config_file" && ! grep -qsF '.autter/env' "$config_file"; then
         echo "" >> "$config_file"
         echo "# Added by autter installer on $(date)" >> "$config_file"
         echo "$path_cmd" >> "$config_file"
@@ -449,6 +495,16 @@ while IFS='|' read -r shell_name config_file; do
     fi
 done <<< "$(detect_all_shells)"
 
+# One activation command for the user's login shell. Telling users to source
+# a whole rc file is unreliable (the edited rc may belong to a different
+# shell, and rc files can rebuild PATH or early-return); sourcing the env
+# file always works in an already-open shell.
+if [ "$(basename "${SHELL:-}")" = "fish" ]; then
+    ACTIVATE_CMD='source "$HOME/.autter/env.fish"'
+else
+    ACTIVATE_CMD='source "$HOME/.autter/env"'
+fi
+
 # Display results to user
 if [ -n "$SHELLS_CONFIGURED" ]; then
     echo ""
@@ -456,17 +512,6 @@ if [ -n "$SHELLS_CONFIGURED" ]; then
     printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
         [ -z "$shell_name" ] && continue
         success "  ✓ $config_file"
-    done
-    
-    echo ""
-    echo "To apply changes immediately:"
-    printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
-        [ -z "$shell_name" ] && continue
-        if [ "$shell_name" = "fish" ]; then
-            echo "  - For fish: source $config_file"
-        else
-            echo "  - For $shell_name: source $config_file"
-        fi
     done
 fi
 
@@ -482,8 +527,9 @@ fi
 if [ -z "$SHELLS_CONFIGURED" ] && [ -z "$SHELLS_ALREADY_CONFIGURED" ]; then
     echo ""
     echo "Could not detect any shell config files."
-    echo "Please add the following line to your shell config and restart:"
-    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo "Please add the following line to your shell config:"
+    echo '  . "$HOME/.autter/env"'
+    echo '(for fish: source "$HOME/.autter/env.fish")'
 fi
 
 # Fix file ownership when running as root for a different user (MDM deployments)
@@ -497,18 +543,40 @@ if [ "$(id -u)" = "0" ] && [ -n "$INSTALL_USER" ]; then
     fi
 fi
 
-echo ""
-printf '%b\n' "${YELLOW}Close and reopen your terminal and IDE sessions to use autter.${NC}"
-
 # Walk the user through onboarding: choose local-only vs connecting to the
 # Autter platform. When the user opts to connect, this also handles login.
 # Under `curl | sh` stdin is the pipe, not the terminal, so hand onboarding
 # the real terminal when one is available — the guided prompts then run
 # inline instead of asking the user to remember `autter onboard` later.
 # Skips itself gracefully in truly non-interactive installs (CI, MDM).
+# `[ -r /dev/tty ]` is not enough: the device node can look readable while
+# opening it fails (no controlling terminal, e.g. CI or `bash < /dev/null`),
+# which used to print a bare "/dev/tty: Device not configured" error. Actually
+# try to open it instead.
 echo ""
-if [ -r /dev/tty ]; then
+if ( : </dev/tty ) 2>/dev/null; then
     ${INSTALL_DIR}/autter onboard </dev/tty || true
 else
     ${INSTALL_DIR}/autter onboard || true
 fi
+
+# PATH guidance goes LAST so it is the message left on screen after the
+# install: the one thing every fresh install needs next is how to run autter
+# in the terminal they already have open. (Onboarding above prints a lot,
+# which used to scroll this advice out of view.)
+echo ""
+case ":${PATH}:" in
+    *:"$INSTALL_DIR":*)
+        # This process inherited a PATH that already resolves autter, so the
+        # parent shell has it too (e.g. an upgrade over an existing install).
+        printf '%b\n' "${GREEN}autter is installed and already on your PATH.${NC}"
+        ;;
+    *)
+        printf '%b\n' "${GREEN}autter is installed.${NC} To use it in this terminal right now, run:"
+        echo ""
+        printf '%b\n' "    ${YELLOW}${ACTIVATE_CMD}${NC}"
+        echo ""
+        echo "New terminals pick it up automatically. Restart your IDE (not just its"
+        echo "terminal tab) so IDE terminals and coding agents see it too."
+        ;;
+esac
