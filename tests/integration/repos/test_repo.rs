@@ -1054,6 +1054,13 @@ impl TestRepo {
         if let Some(feature_flags) = &patch.feature_flags {
             config.insert("feature_flags".to_string(), feature_flags.clone());
         }
+        if let Some(notes_backend) = &patch.notes_backend {
+            config.insert(
+                "notes_backend".to_string(),
+                serde_json::to_value(notes_backend)
+                    .expect("failed to serialize test notes backend config"),
+            );
+        }
 
         let config_dir = home.join(".autter");
         fs::create_dir_all(&config_dir).expect("failed to create test HOME config directory");
@@ -1260,6 +1267,49 @@ impl TestRepo {
         };
 
         repo.apply_default_config_patch();
+        repo.setup_daemon_mode();
+        repo.setup_git_hooks_mode();
+
+        repo
+    }
+
+    /// Create a repo with a dedicated daemon whose process starts only after
+    /// the given config patch has been written to the test HOME. Use this when
+    /// the daemon must observe a specific config from its very first read
+    /// (e.g. notes-backend mode-switch regression tests).
+    pub fn new_dedicated_daemon_with_initial_config<F>(f: F) -> Self
+    where
+        F: FnOnce(&mut ConfigPatch),
+    {
+        ensure_isolated_process_home();
+
+        let mut rng = rand::rng();
+        let n: u64 = rng.random_range(0..10000000000);
+        let base = std::env::temp_dir();
+        let path = base.join(n.to_string());
+        let test_home = base.join(format!("{}-home", n));
+        let git_mode = GitTestMode::from_env();
+        let test_db_path = resolve_test_db_path(&base, n, &test_home, git_mode);
+
+        clone_template_to(&path);
+
+        let mut repo = Self {
+            path,
+            feature_flags: FeatureFlags::default(),
+            config_patch: None,
+            test_db_path,
+            test_home,
+            git_mode,
+            daemon_scope: DaemonTestScope::Dedicated,
+            daemon_process: None,
+            _base_repo_path: None,
+            _base_test_db_path: None,
+            daemon_family_key: OnceLock::new(),
+        };
+
+        repo.apply_default_config_patch();
+        // Written to the test HOME config before the daemon spawns.
+        repo.patch_autter_config(f);
         repo.setup_daemon_mode();
         repo.setup_git_hooks_mode();
 

@@ -103,6 +103,11 @@ pub fn handle_onboard(args: &[String]) {
         eprintln!("Warning: could not save onboarding state: {e}");
     }
 
+    // The background service is what persists authorship notes, and it may
+    // have been started under the previous mode's config. Restart it so the
+    // new notes backend / prompt storage take effect immediately.
+    restart_daemon_for_mode_change();
+
     // Reflect the mode actually configured: a connect attempt can fall back
     // to local if the device login fails.
     let connected = file_config.prompt_storage.as_deref() != Some("local");
@@ -112,6 +117,24 @@ pub fn handle_onboard(args: &[String]) {
     // and platform. Only when the user just opted in.
     if telemetry_enabled {
         record_install_event(connected);
+    }
+}
+
+/// Restart the daemon so it re-reads the freshly-saved mode config. Skipped in
+/// test harnesses, which manage their own daemon lifecycle. Best-effort: a
+/// failed restart must not fail onboarding.
+fn restart_daemon_for_mode_change() {
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return;
+    }
+
+    let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
+        return;
+    };
+
+    if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
+        eprintln!("Warning: could not restart the background service: {e}");
+        eprintln!("  Run `autter install` to apply the new mode to the background service.");
     }
 }
 

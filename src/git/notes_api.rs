@@ -2,7 +2,7 @@
 //!
 //! All authorship-note reads and writes flow through this module. The implementation
 //! dispatches to either the git-notes backend (default) or the HTTP backend based on
-//! `Config::get().notes_backend().kind`.
+//! the currently configured `notes_backend.kind`.
 //!
 //! Phase 0: pure pass-through to `crate::git::refs` (no behavioral change).
 //! Phase 2: kind-aware dispatch to either git or the HTTP backend.
@@ -16,15 +16,22 @@ use std::collections::{HashMap, HashSet};
 // Re-export CommitAuthorship so callers don't need to import from refs directly.
 pub use crate::git::refs::CommitAuthorship;
 
+/// Resolve the notes backend kind from a fresh config snapshot.
+///
+/// This must not use the process-lifetime `Config::get()` cache: the daemon is
+/// a long-lived process and is the component that persists authorship notes,
+/// so a cached kind keeps routing notes to whatever backend was configured
+/// when the daemon started. Switching modes (e.g. `autter onboard` connected
+/// -> local-only) would otherwise silently divert every note away from
+/// refs/notes/ai until the daemon happens to restart.
+fn current_backend_kind() -> NotesBackendKind {
+    Config::fresh().notes_backend_kind()
+}
+
 // --- Writes ---
 
 pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<(), AutterError> {
-    write_note_with_kind(
-        Config::get().notes_backend_kind(),
-        repo,
-        commit_sha,
-        content,
-    )
+    write_note_with_kind(current_backend_kind(), repo, commit_sha, content)
 }
 
 fn write_note_with_kind(
@@ -60,7 +67,7 @@ pub fn write_notes_batch(
     if entries.is_empty() {
         return Ok(());
     }
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http => {
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
             http_write_batch(entries, repo_url.as_deref())
@@ -80,7 +87,7 @@ pub fn write_notes_batch(
 // --- Reads ---
 
 pub fn read_note(repo: &Repository, commit_sha: &str) -> Option<String> {
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http => http_read_note(commit_sha)
             .or_else(|| crate::git::refs::show_authorship_note(repo, commit_sha)),
         NotesBackendKind::GitNotes => crate::git::refs::show_authorship_note(repo, commit_sha),
@@ -99,7 +106,7 @@ pub fn read_notes_batch(
         return Ok(HashMap::new());
     }
 
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http => {
             let mut notes = http_read_notes(commit_shas);
 
@@ -156,7 +163,7 @@ pub fn read_notes_batch(
 }
 
 pub fn read_authorship(repo: &Repository, commit_sha: &str) -> Option<AuthorshipLog> {
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http => {
             // Check the cache first; fall through to git notes on miss.
             if let Some(content) = http_read_note(commit_sha) {
@@ -183,7 +190,7 @@ pub fn read_authorship_v3(
     repo: &Repository,
     commit_sha: &str,
 ) -> Result<AuthorshipLog, AutterError> {
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http => {
             if let Some(content) = http_read_note(commit_sha) {
                 AuthorshipLog::deserialize_from_string(&content).map_err(|e| {
@@ -242,7 +249,7 @@ pub fn read_note_blob_oids(
     repo: &Repository,
     commit_shas: &[String],
 ) -> Result<HashMap<String, String>, AutterError> {
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         // For Http, notes are in notes-db not in git — no blob OIDs exist.
         // Return an empty map; callers handle this as "no notes in git".
         NotesBackendKind::Http => Ok(HashMap::new()),
@@ -259,7 +266,7 @@ pub fn commits_with_notes(
     repo: &Repository,
     commit_shas: &[String],
 ) -> Result<HashSet<String>, AutterError> {
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http => {
             // Check the cache first; fall through to git notes for misses.
             let cached = http_check_exists(commit_shas);
@@ -300,7 +307,7 @@ pub fn filter_commits_with_notes(
     repo: &Repository,
     commit_shas: &[String],
 ) -> Result<Vec<CommitAuthorship>, AutterError> {
-    match Config::get().notes_backend_kind() {
+    match current_backend_kind() {
         NotesBackendKind::Http | NotesBackendKind::Both => {
             // `CommitAuthorship` requires a git_author that is only available from
             // `git rev-list`. Call the underlying git function which handles author
