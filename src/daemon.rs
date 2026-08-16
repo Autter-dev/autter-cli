@@ -7524,8 +7524,10 @@ impl ActorDaemonCoordinator {
         // branch. This runs after the notes fetch above (commits whose notes
         // already exist remotely are skipped) and after the rewrite side
         // effects (rebased local commits already have their notes by now).
+        // Config::fresh(): long-lived daemon, the kill switch must be honored
+        // without a daemon restart.
         if saw_pull_event
-            && config::Config::get().feature_flags().squash_recovery
+            && config::Config::fresh().get_feature_flags().squash_recovery
             && let Some(worktree) = cmd.worktree.as_ref()
         {
             let (old_head, new_head) = Self::resolve_heads_for_command(cmd);
