@@ -174,7 +174,7 @@ function Verify-Checksum {
     )
 
     # Skip verification if no checksums are embedded
-    if ($EmbeddedChecksums -eq '__CHECKSUMS_PLACEHOLDER__') {
+    if ($EmbeddedChecksums -eq $ChecksumsSentinel) {
         return
     }
 
@@ -218,22 +218,27 @@ function Verify-Checksum {
     Write-Success "Checksum verified for $BinaryName"
 }
 
-# GitHub repository details
-# Replaced during release builds with the actual repository (e.g., "autter-dev/autter-cli")
-# When set to __REPO_PLACEHOLDER__, defaults to "autter-dev/autter-cli"
+# Release-fill placeholders. The release workflow blindly string-replaces each
+# placeholder token EVERYWHERE in this file, so the guards below compare
+# against *Sentinel values built by concatenation — those survive the fill.
+# Comparing against the literal token would self-destruct on fill: the pinned
+# copy would ignore its version pin and skip checksum verification.
+
+# Repository ("owner/repo"); the sentinel defaults to the canonical repo.
 $Repo = '__REPO_PLACEHOLDER__'
-if ($Repo -eq '__REPO_PLACEHOLDER__') {
+$RepoSentinel = '__REPO_' + 'PLACEHOLDER__'
+if ($Repo -eq $RepoSentinel) {
     $Repo = 'autter-dev/autter-cli'
 }
 
-# Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")
-# When set to __VERSION_PLACEHOLDER__, defaults to "latest"
+# Version pin (e.g. "v1.6.8") in release copies; the sentinel means "latest".
 $PinnedVersion = '__VERSION_PLACEHOLDER__'
+$VersionSentinel = '__VERSION_' + 'PLACEHOLDER__'
 
-# Embedded checksums - replaced during release builds with actual SHA256 checksums
-# Format: "hash  filename|hash  filename|..." (pipe-separated)
-# When set to __CHECKSUMS_PLACEHOLDER__, checksum verification is skipped
+# Pipe-separated "sha256  filename" entries in release copies; checksum
+# verification is skipped when left as the sentinel.
 $EmbeddedChecksums = '__CHECKSUMS_PLACEHOLDER__'
+$ChecksumsSentinel = '__CHECKSUMS_' + 'PLACEHOLDER__'
 
 # Ensure TLS 1.2 for GitHub downloads on older PowerShell versions
 try {
@@ -241,19 +246,24 @@ try {
 } catch { }
 
 function Get-Architecture {
+    # Environment variables first: they exist on every PowerShell version.
+    # PROCESSOR_ARCHITEW6432 is set when a 32-bit shell runs on a 64-bit OS
+    # (WOW64), where PROCESSOR_ARCHITECTURE misreports 'x86'.
+    foreach ($pa in @($env:PROCESSOR_ARCHITEW6432, $env:PROCESSOR_ARCHITECTURE)) {
+        if ([string]::IsNullOrWhiteSpace($pa)) { continue }
+        if ($pa -match 'ARM64') { return 'arm64' }
+        if ($pa -match '64') { return 'x64' }
+    }
+    # Fallback: RuntimeInformation, which some Windows PowerShell 5.1 hosts
+    # cannot resolve (the type lives in a facade assembly that is not always
+    # loaded), so it may throw rather than return.
     try {
-        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-        switch ($arch) {
+        switch ("$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)") {
             'X64' { return 'x64' }
             'Arm64' { return 'arm64' }
-            default { return $null }
         }
-    } catch {
-        $pa = $env:PROCESSOR_ARCHITECTURE
-        if ($pa -match 'ARM64') { return 'arm64' }
-        elseif ($pa -match '64') { return 'x64' }
-        else { return $null }
-    }
+    } catch { }
+    return $null
 }
 
 # Ensure $PathToAdd is on the User PATH (appended if absent). No Machine PATH,
@@ -312,7 +322,13 @@ function Set-PathEnsureContains {
 
 # Detect architecture and OS
 $arch = Get-Architecture
-if (-not $arch) { Write-ErrorAndExit "Unsupported architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)" }
+if (-not $arch) {
+    # Do NOT probe RuntimeInformation here: on hosts where it is unavailable
+    # that probe itself throws, replacing this message with an unrelated
+    # PropertyNotFound/TypeNotFound error.
+    $reported = if ([string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITECTURE)) { 'unknown' } else { $env:PROCESSOR_ARCHITECTURE }
+    Write-ErrorAndExit "Unsupported architecture (PROCESSOR_ARCHITECTURE='$reported'). autter provides Windows binaries for x64 and arm64."
+}
 $os = 'windows'
 
 # Determine binary name and download URLs
@@ -322,7 +338,7 @@ $binaryName = "autter-$os-$arch"
 # Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
 if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
     $releaseTag = 'local'
-} elseif ($PinnedVersion -ne '__VERSION_PLACEHOLDER__') {
+} elseif ($PinnedVersion -ne $VersionSentinel) {
     # Version-pinned install script from a release
     $releaseTag = $PinnedVersion
     $downloadUrlExe = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName.exe"
@@ -452,6 +468,10 @@ New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Write-Host ("Downloading autter (release: {0})..." -f $releaseTag)
 $tmpFile = Join-Path $installDir "autter.tmp.$PID.exe"
 
+# Each failed attempt is recorded as "<url> -> <reason>" so the final error
+# can report exactly what was tried instead of an opaque "HTTP error".
+$downloadFailures = New-Object System.Collections.Generic.List[string]
+
 function Try-Download {
     param(
         [Parameter(Mandatory = $true)][string]$Url
@@ -468,6 +488,17 @@ function Try-Download {
         }
         return $true
     } catch {
+        $reason = $_.Exception.Message
+        try {
+            # WebException (PowerShell 5.1) and HttpResponseException (7+) both
+            # carry the response; pure network/TLS failures have none, and on
+            # some exception types even probing .Response throws — hence the
+            # inner try/catch keeping the plain exception message.
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $reason = 'HTTP {0} {1}' -f [int]$_.Exception.Response.StatusCode, $_.Exception.Response.StatusCode
+            }
+        } catch { }
+        [void]$downloadFailures.Add(("  {0}`n    -> {1}" -f $Url, $reason))
         return $false
     }
 }
@@ -489,7 +520,17 @@ if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
 
 if (-not $downloadedBinaryName) {
     Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
-    Write-ErrorAndExit 'Failed to download binary (HTTP error)'
+    $details = $downloadFailures -join "`n"
+    $message = "Failed to download $binaryName (release: $releaseTag). Attempted:`n$details"
+    if ($details -match 'HTTP 404') {
+        $message += "`nA 404 means release '$releaseTag' does not include a Windows binary named $binaryName."
+        $message += "`nWindows binaries ship with releases v1.6.8 and later - see https://github.com/$Repo/releases"
+        $message += "`nIf AUTTER_RELEASE_TAG pins an older version, unset it to install the latest release."
+    } else {
+        $message += "`nCheck your network connection, proxy, and TLS settings, then retry."
+        $message += "`nReleases: https://github.com/$Repo/releases"
+    }
+    Write-ErrorAndExit $message
 }
 
 try {
