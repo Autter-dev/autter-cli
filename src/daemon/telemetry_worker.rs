@@ -500,11 +500,21 @@ fn flush_sentry_and_posthog(
         // Error tracking via PostHog: emitted as a `$exception` event so it
         // lands in PostHog's Error Tracking product.
         if let Some(ph) = &posthog {
+            // Prefer the real error variant (recorded as `error_kind`) so that
+            // distinct kinds of failure group separately in error tracking
+            // instead of all collapsing under the generic `AutterError` type.
+            let exception_type = error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("error_kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("AutterError");
+
             let mut props = BTreeMap::new();
             props.insert("$exception_message".to_string(), json!(error.message));
             props.insert(
                 "$exception_list".to_string(),
-                json!([{ "type": "AutterError", "value": error.message }]),
+                json!([{ "type": exception_type, "value": error.message }]),
             );
             props.insert("level".to_string(), json!("error"));
             if let Some(ctx) = &error.context

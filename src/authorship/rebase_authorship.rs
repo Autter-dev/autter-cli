@@ -327,7 +327,8 @@ pub fn prepare_working_log_after_squash(
             source_head_sha.to_string(),
             target_branch_head_sha.to_string(),
         )
-        .ok();
+        .ok()
+        .flatten();
 
     // Step 2: Get list of changed files between the two branches
     let changed_files = repo.diff_changed_files(source_head_sha, target_branch_head_sha)?;
@@ -424,7 +425,8 @@ pub fn prepare_working_log_after_squash_from_final_state(
             source_head_sha.to_string(),
             target_branch_head_sha.to_string(),
         )
-        .ok();
+        .ok()
+        .flatten();
 
     let changed_files = repo.diff_changed_files(source_head_sha, target_branch_head_sha)?;
     if changed_files.is_empty() {
@@ -610,7 +612,8 @@ pub fn rewrite_authorship_after_squash_or_rebase(
             source_head_sha.to_string(),
             target_branch_head_sha.to_string(),
         )
-        .ok();
+        .ok()
+        .flatten();
 
     // Step 3: Get list of changed files between the two branches
     let changed_files = repo.diff_changed_files(source_head_sha, &target_branch_head_sha)?;
@@ -1313,7 +1316,8 @@ pub fn rewrite_authorship_after_rebase_v2(
         let new_head = new_commits.last().unwrap();
         let merge_base = repo
             .merge_base(original_head.to_string(), new_head.to_string())
-            .ok();
+            .ok()
+            .flatten();
 
         let repo_clone = repo.clone();
         let original_head_clone = original_head.to_string();
