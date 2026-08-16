@@ -1,0 +1,55 @@
+.github/workflows/publish-npm-manual.yml
+  s_4b50dacd3d0dd0::t_c705322256c985 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "1d8d2c06c5c56ce54789ec3523875329b7836448",
+  "branch": "posthog/one-off-npm-publish",
+  "prompts": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:8f61c3f41c8780a5396fa9a53d26aff233585cb4d02fcbff1423c5be84321556",
+      "total_additions": 43,
+      "total_deletions": 2,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:8f61c3f41c8780a5396fa9a53d26aff233585cb4d02fcbff1423c5be84321556",
+      "stats": {
+        "total_additions": 43,
+        "total_deletions": 2,
+        "accepted_lines": 42,
+        "overriden_lines": 0,
+        "files": {
+          ".github/workflows/publish-npm-manual.yml": {
+            "total_additions": 41,
+            "total_deletions": 0,
+            "accepted_lines": 41,
+            "overriden_lines": 0
+          },
+          "npm/package.json": {
+            "total_additions": 2,
+            "total_deletions": 2,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
