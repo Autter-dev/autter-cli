@@ -2483,7 +2483,8 @@ fn seed_merge_squash_working_log_for_commit_replay(
             merge_squash.source_head.clone(),
             merge_squash.base_head.clone(),
         )
-        .ok();
+        .ok()
+        .flatten();
     if let Err(error) = attempt_materialize_commit_chain_authorship(
         repo,
         merge_base.as_deref(),
@@ -6774,7 +6775,9 @@ impl ActorDaemonCoordinator {
                         // fail.
                         let fallback_onto = repository
                             .merge_base(old_head.to_string(), new_head.to_string())
-                            .unwrap_or_else(|_| new_head.clone());
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| new_head.clone());
                         tracing::debug!(
                             old_head = %old_head,
                             new_head = %new_head,
@@ -7410,6 +7413,7 @@ impl ActorDaemonCoordinator {
                     invoked_command = ?cmd.invoked_command,
                     root_sid = %cmd.root_sid,
                     ?family,
+                    error_kind = error.kind(),
                     %error,
                     "strict rewrite synthesis failed"
                 );

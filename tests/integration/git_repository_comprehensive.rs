@@ -975,7 +975,11 @@ fn test_merge_base_linear_history() {
     assert!(merge_base.is_ok(), "Should find merge base");
 
     let base = merge_base.unwrap();
-    assert_eq!(base, first.commit_sha, "Merge base should be first commit");
+    assert_eq!(
+        base,
+        Some(first.commit_sha),
+        "Merge base should be first commit"
+    );
 }
 
 #[test]
@@ -1011,7 +1015,8 @@ fn test_merge_base_with_branches() {
 
     let merge_base_sha = merge_base.unwrap();
     assert_eq!(
-        merge_base_sha, base.commit_sha,
+        merge_base_sha,
+        Some(base.commit_sha),
         "Merge base should be base commit"
     );
 }

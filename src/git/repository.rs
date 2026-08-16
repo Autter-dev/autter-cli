@@ -1489,14 +1489,27 @@ impl Repository {
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
     }
 
-    // Find a merge base between two commits
-    pub fn merge_base(&self, one: String, two: String) -> Result<String, AutterError> {
+    // Find a merge base between two commits.
+    //
+    // Returns `Ok(None)` when the two commits share no common ancestor. `git
+    // merge-base` exits with code 1 in that case, which is a normal answer, not
+    // a failure, so it must not surface as a `GitCliError`. This mirrors the
+    // pattern already used by `ci_context::commit_is_ancestor`.
+    pub fn merge_base(&self, one: String, two: String) -> Result<Option<String>, AutterError> {
         let mut args = self.global_args_for_exec();
         args.push("merge-base".to_string());
         args.push(one.to_string());
         args.push(two.to_string());
-        let output = exec_git(&args)?;
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+        let output = exec_git_allow_nonzero(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(Some(String::from_utf8(output.stdout)?.trim().to_string())),
+            Some(1) => Ok(None),
+            code => Err(AutterError::GitCliError {
+                code,
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                args,
+            }),
+        }
     }
 
     // Find a single object, as specified by a revision string.
@@ -3105,6 +3118,28 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<u32>, bool, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_base_returns_none_for_unrelated_histories() {
+        use crate::git::test_utils::TmpRepo;
+
+        let tmp = TmpRepo::new().unwrap();
+        tmp.write_file("a.txt", "a", false).unwrap();
+        let a = tmp.commit_all("first").unwrap();
+
+        // An orphan branch has a fresh root commit with no ancestor in common
+        // with `main`. `git merge-base` exits 1 for this, which must map to
+        // `Ok(None)` rather than a `GitCliError`.
+        tmp.git_command(&["checkout", "--orphan", "unrelated"])
+            .unwrap();
+        tmp.write_file("b.txt", "b", false).unwrap();
+        let b = tmp.commit_all("unrelated root").unwrap();
+
+        let repo = tmp.autter_repo();
+        assert_eq!(repo.merge_base(a.clone(), b).unwrap(), None);
+        // A commit is its own merge base with itself.
+        assert_eq!(repo.merge_base(a.clone(), a.clone()).unwrap(), Some(a));
+    }
 
     #[test]
     fn author_config_overlays_full_identity() {

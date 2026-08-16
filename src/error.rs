@@ -19,6 +19,25 @@ pub enum AutterError {
     Generic(String),
 }
 
+impl AutterError {
+    /// Return a stable, machine-readable name for this error variant. Used as
+    /// the exception type in error tracking so that distinct kinds of failure
+    /// group separately instead of collapsing under a single generic type.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AutterError::IoError(_) => "IoError",
+            AutterError::GitCliError { .. } => "GitCliError",
+            AutterError::GixError(_) => "GixError",
+            AutterError::JsonError(_) => "JsonError",
+            AutterError::Utf8Error(_) => "Utf8Error",
+            AutterError::FromUtf8Error(_) => "FromUtf8Error",
+            AutterError::PresetError(_) => "PresetError",
+            AutterError::SqliteError(_) => "SqliteError",
+            AutterError::Generic(_) => "Generic",
+        }
+    }
+}
+
 impl fmt::Display for AutterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

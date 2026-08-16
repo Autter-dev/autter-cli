@@ -1,0 +1,37 @@
+name: CI
+
+# Minimal compile gate for PRs and main. Until this existed, the release
+# workflow was the repo's only build check, so uncompilable merges could land
+# on main unnoticed — v1.6.8 alone shipped three separate "repair main" fixes.
+#
+# Deliberately just `cargo check`: fast enough to gate every PR, and it
+# compiles the lib, bins, tests, and benches without running anything.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: cargo check
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (lib, bins, tests, benches)
+        run: cargo check --locked --all-targets
