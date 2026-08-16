@@ -1,0 +1,97 @@
+src/mdm/agents/windsurf.rs
+  s_33b037dc63504f::t_7addab7a8c0cd4 358
+  s_33b037dc63504f::t_192c8f83d86759 369
+src/mdm/agents/visual_studio.rs
+  s_33b037dc63504f::t_175a4b85cbbcf7 137,148-155
+.github/workflows/publish-vscode-extension.yml
+  s_33b037dc63504f::t_42c81134d85695 61-64,66-67,70,73,75-76,84-94
+src/mdm/agents/cursor.rs
+  s_33b037dc63504f::t_1e53ceb6a1195c 366
+  s_33b037dc63504f::t_4de9c6533f1ac8 355
+src/mdm/utils.rs
+  s_33b037dc63504f::t_68e33ea0f357c5 781
+  s_33b037dc63504f::t_b2fa939e4ac53c 802-803
+  s_33b037dc63504f::t_e3d5e0bf7f3032 608-610
+  s_33b037dc63504f::t_4a8f73fe644b42 1600-1615
+  s_33b037dc63504f::t_c2700a07b35218 754
+  s_33b037dc63504f::t_0e3ed8be0d8389 749-753,755-770,773-775
+  s_33b037dc63504f::t_8d11a820ce5a20 590-592,595
+src/mdm/agents/vscode.rs
+  s_33b037dc63504f::t_78364e3b365441 166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "1aeac7ea6e72ab4919beca222abccaaac7eea981",
+  "branch": "posthog/extension-install-verification",
+  "prompts": {
+    "s_33b037dc63504f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b8c-9fc2-7579-8929-78a5adf5244b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:adfce116808103f041a6cfd69d0db771fc8ea4ccd6d0e21e7d9ac9b0e04f8e1f",
+      "total_additions": 94,
+      "total_deletions": 23,
+      "accepted_lines": 89,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_33b037dc63504f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b8c-9fc2-7579-8929-78a5adf5244b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:adfce116808103f041a6cfd69d0db771fc8ea4ccd6d0e21e7d9ac9b0e04f8e1f",
+      "stats": {
+        "total_additions": 94,
+        "total_deletions": 23,
+        "accepted_lines": 89,
+        "overriden_lines": 0,
+        "files": {
+          ".github/workflows/publish-vscode-extension.yml": {
+            "total_additions": 21,
+            "total_deletions": 2,
+            "accepted_lines": 21,
+            "overriden_lines": 0
+          },
+          "src/mdm/agents/cursor.rs": {
+            "total_additions": 2,
+            "total_deletions": 4,
+            "accepted_lines": 2,
+            "overriden_lines": 0
+          },
+          "src/mdm/agents/visual_studio.rs": {
+            "total_additions": 12,
+            "total_deletions": 1,
+            "accepted_lines": 12,
+            "overriden_lines": 0
+          },
+          "src/mdm/agents/vscode.rs": {
+            "total_additions": 2,
+            "total_deletions": 2,
+            "accepted_lines": 1,
+            "overriden_lines": 0
+          },
+          "src/mdm/agents/windsurf.rs": {
+            "total_additions": 2,
+            "total_deletions": 4,
+            "accepted_lines": 2,
+            "overriden_lines": 0
+          },
+          "src/mdm/utils.rs": {
+            "total_additions": 55,
+            "total_deletions": 10,
+            "accepted_lines": 51,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
