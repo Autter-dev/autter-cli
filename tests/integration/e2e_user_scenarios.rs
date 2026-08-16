@@ -189,7 +189,7 @@ fn test_multiple_checkpoints_in_sequence() {
 
     let stats = head_stats(&repo);
     assert_stats(&stats, 2, 2, 2, 0, 4);
-    assert_tool_model(&stats, "mock_ai::unknown", 2, 2);
+    assert_tool_model(&stats, "mock_ai::mock_ai/unknown-model", 2, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +212,7 @@ fn test_stats_shows_ai_contribution() {
 
     let stats = head_stats(&repo);
     assert_stats(&stats, 1, 3, 3, 0, 4);
-    assert_tool_model(&stats, "mock_ai::unknown", 3, 3);
+    assert_tool_model(&stats, "mock_ai::mock_ai/unknown-model", 3, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +257,10 @@ def function3():
     let stats = head_stats(&repo);
     assert_stats(&stats, 7, 0, 0, 0, 7);
     // AI only deleted lines — no additions, so tool_model_breakdown may be empty or have 0s
-    if let Some(entry) = stats.tool_model_breakdown.get("mock_ai::unknown") {
+    if let Some(entry) = stats
+        .tool_model_breakdown
+        .get("mock_ai::mock_ai/unknown-model")
+    {
         assert_eq!(entry.ai_additions, 0);
         assert_eq!(entry.ai_accepted, 0);
     }
@@ -298,7 +301,7 @@ def multiply(a, b):
 
     let stats = head_stats(&repo);
     assert_stats(&stats, 0, 4, 4, 0, 4);
-    assert_tool_model(&stats, "mock_ai::unknown", 4, 4);
+    assert_tool_model(&stats, "mock_ai::mock_ai/unknown-model", 4, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +342,7 @@ if __name__ == \"__main__\":
 
     let stats = head_stats(&repo);
     assert_stats(&stats, 1, 16, 16, 0, 17);
-    assert_tool_model(&stats, "mock_ai::unknown", 16, 16);
+    assert_tool_model(&stats, "mock_ai::mock_ai/unknown-model", 16, 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +372,7 @@ class DataProcessor:
 
     let stats = head_stats(&repo);
     assert_stats(&stats, 0, 8, 8, 0, 8);
-    assert_tool_model(&stats, "mock_ai::unknown", 8, 8);
+    assert_tool_model(&stats, "mock_ai::mock_ai/unknown-model", 8, 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +437,7 @@ Line 5: Initial
     let _commit1_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
     let stats1 = head_stats(&repo);
     assert_stats(&stats1, 2, 3, 3, 2, 5);
-    assert_tool_model(&stats1, "mock_ai::unknown", 3, 3);
+    assert_tool_model(&stats1, "mock_ai::mock_ai/unknown-model", 3, 3);
 
     // COMMIT 2: Human deletes 1 line, AI adds 2 lines and deletes 3
     let human_edit2 = "\
@@ -469,7 +472,7 @@ Line 5: Initial
     let commit2_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
     let stats2 = head_stats(&repo);
     assert_stats(&stats2, 0, 2, 2, 4, 2);
-    assert_tool_model(&stats2, "mock_ai::unknown", 2, 2);
+    assert_tool_model(&stats2, "mock_ai::mock_ai/unknown-model", 2, 2);
 
     // Capture blame before squash
     let blame_before = repo.autter(&["blame", "example.txt"]).unwrap();
@@ -506,7 +509,7 @@ Line 5: Initial
     // Verify squashed stats
     let squashed_stats = commit_stats(&repo, &["stats", &squashed_sha, "--json"]);
     assert_stats(&squashed_stats, 1, 4, 4, 0, 6);
-    assert_tool_model(&squashed_stats, "mock_ai::unknown", 4, 4);
+    assert_tool_model(&squashed_stats, "mock_ai::mock_ai/unknown-model", 4, 4);
 
     // Verify blame line content matches (extract author+content, ignoring SHAs/timestamps)
     let extract_attribution_lines = |blame: &str| -> Vec<String> {
@@ -595,7 +598,7 @@ class AIHelper:
 
     let stats_before = head_stats(&repo);
     assert_stats(&stats_before, 0, 8, 8, 0, 8);
-    assert_tool_model(&stats_before, "mock_ai::unknown", 8, 8);
+    assert_tool_model(&stats_before, "mock_ai::mock_ai/unknown-model", 8, 8);
 
     let blame_before = repo.autter(&["blame", "feature.py"]).unwrap();
     assert!(blame_before.contains("mock_ai"));
@@ -625,11 +628,92 @@ def new_base_function():
     // Verify AI authorship is preserved after rebase
     let stats_after = head_stats(&repo);
     assert_stats(&stats_after, 0, 8, 8, 0, 8);
-    assert_tool_model(&stats_after, "mock_ai::unknown", 8, 8);
+    assert_tool_model(&stats_after, "mock_ai::mock_ai/unknown-model", 8, 8);
 
     assert!(repo.path().join("feature.py").exists());
     let content = fs::read_to_string(repo.path().join("feature.py")).unwrap();
     assert!(content.contains("ai_feature"));
+}
+
+// ---------------------------------------------------------------------------
+// Regression: one rebase onto an unrelated root must not poison attribution
+// for every later pull --rebase (P0 "attribution lost at commit").
+//
+// A rebase onto an unrelated root (e.g. the remote repo was created with its
+// own initial commit) leaves a reflog segment whose heads share no git
+// history, so no commit mapping can ever be computed for it. The daemon used
+// to leave that segment unrecorded, and because rewrite synthesis resolves the
+// OLDEST unprocessed reflog segment (pull --rebase has no start-target hint),
+// the unmappable segment shadowed every later pull's real segment: replayed
+// commits silently lost their authorship notes and `autter stats HEAD`
+// reported fresh AI work as untracked right after commit + pull --rebase.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_pull_rebase_after_unrelated_history_reroot_keeps_ai_attribution() {
+    let (repo, _upstream) = TestRepo::new_with_remote();
+
+    // Original root: one human commit.
+    let app_path = repo.path().join("app.txt");
+    fs::write(&app_path, "base line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "app.txt"])
+        .unwrap();
+    repo.git(&["add", "app.txt"]).unwrap();
+    repo.commit("base commit").unwrap();
+    let default_branch = repo.current_branch();
+
+    // Re-root the branch: build an unrelated root commit and rebase the branch
+    // onto it. Afterwards the pre-rebase head and the post-rebase head share
+    // no common ancestor, so this rebase's segment can never produce a commit
+    // mapping.
+    repo.git(&["checkout", "--orphan", "reroot"]).unwrap();
+    repo.git(&["rm", "-f", "app.txt"]).unwrap();
+    fs::write(repo.path().join("README.md"), "unrelated root\n").unwrap();
+    repo.git(&["add", "README.md"]).unwrap();
+    repo.commit("unrelated root commit").unwrap();
+
+    repo.git(&["checkout", &default_branch]).unwrap();
+    repo.git(&["rebase", "reroot"]).unwrap();
+
+    // Publish the re-rooted branch, then land a human commit on the remote
+    // while the local branch gains an unpushed AI commit — the everyday
+    // "commit, then sync" divergence.
+    repo.git(&["push", "-u", "origin", "HEAD"]).unwrap();
+
+    fs::write(&app_path, "base line\nAI line 1\nAI line 2\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    repo.git(&["add", "app.txt"]).unwrap();
+    repo.commit("AI adds lines").unwrap();
+
+    let stats_before = head_stats(&repo);
+    assert_stats(&stats_before, 0, 2, 2, 0, 2);
+    assert_tool_model(&stats_before, "mock_ai::mock_ai/unknown-model", 2, 2);
+
+    repo.git(&["checkout", "-b", "remote-work", "HEAD~1"])
+        .unwrap();
+    fs::write(repo.path().join("notes.txt"), "human note\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "notes.txt"])
+        .unwrap();
+    repo.git(&["add", "notes.txt"]).unwrap();
+    repo.commit("human note").unwrap();
+    repo.git(&["push", "origin", &format!("HEAD:{}", default_branch)])
+        .unwrap();
+
+    repo.git(&["checkout", &default_branch]).unwrap();
+    repo.git(&["pull", "--rebase", "origin", &default_branch])
+        .unwrap();
+
+    // Before the fix, the unmappable re-root segment shadowed this pull's
+    // rebase segment: the replayed AI commit got no authorship note and these
+    // stats collapsed to 100% untracked.
+    let stats_after = head_stats(&repo);
+    assert_stats(&stats_after, 0, 2, 2, 0, 2);
+    assert_tool_model(&stats_after, "mock_ai::mock_ai/unknown-model", 2, 2);
+
+    let blame_after = repo.autter(&["blame", "app.txt"]).unwrap();
+    assert!(
+        blame_after.contains("mock_ai"),
+        "AI attribution must survive a pull --rebase that follows an unrelated-history re-root; blame was:\n{blame_after}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +760,7 @@ def ai_function():
 
     let ai_stats = head_stats(&repo);
     assert_stats(&ai_stats, 0, 6, 6, 1, 6);
-    assert_tool_model(&ai_stats, "mock_ai::unknown", 6, 6);
+    assert_tool_model(&ai_stats, "mock_ai::mock_ai/unknown-model", 6, 6);
 
     // Go back to main and make conflicting changes
     repo.git(&["checkout", &default_branch]).unwrap();
@@ -728,7 +812,7 @@ def human_function():
     // Verify AI authorship preserved after conflict resolution
     let stats_after = head_stats(&repo);
     assert_stats(&stats_after, 0, 6, 6, 3, 6);
-    assert_tool_model(&stats_after, "mock_ai::unknown", 6, 6);
+    assert_tool_model(&stats_after, "mock_ai::mock_ai/unknown-model", 6, 6);
 
     let blame_after = repo.autter(&["blame", "shared.py"]).unwrap();
     assert!(blame_after.contains("mock_ai"));
@@ -806,11 +890,11 @@ AI: AI Line 5
     assert_eq!(range_stats["git_diff_deleted_lines"], 0);
     assert_eq!(range_stats["git_diff_added_lines"], 8);
     assert_eq!(
-        range_stats["tool_model_breakdown"]["mock_ai::unknown"]["ai_additions"],
+        range_stats["tool_model_breakdown"]["mock_ai::mock_ai/unknown-model"]["ai_additions"],
         5
     );
     assert_eq!(
-        range_stats["tool_model_breakdown"]["mock_ai::unknown"]["ai_accepted"],
+        range_stats["tool_model_breakdown"]["mock_ai::mock_ai/unknown-model"]["ai_accepted"],
         5
     );
 
@@ -977,7 +1061,7 @@ def create_user():
 
     let squashed_stats = commit_stats(&repo, &["stats", &squashed_sha, "--json"]);
     assert_stats(&squashed_stats, 4, 4, 4, 0, 8);
-    assert_tool_model(&squashed_stats, "mock_ai::unknown", 4, 4);
+    assert_tool_model(&squashed_stats, "mock_ai::mock_ai/unknown-model", 4, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,7 +1152,7 @@ def process_data(input_data):
 
     let stats_before = head_stats(&repo);
     assert_stats(&stats_before, 3, 4, 4, 0, 7);
-    assert_tool_model(&stats_before, "mock_ai::unknown", 4, 4);
+    assert_tool_model(&stats_before, "mock_ai::mock_ai/unknown-model", 4, 4);
 
     let blame_before = repo.autter(&["blame", "app.py"]).unwrap();
     assert!(blame_before.contains("mock_ai"));
@@ -1180,7 +1264,7 @@ def handle_error(err):
     // Verify stats preserved after rebase
     let stats_after = head_stats(&repo);
     assert_stats(&stats_after, 3, 4, 4, 0, 7);
-    assert_tool_model(&stats_after, "mock_ai::unknown", 4, 4);
+    assert_tool_model(&stats_after, "mock_ai::mock_ai/unknown-model", 4, 4);
 
     let blame_after = repo.autter(&["blame", "app.py"]).unwrap();
     assert!(blame_after.contains("mock_ai"));

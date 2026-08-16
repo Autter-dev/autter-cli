@@ -1007,7 +1007,8 @@ fn stable_carryover_heads_for_command(
                 input.argv,
                 rebase_start_target_hint.as_deref(),
             )
-            .unwrap_or(None)
+            .ok()
+            .and_then(|heads| heads.resolved)
             .map(|(old_head, new_head, _onto_head)| (old_head, new_head));
             from_segment.or_else(|| {
                 ref_head_change.clone().or_else(|| {
@@ -3110,6 +3111,24 @@ fn processed_rebase_new_heads(repository: &Repository) -> Result<HashSet<String>
         }
     }
     Ok(out)
+}
+
+/// Outcome of resolving the next unprocessed rebase reflog segment.
+///
+/// `skipped_unmappable` lists segments whose heads share no git history (e.g. a
+/// rebase onto an unrelated root), so no commit mapping can ever be computed for
+/// them. Callers that synthesize rewrite events must record each of these as an
+/// empty `rebase_complete` event: an unrecorded segment is re-resolved as "the
+/// oldest unprocessed segment" on every later rebase-family command, permanently
+/// shadowing the segment that actually needs processing and silently dropping
+/// authorship notes for every subsequent rebase/pull in the repo.
+struct StableRebaseHeads {
+    /// `(original_head, new_head, onto_head)` of the oldest unprocessed segment
+    /// that can produce a commit mapping, if any.
+    resolved: Option<(String, String, String)>,
+    /// `(original_head, new_head)` pairs of unprocessable segments encountered
+    /// while resolving, oldest first.
+    skipped_unmappable: Vec<(String, String)>,
 }
 
 /// Check whether `ancestor` is an ancestor of `descendant` using
@@ -6517,30 +6536,60 @@ impl ActorDaemonCoordinator {
         worktree: &Path,
         argv: &[String],
         start_target_hint: Option<&str>,
-    ) -> Result<Option<(String, String, String)>, AutterError> {
-        let processed_new_heads = processed_rebase_new_heads(repository)?;
-        let mut segment =
-            resolve_rebase_segment_for_worktree(worktree, start_target_hint, &processed_new_heads)?;
-        let Some(mut segment) = segment.take() else {
-            return Ok(None);
-        };
+    ) -> Result<StableRebaseHeads, AutterError> {
+        let mut processed_new_heads = processed_rebase_new_heads(repository)?;
+        let mut skipped_unmappable = Vec::new();
 
-        if let Some(branch_ref) = resolve_explicit_rebase_branch_ref(worktree, argv)
-            && let Some(original_head) = resolve_reflog_old_oid_for_ref_new_oid_in_worktree(
+        // Bounded: each pass either returns or marks one more segment as locally
+        // processed, and the reflog holds finitely many segments.
+        for _ in 0..64 {
+            let Some(mut segment) = resolve_rebase_segment_for_worktree(
                 worktree,
-                &branch_ref,
-                &segment.new_head,
-            )
-            && original_head != segment.new_head
-        {
-            segment.original_head = original_head;
+                start_target_hint,
+                &processed_new_heads,
+            )?
+            else {
+                return Ok(StableRebaseHeads {
+                    resolved: None,
+                    skipped_unmappable,
+                });
+            };
+
+            if let Some(branch_ref) = resolve_explicit_rebase_branch_ref(worktree, argv)
+                && let Some(original_head) = resolve_reflog_old_oid_for_ref_new_oid_in_worktree(
+                    worktree,
+                    &branch_ref,
+                    &segment.new_head,
+                )
+                && original_head != segment.new_head
+            {
+                segment.original_head = original_head;
+            }
+
+            if repository
+                .merge_base(segment.original_head.clone(), segment.new_head.clone())?
+                .is_none()
+            {
+                tracing::warn!(
+                    original_head = %segment.original_head,
+                    new_head = %segment.new_head,
+                    "rebase segment heads share no history; skipping segment so it cannot shadow later rebases"
+                );
+                processed_new_heads.insert(segment.new_head.clone());
+                skipped_unmappable.push((segment.original_head, segment.new_head));
+                continue;
+            }
+
+            return Ok(StableRebaseHeads {
+                resolved: Some((segment.original_head, segment.new_head, segment.onto_head)),
+                skipped_unmappable,
+            });
         }
 
-        Ok(Some((
-            segment.original_head,
-            segment.new_head,
-            segment.onto_head,
-        )))
+        Ok(StableRebaseHeads {
+            resolved: None,
+            skipped_unmappable,
+        })
     }
 
     fn resolve_merge_squash_source_head_for_event(
@@ -6759,13 +6808,27 @@ impl ActorDaemonCoordinator {
                     })?;
                     let repository = repository_for_rewrite_context(cmd, "rebase_complete")?;
                     let start_target_hint = rebase_start_target_hint_from_command(cmd);
+                    let stable_heads = Self::stable_rebase_heads_from_worktree(
+                        &repository,
+                        worktree,
+                        &cmd.raw_argv,
+                        start_target_hint.as_deref(),
+                    )?;
+                    // Record unmappable segments (heads with no shared history) as
+                    // processed so they stop shadowing real segments; there is no
+                    // attribution mapping to compute for them.
+                    for (skipped_old, skipped_new) in stable_heads.skipped_unmappable {
+                        out.push(RewriteLogEvent::rebase_complete(RebaseCompleteEvent::new(
+                            skipped_old,
+                            skipped_new,
+                            *interactive,
+                            Vec::new(),
+                            Vec::new(),
+                        )));
+                    }
                     let (mapping_old_head, stable_new_head, onto_head) = if let Some(heads) =
-                        Self::stable_rebase_heads_from_worktree(
-                            &repository,
-                            worktree,
-                            &cmd.raw_argv,
-                            start_target_hint.as_deref(),
-                        )? {
+                        stable_heads.resolved
+                    {
                         heads
                     } else if !old_head.is_empty() && !new_head.is_empty() && old_head != new_head {
                         // Fix #1079: Fall back to semantic event heads when the reflog
@@ -6833,6 +6896,16 @@ impl ActorDaemonCoordinator {
                             sid = %cmd.root_sid,
                             "rebase complete: commit mapping produced no commits; authorship notes will NOT be rewritten for this rebase"
                         );
+                        // The emptiness of the mapping is deterministic for these
+                        // heads, so record the segment as processed; leaving it
+                        // unrecorded would shadow every later rebase segment.
+                        out.push(RewriteLogEvent::rebase_complete(RebaseCompleteEvent::new(
+                            mapping_old_head,
+                            stable_new_head,
+                            *interactive,
+                            Vec::new(),
+                            Vec::new(),
+                        )));
                     }
                     if let Some(worktree) = cmd.worktree.as_ref() {
                         self.clear_pending_rebase_original_head_for_worktree(worktree)?;
@@ -7009,13 +7082,24 @@ impl ActorDaemonCoordinator {
                         })?;
                         let repository =
                             repository_for_rewrite_context(cmd, "pull_rebase_complete")?;
-                        let Some((mapping_old_head, new_head, onto_head)) =
-                            Self::stable_rebase_heads_from_worktree(
-                                &repository,
-                                worktree,
-                                &cmd.raw_argv,
-                                None,
-                            )?
+                        let stable_heads = Self::stable_rebase_heads_from_worktree(
+                            &repository,
+                            worktree,
+                            &cmd.raw_argv,
+                            None,
+                        )?;
+                        // Record unmappable segments (heads with no shared history)
+                        // as processed so they stop shadowing real segments.
+                        for (skipped_old, skipped_new) in stable_heads.skipped_unmappable {
+                            out.push(RewriteLogEvent::rebase_complete(RebaseCompleteEvent::new(
+                                skipped_old,
+                                skipped_new,
+                                false,
+                                Vec::new(),
+                                Vec::new(),
+                            )));
+                        }
+                        let Some((mapping_old_head, new_head, onto_head)) = stable_heads.resolved
                         else {
                             tracing::debug!(
                                 sid = %cmd.root_sid,
@@ -7041,6 +7125,23 @@ impl ActorDaemonCoordinator {
                                 false,
                                 original_commits,
                                 new_commits,
+                            )));
+                        } else {
+                            tracing::warn!(
+                                old_head = %mapping_old_head,
+                                new_head = %new_head,
+                                onto = %onto_head,
+                                sid = %cmd.root_sid,
+                                "pull --rebase: commit mapping produced no commits; recording segment as processed"
+                            );
+                            // Deterministically empty mapping — record it so the
+                            // segment cannot shadow later rebase segments.
+                            out.push(RewriteLogEvent::rebase_complete(RebaseCompleteEvent::new(
+                                mapping_old_head,
+                                new_head,
+                                false,
+                                Vec::new(),
+                                Vec::new(),
                             )));
                         }
                         if let Some(worktree) = cmd.worktree.as_ref() {
