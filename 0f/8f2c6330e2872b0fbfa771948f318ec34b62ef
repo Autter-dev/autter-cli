@@ -1,0 +1,98 @@
+.github/workflows/release.yml
+  s_4b50dacd3d0dd0::t_6236c1f4487010 6-7
+  s_4b50dacd3d0dd0::t_fff9ffb45b42e5 197-229
+npm/README.md
+  s_4b50dacd3d0dd0::t_64e6ad7c7b5bba 1-32
+npm/bin/autter.js
+  s_4b50dacd3d0dd0::t_b7b2dfd65136b3 1-45
+README.md
+  s_4b50dacd3d0dd0::t_2f9f1d10dc730c 48-56
+npm/package.json
+  s_4b50dacd3d0dd0::t_4d994afc6ec745 1-51
+npm/install.js
+  s_4b50dacd3d0dd0::t_db4991892762fe 1-236
+INSTALL.md
+  s_4b50dacd3d0dd0::t_36cd1f39164029 25-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "0f8f2c6330e2872b0fbfa771948f318ec34b62ef",
+  "branch": "posthog/installer-path-npm-and-url-fixes",
+  "prompts": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:fdcb267cd1bd9018e6e403232efe8b98d5ad85ebaf66ed35f63055e994bfa7b9",
+      "total_additions": 417,
+      "total_deletions": 0,
+      "accepted_lines": 417,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_4b50dacd3d0dd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a00b86-c4ff-75ea-9e0f-76e42e21a085",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Sagnik Ghosh <sagnik@worqhat.com>",
+      "messages_url": "cas:fdcb267cd1bd9018e6e403232efe8b98d5ad85ebaf66ed35f63055e994bfa7b9",
+      "stats": {
+        "total_additions": 417,
+        "total_deletions": 0,
+        "accepted_lines": 417,
+        "overriden_lines": 0,
+        "files": {
+          ".github/workflows/release.yml": {
+            "total_additions": 35,
+            "total_deletions": 0,
+            "accepted_lines": 35,
+            "overriden_lines": 0
+          },
+          "INSTALL.md": {
+            "total_additions": 9,
+            "total_deletions": 0,
+            "accepted_lines": 9,
+            "overriden_lines": 0
+          },
+          "README.md": {
+            "total_additions": 9,
+            "total_deletions": 0,
+            "accepted_lines": 9,
+            "overriden_lines": 0
+          },
+          "npm/README.md": {
+            "total_additions": 32,
+            "total_deletions": 0,
+            "accepted_lines": 32,
+            "overriden_lines": 0
+          },
+          "npm/bin/autter.js": {
+            "total_additions": 45,
+            "total_deletions": 0,
+            "accepted_lines": 45,
+            "overriden_lines": 0
+          },
+          "npm/install.js": {
+            "total_additions": 236,
+            "total_deletions": 0,
+            "accepted_lines": 236,
+            "overriden_lines": 0
+          },
+          "npm/package.json": {
+            "total_additions": 51,
+            "total_deletions": 0,
+            "accepted_lines": 51,
+            "overriden_lines": 0
+          }
+        }
+      }
+    }
+  }
+}
