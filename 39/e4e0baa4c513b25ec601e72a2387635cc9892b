@@ -1,0 +1,8 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "39e4e0baa4c513b25ec601e72a2387635cc9892b",
+  "branch": "posthog/fix-vscode-copilot-capture",
+  "prompts": {}
+}
