@@ -13,6 +13,43 @@ pub const MIN_CODE_VERSION: (u32, u32) = (1, 99);
 pub const MIN_CLAUDE_VERSION: (u32, u32) = (2, 0);
 pub const MIN_CODEX_VERSION: (u32, u32) = (0, 124);
 
+/// First VS Code version whose built-in Copilot agent fires native agent hooks.
+/// At/above this version the autter-vscode extension stops its own AI-edit
+/// capture and defers to VS Code hooks, so the settings written by
+/// `update_vscode_chat_hook_settings` become load-bearing. Must stay in sync
+/// with MIN_VSCODE_NATIVE_HOOKS_VERSION in agent-support/vscode/src/consts.ts.
+pub const MIN_VSCODE_NATIVE_HOOKS_VERSION: (u32, u32, u32) = (1, 109, 3);
+
+/// The user-level hook directory VS Code loads native agent hooks from
+/// (shared with Copilot CLI). `autter install-hooks` writes autter.json there.
+pub const VSCODE_USER_COPILOT_HOOKS_LOCATION: &str = "~/.copilot/hooks";
+
+/// Parse a version string into (major, minor, patch), tolerating trailing
+/// text and missing patch components (e.g. "1.109.3", "1.110", "1.99.0-insider").
+pub fn parse_version_triple(version_str: &str) -> Option<(u32, u32, u32)> {
+    let (major, minor) = parse_version(version_str)?;
+    let patch = version_str
+        .split_whitespace()
+        .find_map(|token| {
+            let cleaned = token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+                .trim_start_matches('v');
+            let parts: Vec<&str> = cleaned.split('.').collect();
+            if parts.len() < 2 || parts[0].parse::<u32>().is_err() {
+                return None;
+            }
+            parts.get(2).and_then(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            })
+        })
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
 /// Get version from a binary's --version output
 pub fn get_binary_version(binary: &str) -> Result<String, AutterError> {
     let output = Command::new(binary)
@@ -570,9 +607,34 @@ pub fn settings_path_candidates(product: &str) -> Vec<PathBuf> {
         );
     }
 
-    paths.sort();
-    paths.dedup();
-    paths
+    let mut all_paths = Vec::new();
+    for base in paths {
+        push_profile_settings_paths(&base, &mut all_paths);
+        all_paths.push(base);
+    }
+
+    all_paths.sort();
+    all_paths.dedup();
+    all_paths
+}
+
+/// VS Code reads `<User dir>/settings.json` only for the default profile;
+/// every other profile keeps its own settings under
+/// `<User dir>/profiles/<id>/settings.json`. Include each existing profile so
+/// hook settings reach whichever profile is active.
+fn push_profile_settings_paths(user_settings_path: &Path, out: &mut Vec<PathBuf>) {
+    let Some(user_dir) = user_settings_path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(user_dir.join("profiles")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push(path.join("settings.json"));
+        }
+    }
 }
 
 /// Get settings paths for multiple products
@@ -866,9 +928,38 @@ pub fn resolve_hook_binary_path() -> Result<PathBuf, AutterError> {
     Ok(current)
 }
 
+/// VS Code's documented default `chat.hookFilesLocations` entries plus our
+/// user-level hooks dir. Used when the setting doesn't exist yet, because a
+/// user value for it replaces (not merges with) VS Code's built-in defaults.
+fn default_hook_file_locations() -> jsonc_parser::cst::CstInputValue {
+    use jsonc_parser::cst::CstInputValue;
+    CstInputValue::Object(vec![
+        (".github/hooks".to_string(), CstInputValue::Bool(true)),
+        (
+            ".claude/settings.local.json".to_string(),
+            CstInputValue::Bool(true),
+        ),
+        (
+            ".claude/settings.json".to_string(),
+            CstInputValue::Bool(true),
+        ),
+        (
+            "~/.claude/settings.json".to_string(),
+            CstInputValue::Bool(true),
+        ),
+        (
+            VSCODE_USER_COPILOT_HOOKS_LOCATION.to_string(),
+            CstInputValue::Bool(true),
+        ),
+    ])
+}
+
 /// Update VS Code chat hook settings in a settings.json/jsonc file.
 ///
-/// Ensures `"chat.useHooks"` is set to `true`.
+/// Ensures `"chat.useHooks"` is `true` (the VS Code 1.109-era gate) and that
+/// `"chat.hookFilesLocations"` enables `~/.copilot/hooks` (the gate on newer
+/// VS Code builds). Both are required for VS Code's built-in Copilot agent to
+/// run autter's native agent hooks.
 pub fn update_vscode_chat_hook_settings(
     settings_path: &Path,
     dry_run: bool,
@@ -897,6 +988,9 @@ pub fn update_vscode_chat_hook_settings(
     let object = root.object_value_or_set();
     let mut changed = false;
 
+    // Legacy gate: VS Code 1.109.x shipped native agent hooks behind this
+    // boolean. Newer builds ignore it; keep writing it so the 1.109 window
+    // still captures.
     match object.get("chat.useHooks") {
         Some(prop) => {
             let should_update = match prop.value() {
@@ -914,6 +1008,48 @@ pub fn update_vscode_chat_hook_settings(
         }
         None => {
             object.append("chat.useHooks", jsonc_parser::json!(true));
+            changed = true;
+        }
+    }
+
+    // Current gate: VS Code loads hook files from the locations enabled in
+    // `chat.hookFilesLocations`. A user-provided object replaces VS Code's
+    // built-in default set rather than merging with it, so when creating the
+    // setting we seed it with the documented defaults alongside our
+    // user-level `~/.copilot/hooks` entry. Without this entry, current VS
+    // Code builds never load ~/.copilot/hooks/autter.json and Copilot
+    // agent-mode edits go untracked.
+    match object.get("chat.hookFilesLocations") {
+        Some(prop) => match prop.value().and_then(|v| v.as_object()) {
+            Some(locations) => match locations.get(VSCODE_USER_COPILOT_HOOKS_LOCATION) {
+                Some(entry) => {
+                    let should_update = match entry.value() {
+                        Some(node) => match node.as_boolean_lit() {
+                            Some(bool_node) => !bool_node.value(),
+                            None => true,
+                        },
+                        None => true,
+                    };
+                    if should_update {
+                        entry.set_value(jsonc_parser::json!(true));
+                        changed = true;
+                    }
+                }
+                None => {
+                    locations.append(
+                        VSCODE_USER_COPILOT_HOOKS_LOCATION,
+                        jsonc_parser::json!(true),
+                    );
+                    changed = true;
+                }
+            },
+            None => {
+                prop.set_value(default_hook_file_locations());
+                changed = true;
+            }
+        },
+        None => {
+            object.append("chat.hookFilesLocations", default_hook_file_locations());
             changed = true;
         }
     }
@@ -1120,6 +1256,8 @@ mod tests {
         let final_content = fs::read_to_string(&settings_path).unwrap();
         assert!(final_content.contains("// keep existing entries"));
         assert!(final_content.contains("\"chat.useHooks\": true"));
+        assert!(final_content.contains("\"chat.hookFilesLocations\""));
+        assert!(final_content.contains("\"~/.copilot/hooks\": true"));
     }
 
     #[test]
@@ -1127,7 +1265,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let settings_path = temp_dir.path().join("settings.json");
         let initial = r#"{
-    "chat.useHooks": true
+    "chat.useHooks": true,
+    "chat.hookFilesLocations": {
+        ".github/hooks": true,
+        "~/.copilot/hooks": true
+    }
 }
 "#;
         fs::write(&settings_path, initial).unwrap();
@@ -1150,6 +1292,104 @@ mod tests {
 
         let final_content = fs::read_to_string(&settings_path).unwrap();
         assert!(final_content.contains("\"chat.useHooks\": true"));
+        // Fresh hookFilesLocations must carry VS Code's defaults too, since a
+        // user value replaces the built-in default set.
+        assert!(final_content.contains("\".github/hooks\": true"));
+        assert!(final_content.contains("\"~/.claude/settings.json\": true"));
+        assert!(final_content.contains("\"~/.copilot/hooks\": true"));
+    }
+
+    #[test]
+    fn test_update_vscode_chat_hook_settings_adds_copilot_entry_to_existing_locations() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings_path = temp_dir.path().join("settings.json");
+        let initial = r#"{
+    "chat.useHooks": true,
+    "chat.hookFilesLocations": {
+        // user customized this
+        ".github/hooks": false,
+        "my/custom/hooks": true
+    }
+}
+"#;
+        fs::write(&settings_path, initial).unwrap();
+
+        let result = update_vscode_chat_hook_settings(&settings_path, false).unwrap();
+        assert!(result.is_some());
+
+        let final_content = fs::read_to_string(&settings_path).unwrap();
+        // Existing entries (and comments) are preserved untouched.
+        assert!(final_content.contains("// user customized this"));
+        assert!(final_content.contains("\".github/hooks\": false"));
+        assert!(final_content.contains("\"my/custom/hooks\": true"));
+        assert!(final_content.contains("\"~/.copilot/hooks\": true"));
+    }
+
+    #[test]
+    fn test_update_vscode_chat_hook_settings_re_enables_disabled_copilot_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings_path = temp_dir.path().join("settings.json");
+        let initial = r#"{
+    "chat.useHooks": true,
+    "chat.hookFilesLocations": {
+        "~/.copilot/hooks": false
+    }
+}
+"#;
+        fs::write(&settings_path, initial).unwrap();
+
+        let result = update_vscode_chat_hook_settings(&settings_path, false).unwrap();
+        assert!(result.is_some());
+
+        let final_content = fs::read_to_string(&settings_path).unwrap();
+        assert!(final_content.contains("\"~/.copilot/hooks\": true"));
+    }
+
+    #[test]
+    fn test_push_profile_settings_paths_finds_profiles() {
+        let temp_dir = TempDir::new().unwrap();
+        let user_dir = temp_dir.path().join("User");
+        let profile_a = user_dir.join("profiles").join("-1a2b3c4d");
+        let profile_b = user_dir.join("profiles").join("5e6f7a8b");
+        fs::create_dir_all(&profile_a).unwrap();
+        fs::create_dir_all(&profile_b).unwrap();
+        // A stray file in profiles/ must be ignored.
+        fs::write(user_dir.join("profiles").join("stray.txt"), "x").unwrap();
+
+        let mut out = Vec::new();
+        push_profile_settings_paths(&user_dir.join("settings.json"), &mut out);
+        out.sort();
+
+        assert_eq!(
+            out,
+            vec![
+                profile_a.join("settings.json"),
+                profile_b.join("settings.json")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_push_profile_settings_paths_no_profiles_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let user_dir = temp_dir.path().join("User");
+        fs::create_dir_all(&user_dir).unwrap();
+
+        let mut out = Vec::new();
+        push_profile_settings_paths(&user_dir.join("settings.json"), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_parse_version_triple() {
+        assert_eq!(parse_version_triple("1.109.3"), Some((1, 109, 3)));
+        assert_eq!(parse_version_triple("1.110"), Some((1, 110, 0)));
+        assert_eq!(
+            parse_version_triple("1.115.2\nabcdef123\nx64"),
+            Some((1, 115, 2))
+        );
+        assert_eq!(parse_version_triple("1.99.0-insider"), Some((1, 99, 0)));
+        assert_eq!(parse_version_triple("invalid"), None);
     }
 
     #[test]

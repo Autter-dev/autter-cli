@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
-import { exec, spawn } from "child_process";
+import { execFile, spawn } from "child_process";
 import { isVersionSatisfied } from "./utils/semver";
-import { getAutterBinary } from "./utils/binary-path";
+import { getAutterBinary, resolveAutterBinary } from "./utils/binary-path";
 import { MIN_AUTTER_VERSION, AUTTER_INSTALL_DOCS_URL } from "./consts";
 import { getGitRepoRoot } from "./utils/git-api";
 import { shouldSkipLegacyCopilotHooks } from "./utils/vscode-hooks";
@@ -492,9 +492,12 @@ export class AIEditManager {
     if (this.autterVersion) {
       return true;
     }
+    // Resolve well-known install paths / shell PATH first — the extension
+    // host's own PATH often lacks autter when the editor is GUI-launched.
+    await resolveAutterBinary();
     // TODO Consider only re-checking every X attempts
     return new Promise((resolve) => {
-      exec("autter --version", (error, stdout, stderr) => {
+      execFile(getAutterBinary(), ["--version"], (error, stdout, stderr) => {
         if (error) {
           if (!this.hasShownAutterErrorMessage) {
             // Show startup notification

@@ -123,6 +123,17 @@ fn print_amp_plugins_note(installer_id: &str) {
     }
 }
 
+fn print_github_copilot_note(installer_id: &str) {
+    if installer_id == "github-copilot" {
+        println!(
+            "  Note: covers Copilot CLI and VS Code's built-in Copilot agent. VS Code 1.109.3+ runs these hooks natively — restart VS Code after installing."
+        );
+        println!(
+            "  Remote dev (SSH/WSL/devcontainers) runs hooks on the remote host: install autter and run `autter install-hooks` there too. Verify with `autter debug`."
+        );
+    }
+}
+
 /// Find PIDs of running processes that match any of the given process names.
 /// Returns a list of (pid, process_name) tuples for each match found.
 fn find_running_pids(process_names: &[&str]) -> Vec<(u32, String)> {
@@ -510,6 +521,7 @@ async fn async_run_install(
                             } else {
                                 spinner.success(&format!("{}: Hooks updated", name));
                                 print_amp_plugins_note(id);
+                                print_github_copilot_note(id);
                             }
                             if options.verbose {
                                 println!();
@@ -534,6 +546,7 @@ async fn async_run_install(
                         Ok(None) => {
                             spinner.success(&format!("{}: Hooks already up to date", name));
                             print_amp_plugins_note(id);
+                            print_github_copilot_note(id);
                             statuses.insert(id.to_string(), InstallStatus::AlreadyInstalled);
                             detailed_results
                                 .push((id.to_string(), InstallResult::already_installed()));
