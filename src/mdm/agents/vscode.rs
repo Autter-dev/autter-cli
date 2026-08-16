@@ -163,7 +163,7 @@ impl HookInstaller for VSCodeInstaller {
                                 results.push(InstallResult {
                                     changed: false,
                                     diff: None,
-                                    message: "VS Code: Unable to automatically install extension. Download the .vsix from https://open-vsx.org/extension/autter/autter-vscode and install it with: code --install-extension <downloaded .vsix>".to_string(),
+                                    message: format!("VS Code: Unable to automatically install extension ({}). Please cmd+click on the following link to install: vscode:extension/autter.autter-vscode (or download the .vsix from https://open-vsx.org/extension/autter/autter-vscode and install it with: code --install-extension <downloaded .vsix>)", e),
                                 });
                             }
                         }

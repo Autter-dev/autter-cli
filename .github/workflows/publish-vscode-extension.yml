@@ -58,14 +58,22 @@ jobs:
       - name: Package extension (.vsix)
         run: npm run package
 
+      # The two registry publishes are independent: `continue-on-error` lets each
+      # run even if the other fails, `--skip-duplicate` makes re-runs idempotent
+      # (a version one registry already has is skipped, not an error), and the
+      # final gate step fails the job if either attempted publish actually failed.
       - name: Publish to Open VSX
+        id: ovsx
+        continue-on-error: true
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: npx ovsx publish *.vsix -p "$OVSX_PAT"
+        run: npx ovsx publish *.vsix -p "$OVSX_PAT" --skip-duplicate
 
       - name: Publish to VS Code Marketplace
+        id: vsce
         if: ${{ env.VSCE_PAT != '' }}
-        run: npx vsce publish --packagePath *.vsix -p "$VSCE_PAT"
+        continue-on-error: true
+        run: npx vsce publish --packagePath *.vsix -p "$VSCE_PAT" --skip-duplicate
 
       - name: Upload .vsix artifact
         uses: actions/upload-artifact@v4
@@ -73,3 +81,14 @@ jobs:
           name: autter-vscode-vsix
           path: agent-support/vscode/*.vsix
           if-no-files-found: warn
+
+      - name: Check publish results
+        run: |
+          echo "Open VSX: ${{ steps.ovsx.outcome }}"
+          echo "VS Code Marketplace: ${{ steps.vsce.outcome }}"
+          if [ -z "$VSCE_PAT" ]; then
+            echo "::warning::VSCE_PAT secret is not set - VS Code Marketplace publish was skipped"
+          fi
+          if [ "${{ steps.ovsx.outcome }}" = "failure" ] || [ "${{ steps.vsce.outcome }}" = "failure" ]; then
+            exit 1
+          fi

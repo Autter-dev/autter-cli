@@ -344,8 +344,6 @@ impl HookInstaller for CursorInstaller {
                             message: "Cursor: Pending extension install".to_string(),
                         });
                     } else {
-                        println!("Installing extensions...");
-                        println!("\tInstalling extension 'autter.autter-vscode'...");
                         match install_vsc_editor_extension_with_vsix_fallback(
                             &cli,
                             "autter.autter-vscode",
@@ -354,7 +352,7 @@ impl HookInstaller for CursorInstaller {
                                 results.push(InstallResult {
                                     changed: true,
                                     diff: None,
-                                    message: "\tExtension 'autter.autter-vscode' was successfully installed.".to_string(),
+                                    message: "Cursor: Extension installed".to_string(),
                                 });
                             }
                             Err(e) => {
@@ -365,7 +363,7 @@ impl HookInstaller for CursorInstaller {
                                 results.push(InstallResult {
                                     changed: false,
                                     diff: None,
-                                    message: "Cursor: Unable to automatically install extension. Please cmd+click on the following link to install: cursor:extension/autter.autter-vscode (or search for 'autter-vscode' in the Cursor extensions tab)".to_string(),
+                                    message: format!("Cursor: Unable to automatically install extension ({}). Please cmd+click on the following link to install: cursor:extension/autter.autter-vscode (or search for 'autter-vscode' in the Cursor extensions tab)", e),
                                 });
                             }
                         }
