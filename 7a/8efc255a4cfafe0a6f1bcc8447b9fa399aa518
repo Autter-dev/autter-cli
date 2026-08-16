@@ -1,0 +1,8 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "autter_version": "1.6.7",
+  "base_commit_sha": "7a8efc255a4cfafe0a6f1bcc8447b9fa399aa518",
+  "branch": "posthog/windows-release-and-installer-fixes",
+  "prompts": {}
+}
