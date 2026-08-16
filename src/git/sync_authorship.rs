@@ -239,8 +239,10 @@ pub fn push_authorship_notes(
     remote_name: &str,
 ) -> Result<(), AutterError> {
     // Belt-and-suspenders: skip when notes are not stored in refs/notes/ai
-    // (pure HTTP backend), so there is nothing to push.
-    if !crate::config::Config::get()
+    // (pure HTTP backend), so there is nothing to push. Read a fresh config
+    // snapshot — this runs inside the long-lived daemon, where the process
+    // cache can predate a backend-mode switch.
+    if !crate::config::Config::fresh()
         .notes_backend_kind()
         .uses_git_notes()
     {
