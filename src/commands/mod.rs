@@ -7,6 +7,7 @@ pub mod config;
 pub mod daemon;
 pub mod debug;
 pub mod diff;
+pub mod doctor;
 pub mod exchange_nonce;
 pub mod fetch_notes;
 pub mod file_changes;
@@ -51,14 +52,14 @@ pub const EXIT_RUNTIME_ERROR: i32 = 1;
 /// Usage/argument error in a user-invoked subcommand. See [`EXIT_SUCCESS`].
 pub const EXIT_USAGE_ERROR: i32 = 2;
 
-/// Print a one-line stderr pointer to `autter debug`.
+/// Print a one-line stderr pointer to `autter doctor`.
 ///
 /// Reserved for error paths that usually mean a broken installation
 /// (unreachable background service, failed hook install, unrunnable git
-/// binary) rather than a bad invocation -- `autter debug` runs the
-/// self-checks and prints a `fix:` line for each failure.
-pub fn suggest_autter_debug() {
+/// binary) rather than a bad invocation -- `autter doctor` runs the
+/// setup checks and prints a `fix:` line for each failure.
+pub fn suggest_autter_doctor() {
     eprintln!(
-        "[autter] run `autter debug` to diagnose -- each failed check includes a suggested fix"
+        "[autter] run `autter doctor` to check your setup -- each failed check includes a suggested fix"
     );
 }

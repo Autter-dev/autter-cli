@@ -29,14 +29,15 @@ const DEBUG_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-// Remediation strings surfaced as `fix:` lines in the debug report. Keep them
-// to concrete next commands a stuck user can run without support.
-const REMEDIATION_DAEMON_PATHS: &str = "check that your home directory is set and writable (HOME on macOS/Linux, USERPROFILE on Windows), then re-run `autter debug`";
-const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install` and then `autter debug`";
-const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter debug`";
-const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install` to write the required trace2 settings to your global git config, then re-run `autter debug`";
-const REMEDIATION_ATTRIBUTION: &str = "run `autter daemon restart`, then re-run `autter debug`; if the trace2 config check for this git also failed, run `autter install` first -- attribution depends on it";
-const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter debug`; if the trace2 config check also failed, run `autter install`";
+// Remediation strings surfaced as `fix:` lines in the doctor and debug
+// reports. Keep them to concrete next commands a stuck user can run without
+// support.
+const REMEDIATION_DAEMON_PATHS: &str = "check that your home directory is set and writable (HOME on macOS/Linux, USERPROFILE on Windows), then re-run `autter doctor`";
+const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install` and then `autter doctor`";
+const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter doctor`";
+const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install` to write the required trace2 settings to your global git config, then re-run `autter doctor`";
+const REMEDIATION_ATTRIBUTION: &str = "run `autter daemon restart`, then re-run `autter doctor`; if the trace2 config check for this git also failed, run `autter install` first -- attribution depends on it";
+const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter doctor`; if the trace2 config check also failed, run `autter install`";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticStatus {
