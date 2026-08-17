@@ -268,13 +268,30 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
         };
 
         // Flush in a blocking task since the underlying HTTP clients are synchronous.
+        // Catch a panic inside the flush so its message is reported: the join handle
+        // only surfaces "task panicked", which hides the real cause.
         tokio::task::spawn_blocking(move || {
-            flush_telemetry_batch(snapshot);
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                flush_telemetry_batch(snapshot);
+            })) {
+                tracing::error!("telemetry flush panicked: {}", panic_message(&panic));
+            }
         })
         .await
         .unwrap_or_else(|e| {
             tracing::error!(%e, "telemetry flush task panicked");
         });
+    }
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -969,5 +986,19 @@ impl SentryClient {
         } else {
             Err(format!("Sentry returned status {}", status).into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_message;
+
+    #[test]
+    fn panic_message_reads_str_and_string_payloads() {
+        let str_panic = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+        assert_eq!(panic_message(&str_panic), "boom");
+
+        let string_panic = std::panic::catch_unwind(|| panic!("count is {}", 3)).unwrap_err();
+        assert_eq!(panic_message(&string_panic), "count is 3");
     }
 }
