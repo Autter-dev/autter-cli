@@ -75,8 +75,8 @@ pub fn handle_autter(args: &[String]) {
     // per-PID log files.
     //
     // Skip for commands that must work without a running background service
-    // (help, version, config, d management, debug, upgrade) so users can
-    // always diagnose and recover from a broken state.
+    // (help, version, config, d management, debug, doctor, upgrade) so users
+    // can always diagnose and recover from a broken state.
     let needs_daemon = !matches!(
         args[0].as_str(),
         "help"
@@ -90,6 +90,7 @@ pub fn handle_autter(args: &[String]) {
             | "d"
             | "daemon"
             | "debug"
+            | "doctor"
             | "upgrade"
             | "install-hooks"
             | "install"
@@ -107,7 +108,7 @@ pub fn handle_autter(args: &[String]) {
                     "error: failed to connect to autter background service: {}",
                     err
                 );
-                commands::suggest_autter_debug();
+                commands::suggest_autter_doctor();
                 if args[0].as_str() == "checkpoint" {
                     std::process::exit(0);
                 }
@@ -156,6 +157,9 @@ pub fn handle_autter(args: &[String]) {
         }
         "debug" => {
             commands::debug::handle_debug(&args[1..]);
+        }
+        "doctor" => {
+            commands::doctor::handle_doctor(&args[1..]);
         }
         "bg" | "d" | "daemon" => {
             commands::daemon::handle_daemon(&args[1..]);
@@ -216,7 +220,7 @@ pub fn handle_autter(args: &[String]) {
             }
             Err(e) => {
                 eprintln!("Install hooks failed: {}", e);
-                commands::suggest_autter_debug();
+                commands::suggest_autter_doctor();
                 std::process::exit(1);
             }
         },
@@ -228,7 +232,7 @@ pub fn handle_autter(args: &[String]) {
             }
             Err(e) => {
                 eprintln!("Uninstall hooks failed: {}", e);
-                commands::suggest_autter_debug();
+                commands::suggest_autter_doctor();
                 std::process::exit(1);
             }
         },

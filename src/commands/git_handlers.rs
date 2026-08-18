@@ -676,7 +676,7 @@ fn proxy_to_git(
             // Only nudge humans: scripts and tools parsing proxied git stderr
             // must see git's output unchanged.
             if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-                crate::commands::suggest_autter_debug();
+                crate::commands::suggest_autter_doctor();
             }
             std::process::exit(1);
         }
@@ -705,7 +705,7 @@ fn proxy_to_git(
             // Only nudge humans: scripts and tools parsing proxied git stderr
             // must see git's output unchanged.
             if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-                crate::commands::suggest_autter_debug();
+                crate::commands::suggest_autter_doctor();
             }
             std::process::exit(1);
         }

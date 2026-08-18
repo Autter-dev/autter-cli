@@ -352,6 +352,21 @@ autter config [<key> | set <key> <value> | unset <key>]
         body: "autter debug\n\n  Print support/debug diagnostics.",
     },
     HelpEntry {
+        name: "doctor",
+        aliases: &[],
+        summary: "Validate the autter setup end-to-end",
+        body: "autter doctor [--json] [--skip-trace2-checks]
+
+  Run setup validation checks: git and config, the background service,
+  trace2 capture, a real end-to-end checkpoint round-trip, AI agent hooks,
+  and login/connectivity. Every failed check prints a concrete fix.
+
+  Exits 0 when no check fails (warnings allowed), 1 when any check fails.
+
+  --json                 Machine-readable single-line JSON report
+  --skip-trace2-checks   Skip the trace2 event-capture self-check",
+    },
+    HelpEntry {
         name: "bg",
         aliases: &["d", "daemon"],
         summary: "Run and control autter background service",

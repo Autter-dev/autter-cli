@@ -481,10 +481,36 @@ fn collect_agent_capture_info() -> Vec<String> {
     lines
 }
 
+/// Outcome of walking the VS Code native-hooks chain, shared between the
+/// debug report (which prints the lines) and `autter doctor` (which turns the
+/// outcome into a pass/warn/fail check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VsCodeChainOutcome {
+    /// No VS Code CLI found on this machine.
+    NotDetected,
+    /// VS Code found but its version could not be determined.
+    VersionUnknown,
+    /// VS Code predates native agent hooks; the autter extension captures.
+    LegacyExtensionMode,
+    /// Native-hooks mode and every link in the chain is in place.
+    Complete,
+    /// Native-hooks mode but the hook file or chat settings are missing.
+    Incomplete,
+}
+
+pub(crate) struct VsCodeNativeHooksChain {
+    pub(crate) outcome: VsCodeChainOutcome,
+    pub(crate) lines: Vec<String>,
+}
+
+fn collect_vscode_native_hooks_chain() -> Vec<String> {
+    inspect_vscode_native_hooks_chain().lines
+}
+
 /// Walk the chain VS Code's built-in Copilot agent needs for AI edits to
 /// checkpoint on VS Code >= 1.109.3: the autter extension stands down there
 /// and capture only happens if VS Code loads ~/.copilot/hooks/autter.json.
-fn collect_vscode_native_hooks_chain() -> Vec<String> {
+pub(crate) fn inspect_vscode_native_hooks_chain() -> VsCodeNativeHooksChain {
     use crate::mdm::utils::{
         MIN_VSCODE_NATIVE_HOOKS_VERSION, VSCODE_USER_COPILOT_HOOKS_LOCATION, get_editor_version,
         home_dir, parse_version_triple, resolve_editor_cli, settings_paths_for_products,
@@ -495,14 +521,20 @@ fn collect_vscode_native_hooks_chain() -> Vec<String> {
 
     let Some(cli) = resolve_editor_cli("code") else {
         lines.push("  VS Code CLI not found; skipping chain checks".to_string());
-        return lines;
+        return VsCodeNativeHooksChain {
+            outcome: VsCodeChainOutcome::NotDetected,
+            lines,
+        };
     };
 
     let version_str = match get_editor_version(&cli) {
         Ok(v) => v,
         Err(err) => {
             lines.push(format!("  VS Code version: <error: {}>", err));
-            return lines;
+            return VsCodeNativeHooksChain {
+                outcome: VsCodeChainOutcome::VersionUnknown,
+                lines,
+            };
         }
     };
     let first_line = version_str.lines().next().unwrap_or("").trim().to_string();
@@ -518,7 +550,10 @@ fn collect_vscode_native_hooks_chain() -> Vec<String> {
             "  Capture mode: autter extension detection (VS Code predates native agent hooks, added in {}.{}.{})",
             min_major, min_minor, min_patch
         ));
-        return lines;
+        return VsCodeNativeHooksChain {
+            outcome: VsCodeChainOutcome::LegacyExtensionMode,
+            lines,
+        };
     }
 
     lines.push(format!(
@@ -567,13 +602,19 @@ fn collect_vscode_native_hooks_chain() -> Vec<String> {
             "  Chain status: OK — Copilot agent-mode edits should checkpoint (restart VS Code if hooks were just installed)"
                 .to_string(),
         );
-    } else {
-        lines.push(
-            "  Chain status: INCOMPLETE — Copilot agent-mode edits are likely NOT being captured; run `autter install-hooks` and restart VS Code"
-                .to_string(),
-        );
+        return VsCodeNativeHooksChain {
+            outcome: VsCodeChainOutcome::Complete,
+            lines,
+        };
     }
-    lines
+    lines.push(
+        "  Chain status: INCOMPLETE — Copilot agent-mode edits are likely NOT being captured; run `autter install-hooks` and restart VS Code"
+            .to_string(),
+    );
+    VsCodeNativeHooksChain {
+        outcome: VsCodeChainOutcome::Incomplete,
+        lines,
+    }
 }
 
 /// Read `chat.useHooks` and the `~/.copilot/hooks` entry of
