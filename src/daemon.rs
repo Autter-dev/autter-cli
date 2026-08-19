@@ -332,17 +332,27 @@ fn is_trace_payload(payload: &Value) -> bool {
 }
 
 /// Returns true when the error indicates the git working directory vanished
-/// mid-operation. Git reports this as exit code 128 with a stderr such as
-/// "cannot change to '.../T/.tmpXXXX': No such file or directory", typically
-/// when a temp/test repo is cleaned up while an async side effect is still in
-/// flight. These are benign races, so the daemon skips the side effect quietly
-/// rather than reporting a generic "command side effect failed" exception.
+/// mid-operation, typically when a temp/test repo is cleaned up while an async
+/// side effect is still in flight. These are benign races, so the daemon skips
+/// the side effect quietly rather than reporting a generic "command side effect
+/// failed" exception.
+///
+/// The same race surfaces in three shapes:
+/// - git cannot enter the directory: exit 128, stderr "No such file or
+///   directory".
+/// - git finds no repository at or above the gone directory: exit 128, stderr
+///   "not a git repository".
+/// - on Windows the directory read fails before git runs: an `IoError` with a
+///   not-found kind ("The system cannot find the path specified").
 fn is_missing_working_dir_error(error: &AutterError) -> bool {
-    matches!(
-        error,
-        AutterError::GitCliError { code: Some(128), stderr, .. }
-            if stderr.contains("No such file or directory")
-    )
+    match error {
+        AutterError::GitCliError { code: Some(128), stderr, .. } => {
+            stderr.contains("No such file or directory")
+                || stderr.contains("not a git repository")
+        }
+        AutterError::IoError(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 fn trace_root_sid(sid: &str) -> &str {
@@ -9282,6 +9292,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_working_dir_error_detects_exit_128_not_a_git_repository() {
+        // When the directory is gone, git finds no repository at or above the old
+        // path and reports "not a git repository" instead of "No such file or
+        // directory".
+        let error = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: not a git repository (or any of the parent directories): .git"
+                .to_string(),
+            args: vec!["ls-tree".to_string(), "-r".to_string()],
+        };
+        assert!(is_missing_working_dir_error(&error));
+    }
+
+    #[test]
+    fn missing_working_dir_error_detects_io_not_found() {
+        // On Windows the directory read fails before git runs, surfacing as an
+        // IoError with a not-found kind ("The system cannot find the path
+        // specified. (os error 3)").
+        let error = AutterError::IoError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "The system cannot find the path specified. (os error 3)",
+        ));
+        assert!(is_missing_working_dir_error(&error));
+    }
+
+    #[test]
     fn missing_working_dir_error_ignores_other_git_failures() {
         // Exit 128 but a different cause is a real error, not a vanished dir.
         let bad_object = AutterError::GitCliError {
@@ -9298,6 +9334,13 @@ mod tests {
             args: vec![],
         };
         assert!(!is_missing_working_dir_error(&other_code));
+
+        // An IoError with a different kind is a real fault, not a vanished dir.
+        let permission_denied = AutterError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        assert!(!is_missing_working_dir_error(&permission_denied));
 
         // Non-git errors never qualify.
         assert!(!is_missing_working_dir_error(&AutterError::Generic(
