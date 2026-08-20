@@ -891,10 +891,23 @@ impl<B: GitBackend> TraceNormalizer<B> {
                 // Clone/init can resolve into a family only after the repository exists at exit.
                 // In that flow there is no stable pre-command reflog cut to diff against.
             } else {
-                return Err(AutterError::Generic(format!(
-                    "missing reflog end cut for mutating command sid={} primary={:?} family={}",
-                    pending.root_sid, primary_command, family
-                )));
+                // The exit hook delivered no reflog end cut. This normally means a
+                // temp repo was cleaned up before the hook ran, so the cut never
+                // reached the daemon. The family key is still recoverable from the
+                // worktree, so record the command with low confidence rather than
+                // rejecting the whole trace. This mirrors how the daemon tolerates
+                // a working directory that vanished mid-operation.
+                observability::log_message(
+                    "missing reflog end cut for mutating command; recording with low confidence",
+                    "warn",
+                    Some(serde_json::json!({
+                        "component": "trace_normalizer",
+                        "phase": "finalize_root_exit",
+                        "root_sid": pending.root_sid,
+                        "primary_command": primary_command,
+                        "family": family.0,
+                    })),
+                );
             }
         }
 
@@ -2494,5 +2507,42 @@ mod tests {
                 .and_then(|repo| repo.branch.as_deref()),
             Some("main")
         );
+    }
+
+    #[test]
+    fn mutating_command_without_reflog_end_cut_degrades_to_low_confidence() {
+        let backend = Arc::new(MockBackend::default());
+        let mut normalizer = TraceNormalizer::new(backend);
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).expect("create git dir");
+
+        // A checkout whose temp repo is cleaned up before the exit hook delivers
+        // its reflog end cut. The family key is still recoverable from the
+        // worktree, so the command must record with low confidence, not error.
+        let start = serde_json::json!({
+            "event":"start",
+            "sid":"checkout-no-end-cut",
+            "ts":1,
+            "argv":["git","checkout","feature"],
+            "worktree":repo
+        });
+        let exit = serde_json::json!({
+            "event":"exit",
+            "sid":"checkout-no-end-cut",
+            "ts":2,
+            "code":0
+        });
+
+        assert!(normalizer.ingest_payload(&start).unwrap().is_none());
+        let cmd = normalizer
+            .ingest_payload(&exit)
+            .expect("missing reflog end cut should not block normalization")
+            .expect("exit payload should emit a normalized command");
+
+        assert_eq!(cmd.primary_command.as_deref(), Some("checkout"));
+        assert!(matches!(cmd.scope, CommandScope::Family(_)));
+        assert_eq!(cmd.confidence, Confidence::Low);
+        assert!(cmd.ref_changes.is_empty());
     }
 }
