@@ -8,6 +8,8 @@ name: Release
 #
 # Trigger:
 #   - pushing a tag matching `v*` (e.g. v1.5.9) publishes a release
+#   - merging a version bump to main (see tag-release.yml) creates the tag
+#     automatically from Cargo.toml's `version`
 #   - manual run via the Actions tab (workflow_dispatch) builds the binaries
 #     for validation but does NOT publish (no tag to release against)
 #
