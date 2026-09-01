@@ -37,6 +37,14 @@ Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autt
 
 The installer downloads Autter into `~/.autter/bin`, adds it to your user `PATH`, configures supported coding agents and editors, and starts the background service. On macOS, Linux, and WSL it then starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later.
 
+### System requirements
+
+- **git** 2.22 or newer (required)
+- **Linux**: glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+). Ubuntu 20.04 and older WSL2 distros are not supported natively — use a newer WSL distro or run inside an `ubuntu:22.04` Docker container
+- **macOS**: 11 (Big Sur) or newer
+- **Windows**: 10 or newer
+- **npm path**: Node.js 18+
+
 On macOS, Linux, and WSL, make `autter` available in the terminal you already have open (the installer prints this command at the end too):
 
 ```bash
@@ -47,8 +55,11 @@ New terminals pick it up automatically. Restart your IDE (not just its terminal 
 
 ```bash
 autter --version
-autter debug
+autter doctor   # v1.6.10+ — focused setup validation (exits 1 on failure)
+autter debug    # full support dump (always exits 0)
 ```
+
+`autter doctor` runs end-to-end checks (git proxy, hooks, checkpoint round-trip). On v1.6.9 and earlier, use `autter debug` instead.
 
 You do not need to configure each repository separately. Continue using Git, your IDE, and your coding agents as usual.
 

@@ -54,6 +54,8 @@ autter onboard
 
 The npm package is a thin bootstrapper: it downloads the same release binary into `~/.autter/bin` and verifies its checksum, so hooks and self-updates work identically to the script installs.
 
+**System requirements:** git 2.22+, Linux glibc 2.35+ (Ubuntu 22.04+), macOS 11+, Windows 10+, Node.js 18+ for the npm path. See [INSTALL.md](INSTALL.md) for details including Docker-based setup on older Linux distros.
+
 > **Git Bash is not WSL.** The bash installer needs a real Linux environment, so on Windows it only runs inside [WSL](https://learn.microsoft.com/windows/wsl/about) — in Git Bash it exits with instructions. Use the Windows command instead (it works from Git Bash too), and install the CLI where your coding agents actually run: agents launched from Windows need the native install, agents inside WSL need the WSL install.
 
 Signed in to Autter? [**Settings → CLI setup**](https://app.autter.dev/cli/install) in the dashboard generates a single-use command that runs this same installer **and signs the machine in automatically** via a short-lived signed token — no separate login step.

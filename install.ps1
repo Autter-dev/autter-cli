@@ -335,6 +335,16 @@ if (-not $arch) {
 }
 $os = 'windows'
 
+# git is required — autter wraps git and cannot function without it.
+try {
+    $null = & git --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-ErrorAndExit 'git is required but not found. Install Git for Windows (https://git-scm.com/download/win) and re-run the installer.'
+    }
+} catch {
+    Write-ErrorAndExit 'git is required but not found. Install Git for Windows (https://git-scm.com/download/win) and re-run the installer.'
+}
+
 # Determine binary name and download URLs
 $binaryName = "autter-$os-$arch"
 
@@ -603,6 +613,20 @@ if (Test-Path -LiteralPath $finalExe) {
 
 Move-Item -Force -Path $tmpFile -Destination $finalExe
 try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
+
+# Verify the binary runs before reporting success.
+try {
+    $installedVersion = & $finalExe --version 2>&1 | Out-String
+    $installedVersion = $installedVersion.Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installedVersion)) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
+        Write-ErrorAndExit "The autter binary could not run on this system:`n$installedVersion"
+    }
+    Write-Host "Installed autter $installedVersion"
+} catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
+    Write-ErrorAndExit "The autter binary could not run on this system: $($_.Exception.Message)"
+}
 
 # Refresh git.exe for existing wrapper users (it's a copy, not a symlink on Windows)
 $gitShim = Join-Path $installDir 'git.exe'
