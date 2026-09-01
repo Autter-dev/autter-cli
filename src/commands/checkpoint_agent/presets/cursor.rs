@@ -8,7 +8,7 @@ use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::AutterError;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct CursorPreset;
 
@@ -46,10 +46,11 @@ impl AgentPreset for CursorPreset {
 
         let hook_event_name = parse::required_str(&data, "hook_event_name")?;
 
-        // Extract model from hook input (Cursor provides this directly)
-        let model = parse::optional_str(&data, "model")
-            .unwrap_or("unknown")
-            .to_string();
+        let transcript_path = parse::optional_str(&data, "transcript_path").map(|s| s.to_string());
+
+        // Cursor documents both `model` and `model_id` on pre/postToolUse hooks.
+        // Fall back to the transcript when the hook only carries placeholders (Auto, etc.).
+        let model = resolve_cursor_model(&data, transcript_path.as_deref());
 
         // Legacy hooks no longer installed; return error so orchestrator skips.
         if hook_event_name == "beforeSubmitPrompt" || hook_event_name == "afterFileEdit" {
@@ -91,8 +92,6 @@ impl AgentPreset for CursorPreset {
         } else {
             vec![]
         };
-
-        let transcript_path = parse::optional_str(&data, "transcript_path").map(|s| s.to_string());
 
         let mut metadata = HashMap::new();
         if let Some(ref tp) = transcript_path {
@@ -175,6 +174,45 @@ fn normalize_cursor_path(path: &str) -> String {
 #[cfg(not(windows))]
 fn normalize_cursor_path(path: &str) -> String {
     path.to_string()
+}
+
+fn is_cursor_placeholder_model(model: &str) -> bool {
+    let m = model.trim();
+    m.is_empty()
+        || m.eq_ignore_ascii_case("unknown")
+        || m.eq_ignore_ascii_case("default")
+        || m.eq_ignore_ascii_case("auto")
+}
+
+/// Resolve the model for a Cursor hook: prefer hook `model`, then `model_id`, then transcript.
+fn resolve_cursor_model(data: &serde_json::Value, transcript_path: Option<&str>) -> String {
+    let hook_model = parse::optional_str(data, "model");
+    let hook_model_id = parse::optional_str(data, "model_id");
+
+    if let Some(model) = hook_model {
+        if !is_cursor_placeholder_model(model) {
+            return model.to_string();
+        }
+    }
+
+    if let Some(model_id) = hook_model_id {
+        if !is_cursor_placeholder_model(model_id) {
+            return model_id.to_string();
+        }
+    }
+
+    if let Some(path) = transcript_path {
+        if let Ok(Some(model)) = crate::streams::model_extraction::extract_model(
+            Path::new(path),
+            crate::streams::sweep::StreamFormat::CursorJsonl,
+            None,
+        ) && !is_cursor_placeholder_model(&model)
+        {
+            return model;
+        }
+    }
+
+    "unknown".to_string()
 }
 
 fn cursor_file_path_from_tool_input(tool_input: Option<&serde_json::Value>) -> String {
@@ -509,6 +547,120 @@ mod tests {
                 assert_eq!(e.tool_use_id, "bash");
             }
             _ => panic!("Expected PreBashCall"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_model_id_fallback_when_model_missing() {
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "model_id": "claude-opus-4-7",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "claude-opus-4-7");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_prefers_model_over_model_id() {
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "model": "composer-2",
+            "model_id": "claude-opus-4-7",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "composer-2");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_model_id_fallback_when_model_is_placeholder() {
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "model": "auto",
+            "model_id": "claude-opus-4-7",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "claude-opus-4-7");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_unknown_when_only_placeholder_model_and_no_transcript() {
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "model": "auto",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "unknown");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_resolves_model_from_transcript_when_hook_is_auto() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut transcript = NamedTempFile::new().unwrap();
+        writeln!(
+            transcript,
+            r#"{{"role":"assistant","message":{{"model":"claude-sonnet-4","content":[{{"type":"text","text":"hi"}}]}}}}"#
+        )
+        .unwrap();
+        transcript.flush().unwrap();
+
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "postToolUse",
+            "tool_name": "Write",
+            "model": "auto",
+            "transcript_path": transcript.path().to_string_lossy(),
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "claude-sonnet-4");
+            }
+            _ => panic!("Expected PostFileEdit"),
         }
     }
 

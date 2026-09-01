@@ -12,7 +12,8 @@ pub fn extract_model(
     match format {
         StreamFormat::ClaudeJsonl
         | StreamFormat::CopilotEventStreamJsonl
-        | StreamFormat::GeminiJsonl => extract_model_from_jsonl_tail(path),
+        | StreamFormat::GeminiJsonl
+        | StreamFormat::CursorJsonl => extract_model_from_jsonl_tail(path),
         StreamFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
         StreamFormat::AmpThreadJson => extract_model_from_amp_thread_json(path),
         StreamFormat::OpenCodeSqlite => extract_model_from_opencode_sqlite(path, session_id),
@@ -103,7 +104,8 @@ fn extract_model_from_jsonl_line(line: &str) -> Option<String> {
         .get("message")
         .and_then(|m| m.get("model"))
         .and_then(|v| v.as_str())
-        .or_else(|| json.get("model").and_then(|v| v.as_str()));
+        .or_else(|| json.get("model").and_then(|v| v.as_str()))
+        .or_else(|| json.get("model_id").and_then(|v| v.as_str()));
 
     if let Some(model) = candidate
         && model != "<synthetic>"
@@ -367,6 +369,23 @@ mod tests {
         let path = fixture_path("copilot_cli_session_no_model.jsonl");
         let result = extract_model(&path, StreamFormat::CopilotEventStreamJsonl, None).unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_model_cursor_jsonl() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"assistant","message":{{"model":"composer-2","content":[{{"type":"text","text":"ok"}}]}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let result = extract_model(file.path(), StreamFormat::CursorJsonl, None).unwrap();
+        assert_eq!(result, Some("composer-2".to_string()));
     }
 
     #[test]

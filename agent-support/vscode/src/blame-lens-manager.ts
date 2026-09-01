@@ -1127,6 +1127,19 @@ export class BlameLensManager {
    * Extract model name from model string (e.g., "claude-3-opus-20240229" -> "Claude")
    * Returns the part before the first "-" with first letter capitalized, or null if no model.
    */
+  private shouldHideModelName(model: string | undefined): boolean {
+    if (!model || model.trim() === '') {
+      return true;
+    }
+    const lower = model.trim().toLowerCase();
+    return (
+      lower === 'default' ||
+      lower === 'auto' ||
+      lower === 'unknown' ||
+      lower.endsWith('/unknown-model')
+    );
+  }
+
   private extractModelName(modelString: string | undefined): string | null {
     if (!modelString || modelString.trim() === '') {
       return null;
@@ -1138,7 +1151,7 @@ export class BlameLensManager {
     if (trimmed === 'default' || trimmed === 'auto') {
       return 'Cursor';
     }
-    if (trimmed === 'unknown') {
+    if (trimmed === 'unknown' || trimmed.endsWith('/unknown-model')) {
       return null; // Will display as "AI"
     }
     
@@ -1281,9 +1294,8 @@ export class BlameLensManager {
     const tool = record?.agent_id?.tool || lineInfo.author;
     const toolCapitalized = tool.charAt(0).toUpperCase() + tool.slice(1);
     
-    // Build model display: hide if default/auto/unknown/empty
-    const modelLower = model.toLowerCase();
-    const hideModel = !model || modelLower === 'default' || modelLower === 'auto' || modelLower === 'unknown';
+    // Build model display: hide placeholders and tool-scoped unknown fallbacks
+    const hideModel = this.shouldHideModelName(model);
     const modelDisplay = hideModel ? '' : model;
 
     // ═══════════════════════════════════════════════════════════════
