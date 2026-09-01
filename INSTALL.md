@@ -55,7 +55,7 @@ New terminals pick it up automatically. Restart your IDE (not just its terminal 
 
 ```bash
 autter --version
-autter doctor   # v1.6.10+ — focused setup validation (exits 1 on failure)
+autter doctor   # v1.7.0+ — focused setup validation (exits 1 on failure)
 autter debug    # full support dump (always exits 0)
 ```
 
