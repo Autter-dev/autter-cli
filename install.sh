@@ -277,6 +277,74 @@ case $ARCH in
         ;;
 esac
 
+# Minimum glibc for Linux release binaries (built on Ubuntu 22.04).
+MIN_GLIBC_MAJOR=2
+MIN_GLIBC_MINOR=35
+
+# Require git before downloading — autter wraps git and cannot function without it.
+check_git() {
+    if ! command -v git >/dev/null 2>&1; then
+        error "git is required but not found. Install git 2.22 or newer, then re-run the installer."
+    fi
+}
+
+# Linux release binaries need glibc 2.35+ (Ubuntu 22.04). Ubuntu 20.04 / older WSL2
+# distros fail at runtime with GLIBC_2.32+ symbol errors — catch that up front.
+check_linux_glibc() {
+    if [ "$OS" != "linux" ] || [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
+        return 0
+    fi
+
+    if ! command -v ldd >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local glibc_version
+    glibc_version=$(ldd --version 2>&1 | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    if [ -z "$glibc_version" ]; then
+        return 0
+    fi
+
+    local major minor
+    major=${glibc_version%%.*}
+    minor=${glibc_version#*.}
+
+    if [ "$major" -lt "$MIN_GLIBC_MAJOR" ] \
+        || { [ "$major" -eq "$MIN_GLIBC_MAJOR" ] && [ "$minor" -lt "$MIN_GLIBC_MINOR" ]; }; then
+        error "Unsupported glibc version ($glibc_version). autter requires glibc ${MIN_GLIBC_MAJOR}.${MIN_GLIBC_MINOR} or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
+
+On Ubuntu 20.04 or older WSL2 distros, use a newer base image or run inside Docker:
+  docker run -it --rm -v \"\$PWD\":/work -w /work ubuntu:22.04 bash
+  # then re-run this installer inside the container"
+    fi
+}
+
+# Fail the install when the downloaded binary cannot execute (glibc mismatch, etc.).
+verify_binary_runs() {
+    local bin="$1"
+    local output
+    if output=$("$bin" --version 2>&1); then
+        printf '%s' "$output"
+        return 0
+    fi
+
+    rm -f "$bin" 2>/dev/null || true
+    if [ "$OS" = "linux" ] && printf '%s' "$output" | grep -q 'GLIBC_'; then
+        error "The autter binary could not run on this system (incompatible glibc).
+
+$output
+
+autter requires glibc ${MIN_GLIBC_MAJOR}.${MIN_GLIBC_MINOR} or newer (Ubuntu 22.04+). On Ubuntu 20.04 / older WSL2, switch to a newer distro or use Docker:
+  docker run -it --rm -v \"\$PWD\":/work -w /work ubuntu:22.04 bash"
+    fi
+    error "The autter binary could not run on this system:
+
+$output"
+}
+
+check_git
+check_linux_glibc
+
 # Map OS to binary name
 case $OS in
     "darwin")
@@ -459,11 +527,10 @@ else
     warn "Failed to create ~/.local/bin/autter symlink. This is non-fatal."
 fi
 
+# Verify the binary runs before reporting success (catches glibc mismatches, etc.).
+INSTALLED_VERSION=$(verify_binary_runs "${INSTALL_DIR}/autter")
 success "Successfully installed autter into ${INSTALL_DIR}"
 success "You can now run 'autter' from your terminal"
-
-# Print installed version
-INSTALLED_VERSION=$(${INSTALL_DIR}/autter --version 2>&1 || echo "unknown")
 echo "Installed autter ${INSTALLED_VERSION}"
 
 # Login user with install token if provided

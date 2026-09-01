@@ -486,8 +486,8 @@ async fn async_run_install(
 
     let installers = get_all_installers();
     let mut installed_tools: HashSet<String> = HashSet::new();
-    // Track agents whose hooks were updated (name, process_names) for restart warnings
-    let mut updated_agents: Vec<(String, Vec<String>)> = Vec::new();
+    // Track agents whose hooks were checked (updated or already up to date) for restart warnings
+    let mut agents_for_restart: Vec<(String, Vec<String>)> = Vec::new();
     let mut not_detected: Vec<&str> = Vec::new();
 
     for installer in &installers {
@@ -541,7 +541,7 @@ async fn async_run_install(
                                     .map(|s| s.to_string())
                                     .collect();
                                 if !pnames.is_empty() {
-                                    updated_agents.push((name.to_string(), pnames));
+                                    agents_for_restart.push((name.to_string(), pnames));
                                 }
                             }
                         }
@@ -552,6 +552,21 @@ async fn async_run_install(
                             statuses.insert(id.to_string(), InstallStatus::AlreadyInstalled);
                             detailed_results
                                 .push((id.to_string(), InstallResult::already_installed()));
+
+                            // Hooks may be up to date on disk but the agent still needs a
+                            // restart to load them — track for the restart warning below.
+                            if !options.dry_run {
+                                let pnames: Vec<String> = installer
+                                    .process_names()
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                if !pnames.is_empty()
+                                    && !agents_for_restart.iter().any(|(n, _)| n == name)
+                                {
+                                    agents_for_restart.push((name.to_string(), pnames));
+                                }
+                            }
                         }
                         Err(e) => {
                             let error_msg = e.to_string();
@@ -614,7 +629,7 @@ async fn async_run_install(
                         // Track restart detection for extras-only agents (e.g. JetBrains, VS Code)
                         if extras_changed
                             && !options.dry_run
-                            && !updated_agents.iter().any(|(n, _)| n == name)
+                            && !agents_for_restart.iter().any(|(n, _)| n == name)
                         {
                             let pnames: Vec<String> = installer
                                 .process_names()
@@ -622,7 +637,7 @@ async fn async_run_install(
                                 .map(|s| s.to_string())
                                 .collect();
                             if !pnames.is_empty() {
-                                updated_agents.push((name.to_string(), pnames));
+                                agents_for_restart.push((name.to_string(), pnames));
                             }
                         }
                     }
@@ -683,11 +698,12 @@ async fn async_run_install(
         println!("{}", paint("1", "  autter install-hooks --dry-run=false"));
     }
 
-    // Check for running agents that had hooks updated and warn about restart
-    if !options.dry_run && !updated_agents.is_empty() {
+    // Warn when agents that use hooks are running — they must be restarted for
+    // attribution to take effect, including when hooks were already up to date.
+    if !options.dry_run && !agents_for_restart.is_empty() {
         let mut any_running = false;
 
-        for (agent_name, pnames) in &updated_agents {
+        for (agent_name, pnames) in &agents_for_restart {
             let refs: Vec<&str> = pnames.iter().map(|s| s.as_str()).collect();
             let pids = find_running_pids(&refs);
             if !pids.is_empty() {
@@ -726,7 +742,16 @@ async fn async_run_install(
                 "This is expected — once you commit and start a fresh session, attribution will work correctly."
             );
             println!(
-                "If the issue persists, please open an issue at https://github.com/autter-dev/autter-cli/issues"
+                "If the issue persists, run 'autter doctor' (or 'autter debug' on older versions)."
+            );
+        } else if !agents_for_restart.is_empty() {
+            println!();
+            println!(
+                "{}",
+                paint(
+                    "33",
+                    "If any coding agent was open during hook setup, restart it now for AI attribution to take effect."
+                )
             );
         }
     }
@@ -772,7 +797,19 @@ fn warn_if_git_version_too_old() {
             let text = String::from_utf8_lossy(&o.stdout).into_owned();
             parse_git_version(&text)
         }
-        Err(_) => None,
+        Err(_) => {
+            eprintln!();
+            eprintln!(
+                "{}",
+                paint_err(
+                    "1;31",
+                    "WARNING: git not found — autter requires git to function."
+                )
+            );
+            eprintln!("Install git 2.22+ and re-run: autter install-hooks");
+            eprintln!();
+            return;
+        }
     };
 
     if let Some(v) = version {

@@ -101,6 +101,57 @@ async function verifyChecksum(buf, asset, tag) {
   }
 }
 
+function checkGit() {
+  try {
+    execFileSync('git', ['--version'], { encoding: 'utf8', timeout: 10_000, stdio: 'pipe' });
+  } catch {
+    throw new Error(
+      'git is required but not found. Install git 2.22 or newer, then re-run: npm install -g @autter/cli'
+    );
+  }
+}
+
+function checkLinuxGlibc() {
+  if (process.platform !== 'linux') return;
+  try {
+    const out = execFileSync('ldd', ['--version'], { encoding: 'utf8', timeout: 10_000 });
+    const match = out.match(/(\d+)\.(\d+)/);
+    if (!match) return;
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    if (major < 2 || (major === 2 && minor < 35)) {
+      throw new Error(
+        `Unsupported glibc version (${major}.${minor}). autter requires glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 36+). ` +
+          'On Ubuntu 20.04 / older WSL2, use a newer distro or run inside ubuntu:22.04 Docker.'
+      );
+    }
+  } catch (err) {
+    if (err.message?.includes('Unsupported glibc')) throw err;
+    // ldd missing — rely on post-download binary verify
+  }
+}
+
+function verifyBinaryRuns(bin) {
+  try {
+    const out = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 10_000 });
+    return out.trim().split(/\s+/)[0] || null;
+  } catch (err) {
+    const detail = err.stderr?.toString() || err.stdout?.toString() || err.message || String(err);
+    try {
+      fs.rmSync(bin, { force: true });
+    } catch {
+      // best effort
+    }
+    if (process.platform === 'linux' && detail.includes('GLIBC')) {
+      throw new Error(
+        `The autter binary could not run on this system (incompatible glibc).\n${detail}\n\n` +
+          'autter requires glibc 2.35+ (Ubuntu 22.04+). On Ubuntu 20.04 / older WSL2, use a newer distro or Docker.'
+      );
+    }
+    throw new Error(`The autter binary could not run on this system: ${detail}`);
+  }
+}
+
 // `autter --version` prints the bare version ("1.6.8", or "1.6.8 (debug)").
 function installedVersion(bin) {
   try {
@@ -188,6 +239,8 @@ async function ensureBinary() {
     }
   }
 
+  verifyBinaryRuns(dest);
+
   await reportInstallPing(tag);
   return { bin: dest, downloaded: true };
 }
@@ -197,6 +250,14 @@ async function ensureBinary() {
 async function main() {
   if (process.env.AUTTER_NPM_SKIP_DOWNLOAD === '1') {
     console.log('autter: AUTTER_NPM_SKIP_DOWNLOAD=1, skipping binary download');
+    return;
+  }
+
+  try {
+    checkGit();
+    checkLinuxGlibc();
+  } catch (err) {
+    console.warn(`autter: ${err.message}`);
     return;
   }
 

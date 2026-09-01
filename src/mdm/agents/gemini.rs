@@ -21,28 +21,42 @@ impl GeminiInstaller {
 
     /// Returns `(hooks_installed, hooks_up_to_date)` from a parsed settings value.
     /// `hooks_installed` = autter checkpoint command exists in ANY matcher block.
-    /// `hooks_up_to_date` = autter checkpoint command exists in the `"*"` catch-all block.
+    /// `hooks_up_to_date` = `tools.enableHooks` is true and autter checkpoints exist in
+    /// both the `BeforeTool` and `AfterTool` `"*"` catch-all blocks (AI attribution needs
+    /// the post-edit AfterTool hook).
     fn hook_status(settings: &Value) -> (bool, bool) {
-        let before_tool_blocks = settings
-            .get("hooks")
-            .and_then(|h| h.get("BeforeTool"))
-            .and_then(|v| v.as_array());
-
-        let Some(blocks) = before_tool_blocks else {
-            return (false, false);
-        };
+        let enable_hooks = settings
+            .get("tools")
+            .and_then(|t| t.get("enableHooks"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let mut hooks_installed = false;
-        let mut hooks_up_to_date = false;
+        for hook_type in &["BeforeTool", "AfterTool"] {
+            if Self::any_block_has_autter(settings, hook_type) {
+                hooks_installed = true;
+                break;
+            }
+        }
 
-        for block in blocks {
-            let is_catch_all = block
-                .get("matcher")
-                .and_then(|m| m.as_str())
-                .map(|m| m == GEMINI_CATCH_ALL_MATCHER)
-                .unwrap_or(false);
+        let hooks_up_to_date = enable_hooks
+            && Self::catch_all_has_autter(settings, "BeforeTool")
+            && Self::catch_all_has_autter(settings, "AfterTool");
 
-            let has_autter = block
+        (hooks_installed, hooks_up_to_date)
+    }
+
+    fn any_block_has_autter(settings: &Value, hook_type: &str) -> bool {
+        let Some(blocks) = settings
+            .get("hooks")
+            .and_then(|h| h.get(hook_type))
+            .and_then(|v| v.as_array())
+        else {
+            return false;
+        };
+
+        blocks.iter().any(|block| {
+            block
                 .get("hooks")
                 .and_then(|h| h.as_array())
                 .map(|hooks| {
@@ -53,17 +67,43 @@ impl GeminiInstaller {
                             .unwrap_or(false)
                     })
                 })
+                .unwrap_or(false)
+        })
+    }
+
+    fn catch_all_has_autter(settings: &Value, hook_type: &str) -> bool {
+        let Some(blocks) = settings
+            .get("hooks")
+            .and_then(|h| h.get(hook_type))
+            .and_then(|v| v.as_array())
+        else {
+            return false;
+        };
+
+        blocks.iter().any(|block| {
+            let is_catch_all = block
+                .get("matcher")
+                .and_then(|m| m.as_str())
+                .map(|m| m == GEMINI_CATCH_ALL_MATCHER)
                 .unwrap_or(false);
 
-            if has_autter {
-                hooks_installed = true;
-                if is_catch_all {
-                    hooks_up_to_date = true;
-                }
+            if !is_catch_all {
+                return false;
             }
-        }
 
-        (hooks_installed, hooks_up_to_date)
+            block
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(is_autter_checkpoint_command)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        })
     }
 
     fn install_hooks_at(
@@ -967,11 +1007,46 @@ mod tests {
 
     #[test]
     fn c2_autter_in_catch_all_returns_up_to_date() {
-        let cmd = expected_before_cmd();
-        let settings = json!({"hooks": {"BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]}});
+        let before_cmd = expected_before_cmd();
+        let after_cmd = expected_after_cmd();
+        let settings = json!({
+            "tools": {"enableHooks": true},
+            "hooks": {
+                "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": before_cmd}]}],
+                "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": after_cmd}]}]
+            }
+        });
         let (installed, up_to_date) = GeminiInstaller::hook_status(&settings);
         assert!(installed);
         assert!(up_to_date);
+    }
+
+    #[test]
+    fn c2b_before_tool_only_not_up_to_date() {
+        let cmd = expected_before_cmd();
+        let settings = json!({
+            "tools": {"enableHooks": true},
+            "hooks": {"BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]}
+        });
+        let (installed, up_to_date) = GeminiInstaller::hook_status(&settings);
+        assert!(installed);
+        assert!(!up_to_date);
+    }
+
+    #[test]
+    fn c2c_enable_hooks_disabled_not_up_to_date() {
+        let before_cmd = expected_before_cmd();
+        let after_cmd = expected_after_cmd();
+        let settings = json!({
+            "tools": {"enableHooks": false},
+            "hooks": {
+                "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": before_cmd}]}],
+                "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": after_cmd}]}]
+            }
+        });
+        let (installed, up_to_date) = GeminiInstaller::hook_status(&settings);
+        assert!(installed);
+        assert!(!up_to_date);
     }
 
     #[test]
