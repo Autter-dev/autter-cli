@@ -1,3 +1,4 @@
+use crate::authorship::guidance;
 use crate::error::AutterError;
 use crate::git::find_repository;
 use crate::git::notes_api::{
@@ -5,19 +6,7 @@ use crate::git::notes_api::{
 };
 use crate::git::repository::{CommitRange, Repository};
 
-const NO_AUTHORSHIP_DATA_MESSAGE: &str = "No authorship data found for this revision";
-
 pub fn handle_show(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Error: show requires a revision or range");
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-    }
-
-    if args.len() > 1 {
-        eprintln!("Error: show accepts exactly one revision or range");
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-    }
-
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
         Err(e) => {
@@ -25,6 +14,16 @@ pub fn handle_show(args: &[String]) {
             std::process::exit(1);
         }
     };
+
+    if args.is_empty() {
+        crate::commands::usage_hints::eprint_missing_show_args(&repo);
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+    }
+
+    if args.len() > 1 {
+        eprintln!("Error: show accepts exactly one revision or range");
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+    }
 
     if let Err(e) = show_authorship(&repo, &args[0]) {
         eprintln!("Failed to show authorship: {}", e);
@@ -35,7 +34,7 @@ pub fn handle_show(args: &[String]) {
 fn show_authorship(repo: &Repository, spec: &str) -> Result<(), AutterError> {
     let commits = resolve_commits(repo, spec)?;
     if commits.is_empty() {
-        println!("{}", NO_AUTHORSHIP_DATA_MESSAGE);
+        print!("{}", guidance::show_missing_data_message());
         return Ok(());
     }
 
@@ -65,7 +64,7 @@ fn show_authorship(repo: &Repository, spec: &str) -> Result<(), AutterError> {
                 if multiple_commits {
                     println!("{}", sha);
                 }
-                println!("{}", NO_AUTHORSHIP_DATA_MESSAGE);
+                print!("{}", guidance::show_missing_data_message());
             }
         }
     }

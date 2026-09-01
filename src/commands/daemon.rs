@@ -439,6 +439,7 @@ fn spawn_daemon_run_with_piped_stderr(
 
 fn handle_status(repo_working_dir: String) -> Result<(), String> {
     let config = daemon_config_from_env_or_default_paths()?;
+    let cloud_sync = crate::auth::notice::collect_cloud_sync_status();
 
     // Check if the path is inside a git repository before contacting the daemon.
     // When run outside a git repo, still check daemon health but skip the
@@ -449,6 +450,7 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
             "ok": true,
             "git_repo": false,
             "daemon_running": daemon_running,
+            "cloud_sync": cloud_sync,
         });
         println!(
             "{}",
@@ -458,8 +460,15 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
     }
 
     let request = ControlRequest::StatusFamily { repo_working_dir };
-    let response =
+    let daemon_response =
         send_control_request(&config.control_socket_path, &request).map_err(|e| e.to_string())?;
+    let response = serde_json::json!({
+        "ok": daemon_response.ok,
+        "seq": daemon_response.seq,
+        "data": daemon_response.data,
+        "error": daemon_response.error,
+        "cloud_sync": cloud_sync,
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&response).map_err(|e| e.to_string())?
@@ -774,6 +783,9 @@ fn print_help() {
     eprintln!("  autter bg start");
     eprintln!("  autter bg run");
     eprintln!("  autter bg status [--repo <path>]");
+    eprintln!();
+    eprintln!("  `bg status` JSON includes a `cloud_sync` object (queue depth,");
+    eprintln!("  upload health). See also `autter sync status`.");
     eprintln!("  autter bg shutdown [--hard]");
     eprintln!("  autter bg restart [--hard]");
     eprintln!("  autter bg tail [-n <lines>] [--full] [-f | --follow]");

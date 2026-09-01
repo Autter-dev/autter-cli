@@ -458,6 +458,37 @@ impl InternalDatabase {
         Ok(deleted)
     }
 
+    /// Release CAS records after an upload failure and schedule a bounded retry.
+    /// This prevents failed records from remaining stuck in `processing` for the
+    /// ten-minute stale-lock timeout after every transient network error.
+    pub fn mark_cas_failed(
+        &mut self,
+        hashes: &[String],
+        error: &str,
+        retry_delay_secs: i64,
+    ) -> Result<usize, AutterError> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+        let sql = format!(
+            "UPDATE cas_sync_queue
+             SET status = 'pending', attempts = attempts + 1,
+                 last_sync_error = ?, last_sync_at = ?, next_retry_at = ?,
+                 processing_started_at = NULL
+             WHERE hash IN ({})",
+            placeholders.join(",")
+        );
+        let next_retry_at = now.saturating_add(retry_delay_secs.max(0));
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&error, &now, &next_retry_at];
+        params.extend(hashes.iter().map(|hash| hash as &dyn rusqlite::ToSql));
+        Ok(self.conn.execute(&sql, params.as_slice())?)
+    }
+
     /// Get cached CAS messages by hash
     pub fn get_cas_cache(&self, hash: &str) -> Result<Option<String>, AutterError> {
         let result = self.conn.query_row(
@@ -1010,6 +1041,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(error, "test error");
+    }
+
+    #[test]
+    fn test_mark_cas_failed_releases_processing_lock() {
+        let (mut db, _temp_dir) = create_test_db();
+
+        db.enqueue_cas_object(&serde_json::json!({"test": "hash-fail"}), None)
+            .unwrap();
+        let batch = db.dequeue_cas_batch(10).unwrap();
+        assert_eq!(batch.len(), 1);
+        let hash = batch[0].hash.clone();
+
+        let updated = db
+            .mark_cas_failed(std::slice::from_ref(&hash), "upload failed", 60)
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT status FROM cas_sync_queue WHERE hash = ?",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+
+        let processing_started_at: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT processing_started_at FROM cas_sync_queue WHERE hash = ?",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(processing_started_at.is_none());
+
+        let batch = db.dequeue_cas_batch(10).unwrap();
+        assert!(
+            batch.is_empty(),
+            "failed CAS rows should respect next_retry_at before re-claim"
+        );
     }
 
     #[test]

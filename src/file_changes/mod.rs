@@ -90,6 +90,13 @@ pub fn flush_pending_to_cloud() {
         backend_url.clone(),
     )));
     if !default_client.is_logged_in() && !default_client.has_api_key() {
+        crate::daemon::telemetry_worker::note_durable_sync_unauthenticated(
+            "file_changes",
+            pending_count,
+        );
+        if let Some(issue) = default_client.auth_issue() {
+            tracing::warn!(reason = %issue, pending = pending_count, "file-changes: sync authentication unavailable");
+        }
         return;
     }
 
@@ -175,6 +182,10 @@ pub fn flush_pending_to_cloud() {
                         .push(row.file_path.clone());
                 }
 
+                if !by_repo.is_empty() {
+                    crate::daemon::telemetry_worker::note_durable_sync_authenticated();
+                }
+
                 if let Ok(db) = FileChangesDatabase::global()
                     && let Ok(mut lock) = db.lock()
                 {
@@ -198,6 +209,7 @@ pub fn flush_pending_to_cloud() {
                 }
             }
             Err(e) => {
+                crate::auth::notice::record_sync_upload_stalled();
                 mark_batch_failed(&batch, &e.to_string(), 300);
             }
         }

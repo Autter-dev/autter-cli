@@ -30,26 +30,34 @@ pub fn handle_whoami(args: &[String]) {
         println!("API key: {}", masked);
     }
 
+    let mut auth_failed = false;
     match &auth.state {
         AuthState::LoggedOut => {
             println!("Auth state: logged out");
             if api_ctx.api_key.is_none() {
-                std::process::exit(1);
+                auth_failed = true;
             }
         }
         AuthState::LoggedIn => {
             println!("Auth state: logged in");
         }
+        AuthState::SyncBlocked => {
+            println!("Auth state: cloud sync blocked (stored session could not authenticate)");
+            println!("Fix: run `autter login`, then `autter bg restart`");
+            if api_ctx.api_key.is_none() {
+                auth_failed = true;
+            }
+        }
         AuthState::RefreshExpired => {
             println!("Auth state: credentials expired (refresh token expired)");
             if api_ctx.api_key.is_none() {
-                std::process::exit(1);
+                auth_failed = true;
             }
         }
         AuthState::Error(err) => {
             println!("Auth state: error ({})", err);
             if api_ctx.api_key.is_none() {
-                std::process::exit(1);
+                auth_failed = true;
             }
         }
     }
@@ -95,6 +103,24 @@ pub fn handle_whoami(args: &[String]) {
             let role = org.role.unwrap_or_else(|| "<unknown-role>".to_string());
             println!("  - {} ({}) [{}] role={}", org_slug, org_name, org_id, role);
         }
+    }
+
+    if let Some(line) = crate::auth::notice::format_cloud_sync_status_line() {
+        println!("{line}");
+    } else {
+        let pending = crate::auth::notice::pending_sync_counts();
+        if pending.total() > 0 {
+            println!(
+                "Pending cloud sync: {} (upload in progress)",
+                pending.summary()
+            );
+        } else {
+            println!("Pending cloud sync: none");
+        }
+    }
+
+    if auth_failed {
+        std::process::exit(1);
     }
 }
 

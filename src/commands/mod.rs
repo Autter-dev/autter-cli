@@ -26,8 +26,10 @@ pub mod show;
 pub mod show_prompt;
 pub mod squash_authorship;
 pub mod status;
+pub mod sync;
 pub mod telemetry;
 pub mod upgrade;
+pub mod usage_hints;
 pub mod whoami;
 
 /// Process exit codes for `autter` subcommands.

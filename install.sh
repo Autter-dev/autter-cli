@@ -64,8 +64,8 @@ fi
 PINNED_VERSION="__VERSION_PLACEHOLDER__"
 VERSION_SENTINEL='__VERSION_''PLACEHOLDER__'
 
-# Pipe-separated "sha256  filename" entries in release copies; checksum
-# verification is skipped when left as the sentinel.
+# Pipe-separated "sha256  filename" entries in release copies. Public installer
+# copies replace the sentinel by downloading the release's checksums.txt.
 EMBEDDED_CHECKSUMS="__CHECKSUMS_PLACEHOLDER__"
 CHECKSUMS_SENTINEL='__CHECKSUMS_''PLACEHOLDER__'
 
@@ -93,9 +93,13 @@ verify_checksum() {
     local file="$1"
     local binary_name="$2"
 
-    # Skip verification if no checksums are embedded
-    if [ "$EMBEDDED_CHECKSUMS" = "$CHECKSUMS_SENTINEL" ]; then
+    # Local developer installs do not download a release artifact.
+    if [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
         return 0
+    fi
+
+    if [ "$EMBEDDED_CHECKSUMS" = "$CHECKSUMS_SENTINEL" ]; then
+        error "Release checksums were not loaded; refusing to install $binary_name"
     fi
 
     # Extract expected checksum for this binary
@@ -104,7 +108,7 @@ verify_checksum() {
     IFS='|' read -ra CHECKSUM_ENTRIES <<< "$EMBEDDED_CHECKSUMS"
     IFS="$old_ifs"
     for entry in "${CHECKSUM_ENTRIES[@]}"; do
-        if [[ "$entry" =~ ^[[:xdigit:]]+[[:space:]]+$binary_name$ ]]; then
+        if [[ "$entry" =~ ^[[:xdigit:]]{64}[[:space:]]+$binary_name$ ]]; then
             expected=$(echo "$entry" | awk '{print $1}')
             break
         fi
@@ -121,10 +125,12 @@ verify_checksum() {
     elif command -v shasum >/dev/null 2>&1; then
         actual=$(shasum -a 256 "$file" | awk '{print $1}')
     else
-        warn "Neither sha256sum nor shasum available, skipping checksum verification"
-        return 0
+        rm -f "$file" 2>/dev/null || true
+        error "Neither sha256sum nor shasum is available; refusing to install an unverified executable"
     fi
 
+    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+    actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
     if [ "$expected" != "$actual" ]; then
         rm -f "$file" 2>/dev/null || true
         error "Checksum verification failed for $binary_name\nExpected: $expected\nActual:   $actual"
@@ -323,9 +329,33 @@ elif [ -n "${AUTTER_RELEASE_TAG:-}" ] && [ "${AUTTER_RELEASE_TAG:-}" != "latest"
     RELEASE_TAG="$AUTTER_RELEASE_TAG"
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
 else
-    # Default to latest
+    # Resolve the latest-release redirect to a concrete tag below.
     RELEASE_TAG="latest"
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}"
+fi
+
+# Resolve a specific release and load the checksum file produced by release.yml
+# before downloading the executable. A missing/malformed checksum is fatal.
+if [ -z "${AUTTER_LOCAL_BINARY:-}" ]; then
+    CHECKSUMS_TMP=$(mktemp "${TMPDIR:-/tmp}/autter-checksums.XXXXXX") || error "Failed to create checksum temporary file"
+    if [ "$RELEASE_TAG" = "latest" ]; then
+        if ! LATEST_RELEASE_URL=$(curl --fail --location --silent --show-error \
+            --output /dev/null --write-out '%{url_effective}' "https://github.com/${REPO}/releases/latest"); then
+            rm -f "$CHECKSUMS_TMP" 2>/dev/null || true
+            error "Failed to resolve the latest release"
+        fi
+        RELEASE_TAG=$(printf '%s' "$LATEST_RELEASE_URL" | sed -n 's#^.*/releases/tag/\([^/?]*\).*$#\1#p')
+        [ -n "$RELEASE_TAG" ] || { rm -f "$CHECKSUMS_TMP"; error "Failed to resolve latest release to a specific version"; }
+    fi
+    CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/checksums.txt"
+    if ! curl --fail --location --silent --show-error \
+        --output "$CHECKSUMS_TMP" "$CHECKSUMS_URL"; then
+        rm -f "$CHECKSUMS_TMP" 2>/dev/null || true
+        error "Failed to download release checksums"
+    fi
+    EMBEDDED_CHECKSUMS=$(awk 'NF { printf "%s%s", separator, $0; separator="|" }' "$CHECKSUMS_TMP")
+    rm -f "$CHECKSUMS_TMP"
+    [ -n "$EMBEDDED_CHECKSUMS" ] || error "Release checksums are empty"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
 fi
 
 # ============================================================
@@ -408,7 +438,7 @@ if [ ! -s "$TMP_FILE" ]; then
     error "Downloaded file is empty"
 fi
 
-# Verify checksum if embedded (release builds only)
+# Verify before the executable is moved into place or run.
 verify_checksum "$TMP_FILE" "$BINARY_NAME"
 
 mv -f "$TMP_FILE" "${INSTALL_DIR}/autter"

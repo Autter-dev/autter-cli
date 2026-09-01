@@ -346,9 +346,12 @@ fn is_trace_payload(payload: &Value) -> bool {
 ///   not-found kind ("The system cannot find the path specified").
 fn is_missing_working_dir_error(error: &AutterError) -> bool {
     match error {
-        AutterError::GitCliError { code: Some(128), stderr, .. } => {
-            stderr.contains("No such file or directory")
-                || stderr.contains("not a git repository")
+        AutterError::GitCliError {
+            code: Some(128),
+            stderr,
+            ..
+        } => {
+            stderr.contains("No such file or directory") || stderr.contains("not a git repository")
         }
         AutterError::IoError(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
         _ => false,

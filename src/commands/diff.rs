@@ -200,10 +200,8 @@ pub struct DiffBuildArtifacts {
 // ============================================================================
 
 pub fn handle_diff(repo: &Repository, args: &[String]) -> Result<(), AutterError> {
-    if args.is_empty() {
-        eprintln!("Error: diff requires a commit or commit range argument");
-        eprintln!("Usage: autter diff <commit>");
-        eprintln!("       autter diff <commit1>..<commit2>");
+    if crate::commands::usage_hints::diff_args_missing_commit(args) {
+        crate::commands::usage_hints::eprint_missing_diff_args(repo);
         std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 
@@ -402,14 +400,23 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
             serde_json::to_string(&diff_json)
                 .map_err(|e| AutterError::Generic(format!("Failed to serialize JSON: {}", e)))?
         }
-        DiffFormat::GitCompatibleTerminal => format_annotated_diff(
-            repo,
-            &from_commit,
-            &to_commit,
-            &artifacts.attributions,
-            &artifacts.humans,
-            &artifacts.included_files,
-        )?,
+        DiffFormat::GitCompatibleTerminal => {
+            let mut output = format_annotated_diff(
+                repo,
+                &from_commit,
+                &to_commit,
+                &artifacts.attributions,
+                &artifacts.humans,
+                &artifacts.included_files,
+            )?;
+            let has_missing_data = artifacts.attributions.iter().any(|(key, attribution)| {
+                key.side == LineSide::New && matches!(attribution, Attribution::NoData)
+            });
+            if has_missing_data {
+                output.push_str(&crate::authorship::guidance::diff_missing_data_footer());
+            }
+            output
+        }
     };
 
     Ok(output)

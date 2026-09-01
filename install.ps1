@@ -173,17 +173,21 @@ function Verify-Checksum {
         [Parameter(Mandatory = $true)][string]$BinaryName
     )
 
-    # Skip verification if no checksums are embedded
-    if ($EmbeddedChecksums -eq $ChecksumsSentinel) {
+    # Local developer installs do not download a release artifact.
+    if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
         return
+    }
+
+    if ($EmbeddedChecksums -eq $ChecksumsSentinel) {
+        Write-ErrorAndExit "Release checksums were not loaded; refusing to install $BinaryName"
     }
 
     # Extract expected checksum for this binary
     $expected = $null
     $entries = $EmbeddedChecksums -split '\|'
     foreach ($entry in $entries) {
-        if ($entry -match "^([0-9a-fA-F]+)\s+$([regex]::Escape($BinaryName))$") {
-            $expected = $Matches[1]
+        if ($entry -match "^([0-9a-fA-F]{64})\s+$([regex]::Escape($BinaryName))$") {
+            $expected = $Matches[1].ToLowerInvariant()
             break
         }
     }
@@ -235,8 +239,8 @@ if ($Repo -eq $RepoSentinel) {
 $PinnedVersion = '__VERSION_PLACEHOLDER__'
 $VersionSentinel = '__VERSION_' + 'PLACEHOLDER__'
 
-# Pipe-separated "sha256  filename" entries in release copies; checksum
-# verification is skipped when left as the sentinel.
+# Pipe-separated "sha256  filename" entries in release copies. Public installer
+# copies replace the sentinel by downloading the release's checksums.txt.
 $EmbeddedChecksums = '__CHECKSUMS_PLACEHOLDER__'
 $ChecksumsSentinel = '__CHECKSUMS_' + 'PLACEHOLDER__'
 
@@ -349,10 +353,51 @@ if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
     $downloadUrlExe = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName.exe"
     $downloadUrlNoExt = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName"
 } else {
-    # Default to latest
+    # Resolve the latest-release redirect to a concrete tag below.
     $releaseTag = 'latest'
-    $downloadUrlExe = "https://github.com/$Repo/releases/latest/download/$binaryName.exe"
-    $downloadUrlNoExt = "https://github.com/$Repo/releases/latest/download/$binaryName"
+}
+
+# Resolve a specific release and load the checksum file produced by release.yml
+# before downloading the executable. A missing/malformed checksum is fatal.
+if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
+    if ($releaseTag -eq 'latest') {
+        try {
+            $latestResponse = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -Method Head -UseBasicParsing -ErrorAction Stop
+            $latestResponseUriProperty = $latestResponse.BaseResponse.PSObject.Properties['ResponseUri']
+            $latestUrl = if ($latestResponseUriProperty -and $latestResponseUriProperty.Value) {
+                $latestResponse.BaseResponse.ResponseUri.AbsoluteUri
+            } else {
+                $latestResponse.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+            }
+            if ($latestUrl -notmatch '/releases/tag/([^/?]+)') {
+                Write-ErrorAndExit 'Failed to resolve latest release to a specific version'
+            }
+            $releaseTag = $Matches[1]
+        } catch {
+            Write-ErrorAndExit "Failed to resolve the latest release: $($_.Exception.Message)"
+        }
+    }
+    $checksumsUrl = "https://github.com/$Repo/releases/download/$releaseTag/checksums.txt"
+    $checksumsTmp = [IO.Path]::GetTempFileName()
+    try {
+        $oldProgressPreference = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+            $null = Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsTmp -UseBasicParsing -ErrorAction Stop
+        } finally {
+            $ProgressPreference = $oldProgressPreference
+        }
+        $EmbeddedChecksums = ((Get-Content -LiteralPath $checksumsTmp) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '|'
+        if ([string]::IsNullOrWhiteSpace($EmbeddedChecksums)) {
+            Write-ErrorAndExit 'Release checksums are empty'
+        }
+    } catch {
+        Write-ErrorAndExit "Failed to download release checksums: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $checksumsTmp
+    }
+    $downloadUrlExe = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName.exe"
+    $downloadUrlNoExt = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName"
 }
 
 # ============================================================
@@ -543,7 +588,7 @@ try {
     Write-ErrorAndExit 'Download failed'
 }
 
-# Verify checksum if embedded (release builds only)
+# Verify before the executable is moved into place or run.
 Verify-Checksum -File $tmpFile -BinaryName $downloadedBinaryName
 
 $finalExe = Join-Path $installDir 'autter.exe'

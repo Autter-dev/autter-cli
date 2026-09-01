@@ -326,6 +326,12 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
     // Drain the durable queues. Skipped while the auth backoff is active so an
     // expired login doesn't trigger a token-refresh network call on every tick.
     if !durable_sync_auth_backoff_active() {
+        // Metrics that failed while offline or while the org database was
+        // unavailable must be replayed automatically. Historically this queue
+        // was only drained by a hidden manual command, which could leave users
+        // with gigabytes of telemetry that never reached the dashboard.
+        flush_stored_metrics();
+
         // Drain the durable CAS queue (the post-commit transcript bridge enqueues
         // here). This reads directly from the internal DB, mirroring flush_notes.
         flush_cas_queue();
@@ -333,8 +339,113 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
         // Flush pending notes (reads directly from notes-db; no-op when kind != Http).
         flush_notes();
 
+        // Commit-level provenance summaries are a separate, query-friendly
+        // org-database projection. They are queued before the post-commit path
+        // attempts a live upload, then replayed here until the upsert succeeds.
+        flush_commit_summaries();
+
         // Flush pending file change aggregates to the org database.
         crate::file_changes::flush_pending_to_cloud();
+    }
+}
+
+/// Drain a bounded batch of durable commit provenance summaries.
+fn flush_commit_summaries() {
+    use crate::api::org_db::{self, CommitAuthorshipSummaryRow};
+
+    let db = match crate::notes::db::NotesDatabase::global() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(%error, "commit summaries: failed to open durable queue");
+            return;
+        }
+    };
+    let pending = db
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .count_pending_commit_summaries()
+        .unwrap_or(0);
+    if pending == 0 {
+        return;
+    }
+
+    // Check the home token before claiming queue rows. Repo-specific rows may
+    // mint a different org token below, but no hosted upload is possible when
+    // the base login itself is unavailable.
+    let home_client = ApiClient::new(ApiContext::new(None));
+    if !home_client.is_logged_in() && !home_client.has_api_key() {
+        note_durable_sync_unauthenticated("commit summaries", pending);
+        if let Some(issue) = home_client.auth_issue() {
+            tracing::warn!(reason = %issue, pending, "commit summaries: sync authentication unavailable");
+        }
+        return;
+    }
+
+    let rows = match db
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .dequeue_commit_summaries(50)
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "commit summaries: failed to dequeue durable rows");
+            return;
+        }
+    };
+
+    for pending_row in rows {
+        let row = match serde_json::from_str::<CommitAuthorshipSummaryRow>(&pending_row.payload) {
+            Ok(row) => row,
+            Err(error) => {
+                let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = lock.mark_commit_summary_failed(
+                    &pending_row.commit_sha,
+                    &format!("invalid queued payload: {error}"),
+                );
+                tracing::warn!(commit_sha = %pending_row.commit_sha, %error, "commit summaries: invalid queued payload retained");
+                continue;
+            }
+        };
+
+        let client = if let Some(org) = row
+            .repo_url
+            .as_deref()
+            .and_then(crate::api::client::resolve_org_for_repo_cached)
+        {
+            match crate::api::client::access_token_for_org(&org) {
+                Some(token) => ApiClient::new(ApiContext::with_auth(None, token)),
+                None => {
+                    let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let _ = lock.mark_commit_summary_failed(
+                        &pending_row.commit_sha,
+                        "could not mint org-scoped token",
+                    );
+                    continue;
+                }
+            }
+        } else {
+            ApiClient::new(ApiContext::new(None))
+        };
+
+        let result = client.org_identity().and_then(|identity| {
+            org_db::upsert_commit_authorship_summary(&identity, &row, &get_or_create_distinct_id())
+        });
+        let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match result {
+            Ok(()) => {
+                if let Err(error) = lock.mark_commit_summary_synced(&pending_row.commit_sha) {
+                    tracing::warn!(commit_sha = %pending_row.commit_sha, %error, "commit summaries: uploaded row remains queued");
+                } else {
+                    note_durable_sync_authenticated();
+                }
+            }
+            Err(error) => {
+                let _ =
+                    lock.mark_commit_summary_failed(&pending_row.commit_sha, &error.to_string());
+                note_durable_sync_upload_failed();
+                tracing::warn!(commit_sha = %pending_row.commit_sha, %error, "commit summaries: upload failed; retained for retry");
+            }
+        }
     }
 }
 
@@ -355,7 +466,7 @@ static DURABLE_SYNC_AUTH_RETRY_AFTER: std::sync::atomic::AtomicI64 =
 /// Unix timestamp of the last "sync blocked" warning, to rate-limit it.
 static DURABLE_SYNC_LAST_AUTH_WARN: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
-const DURABLE_SYNC_AUTH_RETRY_SECS: i64 = 300;
+const DURABLE_SYNC_AUTH_RETRY_SECS: i64 = 60;
 const DURABLE_SYNC_AUTH_WARN_SECS: i64 = 1800;
 
 fn unix_now_secs() -> i64 {
@@ -371,7 +482,7 @@ fn durable_sync_auth_backoff_active() -> bool {
 
 /// Record that a durable-queue flush found pending work but no valid auth.
 /// Arms the retry backoff and emits a rate-limited warning.
-fn note_durable_sync_unauthenticated(queue: &str, pending: i64) {
+pub(crate) fn note_durable_sync_unauthenticated(queue: &str, pending: i64) {
     let now = unix_now_secs();
     DURABLE_SYNC_AUTH_RETRY_AFTER.store(
         now + DURABLE_SYNC_AUTH_RETRY_SECS,
@@ -392,12 +503,21 @@ fn note_durable_sync_unauthenticated(queue: &str, pending: i64) {
 }
 
 /// Record a successful auth check so the backoff clears immediately.
-fn note_durable_sync_authenticated() {
+pub(crate) fn note_durable_sync_authenticated() {
     DURABLE_SYNC_AUTH_RETRY_AFTER.store(0, std::sync::atomic::Ordering::Relaxed);
     crate::auth::notice::clear_sync_auth_blocked();
 }
 
+/// Record that a durable-queue upload failed after auth was available.
+pub(crate) fn note_durable_sync_upload_failed() {
+    crate::auth::notice::record_sync_upload_stalled();
+}
+
 fn flush_metrics(events: &[MetricEvent]) {
+    if durable_sync_auth_backoff_active() {
+        store_metrics_in_db(events);
+        return;
+    }
     let context = ApiContext::new(None);
     let client = ApiClient::new(context);
 
@@ -412,12 +532,111 @@ fn flush_metrics(events: &[MetricEvent]) {
     for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
         if should_upload && !upload_failed && std::time::Instant::now() < deadline {
             let batch = MetricsBatch::new(chunk.to_vec());
-            if client.upload_metrics(&batch).is_ok() {
-                continue;
+            match client.upload_metrics(&batch) {
+                Ok(_) => {
+                    note_durable_sync_authenticated();
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "metrics: live upload failed; queued for retry");
+                    note_durable_sync_upload_failed();
+                    upload_failed = true;
+                }
             }
-            upload_failed = true;
         }
         store_metrics_in_db(chunk);
+    }
+}
+
+/// Replay one bounded batch from the durable metrics queue. A bounded batch on
+/// every three-second daemon tick drains backlogs steadily without monopolizing
+/// the worker or delaying new checkpoints.
+fn flush_stored_metrics() {
+    let db = match MetricsDatabase::global() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(%error, "metrics: failed to open durable queue");
+            return;
+        }
+    };
+    let pending = db
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .count()
+        .unwrap_or(0);
+    if pending == 0 {
+        return;
+    }
+
+    let client = ApiClient::new(ApiContext::new(None));
+    if !client.is_logged_in() && !client.has_api_key() {
+        note_durable_sync_unauthenticated("metrics", pending as i64);
+        if let Some(issue) = client.auth_issue() {
+            tracing::warn!(reason = %issue, pending, "metrics: durable sync authentication unavailable");
+        }
+        return;
+    }
+
+    let records = match db
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_batch(MAX_METRICS_PER_ENVELOPE)
+    {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(%error, "metrics: failed to read durable queue");
+            return;
+        }
+    };
+
+    let mut events = Vec::with_capacity(records.len());
+    let mut uploaded_ids = Vec::with_capacity(records.len());
+    let mut invalid_ids = Vec::new();
+    for record in records {
+        match serde_json::from_str::<MetricEvent>(&record.event_json) {
+            Ok(event) => {
+                events.push(event);
+                uploaded_ids.push(record.id);
+            }
+            Err(error) => {
+                tracing::warn!(record_id = record.id, %error, "metrics: discarding invalid queued event");
+                invalid_ids.push(record.id);
+            }
+        }
+    }
+
+    if !invalid_ids.is_empty() {
+        let _ = db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delete_records(&invalid_ids);
+    }
+    if events.is_empty() {
+        return;
+    }
+
+    match client.upload_metrics(&MetricsBatch::new(events)) {
+        Ok(response) => {
+            // Per-row errors are validation failures and cannot become valid on
+            // retry. They are already reported by upload_metrics; removing the
+            // whole idempotent batch prevents one malformed event from blocking
+            // the queue forever.
+            let _ = db
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .delete_records(&uploaded_ids);
+            note_durable_sync_authenticated();
+            tracing::info!(
+                uploaded = uploaded_ids.len(),
+                rejected = response.errors.len(),
+                remaining = pending.saturating_sub(uploaded_ids.len()),
+                "metrics: replayed durable queue batch"
+            );
+        }
+        Err(error) => {
+            note_durable_sync_upload_failed();
+            tracing::warn!(%error, pending, "metrics: durable queue upload failed; retained for retry");
+        }
     }
 }
 
@@ -435,10 +654,11 @@ fn store_metrics_in_db(events: &[MetricEvent]) {
         return;
     }
 
-    if let Ok(db) = MetricsDatabase::global()
-        && let Ok(mut db_lock) = db.lock()
-    {
-        let _ = db_lock.insert_events(&event_jsons);
+    if let Ok(db) = MetricsDatabase::global() {
+        let mut db_lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = db_lock.insert_events(&event_jsons) {
+            tracing::error!(%error, count = event_jsons.len(), "metrics: failed to persist retry queue");
+        }
     }
 }
 
@@ -677,9 +897,11 @@ pub fn flush_notes() {
 
     if !client.is_logged_in() && !client.has_api_key() {
         note_durable_sync_unauthenticated("notes", pending_count);
+        if let Some(issue) = client.auth_issue() {
+            tracing::warn!(reason = %issue, pending = pending_count, "notes: sync authentication unavailable");
+        }
         return;
     }
-    note_durable_sync_authenticated();
 
     // Dequeue up to 50 pending notes.
     let pending = {
@@ -750,6 +972,9 @@ pub fn flush_notes() {
         let request = NotesUploadRequest { entries };
         match group_client.upload_notes(request) {
             Ok(resp) => {
+                if resp.success_count > 0 {
+                    note_durable_sync_authenticated();
+                }
                 tracing::debug!(
                     success = resp.success_count,
                     failure = resp.failure_count,
@@ -777,6 +1002,7 @@ pub fn flush_notes() {
                 }
             }
             Err(e) => {
+                note_durable_sync_upload_failed();
                 tracing::warn!(%e, "notes: upload error");
                 if let Ok(db) = crate::notes::db::NotesDatabase::global()
                     && let Ok(mut lock) = db.lock()
@@ -837,6 +1063,7 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(%e, "telemetry: CAS parse error");
+                mark_cas_upload_failed(std::slice::from_ref(&record.hash), &e.to_string());
                 continue;
             }
         };
@@ -863,20 +1090,50 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
             objects: chunk.to_vec(),
         };
         match client.upload_cas(request) {
-            Ok(_response) => {
+            Ok(response) => {
+                let successful_hashes: Vec<String> = response
+                    .results
+                    .iter()
+                    .filter(|result| result.status == "ok")
+                    .map(|result| result.hash.clone())
+                    .collect();
                 // Delete successfully uploaded records from the internal DB queue
                 // so they don't accumulate as stale entries.
-                if let Ok(db) = crate::authorship::internal_db::InternalDatabase::global()
+                if !successful_hashes.is_empty()
+                    && let Ok(db) = crate::authorship::internal_db::InternalDatabase::global()
                     && let Ok(mut db_lock) = db.lock()
                 {
-                    let _ = db_lock.delete_cas_by_hashes(&hashes);
+                    let _ = db_lock.delete_cas_by_hashes(&successful_hashes);
+                    note_durable_sync_authenticated();
                 }
-                tracing::debug!(count = chunk.len(), "telemetry: uploaded CAS objects");
+                let failed_hashes: Vec<String> = response
+                    .results
+                    .iter()
+                    .filter(|result| result.status != "ok")
+                    .map(|result| result.hash.clone())
+                    .collect();
+                if !failed_hashes.is_empty() {
+                    mark_cas_upload_failed(&failed_hashes, "org database rejected CAS object");
+                }
+                tracing::debug!(
+                    uploaded = successful_hashes.len(),
+                    failed = hashes.len().saturating_sub(successful_hashes.len()),
+                    "telemetry: uploaded CAS objects"
+                );
             }
             Err(e) => {
+                mark_cas_upload_failed(&hashes, &e.to_string());
                 tracing::warn!(%e, "telemetry: CAS upload error");
             }
         }
+    }
+}
+
+fn mark_cas_upload_failed(hashes: &[String], error: &str) {
+    note_durable_sync_upload_failed();
+    if let Ok(db) = crate::authorship::internal_db::InternalDatabase::global() {
+        let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = lock.mark_cas_failed(hashes, error, DURABLE_SYNC_AUTH_RETRY_SECS);
     }
 }
 
@@ -903,11 +1160,14 @@ fn flush_cas_queue() {
 
     // Don't lock records as `processing` if we can't upload them anyway — that
     // would just churn the queue through the 10-minute stale-lock recovery.
-    if !cas_client().1 {
+    let (auth_client, enabled) = cas_client();
+    if !enabled {
         note_durable_sync_unauthenticated("cas_transcripts", pending);
+        if let Some(issue) = auth_client.auth_issue() {
+            tracing::warn!(reason = %issue, pending, "cas: sync authentication unavailable");
+        }
         return;
     }
-    note_durable_sync_authenticated();
 
     // Bound the number of batches per tick so a large backlog can't monopolize
     // the flush loop; the remainder is picked up on subsequent ticks.

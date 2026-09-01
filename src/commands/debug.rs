@@ -326,6 +326,10 @@ fn build_debug_report(options: DebugOptions) -> String {
         AuthState::LoggedIn => {
             let _ = writeln!(out, "Status: logged in");
         }
+        AuthState::SyncBlocked => {
+            let _ = writeln!(out, "Status: cloud sync blocked");
+            let _ = writeln!(out, "  fix: run `autter login`, then `autter bg restart`");
+        }
         AuthState::RefreshExpired => {
             let _ = writeln!(out, "Status: credentials expired (refresh token expired)");
             let _ = writeln!(out, "  fix: run `autter login` to sign in again");
@@ -356,7 +360,7 @@ fn build_debug_report(options: DebugOptions) -> String {
         let _ = writeln!(out, "User ID: {}", user_id);
     } else if matches!(
         &auth_info.state,
-        AuthState::LoggedIn | AuthState::RefreshExpired
+        AuthState::LoggedIn | AuthState::SyncBlocked | AuthState::RefreshExpired
     ) {
         let _ = writeln!(out, "User ID: <unavailable>");
     }
@@ -364,7 +368,7 @@ fn build_debug_report(options: DebugOptions) -> String {
         let _ = writeln!(out, "Email: {}", email);
     } else if matches!(
         &auth_info.state,
-        AuthState::LoggedIn | AuthState::RefreshExpired
+        AuthState::LoggedIn | AuthState::SyncBlocked | AuthState::RefreshExpired
     ) {
         let _ = writeln!(out, "Email: <unavailable>");
     }
@@ -372,7 +376,7 @@ fn build_debug_report(options: DebugOptions) -> String {
         let _ = writeln!(out, "Name: {}", name);
     } else if matches!(
         &auth_info.state,
-        AuthState::LoggedIn | AuthState::RefreshExpired
+        AuthState::LoggedIn | AuthState::SyncBlocked | AuthState::RefreshExpired
     ) {
         let _ = writeln!(out, "Name: <unavailable>");
     }
@@ -393,6 +397,8 @@ fn build_debug_report(options: DebugOptions) -> String {
             );
         }
     }
+    let pending = crate::auth::notice::pending_sync_counts();
+    let _ = writeln!(out, "Pending cloud sync: {}", pending.summary());
     let _ = writeln!(out);
 
     let _ = writeln!(out, "== Git Environment ==");

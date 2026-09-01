@@ -18,6 +18,7 @@
 //! that fails on a dropped connection transparently reconnects once.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -204,7 +205,11 @@ fn connect(org_db_url: &str) -> Result<Client, AutterError> {
     let tls = native_tls::TlsConnector::new()
         .map_err(|e| AutterError::Generic(format!("failed to build TLS connector: {e}")))?;
     let connector = postgres_native_tls::MakeTlsConnector::new(tls);
-    let mut client = Client::connect(org_db_url, connector)
+    let mut pg_config = postgres::Config::from_str(org_db_url)
+        .map_err(|e| AutterError::Generic(format!("invalid org database URL: {e}")))?;
+    pg_config.connect_timeout(Duration::from_secs(10));
+    let mut client = pg_config
+        .connect(connector)
         .map_err(|e| AutterError::Generic(format!("failed to connect to org database: {e}")))?;
     client
         .batch_execute(SCHEMA)
@@ -246,15 +251,24 @@ fn get_or_connect(org_db_url: &str) -> Result<Arc<Mutex<Client>>, AutterError> {
 /// so we discard the connection and redial rather than reuse the same socket.
 fn run<T>(
     org_db_url: &str,
-    op: impl FnOnce(&mut Client) -> Result<T, postgres::Error>,
+    mut op: impl FnMut(&mut Client) -> Result<T, postgres::Error>,
 ) -> Result<T, AutterError> {
     let arc = get_or_connect(org_db_url)?;
 
-    // Reuse the cached connection only if we can lock it and it still round-trips.
+    // Reuse the cached connection only if we can lock it and it still
+    // round-trips. If the operation itself discovers a dropped connection,
+    // replay it once on a fresh client. Every caller is an idempotent read or
+    // upsert, so replay is safe after an ambiguous network failure.
     if let Ok(mut guard) = arc.lock()
         && guard.is_valid(Duration::from_secs(5)).is_ok()
     {
-        return op(&mut guard).map_err(map_db_err);
+        match op(&mut guard) {
+            Ok(value) => return Ok(value),
+            Err(error) if !is_connection_error(&error) => return Err(map_db_err(error)),
+            Err(error) => {
+                tracing::warn!(%error, "org database connection failed; reconnecting once");
+            }
+        }
     }
 
     // Cached connection is stale or poisoned — drop it so we dial a fresh one.
@@ -269,8 +283,21 @@ fn run<T>(
     op(&mut guard).map_err(map_db_err)
 }
 
+fn is_connection_error(error: &postgres::Error) -> bool {
+    error.is_closed() || error.as_db_error().is_none()
+}
+
 fn map_db_err(e: postgres::Error) -> AutterError {
     AutterError::Generic(format!("org database operation failed: {e}"))
+}
+
+/// Verify that the organization data plane is reachable using the same cached,
+/// self-healing connection path as uploads. No user data is read or written.
+pub fn ping(identity: &OrgIdentity) -> Result<(), AutterError> {
+    run(&identity.org_db_url, |client| {
+        client.simple_query("SELECT 1")?;
+        Ok(())
+    })
 }
 
 /// Best-effort `data.push` audit row. Never returns an error (mirrors the old
@@ -343,6 +370,9 @@ pub fn upsert_notes(
                     );
                 }
                 Err(e) => {
+                    if is_connection_error(&e) {
+                        return Err(e);
+                    }
                     tracing::warn!(commit = %entry.commit_sha, "note upsert failed: {e}");
                     failure_count += 1;
                 }
@@ -414,6 +444,9 @@ pub fn upsert_cas(
                     });
                 }
                 Err(e) => {
+                    if is_connection_error(&e) {
+                        return Err(e);
+                    }
                     tracing::warn!(hash = %obj.hash, "cas upsert failed: {e}");
                     failure_count += 1;
                     results.push(CasUploadResult {
@@ -553,9 +586,27 @@ pub fn insert_metrics(
             );
 
             if let Err(e) = result {
+                if is_connection_error(&e) {
+                    return Err(e);
+                }
                 tracing::warn!(event_id = event.event_id, "metric insert failed: {e}");
                 errors.push((index, e.to_string()));
             }
+        }
+
+        let stored_count = events.len().saturating_sub(errors.len());
+        if stored_count > 0 {
+            record_push(
+                client,
+                identity,
+                None,
+                &serde_json::json!({
+                    "kind": "metrics",
+                    "stored_count": stored_count,
+                    "failure_count": errors.len(),
+                    "distinct_id": distinct_id,
+                }),
+            );
         }
 
         Ok(errors)
@@ -563,7 +614,7 @@ pub fn insert_metrics(
 }
 
 /// Explicit per-commit authorship summary for cloud analytics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitAuthorshipSummaryRow {
     pub commit_sha: String,
     pub repo_url: Option<String>,
@@ -714,6 +765,9 @@ pub fn upsert_file_change_counts(
             );
 
             if let Err(e) = result {
+                if is_connection_error(&e) {
+                    return Err(e);
+                }
                 tracing::warn!(
                     repo_url = %row.repo_url,
                     file_path = %row.file_path,

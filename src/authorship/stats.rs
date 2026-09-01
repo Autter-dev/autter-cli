@@ -233,6 +233,14 @@ pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> Str
         }
     }
 
+    if stats.ai_additions == 0 && stats.human_additions == 0 && stats.unknown_additions > 0 {
+        let guidance = crate::authorship::guidance::stats_all_untracked_footer();
+        output.push_str(&guidance);
+        if is_interactive {
+            print!("{}", guidance);
+        }
+    }
+
     output
 }
 

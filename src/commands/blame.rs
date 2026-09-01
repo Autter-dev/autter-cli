@@ -1960,7 +1960,10 @@ fn output_why_format(
                 println!("No AI prompt is associated with this line.");
             }
             None => {
-                println!("No authorship information is available for this line.");
+                print!(
+                    "{}",
+                    crate::authorship::guidance::blame_line_missing_data_message()
+                );
             }
         }
         return Ok(());

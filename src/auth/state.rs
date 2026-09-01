@@ -5,6 +5,7 @@ use super::identity::{TokenOrg, extract_identity_from_access_token};
 pub enum AuthState {
     LoggedOut,
     LoggedIn,
+    SyncBlocked,
     RefreshExpired,
     Error(String),
 }
@@ -42,6 +43,8 @@ pub fn collect_auth_status() -> AuthStatus {
             let identity = extract_identity_from_access_token(&creds.access_token);
             let state = if creds.is_refresh_token_expired() {
                 AuthState::RefreshExpired
+            } else if super::notice::sync_auth_blocked_recently() {
+                AuthState::SyncBlocked
             } else {
                 AuthState::LoggedIn
             };

@@ -6,6 +6,7 @@ pub mod autter_hooks;
 pub mod background_agent;
 pub mod cas_bridge;
 pub mod diff_ai_accepted;
+pub mod guidance;
 pub mod ignore;
 pub mod imara_diff_utils;
 pub mod internal_db;

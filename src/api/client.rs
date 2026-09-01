@@ -12,51 +12,81 @@ use url::Url;
 /// Note: Cross-process races are acceptable - both processes get valid tokens.
 static REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthLoadIssue {
+    NoCredentials,
+    CredentialStore(String),
+    RefreshExpired,
+    RefreshFailed(String),
+}
+
+impl std::fmt::Display for AuthLoadIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCredentials => write!(f, "no stored credentials"),
+            Self::CredentialStore(error) => write!(f, "could not read credentials: {error}"),
+            Self::RefreshExpired => write!(f, "refresh token expired"),
+            Self::RefreshFailed(error) => write!(f, "access-token refresh failed: {error}"),
+        }
+    }
+}
+
 /// Attempt to load stored credentials and refresh if needed.
 /// Returns None on any failure (not logged in, expired, refresh failed).
 /// Uses in-process Mutex for thread safety during token refresh.
-fn try_load_auth_token() -> Option<String> {
+fn try_load_auth_token() -> Result<String, AuthLoadIssue> {
     let store = CredentialStore::new();
 
     let creds = match store.load() {
         Ok(Some(c)) => c,
-        _ => return None,
+        Ok(None) => return Err(AuthLoadIssue::NoCredentials),
+        Err(error) => return Err(AuthLoadIssue::CredentialStore(error)),
     };
 
     // If refresh token expired, can't authenticate
     if creds.is_refresh_token_expired() {
-        return None;
+        return Err(AuthLoadIssue::RefreshExpired);
     }
 
     // Fast path: if access token is valid (with 5 min buffer), use it directly
     if !creds.is_access_token_expired(300) {
-        return Some(creds.access_token);
+        return Ok(creds.access_token);
     }
 
     // Need to refresh - acquire mutex to prevent thundering herd within this process
-    // If mutex is poisoned (previous panic), we return None gracefully
-    let _guard = REFRESH_LOCK.lock().ok()?;
+    // A panic in unrelated upload code must never disable token refresh for the
+    // rest of this long-lived daemon process.
+    let _guard = REFRESH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // Re-check credentials after acquiring lock - another thread may have refreshed
     let creds = match store.load() {
         Ok(Some(c)) => c,
-        _ => return None,
+        Ok(None) => return Err(AuthLoadIssue::NoCredentials),
+        Err(error) => return Err(AuthLoadIssue::CredentialStore(error)),
     };
 
     // Check again if access token is now valid (another thread may have refreshed)
     if !creds.is_access_token_expired(300) {
-        return Some(creds.access_token);
+        return Ok(creds.access_token);
     }
 
     // Still expired - we need to refresh
     let client = OAuthClient::new();
     match client.refresh_access_token(&creds.refresh_token) {
         Ok(new_creds) => {
-            // Store refreshed credentials (ignore errors - we still have the token)
-            let _ = store.store(&new_creds);
-            Some(new_creds.access_token)
+            // The current process can use the fresh token even if persisting it
+            // fails, but surface that failure so the next process is diagnosable.
+            if let Err(error) = store.store(&new_creds) {
+                tracing::warn!(%error, "could not persist refreshed credentials");
+            }
+            Ok(new_creds.access_token)
         }
-        Err(_) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not refresh autter access token");
+            Err(AuthLoadIssue::RefreshFailed(error))
+        }
     }
     // Mutex guard is automatically released when _guard is dropped
 }
@@ -224,6 +254,8 @@ pub struct ApiContext {
     pub base_url: String,
     /// Optional authentication token
     pub auth_token: Option<String>,
+    /// Why automatic credential loading did not produce an access token.
+    pub auth_issue: Option<AuthLoadIssue>,
     /// Optional API key for X-API-Key header
     pub api_key: Option<String>,
     /// Optional git author identity for X-Author-Identity header (only sent when API key is set)
@@ -240,6 +272,7 @@ impl std::fmt::Debug for ApiContext {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("auth_issue", &self.auth_issue)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("author_identity", &self.author_identity)
             .field("timeout_secs", &self.timeout_secs)
@@ -295,9 +328,14 @@ impl ApiContext {
         } else {
             None
         };
+        let (auth_token, auth_issue) = match try_load_auth_token() {
+            Ok(token) => (Some(token), None),
+            Err(issue) => (None, Some(issue)),
+        };
         Self {
             base_url: base_url.unwrap_or_else(Self::default_base_url),
-            auth_token: try_load_auth_token(),
+            auth_token,
+            auth_issue,
             api_key,
             author_identity,
             timeout_secs: Some(30),
@@ -319,6 +357,7 @@ impl ApiContext {
         Self {
             base_url: base_url.unwrap_or_else(Self::default_base_url),
             auth_token: None,
+            auth_issue: None,
             api_key,
             author_identity,
             timeout_secs: Some(30),
@@ -340,6 +379,7 @@ impl ApiContext {
         Self {
             base_url: base_url.unwrap_or_else(Self::default_base_url),
             auth_token: Some(auth_token),
+            auth_issue: None,
             api_key,
             author_identity,
             timeout_secs: Some(30),
@@ -446,6 +486,10 @@ impl ApiClient {
         self.context.auth_token.is_some()
     }
 
+    pub fn auth_issue(&self) -> Option<&AuthLoadIssue> {
+        self.context.auth_issue.as_ref()
+    }
+
     /// Decode the org routing identity (`org_db_url` + uploader identity) from the
     /// context's access token. Used by the notes/CAS data path, which writes
     /// straight to the org's own database. Errors when not authenticated.
@@ -454,6 +498,13 @@ impl ApiClient {
             AutterError::Generic("not authenticated: no access token for org database".to_string())
         })?;
         crate::api::org_db::identity_from_token(token)
+    }
+
+    /// Probe the exact organization database used by notes, transcripts, and
+    /// telemetry uploads.
+    pub fn check_org_data_plane(&self) -> Result<(), AutterError> {
+        let identity = self.org_identity()?;
+        crate::api::org_db::ping(&identity)
     }
 
     /// Check if an API key is configured

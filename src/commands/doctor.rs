@@ -8,6 +8,7 @@
 //! non-zero when any check fails, and `--json` emits a machine-readable
 //! report on a single line.
 
+use crate::api::{ApiClient, ApiContext};
 use crate::auth::{AuthState, collect_auth_status, format_unix_timestamp};
 use crate::commands::arg_parser::{self, ScanMode};
 use crate::config::{self, Config};
@@ -217,6 +218,8 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     let (auth_check, authenticated) = check_auth();
     reporter.add(auth_check);
     reporter.add(check_connectivity(authenticated));
+    reporter.add(check_org_data_plane());
+    reporter.add(check_sync_queue());
 
     reporter.finish()
 }
@@ -624,9 +627,14 @@ fn check_auth() -> (DoctorCheck, bool) {
     let status = collect_auth_status();
     let has_api_key = Config::get().api_key().is_some();
     let mut details = vec![format!("credential backend: {}", status.backend)];
+    let live_context = ApiContext::new(None);
+    let live_token = live_context.auth_token.is_some();
+    if let Some(issue) = &live_context.auth_issue {
+        details.push(format!("credential check: {issue}"));
+    }
 
     match status.state {
-        AuthState::LoggedIn => {
+        AuthState::LoggedIn if live_token => {
             let who = status
                 .email
                 .or(status.name)
@@ -650,6 +658,44 @@ fn check_auth() -> (DoctorCheck, bool) {
                 true,
             )
         }
+        AuthState::LoggedIn => (
+            DoctorCheck {
+                section: SECTION_ACCOUNT,
+                name,
+                status: DoctorStatus::Failed,
+                summary: "stored login could not produce a usable access token".to_string(),
+                details,
+                remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
+            },
+            has_api_key,
+        ),
+        AuthState::SyncBlocked if live_token => (
+            DoctorCheck {
+                section: SECTION_ACCOUNT,
+                name,
+                status: DoctorStatus::Warning,
+                summary: "a previous sync was authentication-blocked; credentials now load"
+                    .to_string(),
+                details,
+                remediation: Some(
+                    "let the data-plane check finish; restart with `autter bg restart` if the queue remains blocked"
+                        .to_string(),
+                ),
+            },
+            true,
+        ),
+        AuthState::SyncBlocked => (
+            DoctorCheck {
+                section: SECTION_ACCOUNT,
+                name,
+                status: DoctorStatus::Failed,
+                summary: "cloud sync is blocked because stored credentials cannot authenticate"
+                    .to_string(),
+                details,
+                remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
+            },
+            has_api_key,
+        ),
         AuthState::RefreshExpired => (
             DoctorCheck {
                 section: SECTION_ACCOUNT,
@@ -743,6 +789,93 @@ fn check_connectivity(authenticated: bool) -> DoctorCheck {
                 base_url
             )),
         },
+    }
+}
+
+/// Probe the actual per-organization PostgreSQL data plane. API reachability is
+/// insufficient: login can work while the database route, TLS connection, or
+/// cached client used by uploads is broken.
+fn check_org_data_plane() -> DoctorCheck {
+    let name = "organization data plane".to_string();
+    let client = ApiClient::new(ApiContext::new(None));
+    if !client.is_logged_in() {
+        let reason = client
+            .auth_issue()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "no access token".to_string());
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: "data-plane probe skipped because no usable login is available".to_string(),
+            details: vec![format!("reason: {reason}")],
+            remediation: Some("run `autter login`, then re-run `autter doctor`".to_string()),
+        };
+    }
+
+    match client.check_org_data_plane() {
+        Ok(()) => {
+            crate::auth::notice::clear_sync_auth_blocked();
+            DoctorCheck {
+                section: SECTION_ACCOUNT,
+                name,
+                status: DoctorStatus::Passed,
+                summary: "organization database is reachable by the upload path".to_string(),
+                details: Vec::new(),
+                remediation: None,
+            }
+        }
+        Err(error) => DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Failed,
+            summary: "could not reach the organization database used for uploads".to_string(),
+            details: vec![format!("error: {error}")],
+            remediation: Some(
+                "check network access to the organization database, then run `autter bg restart` and `autter doctor`"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn check_sync_queue() -> DoctorCheck {
+    let name = "durable sync queue".to_string();
+    let pending = crate::auth::notice::pending_sync_counts();
+    let details = vec![pending.summary()];
+    if pending.total() == 0 {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Passed,
+            summary: "all local cloud-sync queues are empty".to_string(),
+            details,
+            remediation: None,
+        };
+    }
+
+    if crate::auth::notice::sync_auth_blocked_recently() {
+        DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Failed,
+            summary: "queued data is not draining because cloud sync is authentication-blocked"
+                .to_string(),
+            details,
+            remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
+        }
+    } else {
+        DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: "local data is queued for background upload".to_string(),
+            details,
+            remediation: Some(
+                "keep the background service running; re-run `autter doctor` if these counts do not decrease"
+                    .to_string(),
+            ),
+        }
     }
 }
 

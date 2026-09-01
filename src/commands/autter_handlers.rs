@@ -91,6 +91,7 @@ pub fn handle_autter(args: &[String]) {
             | "daemon"
             | "debug"
             | "doctor"
+            | "sync"
             | "upgrade"
             | "install-hooks"
             | "install"
@@ -160,6 +161,9 @@ pub fn handle_autter(args: &[String]) {
         }
         "doctor" => {
             commands::doctor::handle_doctor(&args[1..]);
+        }
+        "sync" => {
+            commands::sync::handle_sync(&args[1..]);
         }
         "bg" | "d" | "daemon" => {
             commands::daemon::handle_daemon(&args[1..]);
@@ -794,7 +798,17 @@ fn handle_ai_blame(args: &[String]) {
     let args = &pp.rest;
 
     if args.is_empty() {
-        eprintln!("Error: blame requires a file argument");
+        let current_dir = env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+        if let Ok(repo) = find_repository_in_path(&current_dir) {
+            commands::usage_hints::eprint_missing_blame_args(&repo);
+        } else {
+            eprintln!("Error: blame requires a file argument");
+            eprintln!();
+            eprintln!("Usage: autter blame <file>");
+        }
         std::process::exit(crate::commands::EXIT_USAGE_ERROR);
     }
 

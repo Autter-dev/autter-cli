@@ -367,6 +367,21 @@ autter config [<key> | set <key> <value> | unset <key>]
   --skip-trace2-checks   Skip the trace2 event-capture self-check",
     },
     HelpEntry {
+        name: "sync",
+        aliases: &[],
+        summary: "Inspect cloud upload health and local queue depth",
+        body: "autter sync status [--json]
+
+  Show whether authorship data is reaching autter cloud, how much is queued
+  locally, and what to do when uploads are blocked.
+
+  Exits 0 when cloud sync is disabled, healthy, or actively draining a
+  backlog. Exits 1 when user action is required (expired login, upload
+  failures, or background service not running with pending data).
+
+  --json   Machine-readable JSON report",
+    },
+    HelpEntry {
         name: "bg",
         aliases: &["d", "daemon"],
         summary: "Run and control autter background service",

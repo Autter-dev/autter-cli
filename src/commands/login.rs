@@ -19,6 +19,7 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     // Check if already logged in
     if let Ok(Some(creds)) = store.load()
         && !creds.is_refresh_token_expired()
+        && !crate::auth::notice::sync_auth_blocked_recently()
     {
         return Ok(LoginOutcome::AlreadyLoggedIn);
     }
@@ -73,9 +74,16 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     };
 
     // Store credentials (non-fatal on failure)
-    if let Err(e) = store.store(&creds) {
-        eprintln!("\nWarning: Failed to store credentials: {}", e);
-        eprintln!("You may need to log in again next time.");
+    match store.store(&creds) {
+        Ok(()) => {
+            crate::auth::notice::clear_sync_auth_blocked();
+            print_login_success(&creds.access_token);
+            resume_cloud_sync_after_login();
+        }
+        Err(e) => {
+            eprintln!("\nWarning: Failed to store credentials: {}", e);
+            eprintln!("You may need to log in again next time.");
+        }
     }
 
     Ok(LoginOutcome::LoggedIn)
@@ -97,8 +105,10 @@ pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
     store
         .store(&creds)
         .map_err(|e| format!("Failed to store credentials: {}", e))?;
+    crate::auth::notice::clear_sync_auth_blocked();
 
     print_login_success(&creds.access_token);
+    resume_cloud_sync_after_login();
     Ok(LoginOutcome::LoggedIn)
 }
 
@@ -126,6 +136,36 @@ fn print_login_success(access_token: &str) {
             Some(slug) => eprintln!("  Organization: {} ({})", org_name, slug),
             None => eprintln!("  Organization: {}", org_name),
         }
+    }
+}
+
+/// Restart the background service so it picks up fresh credentials and clears
+/// any in-memory sync backoff. Skipped in test harnesses, which manage their
+/// own daemon lifecycle. Best-effort: a failed restart must not fail login.
+fn resume_cloud_sync_after_login() {
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return;
+    }
+
+    let pending = crate::auth::notice::pending_sync_counts();
+    if pending.total() > 0 {
+        eprintln!(
+            "  {} queued locally — restarting background service to upload.",
+            pending.summary()
+        );
+    } else {
+        eprintln!("  Restarting background service to resume cloud sync.");
+    }
+
+    let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
+        eprintln!("  Warning: could not restart background service automatically.");
+        eprintln!("  Run `autter bg restart` if cloud sync does not resume.");
+        return;
+    };
+
+    if let Err(error) = crate::commands::daemon::restart_daemon(&daemon_config) {
+        eprintln!("  Warning: could not restart background service: {error}");
+        eprintln!("  Run `autter bg restart` if cloud sync does not resume.");
     }
 }
 
@@ -222,6 +262,7 @@ pub fn handle_login(args: &[String]) {
     let store = CredentialStore::new();
     if let Ok(Some(creds)) = store.load()
         && !creds.is_refresh_token_expired()
+        && !crate::auth::notice::sync_auth_blocked_recently()
     {
         eprintln!("Already logged in. Use 'autter logout' to log out first.");
         return;

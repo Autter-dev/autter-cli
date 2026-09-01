@@ -486,6 +486,7 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
     if let Ok(stats) = stats_for_commit_stats(repo, &commit_sha, &ignore_patterns) {
         write_stats_to_terminal(&stats, true);
     }
+    crate::auth::notice::eprint_post_commit_sync_reminder();
 }
 
 fn head_state_to_repo_context(

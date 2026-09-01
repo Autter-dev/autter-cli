@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// Current schema version (must equal MIGRATIONS.len()).
-const SCHEMA_VERSION: usize = 2;
+const SCHEMA_VERSION: usize = 3;
 
 /// Database migrations — each entry upgrades the schema by one version.
 const MIGRATIONS: &[&str] = &[
@@ -45,6 +45,23 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE notes ADD COLUMN repo_url TEXT;
     "#,
+    // Migration 2 → 3: durable upload queue for the query-friendly commit
+    // summary. Notes and metrics already survived offline operation, but this
+    // derived row was previously attempted only once during `git commit`.
+    r#"
+    CREATE TABLE IF NOT EXISTS commit_summary_queue (
+        commit_sha            TEXT PRIMARY KEY NOT NULL,
+        payload               TEXT NOT NULL,
+        attempts              INTEGER NOT NULL DEFAULT 0,
+        last_sync_error       TEXT,
+        next_retry_at         INTEGER NOT NULL DEFAULT 0,
+        processing_started_at INTEGER,
+        created_at            INTEGER NOT NULL,
+        updated_at            INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_commit_summary_queue_retry
+        ON commit_summary_queue(next_retry_at, attempts);
+    "#,
 ];
 
 /// Global singleton for the notes database.
@@ -59,6 +76,12 @@ pub struct PendingNote {
     /// Canonical remote URL of the repo this note came from (None = unknown →
     /// home org). Used to route the upload to the org that owns the repository.
     pub repo_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingCommitSummary {
+    pub commit_sha: String,
+    pub payload: String,
 }
 
 /// SQLite wrapper for notes storage and queue.
@@ -505,6 +528,105 @@ impl NotesDatabase {
         Ok(())
     }
 
+    // ----- Commit summary queue -----
+
+    pub fn enqueue_commit_summary(
+        &mut self,
+        commit_sha: &str,
+        payload: &str,
+    ) -> Result<(), AutterError> {
+        let now = unix_now();
+        self.conn.execute(
+            r#"INSERT INTO commit_summary_queue
+                 (commit_sha, payload, attempts, next_retry_at, created_at, updated_at)
+               VALUES (?1, ?2, 0, ?3, ?3, ?3)
+               ON CONFLICT(commit_sha) DO UPDATE SET
+                 payload = excluded.payload, attempts = 0, last_sync_error = NULL,
+                 next_retry_at = excluded.next_retry_at,
+                 processing_started_at = NULL, updated_at = excluded.updated_at"#,
+            params![commit_sha, payload, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_pending_commit_summaries(&self) -> Result<i64, AutterError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM commit_summary_queue", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    pub fn dequeue_commit_summaries(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<PendingCommitSummary>, AutterError> {
+        let now = unix_now();
+        self.conn.execute(
+            "UPDATE commit_summary_queue SET processing_started_at = NULL
+             WHERE processing_started_at IS NOT NULL AND processing_started_at < ?1",
+            params![now - 600],
+        )?;
+        let shas: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT commit_sha FROM commit_summary_queue
+                 WHERE processing_started_at IS NULL AND next_retry_at <= ?1
+                 ORDER BY next_retry_at LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![now, limit as i64], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if shas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.conn.transaction()?;
+        for sha in &shas {
+            tx.execute(
+                "UPDATE commit_summary_queue SET processing_started_at = ?1 WHERE commit_sha = ?2",
+                params![now, sha],
+            )?;
+        }
+        tx.commit()?;
+        let mut out = Vec::with_capacity(shas.len());
+        for sha in shas {
+            let payload = self.conn.query_row(
+                "SELECT payload FROM commit_summary_queue WHERE commit_sha = ?1",
+                params![&sha],
+                |row| row.get(0),
+            )?;
+            out.push(PendingCommitSummary {
+                commit_sha: sha,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn mark_commit_summary_synced(&mut self, commit_sha: &str) -> Result<(), AutterError> {
+        self.conn.execute(
+            "DELETE FROM commit_summary_queue WHERE commit_sha = ?1",
+            params![commit_sha],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_commit_summary_failed(
+        &mut self,
+        commit_sha: &str,
+        error: &str,
+    ) -> Result<(), AutterError> {
+        let now = unix_now();
+        self.conn.execute(
+            r#"UPDATE commit_summary_queue SET
+                 processing_started_at = NULL, attempts = attempts + 1,
+                 last_sync_error = ?1,
+                 next_retry_at = ?2 + (1 << MIN(attempts + 1, 8)) * 5
+               WHERE commit_sha = ?3"#,
+            params![error, now, commit_sha],
+        )?;
+        Ok(())
+    }
+
     // ----- Read operations -----
 
     /// Retrieve the note content for a single commit SHA.
@@ -664,7 +786,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+
+        let summary_table_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='commit_summary_queue'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(summary_table_count, 1, "commit_summary_queue should exist");
     }
 
     #[test]
@@ -918,6 +1050,64 @@ mod tests {
         assert!(
             !results.contains_key("sha_missing"),
             "missing SHA should not be in result"
+        );
+    }
+
+    // --- commit summary queue ---
+
+    #[test]
+    fn test_commit_summary_queue_roundtrip() {
+        let (mut db, _tmp) = create_test_db();
+
+        db.enqueue_commit_summary("abc123", r#"{"commit_sha":"abc123"}"#)
+            .unwrap();
+        assert_eq!(db.count_pending_commit_summaries().unwrap(), 1);
+
+        let rows = db.dequeue_commit_summaries(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_sha, "abc123");
+        assert_eq!(rows[0].payload, r#"{"commit_sha":"abc123"}"#);
+
+        db.mark_commit_summary_synced("abc123").unwrap();
+        assert_eq!(db.count_pending_commit_summaries().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_commit_summary_failed_schedules_retry() {
+        let (mut db, _tmp) = create_test_db();
+
+        db.enqueue_commit_summary("def456", r#"{"commit_sha":"def456"}"#)
+            .unwrap();
+        let rows = db.dequeue_commit_summaries(10).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        db.mark_commit_summary_failed("def456", "org database unreachable")
+            .unwrap();
+
+        let pending: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM commit_summary_queue WHERE commit_sha = 'def456'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+
+        let attempts: i64 = db
+            .conn
+            .query_row(
+                "SELECT attempts FROM commit_summary_queue WHERE commit_sha = 'def456'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+
+        let rows = db.dequeue_commit_summaries(10).unwrap();
+        assert!(
+            rows.is_empty(),
+            "failed rows should not be immediately re-claimed"
         );
     }
 

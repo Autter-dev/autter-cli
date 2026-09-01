@@ -377,6 +377,9 @@ pub fn post_commit_with_final_state(
                 None => {}
             }
         }
+        if is_interactive {
+            crate::auth::notice::eprint_post_commit_sync_reminder();
+        }
     }
     Ok((commit_sha.to_string(), authorship_log))
 }
@@ -635,26 +638,6 @@ fn upload_commit_authorship_summary(
     };
     use crate::api::org_db::{self, CommitAuthorshipSummaryRow};
 
-    let repo_url = current_repo_url(repo);
-    let client = if let Some(repo_url) = repo_url.as_deref()
-        && let Some(org) = resolve_org_for_repo_cached(repo_url)
-    {
-        let Some(token) = access_token_for_org(&org) else {
-            return;
-        };
-        ApiClient::new(ApiContext::with_auth(None, token))
-    } else {
-        ApiClient::new(ApiContext::new(None))
-    };
-
-    if !client.is_logged_in() {
-        return;
-    }
-
-    let Ok(identity) = client.org_identity() else {
-        return;
-    };
-
     let total = stats.git_diff_added_lines as f64;
     let percent = |count: u32| {
         if total <= 0.0 {
@@ -673,7 +656,7 @@ fn upload_commit_authorship_summary(
 
     let row = CommitAuthorshipSummaryRow {
         commit_sha: commit_sha.to_string(),
-        repo_url,
+        repo_url: current_repo_url(repo),
         branch: current_branch(repo),
         base_commit_sha: parent_sha.to_string(),
         human_author: human_author.to_string(),
@@ -691,12 +674,66 @@ fn upload_commit_authorship_summary(
         hunks,
     };
 
-    if let Err(e) = org_db::upsert_commit_authorship_summary(
+    // Persist before making any network call. A commit must never lose its
+    // query-friendly provenance summary merely because auth expired, the org
+    // database was unavailable, or the process exited immediately afterwards.
+    let payload = match serde_json::to_string(&row) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::error!(%e, commit_sha, "commit authorship summary serialization failed");
+            return;
+        }
+    };
+    let queued = crate::notes::db::NotesDatabase::global()
+        .map_err(|e| e.to_string())
+        .and_then(|db| {
+            db.lock()
+                .map_err(|_| "notes database lock poisoned".to_string())?
+                .enqueue_commit_summary(commit_sha, &payload)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = queued {
+        tracing::error!(%e, commit_sha, "commit authorship summary could not be queued");
+        return;
+    }
+
+    // Attempt an immediate upload for the normal online case. Every early
+    // return below is safe because the durable daemon queue owns the retry.
+    let client = if let Some(repo_url) = row.repo_url.as_deref()
+        && let Some(org) = resolve_org_for_repo_cached(repo_url)
+    {
+        let Some(token) = access_token_for_org(&org) else {
+            return;
+        };
+        ApiClient::new(ApiContext::with_auth(None, token))
+    } else {
+        ApiClient::new(ApiContext::new(None))
+    };
+
+    if !client.is_logged_in() {
+        return;
+    }
+
+    let Ok(identity) = client.org_identity() else {
+        return;
+    };
+
+    match org_db::upsert_commit_authorship_summary(
         &identity,
         &row,
         &crate::config::get_or_create_distinct_id(),
     ) {
-        tracing::warn!(%e, commit_sha, "commit authorship summary upload failed");
+        Ok(()) => {
+            if let Ok(db) = crate::notes::db::NotesDatabase::global() {
+                let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Err(e) = lock.mark_commit_summary_synced(commit_sha) {
+                    tracing::warn!(%e, commit_sha, "uploaded commit summary remains queued");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%e, commit_sha, "commit authorship summary upload failed; queued for retry");
+        }
     }
 }
 
