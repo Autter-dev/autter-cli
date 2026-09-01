@@ -184,13 +184,20 @@ fn is_cursor_placeholder_model(model: &str) -> bool {
         || m.eq_ignore_ascii_case("auto")
 }
 
-/// Resolve the model for a Cursor hook: prefer hook `model`/`model_id`, then transcript.
+/// Resolve the model for a Cursor hook: prefer hook `model`, then `model_id`, then transcript.
 fn resolve_cursor_model(data: &serde_json::Value, transcript_path: Option<&str>) -> String {
-    let hook_model = parse::optional_str_multi(data, &["model", "model_id"]);
+    let hook_model = parse::optional_str(data, "model");
+    let hook_model_id = parse::optional_str(data, "model_id");
 
     if let Some(model) = hook_model {
         if !is_cursor_placeholder_model(model) {
             return model.to_string();
+        }
+    }
+
+    if let Some(model_id) = hook_model_id {
+        if !is_cursor_placeholder_model(model_id) {
+            return model_id.to_string();
         }
     }
 
@@ -205,7 +212,7 @@ fn resolve_cursor_model(data: &serde_json::Value, transcript_path: Option<&str>)
         }
     }
 
-    hook_model.unwrap_or("unknown").to_string()
+    "unknown".to_string()
 }
 
 fn cursor_file_path_from_tool_input(tool_input: Option<&serde_json::Value>) -> String {
@@ -579,6 +586,47 @@ mod tests {
         match &events[0] {
             ParsedHookEvent::PreFileEdit(e) => {
                 assert_eq!(e.context.agent_id.model, "composer-2");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_model_id_fallback_when_model_is_placeholder() {
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "model": "auto",
+            "model_id": "claude-opus-4-7",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "claude-opus-4-7");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_unknown_when_only_placeholder_model_and_no_transcript() {
+        let input = json!({
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/home/user/project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "model": "auto",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "unknown");
             }
             _ => panic!("Expected PreFileEdit"),
         }
