@@ -45,6 +45,38 @@ impl FileLineStats {
     }
 }
 
+/// Serialize the line ranges a single checkpoint (step) touched in one file, as a
+/// compact JSON array of `[start, end]` pairs (1-indexed, inclusive), sorted and
+/// with overlapping/adjacent ranges merged. A checkpoint's own lines are the
+/// attributions whose `author_id` embeds this checkpoint's `trace_id` (AI kinds
+/// use `s_<session>::t_<trace>`). Returns `None` when nothing is attributable to
+/// this step (e.g. plain human saves), so the metric field stays empty.
+fn serialize_touched_ranges(entry: &WorkingLogEntry, trace_id: &str) -> Option<String> {
+    if trace_id.is_empty() {
+        return None;
+    }
+    let mut ranges: Vec<(u32, u32)> = entry
+        .line_attributions
+        .iter()
+        .filter(|la| la.author_id.contains(trace_id))
+        .map(|la| (la.start_line, la.end_line))
+        .collect();
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<[u32; 2]> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last[1].saturating_add(1) => {
+                last[1] = last[1].max(end);
+            }
+            _ => merged.push([start, end]),
+        }
+    }
+    serde_json::to_string(&merged).ok()
+}
+
 /// Latest checkpoint state needed to process a file in the next checkpoint.
 #[derive(Debug, Clone)]
 struct PreviousFileState {
@@ -388,6 +420,13 @@ fn execute_resolved_checkpoint(
             }
             if let Some(ek) = edit_kind {
                 values = values.edit_kind(ek);
+            }
+            // Record the exact line ranges this step touched, so per-session step
+            // detail survives even when a later checkpoint overwrites these lines
+            // (the authorship note would drop them). Attributions carrying this
+            // checkpoint's trace_id are the lines it authored.
+            if let Some(ranges) = serialize_touched_ranges(entry, &trace_id) {
+                values = values.line_ranges(ranges);
             }
 
             let file_attrs = attrs.clone().author(&checkpoint.author);

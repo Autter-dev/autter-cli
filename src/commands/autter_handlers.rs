@@ -540,16 +540,44 @@ fn handle_checkpoint(args: &[String]) {
         );
     }
 
+    // How long to wait for a freshly-spawned daemon to accept connections when a
+    // send fails. Paid only when the daemon is down — the exact case that used
+    // to silently drop a whole session's checkpoints — so a one-off spawn cost
+    // beats losing the data.
+    const CHECKPOINT_DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     let mut sent_count = 0u64;
+    let mut active_socket = config.control_socket_path.clone();
+    let mut tried_spawn = false;
     for request in requests {
         let t_send = std::time::Instant::now();
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
         };
-        let send_result = crate::daemon::send_control_request_fire_and_forget(
-            &config.control_socket_path,
-            &control_request,
-        );
+        let mut send_result =
+            crate::daemon::send_control_request_fire_and_forget(&active_socket, &control_request);
+
+        // A failed send almost always means the daemon is down (crashed, never
+        // started, or restarting). Rather than dropping the checkpoint — which
+        // silently loses the session's steps — spawn the daemon and retry once.
+        // `ensure_daemon_running` is a no-op when the daemon is already up, so a
+        // transient blip is retried too. Only attempt the spawn once per call.
+        if send_result.is_err() && !tried_spawn {
+            tried_spawn = true;
+            match crate::commands::daemon::ensure_daemon_running(CHECKPOINT_DAEMON_SPAWN_TIMEOUT) {
+                Ok(spawned) => {
+                    active_socket = spawned.control_socket_path;
+                    send_result = crate::daemon::send_control_request_fire_and_forget(
+                        &active_socket,
+                        &control_request,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Background worker unavailable, checkpoint dropped: {}", e);
+                    std::process::exit(0);
+                }
+            }
+        }
         if perf {
             eprintln!(
                 "[perf] checkpoint: ipc_send={:.1}ms",
