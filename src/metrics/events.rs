@@ -452,6 +452,7 @@ pub mod checkpoint_pos {
     pub const LINES_DELETED_SLOC: usize = 6; // u32 - for this file
     pub const TOOL_USE_ID: usize = 7; // String - nullable
     pub const EDIT_KIND: usize = 8; // String - nullable ("file_edit" | "bash")
+    pub const LINE_RANGES: usize = 9; // String - nullable; JSON `[[start,end],…]` (1-indexed, inclusive) touched by this step in this file
 }
 
 /// Values for Event ID 4: checkpoint
@@ -471,6 +472,7 @@ pub mod checkpoint_pos {
 /// | 6 | lines_deleted_sloc | u32 |
 /// | 7 | external_tool_use_id | String (nullable) |
 /// | 8 | edit_kind | String (nullable) |
+/// | 9 | line_ranges | String (nullable) — JSON `[[start,end],…]` touched by this step |
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointValues {
     pub checkpoint_ts: PosField<u64>,
@@ -482,6 +484,10 @@ pub struct CheckpointValues {
     pub lines_deleted_sloc: PosField<u32>,
     pub external_tool_use_id: PosField<String>,
     pub edit_kind: PosField<String>,
+    /// JSON `[[start,end],…]` (1-indexed, inclusive) of the line ranges this
+    /// checkpoint/step touched in this file. Empty/absent on older clients and
+    /// on checkpoints that touched no attributable lines (e.g. human saves).
+    pub line_ranges: PosField<String>,
 }
 
 impl CheckpointValues {
@@ -587,6 +593,17 @@ impl CheckpointValues {
         self.edit_kind = Some(None);
         self
     }
+
+    pub fn line_ranges(mut self, value: impl Into<String>) -> Self {
+        self.line_ranges = Some(Some(value.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn line_ranges_null(mut self) -> Self {
+        self.line_ranges = Some(None);
+        self
+    }
 }
 
 impl PosEncoded for CheckpointValues {
@@ -634,6 +651,11 @@ impl PosEncoded for CheckpointValues {
             checkpoint_pos::EDIT_KIND,
             string_to_json(&self.edit_kind),
         );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::LINE_RANGES,
+            string_to_json(&self.line_ranges),
+        );
 
         map
     }
@@ -649,6 +671,7 @@ impl PosEncoded for CheckpointValues {
             lines_deleted_sloc: sparse_get_u32(arr, checkpoint_pos::LINES_DELETED_SLOC),
             external_tool_use_id: sparse_get_string(arr, checkpoint_pos::TOOL_USE_ID),
             edit_kind: sparse_get_string(arr, checkpoint_pos::EDIT_KIND),
+            line_ranges: sparse_get_string(arr, checkpoint_pos::LINE_RANGES),
         }
     }
 }
