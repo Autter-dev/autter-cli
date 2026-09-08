@@ -234,6 +234,22 @@ impl MetricsDatabase {
         Ok(records)
     }
 
+    pub fn finish_upload(&mut self, accepted_ids: &[i64], retry_ids: &[i64]) -> Result<(), AutterError> {
+        let transaction = self.conn.transaction()?;
+        for record_id in accepted_ids {
+            transaction.execute("DELETE FROM metrics WHERE id = ?1", params![record_id])?;
+        }
+        for record_id in retry_ids {
+            transaction.execute(
+                "INSERT INTO metrics (event_json) SELECT event_json FROM metrics WHERE id = ?1",
+                params![record_id],
+            )?;
+            transaction.execute("DELETE FROM metrics WHERE id = ?1", params![record_id])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Delete records by ID (after successful upload)
     pub fn delete_records(&mut self, ids: &[i64]) -> Result<(), AutterError> {
         if ids.is_empty() {
@@ -347,6 +363,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, "2");
+    }
+
+    #[test]
+    fn rejected_records_remain_queued_without_blocking_new_records() {
+        let (mut database, _directory) = create_test_db();
+        database.insert_events(&["accepted".into(), "retry".into(), "next".into()]).unwrap();
+        let batch = database.get_batch(2).unwrap();
+        database.finish_upload(&[batch[0].id], &[batch[1].id]).unwrap();
+        let remaining = database.get_batch(10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].event_json, "next");
+        assert_eq!(remaining[1].event_json, "retry");
+        assert!(remaining[1].id > batch[1].id);
+    }
+
+    #[test]
+    fn accepted_batch_leaves_no_pending_records() {
+        let (mut database, _directory) = create_test_db();
+        database.insert_events(&["accepted".into()]).unwrap();
+        let batch = database.get_batch(1).unwrap();
+        database.finish_upload(&[batch[0].id], &[]).unwrap();
+        assert_eq!(database.count().unwrap(), 0);
     }
 
     #[test]

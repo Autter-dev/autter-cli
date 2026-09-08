@@ -533,12 +533,19 @@ fn flush_metrics(events: &[MetricEvent]) {
         if should_upload && !upload_failed && std::time::Instant::now() < deadline {
             let batch = MetricsBatch::new(chunk.to_vec());
             match client.upload_metrics(&batch) {
-                Ok(_) => {
+                Ok(response) if response.errors.is_empty() => {
                     note_durable_sync_authenticated();
                     continue;
                 }
+                Ok(response) => {
+                    tracing::warn!(rejected = response.errors.len(), "metrics: batch not fully accepted; queued for retry");
+                    crate::auth::notice::record_metrics_upload_stalled();
+                    note_durable_sync_upload_failed();
+                    upload_failed = true;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "metrics: live upload failed; queued for retry");
+                    crate::auth::notice::record_metrics_upload_stalled();
                     note_durable_sync_upload_failed();
                     upload_failed = true;
                 }
@@ -617,24 +624,37 @@ fn flush_stored_metrics() {
 
     match client.upload_metrics(&MetricsBatch::new(events)) {
         Ok(response) => {
-            // Per-row errors are validation failures and cannot become valid on
-            // retry. They are already reported by upload_metrics; removing the
-            // whole idempotent batch prevents one malformed event from blocking
-            // the queue forever.
-            let _ = db
+            let accepted_ids: Vec<_> = response.successful_indices(uploaded_ids.len())
+                .into_iter()
+                .map(|index| uploaded_ids[index])
+                .collect();
+            let retry_ids: Vec<_> = response.errors.iter()
+                .filter_map(|error| uploaded_ids.get(error.index).copied())
+                .collect();
+            let deleted = db
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .delete_records(&uploaded_ids);
-            note_durable_sync_authenticated();
+                .finish_upload(&accepted_ids, &retry_ids);
+            if deleted.is_ok() && response.errors.is_empty() {
+                note_durable_sync_authenticated();
+                if pending == accepted_ids.len() {
+                    crate::auth::notice::clear_metrics_upload_stalled();
+                }
+            } else {
+                crate::auth::notice::record_metrics_upload_stalled();
+                note_durable_sync_upload_failed();
+                tracing::warn!(rejected = response.errors.len(), "metrics: queue batch needs retry");
+            }
             tracing::info!(
-                uploaded = uploaded_ids.len(),
+                uploaded = accepted_ids.len(),
                 rejected = response.errors.len(),
-                remaining = pending.saturating_sub(uploaded_ids.len()),
+                remaining = pending.saturating_sub(if deleted.is_ok() { accepted_ids.len() } else { 0 }),
                 "metrics: replayed durable queue batch"
             );
         }
         Err(error) => {
             note_durable_sync_upload_failed();
+            crate::auth::notice::record_metrics_upload_stalled();
             tracing::warn!(%error, pending, "metrics: durable queue upload failed; retained for retry");
         }
     }

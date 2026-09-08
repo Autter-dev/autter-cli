@@ -371,13 +371,14 @@ autter config [<key> | set <key> <value> | unset <key>]
         aliases: &[],
         summary: "Inspect cloud upload health and local queue depth",
         body: "autter sync status [--json]
+autter sync open
 
-  Show whether authorship data is reaching autter cloud, how much is queued
-  locally, and what to do when uploads are blocked.
+  Show local upload queues, the last confirmed metrics batch, and the next
+  action for a blocked upload. Open the dashboard for the reported organization.
 
-  Exits 0 when cloud sync is disabled, healthy, or actively draining a
-  backlog. Exits 1 when user action is required (expired login, upload
-  failures, or background service not running with pending data).
+  An empty queue does not confirm upload of every local change.
+  Status exits 0 when upload is off or no problem is detected. It exits 1
+  when sign-in, the background service, an upload, or a queue read needs attention.
 
   --json   Machine-readable JSON report",
     },

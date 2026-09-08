@@ -81,6 +81,13 @@ pub fn upload_metrics_with_retry(
                         })),
                     );
                 }
+                if !response.errors.is_empty() {
+                    crate::auth::notice::record_metrics_upload_stalled();
+                    return Err(AutterError::Generic(format!(
+                        "{} metric records were not accepted; upload is incomplete",
+                        response.errors.len(),
+                    )));
+                }
                 return Ok(());
             }
             Err(e) => {
@@ -123,6 +130,11 @@ impl ApiClient {
             &batch.events,
             &config::get_or_create_distinct_id(),
         )?;
+        if failed.is_empty() && !batch.events.is_empty()
+            && let Some(access_token) = self.context().auth_token.as_deref()
+        {
+            crate::auth::notice::record_metrics_upload(access_token);
+        }
         let errors = failed
             .into_iter()
             .map(|(index, error)| MetricsUploadError { index, error })

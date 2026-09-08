@@ -15,7 +15,9 @@ struct SyncStatusOutput {
 
 pub fn handle_sync(args: &[String]) {
     match args.first().map(|s| s.as_str()) {
-        None | Some("status") => print_status(&args[1..]),
+        None => print_status(args),
+        Some("status") => print_status(&args[1..]),
+        Some("open") => open_dashboard(),
         Some("--help") | Some("-h") | Some("help") => print_help(),
         Some(other) => {
             eprintln!("Unknown sync subcommand: {other}");
@@ -65,11 +67,8 @@ fn print_status(args: &[String]) {
 }
 
 fn print_human_status(report: &crate::auth::notice::CloudSyncStatusReport) {
+    println!("{}", crate::auth::notice::format_sync_report(report));
     if !report.enabled {
-        println!("Cloud sync: disabled (local-only mode)");
-        println!();
-        println!("Authorship data stays on this machine. Run `autter onboard` or");
-        println!("`autter config set notes_backend.kind http` to enable cloud upload.");
         return;
     }
 
@@ -83,7 +82,9 @@ fn print_human_status(report: &crate::auth::notice::CloudSyncStatusReport) {
         }
     );
 
-    if report.pending.total > 0 {
+    if !report.queue_status_available {
+        println!("Pending uploads: unavailable");
+    } else if report.pending.total > 0 {
         println!("Pending uploads:");
         print_pending_line("  telemetry events", report.pending.metrics);
         print_pending_line("  authorship notes", report.pending.notes);
@@ -99,22 +100,39 @@ fn print_human_status(report: &crate::auth::notice::CloudSyncStatusReport) {
         println!("Fix: {remediation}");
     } else if report.state == CloudSyncState::Draining {
         println!();
-        println!("Uploads are in progress. Re-run `autter sync status` to confirm the");
-        println!("queue drains, or `autter doctor` if counts stop decreasing.");
+        println!("Records are waiting for upload. Run `autter sync status` again to check");
+        println!("the queue, or `autter doctor` if the count does not decrease.");
     } else {
         println!();
-        println!("Cloud uploads are healthy.");
+        println!("An empty queue does not confirm that every local change is on the dashboard.");
+    }
+    if let Some(dashboard_url) = report.dashboard_url.as_deref() {
+        println!("Dashboard: {dashboard_url}");
+    }
+}
+
+fn open_dashboard() {
+    let report = collect_cloud_sync_status();
+    let Some(dashboard_url) = report.dashboard_url else {
+        eprintln!("Dashboard organization unavailable. Run `autter login`, then `autter whoami`.");
+        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    };
+    println!("Dashboard: {dashboard_url}");
+    if crate::commands::personal_dashboard::open_browser(&dashboard_url).is_err() {
+        eprintln!("Could not open the browser. Open the dashboard address shown above.");
+        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
     }
 }
 
 fn state_label(state: CloudSyncState) -> &'static str {
     match state {
         CloudSyncState::Disabled => "disabled",
-        CloudSyncState::Healthy => "healthy",
-        CloudSyncState::Draining => "draining backlog",
+        CloudSyncState::Healthy => "no queued uploads",
+        CloudSyncState::Draining => "upload pending",
         CloudSyncState::AuthBlocked => "auth blocked",
         CloudSyncState::UploadFailing => "upload failing",
         CloudSyncState::DaemonNotRunning => "background service not running",
+        CloudSyncState::StatusUnavailable => "queue status unavailable",
     }
 }
 
@@ -129,10 +147,11 @@ fn print_help() {
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  autter sync status [--json]");
+    eprintln!("  autter sync open");
     eprintln!();
     eprintln!("Shows whether authorship data is reaching autter cloud, how much is");
     eprintln!("queued locally, and what to do when uploads are blocked.");
     eprintln!();
-    eprintln!("Exits 0 when cloud sync is disabled, healthy, or actively draining a");
-    eprintln!("backlog. Exits 1 when user action is required.");
+    eprintln!("Status exits 0 when upload is off or no problem is detected.");
+    eprintln!("It exits 1 when sign-in, upload, the service, or a queue read needs attention.");
 }

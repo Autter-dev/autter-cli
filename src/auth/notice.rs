@@ -27,6 +27,47 @@ const SYNC_BLOCKED_FRESH_SECS: i64 = 48 * 60 * 60;
 
 static NOTICE_EMITTED: AtomicBool = AtomicBool::new(false);
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MetricsReceipt {
+    uploaded_at: i64,
+    user_id: String,
+    organization_slug: Option<String>,
+}
+
+fn metrics_receipt_path() -> PathBuf {
+    crate::mdm::utils::home_dir()
+        .join(".autter")
+        .join("internal")
+        .join("last-metrics-receipt.json")
+}
+
+pub fn record_metrics_upload(access_token: &str) {
+    let identity = crate::auth::identity::extract_identity_from_access_token(access_token);
+    let Some(user_id) = identity.user_id.as_ref() else {
+        return;
+    };
+    let receipt = MetricsReceipt {
+        uploaded_at: unix_now(),
+        user_id: user_id.clone(),
+        organization_slug: identity.active_org().and_then(|org| org.org_slug.clone()),
+    };
+    let receipt_path = metrics_receipt_path();
+    if let Some(parent) = receipt_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_vec(&receipt) {
+        let _ = std::fs::write(receipt_path, content);
+    }
+}
+
+fn current_metrics_receipt() -> Option<MetricsReceipt> {
+    let credentials = CredentialStore::new().load().ok().flatten()?;
+    let identity = crate::auth::identity::extract_identity_from_access_token(&credentials.access_token);
+    let content = std::fs::read(metrics_receipt_path()).ok()?;
+    let receipt: MetricsReceipt = serde_json::from_slice(&content).ok()?;
+    (identity.user_id.as_deref() == Some(receipt.user_id.as_str())).then_some(receipt)
+}
+
 fn notice_stamp_path() -> PathBuf {
     crate::mdm::utils::home_dir()
         .join(".autter")
@@ -82,6 +123,19 @@ pub fn clear_sync_upload_stalled() {
     let _ = std::fs::remove_file(sync_upload_stalled_stamp_path());
 }
 
+pub fn record_metrics_upload_stalled() {
+    let stamp = sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at");
+    if let Some(parent) = stamp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(stamp, unix_now().to_string());
+}
+
+pub fn clear_metrics_upload_stalled() {
+    let stamp = sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at");
+    let _ = std::fs::remove_file(stamp);
+}
+
 /// True when the daemon recently reported auth-blocked sync attempts.
 pub fn sync_auth_blocked_recently() -> bool {
     let Ok(raw) = std::fs::read_to_string(sync_blocked_stamp_path()) else {
@@ -95,13 +149,17 @@ pub fn sync_auth_blocked_recently() -> bool {
 
 /// True when the daemon recently reported non-auth upload failures.
 pub fn sync_upload_stalled_recently() -> bool {
-    let Ok(raw) = std::fs::read_to_string(sync_upload_stalled_stamp_path()) else {
-        return false;
-    };
-    let Ok(at) = raw.trim().parse::<i64>() else {
-        return false;
-    };
-    unix_now() - at < SYNC_BLOCKED_FRESH_SECS
+    [
+        sync_upload_stalled_stamp_path(),
+        sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at"),
+    ]
+    .iter()
+    .any(|stamp| {
+        std::fs::read_to_string(stamp)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .is_some_and(|at| unix_now() - at < SYNC_BLOCKED_FRESH_SECS)
+    })
 }
 
 /// Why cloud sync needs user attention, if anything.
@@ -139,18 +197,15 @@ pub fn cloud_sync_attention() -> Option<CloudSyncAttention> {
     }
 
     let creds = CredentialStore::new().load().ok().flatten();
-    let auth_blocked = creds.as_ref().is_some_and(|c| c.is_refresh_token_expired())
+    let auth_blocked = creds.as_ref().is_none_or(|credentials| credentials.is_refresh_token_expired())
         || sync_auth_blocked_recently();
 
-    if auth_blocked && (creds.is_some() || sync_auth_blocked_recently()) {
+    if auth_blocked {
         return Some(CloudSyncAttention::AuthBlocked);
     }
 
     if !background_service_running() {
-        let pending = pending_sync_counts();
-        if pending.total() > 0 {
-            return Some(CloudSyncAttention::DaemonNotRunning);
-        }
+        return Some(CloudSyncAttention::DaemonNotRunning);
     }
 
     if sync_upload_stalled_recently() {
@@ -180,8 +235,12 @@ pub struct CloudSyncStatusReport {
     /// Overall state: healthy, draining a backlog, or blocked.
     pub state: CloudSyncState,
     pub pending: PendingSyncCountsJson,
+    pub queue_status_available: bool,
     pub auth_blocked_recently: bool,
     pub upload_stalled_recently: bool,
+    pub last_metrics_upload_at: Option<i64>,
+    pub organization_slug: Option<String>,
+    pub dashboard_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
 }
@@ -195,13 +254,16 @@ pub enum CloudSyncState {
     AuthBlocked,
     UploadFailing,
     DaemonNotRunning,
+    StatusUnavailable,
 }
 
 /// Collect the current cloud-sync picture for status commands.
 pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
     let enabled = cloud_sync_enabled();
     let daemon_running = background_service_running();
-    let pending = pending_sync_counts();
+    let queue_counts = read_pending_sync_counts();
+    let queue_status_available = queue_counts.is_some();
+    let pending = queue_counts.unwrap_or_default();
     let pending_json = PendingSyncCountsJson::from(pending);
     let auth_blocked_recently = sync_auth_blocked_recently();
     let upload_stalled_recently = sync_upload_stalled_recently();
@@ -215,21 +277,42 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
             CloudSyncAttention::UploadFailing => CloudSyncState::UploadFailing,
             CloudSyncAttention::DaemonNotRunning => CloudSyncState::DaemonNotRunning,
         }
+    } else if !queue_status_available {
+        CloudSyncState::StatusUnavailable
     } else if pending.total() > 0 {
         CloudSyncState::Draining
     } else {
         CloudSyncState::Healthy
     };
 
-    let remediation = attention.map(remediation_for);
+    let remediation = attention.map(remediation_for).or_else(|| {
+        (state == CloudSyncState::StatusUnavailable)
+            .then(|| "run `autter doctor` to check the local upload queue".to_string())
+    });
+    let receipt = current_metrics_receipt();
+    let last_metrics_upload_at = receipt.as_ref().map(|receipt| receipt.uploaded_at);
+    let organization_slug = receipt.and_then(|receipt| receipt.organization_slug).or_else(|| {
+        let credentials = CredentialStore::new().load().ok().flatten()?;
+        let identity = crate::auth::identity::extract_identity_from_access_token(&credentials.access_token);
+        identity.active_org().and_then(|org| org.org_slug.clone())
+    });
+    let dashboard_url = organization_slug.as_deref().and_then(|slug| {
+        let mut url = url::Url::parse(&crate::commands::login::web_app_url()).ok()?;
+        url.path_segments_mut().ok()?.pop_if_empty().push(slug).push("provenance");
+        Some(url.to_string())
+    });
 
     CloudSyncStatusReport {
         enabled,
         daemon_running,
         state,
         pending: pending_json,
+        queue_status_available,
         auth_blocked_recently,
         upload_stalled_recently,
+        last_metrics_upload_at,
+        organization_slug,
+        dashboard_url,
         remediation,
     }
 }
@@ -314,41 +397,32 @@ impl PendingSyncCounts {
 /// Count every durable local queue used by cloud sync. Best-effort: an
 /// unavailable database contributes zero instead of breaking diagnostics.
 pub fn pending_sync_counts() -> PendingSyncCounts {
+    read_pending_sync_counts().unwrap_or_default()
+}
+
+fn read_pending_sync_counts() -> Option<PendingSyncCounts> {
     let metrics = crate::metrics::db::MetricsDatabase::global()
         .ok()
-        .and_then(|db| db.lock().ok().map(|lock| lock.count().unwrap_or(0) as i64))
-        .unwrap_or(0);
+        .and_then(|db| db.lock().ok()?.count().ok())? as i64;
     let notes = crate::notes::db::NotesDatabase::global()
         .ok()
-        .and_then(|db| db.lock().ok().map(|lock| lock.count_pending().unwrap_or(0)))
-        .unwrap_or(0);
+        .and_then(|db| db.lock().ok()?.count_pending().ok())?;
     let commit_summaries = crate::notes::db::NotesDatabase::global()
         .ok()
-        .and_then(|db| {
-            db.lock()
-                .ok()
-                .map(|lock| lock.count_pending_commit_summaries().unwrap_or(0))
-        })
-        .unwrap_or(0);
+        .and_then(|db| db.lock().ok()?.count_pending_commit_summaries().ok())?;
     let transcripts = crate::authorship::internal_db::InternalDatabase::global()
         .ok()
-        .and_then(|db| {
-            db.lock()
-                .ok()
-                .map(|lock| lock.count_pending_cas().unwrap_or(0))
-        })
-        .unwrap_or(0);
+        .and_then(|db| db.lock().ok()?.count_pending_cas().ok())?;
     let file_changes = crate::file_changes::FileChangesDatabase::global()
         .ok()
-        .and_then(|db| db.lock().ok().map(|lock| lock.count_pending().unwrap_or(0)))
-        .unwrap_or(0);
-    PendingSyncCounts {
+        .and_then(|db| db.lock().ok()?.count_pending().ok())?;
+    Some(PendingSyncCounts {
         metrics,
         notes,
         commit_summaries,
         transcripts,
         file_changes,
-    }
+    })
 }
 
 fn print_sync_attention_message(attention: CloudSyncAttention, pending: PendingSyncCounts) {
@@ -431,44 +505,107 @@ pub fn maybe_warn_logged_out() {
 
 /// Unconditional reminder right after `git commit` — the moment users care most.
 pub fn eprint_post_commit_sync_reminder() {
-    eprint_sync_attention(false);
+    if std::io::stdout().is_terminal()
+        && !crate::commands::arg_parser::quiet()
+        && !crate::commands::arg_parser::json()
+    {
+        eprintln!("Local commit recorded.");
+        if let Some(line) = format_cloud_sync_status_line() {
+            eprintln!("{line}");
+        }
+    }
 }
 
 /// Human-readable cloud-sync summary for `whoami` / `doctor` / `debug`.
 pub fn format_cloud_sync_status_line() -> Option<String> {
     let report = collect_cloud_sync_status();
-    if !report.enabled {
-        return None;
-    }
+    Some(format_sync_report(&report))
+}
+
+pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
     let detail = match report.state {
-        CloudSyncState::AuthBlocked => "login expired — run `autter login`",
-        CloudSyncState::UploadFailing => "uploads failing — run `autter doctor`",
+        CloudSyncState::Disabled => "off; records stay on this computer. Connect: `autter onboard`",
+        CloudSyncState::AuthBlocked => "blocked; sign in with `autter login`",
+        CloudSyncState::UploadFailing => "upload failed; run `autter doctor`",
         CloudSyncState::DaemonNotRunning => {
-            "background service not running — run `autter bg start`"
+            "background service stopped; run `autter bg start`"
         }
-        CloudSyncState::Draining => "upload in progress",
-        CloudSyncState::Healthy | CloudSyncState::Disabled => return None,
+        CloudSyncState::Draining => "upload pending; check `autter sync status`",
+        CloudSyncState::Healthy => "no queued uploads; open the dashboard with `autter sync open`",
+        CloudSyncState::StatusUnavailable => "queue status unavailable; run `autter doctor`",
     };
-    if report.pending.total > 0 {
-        Some(format!(
-            "Cloud sync: {detail} ({})",
-            PendingSyncCounts {
-                metrics: report.pending.metrics,
-                notes: report.pending.notes,
-                commit_summaries: report.pending.commit_summaries,
-                transcripts: report.pending.transcripts,
-                file_changes: report.pending.file_changes,
-            }
-            .summary()
-        ))
-    } else {
-        Some(format!("Cloud sync: {detail}"))
+    let mut summary = format!("Cloud upload: {detail}");
+    if report.enabled && report.pending.total > 0 {
+        summary.push_str(&format!(" ({} records waiting)", report.pending.total));
     }
+    if report.enabled {
+        if let Some(uploaded_at) = report.last_metrics_upload_at {
+            summary.push_str(&format!(
+                "\nLast metrics batch received: {}",
+                crate::auth::format_unix_timestamp(uploaded_at),
+            ));
+        } else {
+            summary.push_str("\nNo upload receipt recorded on this computer.");
+        }
+        if let Some(organization_slug) = report.organization_slug.as_deref() {
+            summary.push_str(&format!("\nDashboard organization: {organization_slug}"));
+        }
+    }
+    summary
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_report(state: CloudSyncState) -> CloudSyncStatusReport {
+        CloudSyncStatusReport {
+            enabled: state != CloudSyncState::Disabled,
+            daemon_running: true,
+            state,
+            pending: PendingSyncCountsJson::from(PendingSyncCounts::default()),
+            queue_status_available: state != CloudSyncState::StatusUnavailable,
+            auth_blocked_recently: false,
+            upload_stalled_recently: false,
+            last_metrics_upload_at: None,
+            organization_slug: None,
+            dashboard_url: None,
+            remediation: None,
+        }
+    }
+
+    #[test]
+    fn empty_queue_does_not_claim_confirmed_upload() {
+        let summary = format_sync_report(&status_report(CloudSyncState::Healthy));
+        assert!(summary.contains("no queued uploads"));
+        assert!(summary.contains("No upload receipt recorded"));
+        assert!(!summary.contains("Last metrics batch received"));
+    }
+
+    #[test]
+    fn blocked_states_show_the_next_action() {
+        for (state, command) in [
+            (CloudSyncState::Disabled, "autter onboard"),
+            (CloudSyncState::AuthBlocked, "autter login"),
+            (CloudSyncState::UploadFailing, "autter doctor"),
+            (CloudSyncState::DaemonNotRunning, "autter bg start"),
+            (CloudSyncState::StatusUnavailable, "autter doctor"),
+        ] {
+            assert!(format_sync_report(&status_report(state)).contains(command));
+        }
+    }
+
+    #[test]
+    fn pending_upload_remains_distinct_from_an_earlier_receipt() {
+        let mut report = status_report(CloudSyncState::Draining);
+        report.pending.metrics = 2;
+        report.pending.total = 2;
+        report.last_metrics_upload_at = Some(1_735_689_600);
+        let summary = format_sync_report(&report);
+        assert!(summary.contains("upload pending"));
+        assert!(summary.contains("2 records waiting"));
+        assert!(summary.contains("Last metrics batch received"));
+    }
 
     #[test]
     fn notice_interval_parse_roundtrip() {

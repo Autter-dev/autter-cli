@@ -26,6 +26,7 @@ struct CheckpointInfo {
 struct StatusOutput {
     stats: CommitStats,
     checkpoints: Vec<CheckpointInfo>,
+    cloud_sync: crate::auth::notice::CloudSyncStatusReport,
 }
 
 pub fn handle_status(args: &[String]) {
@@ -72,6 +73,7 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             let output = StatusOutput {
                 stats: CommitStats::default(),
                 checkpoints: vec![],
+                cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
             };
             let json_str = serde_json::to_string(&output)?;
             println!("{}", json_str);
@@ -92,6 +94,11 @@ fn run_status(json: bool) -> Result<(), AutterError> {
                 "If hooks are already installed, run `autter debug` and check the 'AI Agent Capture' section to see whether each agent/editor is actually able to checkpoint."
             );
             eprintln!();
+        }
+        if !json && !crate::commands::arg_parser::quiet()
+            && let Some(line) = crate::auth::notice::format_cloud_sync_status_line()
+        {
+            eprintln!("{line}");
         }
         return Ok(());
     }
@@ -167,13 +174,21 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         let output = StatusOutput {
             stats,
             checkpoints: checkpoint_infos,
+            cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
         };
         let json_str = serde_json::to_string(&output)?;
         println!("{}", json_str);
         return Ok(());
     }
 
+    if crate::commands::arg_parser::quiet() {
+        return Ok(());
+    }
     write_stats_to_terminal(&stats, true);
+    println!("Changes captured on this computer. Commit them to record committed-code totals.");
+    if let Some(line) = crate::auth::notice::format_cloud_sync_status_line() {
+        println!("{line}");
+    }
 
     println!();
     for cp in &checkpoint_infos {

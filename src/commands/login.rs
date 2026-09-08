@@ -192,7 +192,7 @@ const DEFAULT_WEB_APP_URL: &str = "https://app.autter.dev";
 ///   1. `AUTTER_WEB_URL` env (explicit override, e.g. a local Vite dev server)
 ///   2. derived from the configured `api_base_url` (swap the `api` host label)
 ///   3. the default `https://app.autter.dev`
-fn web_app_url() -> String {
+pub(crate) fn web_app_url() -> String {
     if let Ok(url) = std::env::var("AUTTER_WEB_URL")
         && !url.trim().is_empty()
     {
