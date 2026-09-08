@@ -2346,9 +2346,28 @@ fn discover_repository_paths_no_git_exec(
     }
 
     Err(AutterError::Generic(format!(
-        "No git repository found for path without exec: {}",
+        "{NO_REPOSITORY_DISCOVERED_PREFIX}: {}",
         path.display()
     )))
+}
+
+/// Message prefix for the "no git repository at or above this path" outcome of
+/// [`discover_repository_in_path_no_git_exec`]. Callers that treat a
+/// non-repository path as benign match on it through
+/// [`is_no_repository_discovered_error`].
+const NO_REPOSITORY_DISCOVERED_PREFIX: &str = "No git repository found for path without exec";
+
+/// Returns `true` when `error` is the benign "no repository at this path"
+/// outcome of [`discover_repository_in_path_no_git_exec`], as opposed to a real
+/// discovery fault such as an unreadable git config. A caller for which a
+/// non-repository path is not an error — for example a git command traced in a
+/// temporary scratch directory — uses this to skip quietly instead of
+/// reporting.
+pub fn is_no_repository_discovered_error(error: &AutterError) -> bool {
+    matches!(
+        error,
+        AutterError::Generic(message) if message.starts_with(NO_REPOSITORY_DISCOVERED_PREFIX)
+    )
 }
 
 fn git_config_file_for_repo_paths(
@@ -3152,6 +3171,27 @@ mod tests {
         assert_eq!(repo.merge_base(a.clone(), b).unwrap(), None);
         // A commit is its own merge base with itself.
         assert_eq!(repo.merge_base(a.clone(), a.clone()).unwrap(), Some(a));
+    }
+
+    #[test]
+    fn discovery_in_non_repository_path_is_recognised_as_benign() {
+        // A directory that is not a git repository — a temporary scratch dir
+        // here — yields the "no repository found" outcome, which callers treat
+        // as benign rather than a fault.
+        let tmp = tempfile::tempdir().unwrap();
+        let error = discover_repository_in_path_no_git_exec(tmp.path()).unwrap_err();
+        assert!(is_no_repository_discovered_error(&error), "{error}");
+    }
+
+    #[test]
+    fn other_errors_are_not_recognised_as_no_repository() {
+        // A real fault must not be mistaken for the benign no-repository case.
+        assert!(!is_no_repository_discovered_error(&AutterError::Generic(
+            "Git directory has no parent: /tmp/x".to_string()
+        )));
+        assert!(!is_no_repository_discovered_error(&AutterError::IoError(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "gone")
+        )));
     }
 
     #[test]
