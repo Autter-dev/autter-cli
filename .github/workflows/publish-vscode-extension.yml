@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Map the optional Marketplace secret to an env var: the `secrets` context is
     # NOT allowed in a step `if:` (doing so makes the whole workflow invalid and
     # every run a startup failure), but the `env` context is.
