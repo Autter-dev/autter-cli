@@ -1108,15 +1108,18 @@ fn resolve_stash_target_oid_for_command(
     }
 
     let target_spec = stash_target_spec(&parsed.command_args);
-    let resolved =
-        resolve_stash_target_oid_for_worktree(worktree, target_spec).ok_or_else(|| {
-            AutterError::Generic(format!(
-                "failed to resolve stash target oid from repo state (spec={:?}, worktree={})",
-                target_spec,
-                worktree.display()
-            ))
-        })?;
-    Ok(Some(resolved))
+    if let Some(resolved) = resolve_stash_target_oid_for_worktree(worktree, target_spec) {
+        return Ok(Some(resolved));
+    }
+    // On-disk resolution missed; for a top-of-stack target, recover from history.
+    if stash_target_spec_is_top_of_stack(target_spec) {
+        return Ok(recover_top_stash_target_oid_from_history(worktree));
+    }
+    Err(AutterError::Generic(format!(
+        "failed to resolve stash target oid from repo state (spec={:?}, worktree={})",
+        target_spec,
+        worktree.display()
+    )))
 }
 
 fn stash_target_spec_is_top_of_stack(target_spec: Option<&str>) -> bool {
@@ -1166,6 +1169,19 @@ fn inferred_top_stash_sha_from_rewrite_history(
     Ok(stack.last().cloned())
 }
 
+/// Recover the top stash sha from the daemon's own rewrite history.
+///
+/// Popping or dropping the last stash deletes both `refs/stash` and its reflog,
+/// so the on-disk resolvers find nothing. The rewrite history still records the
+/// stash, so the top of the reconstructed stack is the target that was just
+/// popped or dropped. Returns `None` when history cannot recover it, which the
+/// event builder treats as a benign data hole rather than an error.
+fn recover_top_stash_target_oid_from_history(worktree: &Path) -> Option<String> {
+    inferred_top_stash_sha_from_rewrite_history(worktree)
+        .ok()
+        .flatten()
+}
+
 fn resolve_stash_target_oid_for_terminal_payload(
     worktree: &Path,
     argv: &[String],
@@ -1200,16 +1216,13 @@ fn resolve_stash_target_oid_for_terminal_payload(
                 return Ok(Some(target_oid));
             }
             if stash_target_spec_is_top_of_stack(target_spec) {
-                return latest_reflog_old_oid_for_worktree(worktree, "refs/stash")
-                    .ok_or_else(|| {
-                        AutterError::Generic(format!(
-                            "failed to resolve stash {:?} target oid from terminal reflog state (spec={:?}, worktree={})",
-                            parsed.command_args.first().map(String::as_str).unwrap_or("stash"),
-                            target_spec,
-                            worktree.display()
-                        ))
-                    })
-                    .map(Some);
+                if let Some(target_oid) =
+                    latest_reflog_old_oid_for_worktree(worktree, "refs/stash")
+                {
+                    return Ok(Some(target_oid));
+                }
+                // Reflog lookup missed too; recover the top stash sha from history.
+                return Ok(recover_top_stash_target_oid_from_history(worktree));
             }
             Err(AutterError::Generic(format!(
                 "failed to resolve stash {:?} target oid from terminal state for non-top stash reference (spec={:?}, worktree={})",
@@ -6444,11 +6457,8 @@ impl ActorDaemonCoordinator {
                 .filter(|oid| !oid.is_empty() && !is_zero_oid(oid)),
             StashOperation::Apply => cmd.stash_target_oid.clone().or_else(|| {
                 let worktree = cmd.worktree.as_deref()?;
-                resolve_stash_target_oid_for_worktree(worktree, stash_ref).or_else(|| {
-                    inferred_top_stash_sha_from_rewrite_history(worktree)
-                        .ok()
-                        .flatten()
-                })
+                resolve_stash_target_oid_for_worktree(worktree, stash_ref)
+                    .or_else(|| recover_top_stash_target_oid_from_history(worktree))
             }),
             StashOperation::Pop | StashOperation::Drop | StashOperation::Branch => {
                 cmd.stash_target_oid.clone().or_else(|| {
@@ -10050,5 +10060,59 @@ mod tests {
             tokio::task::yield_now().await;
         }
         coord.request_shutdown();
+    }
+
+    fn init_repo_with_stash_create_event(stash_sha: &str) -> crate::git::test_utils::TmpRepo {
+        let tmp = crate::git::test_utils::TmpRepo::new().unwrap();
+        tmp.autter_repo()
+            .storage
+            .append_rewrite_event(RewriteLogEvent::Stash {
+                stash: StashEvent::new(
+                    StashOperation::Create,
+                    Some("stash@{0}".to_string()),
+                    Some(stash_sha.to_string()),
+                    None,
+                    Vec::new(),
+                    true,
+                    Vec::new(),
+                ),
+            })
+            .unwrap();
+        tmp
+    }
+
+    // When the last stash is popped, git deletes both refs/stash and its reflog,
+    // so the on-disk resolvers find nothing. Both payload resolvers must recover
+    // the target sha from the daemon's rewrite history instead of erroring.
+    #[test]
+    fn stash_pop_target_oid_recovers_from_history_when_ref_and_reflog_absent() {
+        let stash_sha = "1111111111111111111111111111111111111111";
+        let tmp = init_repo_with_stash_create_event(stash_sha);
+        let worktree = tmp.path();
+        let argv = vec!["git".to_string(), "stash".to_string(), "pop".to_string()];
+
+        let from_command = resolve_stash_target_oid_for_command(worktree, &argv).unwrap();
+        assert_eq!(from_command.as_deref(), Some(stash_sha));
+
+        let from_terminal =
+            resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).unwrap();
+        assert_eq!(from_terminal.as_deref(), Some(stash_sha));
+    }
+
+    // A non-top-of-stack reference cannot be recovered from history, so it still
+    // surfaces as an error rather than being silently dropped.
+    #[test]
+    fn stash_drop_non_top_reference_still_errors_without_on_disk_state() {
+        let tmp = init_repo_with_stash_create_event("2222222222222222222222222222222222222222");
+        let worktree = tmp.path();
+        let argv = vec![
+            "git".to_string(),
+            "stash".to_string(),
+            "drop".to_string(),
+            "stash@{2}".to_string(),
+        ];
+
+        assert!(resolve_stash_target_oid_for_command(worktree, &argv).is_err());
+        assert!(resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).is_err());
     }
 }
