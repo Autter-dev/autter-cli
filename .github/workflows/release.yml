@@ -74,11 +74,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             tool: cargo
           - asset: autter-windows-arm64.exe
-            # Cross-compile ARM64 on the x64 runner: the preinstalled VS 2022
-            # toolchain includes the ARM64 MSVC compiler and libraries.
-            os: blacksmith-4vcpu-windows-2025
+            # Cross-compile ARM64 on an x64 runner. Stay on GitHub-hosted
+            # windows-2022: Blacksmith's windows-2025 image exports x64 LIB/
+            # INCLUDE by default, so link.exe pulls um\x64\*.lib and fails with
+            # LNK4272 / LNK1120 unless the amd64_arm64 MSVC env is set first.
+            # windows-2022 is the last known-good host for this target (v1.7.2).
+            os: windows-2022
             target: aarch64-pc-windows-msvc
             tool: cargo
+            msvc_arch: amd64_arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,6 +102,16 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
+
+      # Point LIB/INCLUDE/PATH at the ARM64 Windows SDK + MSVC libs when
+      # cross-compiling aarch64-pc-windows-msvc from an x64 host. Without this,
+      # runners that pre-export an x64 MSVC environment (notably Blacksmith
+      # windows-2025) link the wrong machine-type libraries.
+      - name: Configure MSVC for target arch
+        if: ${{ matrix.msvc_arch }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Build (cargo)
         if: matrix.tool == 'cargo'
