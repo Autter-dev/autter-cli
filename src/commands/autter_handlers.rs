@@ -97,6 +97,9 @@ pub fn handle_autter(args: &[String]) {
             | "install"
             | "uninstall-hooks"
             | "telemetry"
+            | "login"
+            | "logout"
+            | "whoami"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{

@@ -479,13 +479,15 @@ autter onboard [options]
     HelpEntry {
         name: "login",
         aliases: &[],
-        summary: "Open the dashboard to create a sign-in token",
+        summary: "Sign in to Autter in the browser",
         body: "\
 autter login [--token <token>]
 
-  Open the dashboard to create a sign-in token.
+  Sign in to Autter. Opens a browser, shows a one-time code, and waits
+  until you approve the device. No token paste is required.
 
-  --token <token>   Complete sign-in with a token from the dashboard",
+  --token <token>   Non-interactive fallback: complete sign-in with a
+                    Personal Access Token from Settings -> Access Tokens",
     },
     HelpEntry {
         name: "logout",

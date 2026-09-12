@@ -130,7 +130,8 @@ impl ApiClient {
             &batch.events,
             &config::get_or_create_distinct_id(),
         )?;
-        if failed.is_empty() && !batch.events.is_empty()
+        if failed.is_empty()
+            && !batch.events.is_empty()
             && let Some(access_token) = self.context().auth_token.as_deref()
         {
             crate::auth::notice::record_metrics_upload(access_token);

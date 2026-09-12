@@ -99,7 +99,13 @@ Choose to connect when prompted. Autter opens a browser, shows a one-time code, 
 autter onboard --connect
 ```
 
-If the browser-based onboarding flow does not work, use a Personal Access Token (PAT):
+To sign in again later (for example after a session expires), run:
+
+```bash
+autter login
+```
+
+If the browser-based flow does not work, use a Personal Access Token (PAT):
 
 1. Sign in to the Autter web app.
 2. Open the organization you want to connect.

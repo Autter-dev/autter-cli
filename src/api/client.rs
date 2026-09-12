@@ -9,7 +9,8 @@ use url::Url;
 
 /// Global mutex to prevent multiple threads from refreshing simultaneously.
 /// This provides in-process synchronization to avoid thundering herd issues.
-/// Note: Cross-process races are acceptable - both processes get valid tokens.
+/// Cross-process refresh is serialized separately via `acquire_refresh_file_lock`
+/// because device-flow refresh tokens rotate on every use.
 static REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,14 +61,24 @@ fn try_load_auth_token() -> Result<String, AuthLoadIssue> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // Re-check credentials after acquiring lock - another thread may have refreshed
+    // Device-flow refresh tokens rotate on every use. The git proxy and the
+    // daemon are separate processes, so an in-process mutex is not enough:
+    // two concurrent refreshes can make the server invalidate the only copy
+    // we still have on disk. Wait for a sibling refresh, then reload.
+    let _file_lock = acquire_refresh_file_lock();
+
+    // Re-check credentials after acquiring lock - another thread/process may have refreshed
     let creds = match store.load() {
         Ok(Some(c)) => c,
         Ok(None) => return Err(AuthLoadIssue::NoCredentials),
         Err(error) => return Err(AuthLoadIssue::CredentialStore(error)),
     };
 
-    // Check again if access token is now valid (another thread may have refreshed)
+    if creds.is_refresh_token_expired() {
+        return Err(AuthLoadIssue::RefreshExpired);
+    }
+
+    // Check again if access token is now valid (another thread/process may have refreshed)
     if !creds.is_access_token_expired(300) {
         return Ok(creds.access_token);
     }
@@ -84,11 +95,51 @@ fn try_load_auth_token() -> Result<String, AuthLoadIssue> {
             Ok(new_creds.access_token)
         }
         Err(error) => {
+            // Lost the rotation race: another process already swapped the
+            // stored refresh token. Reload and use that session if it is live.
+            if let Ok(Some(reloaded)) = store.load() {
+                if !reloaded.is_refresh_token_expired() && !reloaded.is_access_token_expired(300) {
+                    return Ok(reloaded.access_token);
+                }
+                if reloaded.refresh_token != creds.refresh_token
+                    && !reloaded.is_refresh_token_expired()
+                    && let Ok(new_creds) = client.refresh_access_token(&reloaded.refresh_token)
+                {
+                    if let Err(store_error) = store.store(&new_creds) {
+                        tracing::warn!(%store_error, "could not persist refreshed credentials");
+                    }
+                    return Ok(new_creds.access_token);
+                }
+            }
             tracing::warn!(%error, "could not refresh autter access token");
             Err(AuthLoadIssue::RefreshFailed(error))
         }
     }
-    // Mutex guard is automatically released when _guard is dropped
+    // Mutex / file-lock guards are released when dropped
+}
+
+/// Cross-process lock around refresh-token rotation.
+///
+/// Returns `None` in tests, when the lock file cannot be created, or if a
+/// sibling still holds the lock after a short wait (caller then reloads).
+fn acquire_refresh_file_lock() -> Option<crate::utils::LockFile> {
+    if cfg!(test) || std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return None;
+    }
+    let path = crate::mdm::utils::home_dir()
+        .join(".autter")
+        .join("internal")
+        .join("credentials.lock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    for _ in 0..10 {
+        if let Some(lock) = crate::utils::LockFile::try_acquire(&path) {
+            return Some(lock);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    None
 }
 
 /// Prefix marking a Personal Access Token (mirrors the backend).

@@ -234,7 +234,11 @@ impl MetricsDatabase {
         Ok(records)
     }
 
-    pub fn finish_upload(&mut self, accepted_ids: &[i64], retry_ids: &[i64]) -> Result<(), AutterError> {
+    pub fn finish_upload(
+        &mut self,
+        accepted_ids: &[i64],
+        retry_ids: &[i64],
+    ) -> Result<(), AutterError> {
         let transaction = self.conn.transaction()?;
         for record_id in accepted_ids {
             transaction.execute("DELETE FROM metrics WHERE id = ?1", params![record_id])?;
@@ -368,9 +372,13 @@ mod tests {
     #[test]
     fn rejected_records_remain_queued_without_blocking_new_records() {
         let (mut database, _directory) = create_test_db();
-        database.insert_events(&["accepted".into(), "retry".into(), "next".into()]).unwrap();
+        database
+            .insert_events(&["accepted".into(), "retry".into(), "next".into()])
+            .unwrap();
         let batch = database.get_batch(2).unwrap();
-        database.finish_upload(&[batch[0].id], &[batch[1].id]).unwrap();
+        database
+            .finish_upload(&[batch[0].id], &[batch[1].id])
+            .unwrap();
         let remaining = database.get_batch(10).unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].event_json, "next");

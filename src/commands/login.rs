@@ -16,12 +16,22 @@ pub enum LoginOutcome {
 pub fn run_device_login() -> Result<LoginOutcome, String> {
     let store = CredentialStore::new();
 
-    // Check if already logged in
     if let Ok(Some(creds)) = store.load()
         && !creds.is_refresh_token_expired()
-        && !crate::auth::notice::sync_auth_blocked_recently()
     {
-        return Ok(LoginOutcome::AlreadyLoggedIn);
+        if !crate::auth::notice::sync_auth_blocked_recently() {
+            return Ok(LoginOutcome::AlreadyLoggedIn);
+        }
+        // A sync-blocked stamp can outlive a transient refresh failure. Probe a
+        // live access token before forcing the user through a new sign-in.
+        let ctx = crate::api::client::ApiContext::new(None);
+        if ctx.auth_token.is_some() {
+            crate::auth::notice::clear_sync_auth_blocked();
+            eprintln!("Stored credentials still work. Resuming cloud sync.");
+            resume_cloud_sync_after_login();
+            return Ok(LoginOutcome::LoggedIn);
+        }
+        eprintln!("Stored credentials could not authenticate. Starting a new sign-in...\n");
     }
 
     let client = OAuthClient::new();
@@ -229,28 +239,31 @@ fn derive_web_url_from_api(api_base_url: &str) -> Option<String> {
     })
 }
 
-/// Print the step-by-step browser sign-in instructions.
-fn print_login_instructions(url: &str) {
-    eprintln!("To sign in to Autter:\n");
-    eprintln!("  1. We've opened the Autter dashboard in your browser:");
-    eprintln!("       {}", url);
-    eprintln!("     (If it didn't open, copy that link into your browser.)\n");
-    eprintln!("  2. Log in, then open any organization's");
-    eprintln!("       Settings -> Access Tokens\n");
-    eprintln!("  3. Click \"Create token\", give it a name, and copy the token.\n");
-    eprintln!("  4. Come back here and run:");
+/// Print the PAT fallback for when the interactive device flow cannot complete.
+fn print_pat_fallback_instructions() {
+    eprintln!("You can retry with `autter login`, or sign in with a Personal Access Token:\n");
+    eprintln!("  1. Open the Autter dashboard:");
+    eprintln!("       {}", web_app_url());
+    eprintln!("  2. Open any organization's Settings -> Access Tokens");
+    eprintln!("  3. Click \"Create token\", copy it, and run:");
     eprintln!("       autter login --token <paste-your-token>\n");
 }
 
 /// Handle the `autter login` command.
 ///
-/// Two-step, browser-assisted Personal Access Token flow:
-///   1. `autter login` opens the dashboard so the user can create + copy a token.
-///   2. `autter login --token <PAT>` completes sign-in with that token.
+/// Default path is the OAuth2 device-authorization flow: the CLI opens a
+/// browser, the user approves the device, and credentials are stored with no
+/// token paste. `--token <PAT>` remains the non-interactive / CI fallback.
 pub fn handle_login(args: &[String]) {
-    // Step 2: complete sign-in with a token created in the browser.
+    if args
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
+    {
+        crate::commands::arg_parser::print_command_help("login");
+        return;
+    }
+
     if let Some(token) = parse_token_arg(args) {
-        // run_pat_login prints the success message + identity on success.
         if let Err(e) = run_pat_login(&token) {
             eprintln!("{}", e);
             std::process::exit(1);
@@ -258,21 +271,17 @@ pub fn handle_login(args: &[String]) {
         return;
     }
 
-    // Already signed in? Nothing to do.
-    let store = CredentialStore::new();
-    if let Ok(Some(creds)) = store.load()
-        && !creds.is_refresh_token_expired()
-        && !crate::auth::notice::sync_auth_blocked_recently()
-    {
-        eprintln!("Already logged in. Use 'autter logout' to log out first.");
-        return;
-    }
-
-    // Step 1: open the dashboard and tell the user what to do next.
-    let url = web_app_url();
-    print_login_instructions(&url);
-    if open_browser(&url).is_err() {
-        eprintln!("  (Could not open the browser automatically — open the link above.)");
+    match run_device_login() {
+        Ok(LoginOutcome::AlreadyLoggedIn) => {
+            eprintln!("Already logged in. Use 'autter logout' to log out first.");
+        }
+        Ok(LoginOutcome::LoggedIn) => {}
+        Err(e) => {
+            eprintln!("{}", e);
+            eprintln!();
+            print_pat_fallback_instructions();
+            std::process::exit(1);
+        }
     }
 }
 
@@ -305,4 +314,35 @@ fn open_browser(url: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_token_arg_supports_space_and_equals() {
+        assert_eq!(
+            parse_token_arg(&["--token".into(), "autter_pat_abc".into()]),
+            Some("autter_pat_abc".into())
+        );
+        assert_eq!(
+            parse_token_arg(&["--token=autter_pat_abc".into()]),
+            Some("autter_pat_abc".into())
+        );
+        assert_eq!(parse_token_arg(&["--json".into()]), None);
+    }
+
+    #[test]
+    fn derive_web_url_swaps_api_host_label() {
+        assert_eq!(
+            derive_web_url_from_api("https://api.autter.dev"),
+            Some("https://app.autter.dev".into())
+        );
+        assert_eq!(
+            derive_web_url_from_api("https://test-api.autter.dev"),
+            Some("https://test-app.autter.dev".into())
+        );
+        assert_eq!(derive_web_url_from_api("https://example.com"), None);
+    }
 }

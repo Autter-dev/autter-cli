@@ -76,7 +76,13 @@ Start with the guided browser flow:
 autter onboard
 ```
 
-Pick "connect" and authorize the device in your browser. If that flow is unavailable, mint a **Personal Access Token (PAT)** under **Org Settings → Access Tokens** and register it directly:
+Pick "connect" and authorize the device in your browser. To sign in again later without re-running onboarding:
+
+```bash
+autter login
+```
+
+That opens a browser, shows a one-time code, and waits until you approve the device. If the browser flow is unavailable, mint a **Personal Access Token (PAT)** under **Org Settings → Access Tokens** and register it directly:
 
 ```bash
 autter login --token autter_pat_xxxxxxxx

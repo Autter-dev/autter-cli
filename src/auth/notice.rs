@@ -62,7 +62,8 @@ pub fn record_metrics_upload(access_token: &str) {
 
 fn current_metrics_receipt() -> Option<MetricsReceipt> {
     let credentials = CredentialStore::new().load().ok().flatten()?;
-    let identity = crate::auth::identity::extract_identity_from_access_token(&credentials.access_token);
+    let identity =
+        crate::auth::identity::extract_identity_from_access_token(&credentials.access_token);
     let content = std::fs::read(metrics_receipt_path()).ok()?;
     let receipt: MetricsReceipt = serde_json::from_slice(&content).ok()?;
     (identity.user_id.as_deref() == Some(receipt.user_id.as_str())).then_some(receipt)
@@ -197,7 +198,9 @@ pub fn cloud_sync_attention() -> Option<CloudSyncAttention> {
     }
 
     let creds = CredentialStore::new().load().ok().flatten();
-    let auth_blocked = creds.as_ref().is_none_or(|credentials| credentials.is_refresh_token_expired())
+    let auth_blocked = creds
+        .as_ref()
+        .is_none_or(|credentials| credentials.is_refresh_token_expired())
         || sync_auth_blocked_recently();
 
     if auth_blocked {
@@ -291,14 +294,22 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
     });
     let receipt = current_metrics_receipt();
     let last_metrics_upload_at = receipt.as_ref().map(|receipt| receipt.uploaded_at);
-    let organization_slug = receipt.and_then(|receipt| receipt.organization_slug).or_else(|| {
-        let credentials = CredentialStore::new().load().ok().flatten()?;
-        let identity = crate::auth::identity::extract_identity_from_access_token(&credentials.access_token);
-        identity.active_org().and_then(|org| org.org_slug.clone())
-    });
+    let organization_slug = receipt
+        .and_then(|receipt| receipt.organization_slug)
+        .or_else(|| {
+            let credentials = CredentialStore::new().load().ok().flatten()?;
+            let identity = crate::auth::identity::extract_identity_from_access_token(
+                &credentials.access_token,
+            );
+            identity.active_org().and_then(|org| org.org_slug.clone())
+        });
     let dashboard_url = organization_slug.as_deref().and_then(|slug| {
         let mut url = url::Url::parse(&crate::commands::login::web_app_url()).ok()?;
-        url.path_segments_mut().ok()?.pop_if_empty().push(slug).push("provenance");
+        url.path_segments_mut()
+            .ok()?
+            .pop_if_empty()
+            .push(slug)
+            .push("provenance");
         Some(url.to_string())
     });
 
@@ -527,9 +538,7 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
         CloudSyncState::Disabled => "off; records stay on this computer. Connect: `autter onboard`",
         CloudSyncState::AuthBlocked => "blocked; sign in with `autter login`",
         CloudSyncState::UploadFailing => "upload failed; run `autter doctor`",
-        CloudSyncState::DaemonNotRunning => {
-            "background service stopped; run `autter bg start`"
-        }
+        CloudSyncState::DaemonNotRunning => "background service stopped; run `autter bg start`",
         CloudSyncState::Draining => "upload pending; check `autter sync status`",
         CloudSyncState::Healthy => "no queued uploads; open the dashboard with `autter sync open`",
         CloudSyncState::StatusUnavailable => "queue status unavailable; run `autter doctor`",

@@ -95,7 +95,8 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             );
             eprintln!();
         }
-        if !json && !crate::commands::arg_parser::quiet()
+        if !json
+            && !crate::commands::arg_parser::quiet()
             && let Some(line) = crate::auth::notice::format_cloud_sync_status_line()
         {
             eprintln!("{line}");

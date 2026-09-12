@@ -538,7 +538,10 @@ fn flush_metrics(events: &[MetricEvent]) {
                     continue;
                 }
                 Ok(response) => {
-                    tracing::warn!(rejected = response.errors.len(), "metrics: batch not fully accepted; queued for retry");
+                    tracing::warn!(
+                        rejected = response.errors.len(),
+                        "metrics: batch not fully accepted; queued for retry"
+                    );
                     crate::auth::notice::record_metrics_upload_stalled();
                     note_durable_sync_upload_failed();
                     upload_failed = true;
@@ -624,11 +627,14 @@ fn flush_stored_metrics() {
 
     match client.upload_metrics(&MetricsBatch::new(events)) {
         Ok(response) => {
-            let accepted_ids: Vec<_> = response.successful_indices(uploaded_ids.len())
+            let accepted_ids: Vec<_> = response
+                .successful_indices(uploaded_ids.len())
                 .into_iter()
                 .map(|index| uploaded_ids[index])
                 .collect();
-            let retry_ids: Vec<_> = response.errors.iter()
+            let retry_ids: Vec<_> = response
+                .errors
+                .iter()
                 .filter_map(|error| uploaded_ids.get(error.index).copied())
                 .collect();
             let deleted = db
@@ -643,12 +649,19 @@ fn flush_stored_metrics() {
             } else {
                 crate::auth::notice::record_metrics_upload_stalled();
                 note_durable_sync_upload_failed();
-                tracing::warn!(rejected = response.errors.len(), "metrics: queue batch needs retry");
+                tracing::warn!(
+                    rejected = response.errors.len(),
+                    "metrics: queue batch needs retry"
+                );
             }
             tracing::info!(
                 uploaded = accepted_ids.len(),
                 rejected = response.errors.len(),
-                remaining = pending.saturating_sub(if deleted.is_ok() { accepted_ids.len() } else { 0 }),
+                remaining = pending.saturating_sub(if deleted.is_ok() {
+                    accepted_ids.len()
+                } else {
+                    0
+                }),
                 "metrics: replayed durable queue batch"
             );
         }
