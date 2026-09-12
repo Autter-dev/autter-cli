@@ -10,8 +10,8 @@ name: Release
 #   - pushing a tag matching `v*` (e.g. v1.5.9) publishes a release
 #   - merging a version bump to main (see tag-release.yml) creates the tag
 #     automatically from Cargo.toml's `version`
-#   - manual run via the Actions tab (workflow_dispatch) builds the binaries
-#     for validation but does NOT publish (no tag to release against)
+#   - a manual run on a branch builds binaries for validation without publishing
+#   - a manual run targeting a v* tag publishes that tagged release
 #
 # Asset names match what install.sh / install.ps1 expect: autter-<os>-<arch>
 #   macos/arm64 -> autter-macos-arm64    macos/x64 -> autter-macos-x64
@@ -131,7 +131,9 @@ jobs:
     name: Publish release
     needs: build
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Only publish for tag pushes; workflow_dispatch runs stop after building.
+    # Publish only when the workflow is running against a version tag. A manual
+    # branch dispatch therefore remains build-only, while tag-release.yml can
+    # explicitly dispatch this workflow for its GITHUB_TOKEN-created tag.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout

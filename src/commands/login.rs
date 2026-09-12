@@ -39,9 +39,9 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     // Start device flow
     eprintln!("Starting device authorization...\n");
 
-    let auth_response = client
-        .start_device_flow()
-        .map_err(|e| format!("Failed to start authorization: {}", e))?;
+    let auth_response = client.start_device_flow().map_err(|e| {
+        cli_authorization_failure(format!("could not start the browser sign-in: {e}"))
+    })?;
 
     // Build the display URL
     let display_url = auth_response
@@ -74,29 +74,33 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     ) {
         Ok(creds) => {
             spinner.stop();
-            eprintln!("\x1b[1;32m✓ Device authorized.\x1b[0m");
             creds
         }
         Err(e) => {
             spinner.stop();
-            return Err(format!("Authorization failed: {}", e));
+            return Err(cli_authorization_failure(e));
         }
     };
 
-    // Store credentials (non-fatal on failure)
-    match store.store(&creds) {
-        Ok(()) => {
-            crate::auth::notice::clear_sync_auth_blocked();
-            print_login_success(&creds.access_token);
-            resume_cloud_sync_after_login();
-        }
-        Err(e) => {
-            eprintln!("\nWarning: Failed to store credentials: {}", e);
-            eprintln!("You may need to log in again next time.");
-        }
-    }
+    // Authorization is only successful once the credentials are safely stored.
+    // Reporting success before this point leaves the user with a browser approval
+    // but no durable CLI session.
+    store.store(&creds).map_err(|e| {
+        format!(
+            "CLI authorization failed: browser approval succeeded, but credentials could not be saved: {e}\nExisting stored credentials were not changed."
+        )
+    })?;
+
+    crate::auth::notice::clear_sync_auth_blocked();
+    eprintln!("\x1b[1;32m✓ CLI authorization successful.\x1b[0m");
+    print_login_identity(&creds.access_token);
+    resume_cloud_sync_after_login();
 
     Ok(LoginOutcome::LoggedIn)
+}
+
+fn cli_authorization_failure(detail: impl std::fmt::Display) -> String {
+    format!("CLI authorization failed: {detail}\nNo credentials were issued or changed.")
 }
 
 /// Sign in with a Personal Access Token instead of the interactive device flow.
@@ -117,17 +121,17 @@ pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
         .map_err(|e| format!("Failed to store credentials: {}", e))?;
     crate::auth::notice::clear_sync_auth_blocked();
 
-    print_login_success(&creds.access_token);
+    eprintln!("Successfully logged in with a Personal Access Token.");
+    print_login_identity(&creds.access_token);
     resume_cloud_sync_after_login();
     Ok(LoginOutcome::LoggedIn)
 }
 
-/// Print "Successfully logged in!" plus the signed-in user and active org, read
-/// from the access token's claims (best-effort — falls back gracefully).
-fn print_login_success(access_token: &str) {
+/// Print the signed-in user and active org from the access token's claims
+/// (best-effort — falls back gracefully).
+fn print_login_identity(access_token: &str) {
     use crate::auth::identity::extract_identity_from_access_token;
 
-    eprintln!("Successfully logged in!");
     let identity = extract_identity_from_access_token(access_token);
 
     if let Some(name) = identity.name.as_deref().filter(|s| !s.is_empty()) {
@@ -344,5 +348,15 @@ mod tests {
             Some("https://test-app.autter.dev".into())
         );
         assert_eq!(derive_web_url_from_api("https://example.com"), None);
+    }
+
+    #[test]
+    fn authorization_failure_is_explicit_about_credential_state() {
+        let message = cli_authorization_failure("the request was denied");
+
+        assert_eq!(
+            message,
+            "CLI authorization failed: the request was denied\nNo credentials were issued or changed."
+        );
     }
 }
