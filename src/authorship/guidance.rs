@@ -43,7 +43,33 @@ pub fn show_missing_data_message() -> String {
 }
 
 fn append_capture_steps(out: &mut String) {
-    out.push_str("\nTo start capturing authorship:\n");
+    out.push_str("\nLikely cause: agent/editor hooks or the git proxy did not checkpoint before this commit.\n");
+    out.push_str("\nTo diagnose and start capturing authorship:\n");
     out.push_str("  autter install-hooks    # wire up agent and editor hooks\n");
-    out.push_str("  autter debug            # verify each editor/agent can checkpoint\n");
+    out.push_str("  autter install          # ensure git proxy + trace2 are configured\n");
+    out.push_str("  autter doctor           # verify checkpoint → attribution round-trip\n");
+    out.push_str("  autter daemon restart    # if doctor says checkpoints are not persisting\n");
+    out.push_str("  autter debug            # full support dump if doctor still fails\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_steps_point_at_doctor_and_daemon() {
+        let footer = diff_missing_data_footer();
+        assert!(footer.contains("autter doctor"), "{footer}");
+        assert!(footer.contains("autter daemon restart"), "{footer}");
+        assert!(footer.contains("Likely cause:"), "{footer}");
+        assert!(footer.contains("autter install-hooks"), "{footer}");
+    }
+
+    #[test]
+    fn show_message_keeps_notes_explanation() {
+        let msg = show_missing_data_message();
+        assert!(msg.contains(NO_AUTHORSHIP_DATA_MESSAGE), "{msg}");
+        assert!(msg.contains("git notes"), "{msg}");
+        assert!(msg.contains("autter doctor"), "{msg}");
+    }
 }

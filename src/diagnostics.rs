@@ -36,8 +36,10 @@ const REMEDIATION_DAEMON_PATHS: &str = "check that your home directory is set an
 const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install` and then `autter doctor`";
 const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter doctor`";
 const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install` to write the required trace2 settings to your global git config, then re-run `autter doctor`";
-const REMEDIATION_ATTRIBUTION: &str = "run `autter daemon restart`, then re-run `autter doctor`; if the trace2 config check for this git also failed, run `autter install` first -- attribution depends on it";
 const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter doctor`; if the trace2 config check also failed, run `autter install`";
+
+/// Fallback when the attribution self-check fails for an unrecognized reason.
+const REMEDIATION_ATTRIBUTION_FALLBACK: &str = "likely cause: the checkpoint → daemon → commit → notes pipeline is broken end-to-end. next: run `autter daemon restart`, then `autter doctor`; if any trace2 check also failed, run `autter install` first";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticStatus {
@@ -461,17 +463,104 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
             DiagnosticCheckResult::passed("attribution self-check completed", details, commands)
         }
         Err(err) => {
-            let mut details = vec![format!("repo: {}", repo_path.display()), err];
-            details.push(daemon_family_status_detail(&repo_path));
+            let mut details = vec![format!("repo: {}", repo_path.display()), err.clone()];
+            let daemon_detail = daemon_family_status_detail(&repo_path);
+            details.push(daemon_detail.clone());
             if path_is_in_debug_self_check_root(&repo_path) {
                 details.push(
                     "failed self-check repository was left in place for inspection".to_string(),
                 );
+                details.push(format!(
+                    "inspect leftover repo with: cd {} && autter blame {}",
+                    repo_path.display(),
+                    SELF_CHECK_FILE
+                ));
             }
+            let remediation =
+                attribution_self_check_remediation(&err, Some(daemon_detail.as_str()));
             DiagnosticCheckResult::failed("attribution self-check failed", details, commands)
-                .with_remediation(REMEDIATION_ATTRIBUTION)
+                .with_remediation(remediation)
         }
     }
+}
+
+/// Map attribution self-check failure text to a cause-specific `fix:` line.
+///
+/// Doctor and debug print this as the actionable next step; the leading
+/// `likely cause:` clause tells the user *why* before the commands.
+pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Option<&str>) -> String {
+    let err_l = err.to_ascii_lowercase();
+    let daemon_error = daemon_detail
+        .filter(|d| d.contains("last_error=") && !d.contains("last_error=<none>"))
+        .and_then(|d| {
+            d.split("last_error=")
+                .nth(1)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && *s != "<none>")
+        });
+
+    if err_l.contains("waiting for checkpoint persistence")
+        || err_l.contains("checkpoint(s) visible")
+    {
+        let mut msg = String::from(
+            "likely cause: checkpoints are not persisting to the working log (daemon not draining or checkpoint write failing). next: run `autter daemon status`, then `autter daemon restart`, then re-run `autter doctor`",
+        );
+        if let Some(daemon_err) = daemon_error {
+            msg.push_str(&format!(" (daemon last_error: {})", daemon_err));
+        }
+        return msg;
+    }
+
+    if err_l.contains("checkpoint")
+        && (err_l.contains("command failed") || err_l.contains("command timed out"))
+    {
+        return String::from(
+            "likely cause: the `autter checkpoint` command itself failed or hung before writing. next: run `autter daemon restart`, then `autter doctor`; if it keeps failing, re-run `autter install` and check `autter debug` for the checkpoint command log",
+        );
+    }
+
+    if err_l.contains("unexpected attribution")
+        || err_l.contains("waiting for expected attribution")
+    {
+        // Checkpoints ran far enough to commit; blame/notes did not match.
+        if err_l.contains("got untracked") || err_l.contains("got unknown") {
+            return String::from(
+                "likely cause: the commit completed but authorship notes were not written (post-commit / git-proxy / notes path). next: run `autter install` so git is proxied and trace2 is configured, then `autter doctor`; if trace2 checks already failed above, fix those first",
+            );
+        }
+        return String::from(
+            "likely cause: blame saw the wrong line classes after commit (notes present but mismatched). next: inspect the leftover self-check repo if listed above, run `autter install`, then `autter doctor`; share `autter debug` output if it still fails",
+        );
+    }
+
+    if err_l.contains("blame analysis failed") {
+        return String::from(
+            "likely cause: blame/notes could not be read after the self-check commit. next: run `autter install`, then `autter doctor`; if notes backend errors appear in the details, re-run `autter daemon restart` and try again",
+        );
+    }
+
+    if err_l.contains("failed to create")
+        || err_l.contains("failed to write")
+        || err_l.contains("permission denied")
+    {
+        return String::from(
+            "likely cause: the self-check could not create or write its temp repository (permissions or full disk). next: check that your home directory is writable, free some disk space, then re-run `autter doctor`",
+        );
+    }
+
+    if err_l.contains("timed out") && err_l.contains("before this command could start") {
+        return String::from(
+            "likely cause: earlier self-check steps exhausted the time budget (often a stuck daemon). next: run `autter daemon restart`, then `autter doctor`",
+        );
+    }
+
+    if let Some(daemon_err) = daemon_error {
+        return format!(
+            "likely cause: daemon reported an error while the self-check ran ({daemon_err}). next: run `autter daemon status`, then `autter daemon restart`, then `autter doctor`; if a trace2 check also failed, run `autter install` first"
+        );
+    }
+
+    REMEDIATION_ATTRIBUTION_FALLBACK.to_string()
 }
 
 pub fn run_trace2_file_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
@@ -1507,5 +1596,43 @@ mod tests {
             "{record:?}"
         );
         assert!(record.stderr.contains("err"), "{record:?}");
+    }
+
+    #[test]
+    fn attribution_remediation_maps_checkpoint_persistence() {
+        let msg = attribution_self_check_remediation(
+            "timed out after 3.0s waiting for checkpoint persistence: only 0 checkpoint(s) visible, expected at least 1",
+            Some("daemon status for repo: latest_seq=0, last_error=<none>"),
+        );
+        assert!(
+            msg.contains("likely cause: checkpoints are not persisting"),
+            "{msg}"
+        );
+        assert!(msg.contains("autter daemon restart"), "{msg}");
+    }
+
+    #[test]
+    fn attribution_remediation_maps_untracked_after_commit() {
+        let msg = attribution_self_check_remediation(
+            "timed out after 1.2s waiting for expected attribution via notes backend for abc in /tmp/x: unexpected attribution for line 2: got untracked, expected known_human",
+            None,
+        );
+        assert!(msg.contains("authorship notes were not written"), "{msg}");
+        assert!(msg.contains("autter install"), "{msg}");
+    }
+
+    #[test]
+    fn attribution_remediation_includes_daemon_last_error() {
+        let msg = attribution_self_check_remediation(
+            "timed out after 3.0s waiting for checkpoint persistence: only 0 checkpoint(s) visible, expected at least 1",
+            Some("daemon status for repo: latest_seq=0, last_error=socket closed"),
+        );
+        assert!(msg.contains("daemon last_error: socket closed"), "{msg}");
+    }
+
+    #[test]
+    fn attribution_remediation_falls_back_for_unknown_errors() {
+        let msg = attribution_self_check_remediation("something unexpected went wrong", None);
+        assert_eq!(msg, REMEDIATION_ATTRIBUTION_FALLBACK);
     }
 }

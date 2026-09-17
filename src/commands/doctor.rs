@@ -37,6 +37,8 @@ const SECTION_E2E: &str = "End-to-end checkpoint";
 const SECTION_AGENTS: &str = "AI agent hooks";
 const SECTION_ACCOUNT: &str = "Account & sync";
 
+const REMEDIATION_TRACE2_THEN_ATTRIBUTION: &str = "a trace2 check failed above — attribution depends on it. run `autter install`, then `autter doctor`";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum DoctorStatus {
@@ -151,16 +153,21 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     // checked for both the git autter runs and the git on the user's PATH.
     let configured_target = GitDiagnosticTarget::new("configured git", &git_cmd);
     let terminal_target = GitDiagnosticTarget::new("terminal git", "git");
-    reporter.add(check_from_diagnostic(
-        SECTION_TRACE2,
-        "trace2 config (configured git)",
-        crate::diagnostics::check_trace2_global_config(&configured_target),
-    ));
-    reporter.add(check_from_diagnostic(
-        SECTION_TRACE2,
-        "trace2 config (terminal git)",
-        crate::diagnostics::check_trace2_global_config(&terminal_target),
-    ));
+    let mut trace2_blocking = false;
+    for (name, target) in [
+        ("trace2 config (configured git)", &configured_target),
+        ("trace2 config (terminal git)", &terminal_target),
+    ] {
+        let check = check_from_diagnostic(
+            SECTION_TRACE2,
+            name,
+            crate::diagnostics::check_trace2_global_config(target),
+        );
+        if check.status == DoctorStatus::Failed {
+            trace2_blocking = true;
+        }
+        reporter.add(check);
+    }
     if options.skip_trace2_checks {
         reporter.add(skipped_check(
             SECTION_TRACE2,
@@ -168,11 +175,15 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
             format!("skipped ({})", SKIP_TRACE2_CHECKS_FLAG),
         ));
     } else {
-        reporter.add(check_from_diagnostic(
+        let capture = check_from_diagnostic(
             SECTION_TRACE2,
             "trace2 event capture",
             crate::diagnostics::run_trace2_file_self_check(&configured_target),
-        ));
+        );
+        if capture.status == DoctorStatus::Failed {
+            trace2_blocking = true;
+        }
+        reporter.add(capture);
     }
 
     // End-to-end: a real checkpoint event through the full pipeline --
@@ -195,6 +206,15 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
                 "checkpoint -> service -> commit -> attribution round-trip succeeded ({})",
                 e2e_target.label
             );
+        } else if e2e_check.status == DoctorStatus::Failed && trace2_blocking {
+            // Attribution cannot work without trace2; steer the user to the
+            // failed checks above before the stage-specific remediation.
+            e2e_check.remediation = Some(match e2e_check.remediation.take() {
+                Some(stage) => format!(
+                    "a trace2 check failed above — attribution depends on it. run `autter install` first, then: {stage}"
+                ),
+                None => REMEDIATION_TRACE2_THEN_ATTRIBUTION.to_string(),
+            });
         }
         reporter.add(e2e_check);
     } else {

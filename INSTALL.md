@@ -243,4 +243,18 @@ autter whoami
 autter onboard --force
 ```
 
+### Attribution checks fail (`autter doctor` / `autter debug`)
+
+`autter doctor` prints a `fix:` line with a likely cause and next command for each failure. Common cases:
+
+1. **Checkpoints not persisting** (timeout waiting for working-log entries):  
+   `autter daemon status`, then `autter daemon restart`, then `autter doctor`.
+2. **Trace2 config / event capture failed**:  
+   `autter install`, then `autter doctor`. Attribution depends on the git proxy and trace2 settings.
+3. **Commit succeeded but blame lines are all untracked / wrong class**:  
+   post-commit notes did not land — usually the same as (2). Run `autter install` and ensure commits go through the Autter-managed `git`.
+4. **Still stuck**: run `autter debug` and review (or share) its attribution self-check section, including the leftover self-check repo path if one was kept for inspection.
+
+When `autter diff` / `blame` / `show` report missing authorship on real commits, the same sequence applies: hooks (`install-hooks`) → install → doctor.
+
 For additional diagnostics, run `autter debug` and review its output before including it in an issue.
