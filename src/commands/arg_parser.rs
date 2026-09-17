@@ -165,17 +165,84 @@ fn color_forced_off() -> bool {
     store().read().unwrap().no_color || std::env::var_os("NO_COLOR").is_some()
 }
 
+/// On Windows, enable VT processing (and report whether ANSI works). Without
+/// this, ConHost prints raw `\x1b[…` bytes even when stdout is a TTY. Elsewhere
+/// a TTY is enough.
+fn terminal_supports_ansi() -> bool {
+    #[cfg(windows)]
+    {
+        crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 /// Centralized color decision for **stdout**: honor `--no-color`/`--plain`, the
 /// `NO_COLOR` env var, and whether stdout is a TTY. This is the project-wide
 /// `should_colorize()` for human-readable output written via `print!`/`println!`.
 pub fn use_color() -> bool {
-    !color_forced_off() && std::io::stdout().is_terminal()
+    if color_forced_off() || !std::io::stdout().is_terminal() {
+        return false;
+    }
+    terminal_supports_ansi()
 }
 
 /// Same decision as [`use_color`] but keyed on **stderr**'s TTY, for color
 /// emitted via `eprint!`/`eprintln!` (warnings, notices, progress messages).
 pub fn use_color_stderr() -> bool {
-    !color_forced_off() && std::io::stderr().is_terminal()
+    if color_forced_off() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    terminal_supports_ansi()
+}
+
+/// Whether OSC 8 hyperlinks are safe to emit. Color/VT support is not enough —
+/// classic ConHost with VT enabled still dumps OSC 8 sequences as literal text.
+pub fn use_hyperlinks() -> bool {
+    if !use_color() {
+        return false;
+    }
+    // Explicit opt-out / opt-in (https://gist.github.com/egmontkob/eb114476d1dda0276486)
+    if let Ok(v) = std::env::var("FORCE_HYPERLINK") {
+        return v != "0";
+    }
+    if std::env::var_os("DOMTERM").is_some() {
+        return true;
+    }
+    if let Ok(program) = std::env::var("TERM_PROGRAM") {
+        match program.as_str() {
+            "iTerm.app" | "WezTerm" | "ghostty" | "vscode" | "Hyper" | "kitty" => return true,
+            _ => {}
+        }
+    }
+    if let Ok(term) = std::env::var("TERM") {
+        if term.contains("kitty") || term.contains("vte") || term == "xterm-kitty" {
+            return true;
+        }
+    }
+    // Windows Terminal sets WT_SESSION; classic cmd/ConHost does not.
+    if std::env::var_os("WT_SESSION").is_some() {
+        return true;
+    }
+    // VTE-based terminals (GNOME Terminal, Tilix, …) advertise via VTE_VERSION ≥ 5000.
+    if let Ok(vte) = std::env::var("VTE_VERSION")
+        && let Ok(n) = vte.parse::<u32>()
+        && n >= 5000
+    {
+        return true;
+    }
+    // Non-Windows TTYs often support OSC 8 in modern emulators; keep the prior
+    // interactive behavior there. On Windows, require an explicit signal above.
+    #[cfg(not(windows))]
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
 }
 
 /// Wrap `text` in the SGR `code` (e.g. `"1;32"`) when stdout coloring is

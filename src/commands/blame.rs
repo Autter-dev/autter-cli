@@ -626,6 +626,7 @@ impl Repository {
                 &lines,
                 &request.line_ranges,
                 &request.options,
+                &commits_with_notes,
             )?;
         }
 
@@ -1702,6 +1703,7 @@ fn output_default_format(
     lines: &[&str],
     line_ranges: &[(u32, u32)],
     options: &AutterBlameOptions,
+    commits_with_notes: &std::collections::HashSet<String>,
 ) -> Result<(), AutterError> {
     let mut output = String::new();
 
@@ -1720,6 +1722,21 @@ fn output_default_format(
     }
     let mut requested_lines: Vec<u32> = line_to_hunk.keys().copied().collect();
     requested_lines.sort_unstable();
+
+    // Lines shown as the git author because Autter has no note (and the commit
+    // isn't a known-agent email simulation). Used for the consistency notice.
+    let mut unattested_git_author_lines = 0usize;
+    if !options.mark_unknown {
+        for line_num in &requested_lines {
+            if let Some(hunk) = line_to_hunk.get(line_num)
+                && !commits_with_notes.contains(&hunk.commit_sha)
+                && crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email)
+                    .is_none()
+            {
+                unattested_git_author_lines += 1;
+            }
+        }
+    }
 
     // Calculate the maximum line number width for proper padding
     let max_line_num = lines.len() as u32;
@@ -1874,6 +1891,15 @@ fn output_default_format(
         // Append git-like stats lines to output string
         let stats = "num read blob: 1\nnum get patch: 0\nnum commits: 0\n";
         output.push_str(stats);
+    }
+
+    // Interactive TTY only: explain git-author fallback so blame doesn't look
+    // like it contradicts `autter stats` on the same commit. Keep porcelain /
+    // pager-piped / scripted output byte-compatible with git blame.
+    if unattested_git_author_lines > 0 && io::stdout().is_terminal() {
+        output.push_str(&crate::authorship::guidance::blame_git_author_fallback_notice(
+            unattested_git_author_lines,
+        ));
     }
 
     // Output handling - respect pager environment variables

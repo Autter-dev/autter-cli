@@ -33,6 +33,22 @@ pub fn blame_line_missing_data_message() -> String {
     out
 }
 
+/// Short notice when `autter blame` falls back to the git author for lines
+/// without Autter attestations — so it does not contradict `autter stats`,
+/// which reports those same lines as untracked.
+pub fn blame_git_author_fallback_notice(unattested_lines: usize) -> String {
+    if unattested_lines == 1 {
+        "\nNote: 1 line has no Autter attestation, so blame shows the git author \
+(same as `git blame`). `autter stats` counts that line as untracked. Use `--mark-unknown` to label it Unknown.\n"
+            .to_string()
+    } else {
+        format!(
+            "\nNote: {unattested_lines} lines have no Autter attestation, so blame shows the git author \
+(same as `git blame`). `autter stats` counts those lines as untracked. Use `--mark-unknown` to label them Unknown.\n"
+        )
+    }
+}
+
 /// Guidance when `autter show` finds commits but no authorship notes.
 pub fn show_missing_data_message() -> String {
     let mut out = format!("{NO_AUTHORSHIP_DATA_MESSAGE}.\n");
@@ -71,5 +87,17 @@ mod tests {
         assert!(msg.contains(NO_AUTHORSHIP_DATA_MESSAGE), "{msg}");
         assert!(msg.contains("git notes"), "{msg}");
         assert!(msg.contains("autter doctor"), "{msg}");
+    }
+
+    #[test]
+    fn blame_fallback_notice_points_at_stats_and_mark_unknown() {
+        let one = blame_git_author_fallback_notice(1);
+        assert!(one.contains("1 line has"), "{one}");
+        assert!(one.contains("autter stats"), "{one}");
+        assert!(one.contains("--mark-unknown"), "{one}");
+
+        let many = blame_git_author_fallback_notice(4);
+        assert!(many.contains("4 lines have"), "{many}");
+        assert!(many.contains("untracked"), "{many}");
     }
 }

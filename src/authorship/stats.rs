@@ -195,11 +195,15 @@ pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> Str
     // two anchors (human / AI) otherwise.
     if show_untracked {
         let untracked_percentage = untracked_pct_raw.round() as u32;
-        // When interactive, wrap "untracked" in an OSC 8 hyperlink so it is clickable in
-        // supporting terminals (iTerm2, Warp, etc.). Spaces are constructed manually —
-        // not via format-width padding on the label — so that invisible escape bytes do
-        // not misalign the output.
-        let untracked_label = if is_interactive && colorize {
+        // When interactive *and* the terminal supports OSC 8, wrap "untracked" in a
+        // hyperlink. Color alone is not enough — Windows ConHost with VT enabled still
+        // dumps OSC 8 as literal text. Spaces are constructed manually — not via
+        // format-width padding on the label — so invisible escape bytes do not
+        // misalign the output.
+        let untracked_label = if is_interactive
+            && colorize
+            && crate::commands::arg_parser::use_hyperlinks()
+        {
             "\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\\x1b[4muntracked\x1b[24m\x1b]8;;\x1b\\"
                 .to_string()
         } else {
@@ -789,18 +793,27 @@ mod tests {
         let all_untracked_output = write_stats_to_terminal(&all_untracked_stats, false);
         assert_debug_snapshot!(all_untracked_output);
 
-        // OSC 8 hyperlink emitted when is_interactive = true
-        // Not a snapshot test — asserts presence of the escape sequence directly.
-        let hyperlink_output = write_stats_to_terminal(&untracked_stats, true);
+        // OSC 8 hyperlink only when the terminal advertises hyperlink support
+        // (see use_hyperlinks). In non-TTY unit tests this stays plain "untracked".
+        let interactive_output = write_stats_to_terminal(&untracked_stats, true);
         assert!(
-            hyperlink_output.contains("\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\"),
-            "Expected OSC 8 hyperlink in interactive output, got: {:?}",
-            hyperlink_output
-        );
-        assert!(
-            hyperlink_output.contains("untracked"),
+            interactive_output.contains("untracked"),
             "Expected 'untracked' label in interactive output"
         );
+        if crate::commands::arg_parser::use_hyperlinks() {
+            assert!(
+                interactive_output
+                    .contains("\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\"),
+                "Expected OSC 8 hyperlink when hyperlinks are enabled, got: {:?}",
+                interactive_output
+            );
+        } else {
+            assert!(
+                !interactive_output.contains("\x1b]8;;"),
+                "OSC 8 must not leak when hyperlinks are disabled, got: {:?}",
+                interactive_output
+            );
+        }
     }
 
     #[test]
