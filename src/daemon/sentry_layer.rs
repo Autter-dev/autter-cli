@@ -67,20 +67,29 @@ impl Visit for MessageVisitor {
     }
 }
 
-/// Combine the static tracing message with a structured `error` field (as
-/// emitted by `%error`) so the resulting exception value reflects the real
-/// underlying cause. Returns the message unchanged when there is no non-empty
-/// `error` field to promote.
+/// Field names that carry an underlying error's text, in priority order. Call
+/// sites name this field inconsistently (`%error`, `error = %e`, `%e`, `%err`),
+/// so the promotion has to recognise every alias rather than only `error`.
+const PROMOTED_ERROR_FIELDS: [&str; 4] = ["error", "err", "e", "source"];
+
+/// Combine the static tracing message with the underlying error's text so the
+/// resulting exception value reflects the real cause. The error is read from the
+/// first non-empty of the [`PROMOTED_ERROR_FIELDS`] aliases. Returns the message
+/// unchanged when none of them are present.
 fn message_with_promoted_error(
     message: &str,
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
-    match fields.get("error").and_then(|v| v.as_str()) {
-        Some(error) if !error.is_empty() && !message.is_empty() => {
-            format!("{}: {}", message, error)
-        }
-        Some(error) if !error.is_empty() => error.to_string(),
-        _ => message.to_string(),
+    let promoted = PROMOTED_ERROR_FIELDS.iter().find_map(|name| {
+        fields
+            .get(*name)
+            .and_then(|v| v.as_str())
+            .filter(|error| !error.is_empty())
+    });
+    match promoted {
+        Some(error) if !message.is_empty() => format!("{}: {}", message, error),
+        Some(error) => error.to_string(),
+        None => message.to_string(),
     }
 }
 
@@ -176,5 +185,40 @@ mod tests {
     fn uses_error_as_message_when_base_is_empty() {
         let f = fields(&[("error", json!("standalone cause"))]);
         assert_eq!(message_with_promoted_error("", &f), "standalone cause");
+    }
+
+    #[test]
+    fn promotes_e_field_from_percent_e_call_sites() {
+        let f = fields(&[(
+            "e",
+            json!("failed binding control socket: Address already in use"),
+        )]);
+        assert_eq!(
+            message_with_promoted_error("control listener exited with error", &f),
+            "control listener exited with error: failed binding control socket: Address already in use"
+        );
+    }
+
+    #[test]
+    fn promotes_err_and_source_aliases() {
+        let err = fields(&[("err", json!("update check failed cause"))]);
+        assert_eq!(
+            message_with_promoted_error("update check failed", &err),
+            "update check failed: update check failed cause"
+        );
+        let source = fields(&[("source", json!("root cause"))]);
+        assert_eq!(
+            message_with_promoted_error("wrapper failed", &source),
+            "wrapper failed: root cause"
+        );
+    }
+
+    #[test]
+    fn skips_empty_alias_for_a_later_populated_one() {
+        let f = fields(&[("error", json!("")), ("e", json!("real cause"))]);
+        assert_eq!(
+            message_with_promoted_error("something happened", &f),
+            "something happened: real cause"
+        );
     }
 }
