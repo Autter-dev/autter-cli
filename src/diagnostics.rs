@@ -26,6 +26,14 @@ const SELF_CHECK_TRACE_ENV_REMOVE: &[&str] = &[
     "GIT_TRACE2_ENV_VARS",
 ];
 const DEBUG_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// End-to-end attribution self-check budget. Windows process spawn is slower,
+/// so give it a longer wall clock — the old shared 3s budget often expired
+/// before waits started ("timed out after 0.0s").
+const ATTRIBUTION_SELF_CHECK_TIMEOUT: Duration = if cfg!(windows) {
+    Duration::from_secs(20)
+} else {
+    Duration::from_secs(12)
+};
 const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -33,13 +41,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 // reports. Keep them to concrete next commands a stuck user can run without
 // support.
 const REMEDIATION_DAEMON_PATHS: &str = "check that your home directory is set and writable (HOME on macOS/Linux, USERPROFILE on Windows), then re-run `autter doctor`";
-const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install` and then `autter doctor`";
+const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install --system` and then `autter doctor`";
 const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter doctor`";
-const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install` to write the required trace2 settings to your global git config, then re-run `autter doctor`";
-const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter doctor`; if the trace2 config check also failed, run `autter install`";
+const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install --system` (or `autter onboard`) to write the required trace2 settings to your global git config, then re-run `autter doctor`";
+const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter doctor`; if the trace2 config check also failed, run `autter install --system`";
 
 /// Fallback when the attribution self-check fails for an unrecognized reason.
-const REMEDIATION_ATTRIBUTION_FALLBACK: &str = "likely cause: the checkpoint → daemon → commit → notes pipeline is broken end-to-end. next: run `autter daemon restart`, then `autter doctor`; if any trace2 check also failed, run `autter install` first";
+const REMEDIATION_ATTRIBUTION_FALLBACK: &str = "likely cause: the checkpoint → daemon → commit → notes pipeline is broken end-to-end. next: run `autter daemon restart`, then `autter doctor`; if any trace2 check also failed, run `autter install --system` first";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticStatus {
@@ -157,8 +165,6 @@ impl GitDiagnosticTarget {
 pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticCheckResult {
     let mut commands = Vec::new();
     let mut details = Vec::new();
-    let mut probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
-
     let config = match crate::daemon::DaemonConfig::from_env_or_default_paths() {
         Ok(config) => config,
         Err(err) => {
@@ -197,7 +203,6 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
             .with_remediation(REMEDIATION_DAEMON_FAILED);
         }
         restarted = true;
-        probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
     } else if !initially_up {
         details.push("daemon was not running; starting daemon".to_string());
         if let Err(err) = crate::commands::daemon::ensure_daemon_running(DEBUG_CHECK_TIMEOUT) {
@@ -209,8 +214,9 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
             )
             .with_remediation(REMEDIATION_DAEMON_FAILED);
         }
-        probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
     }
+    // Fresh budget for the ingestion probe (warm daemon included).
+    let probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
 
     match run_daemon_trace2_ingestion_probe(&mut commands, git_program, &config, probe_deadline) {
         Ok(mut probe_details) => {
@@ -365,7 +371,7 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
 
 pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
     let mut commands = Vec::new();
-    let deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
+    let deadline = Instant::now() + ATTRIBUTION_SELF_CHECK_TIMEOUT;
     let repo_path = debug_self_check_root().join(format!(
         "{}-{}",
         sanitize_label(&target.label),
@@ -515,7 +521,7 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
         && (err_l.contains("command failed") || err_l.contains("command timed out"))
     {
         return String::from(
-            "likely cause: the `autter checkpoint` command itself failed or hung before writing. next: run `autter daemon restart`, then `autter doctor`; if it keeps failing, re-run `autter install` and check `autter debug` for the checkpoint command log",
+            "likely cause: the `autter checkpoint` command itself failed or hung before writing. next: run `autter daemon restart`, then `autter doctor`; if it keeps failing, re-run `autter install --system` and check `autter debug` for the checkpoint command log",
         );
     }
 
@@ -525,17 +531,17 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
         // Checkpoints ran far enough to commit; blame/notes did not match.
         if err_l.contains("got untracked") || err_l.contains("got unknown") {
             return String::from(
-                "likely cause: the commit completed but authorship notes were not written (post-commit / git-proxy / notes path). next: run `autter install` so git is proxied and trace2 is configured, then `autter doctor`; if trace2 checks already failed above, fix those first",
+                "likely cause: the commit completed but authorship notes were not written (post-commit / git-proxy / notes path). next: run `autter install --system` so git is proxied and trace2 is configured, then `autter doctor`; if trace2 checks already failed above, fix those first",
             );
         }
         return String::from(
-            "likely cause: blame saw the wrong line classes after commit (notes present but mismatched). next: inspect the leftover self-check repo if listed above, run `autter install`, then `autter doctor`; share `autter debug` output if it still fails",
+            "likely cause: blame saw the wrong line classes after commit (notes present but mismatched). next: inspect the leftover self-check repo if listed above, run `autter install --system`, then `autter doctor`; share `autter debug` output if it still fails",
         );
     }
 
     if err_l.contains("blame analysis failed") {
         return String::from(
-            "likely cause: blame/notes could not be read after the self-check commit. next: run `autter install`, then `autter doctor`; if notes backend errors appear in the details, re-run `autter daemon restart` and try again",
+            "likely cause: blame/notes could not be read after the self-check commit. next: run `autter install --system`, then `autter doctor`; if notes backend errors appear in the details, re-run `autter daemon restart` and try again",
         );
     }
 
@@ -556,7 +562,7 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
 
     if let Some(daemon_err) = daemon_error {
         return format!(
-            "likely cause: daemon reported an error while the self-check ran ({daemon_err}). next: run `autter daemon status`, then `autter daemon restart`, then `autter doctor`; if a trace2 check also failed, run `autter install` first"
+            "likely cause: daemon reported an error while the self-check ran ({daemon_err}). next: run `autter daemon status`, then `autter daemon restart`, then `autter doctor`; if a trace2 check also failed, run `autter install --system` first"
         );
     }
 
@@ -754,7 +760,7 @@ fn run_required_until(
             stdout: String::new(),
             stderr: format!(
                 "self-check timed out after {:.1}s before this command could start",
-                DEBUG_CHECK_TIMEOUT.as_secs_f64()
+                ATTRIBUTION_SELF_CHECK_TIMEOUT.as_secs_f64()
             ),
             timed_out: true,
         };

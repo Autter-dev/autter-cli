@@ -23,6 +23,8 @@ struct InstallOptions {
     verbose: bool,
     install_skills: bool,
     include_visual_studio_extension: bool,
+    /// When true, also write global git trace2 config and start the daemon.
+    apply_system: bool,
 }
 
 /// Installation status for a tool
@@ -313,19 +315,26 @@ fn ensure_daemon(dry_run: bool) {
     }
 }
 
-/// Main entry point for install-hooks command
+/// Main entry point for install-hooks command.
+///
+/// By default this only installs IDE/agent hooks. Global git trace2 config and
+/// daemon start are applied when `--system` is passed, or from `autter onboard`
+/// after the user consents — so `npm install` / bare `install-hooks` no longer
+/// mutate the machine silently.
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
     let options = parse_install_options(args);
 
-    // Daemon trace2 config must be in place before any install work starts.
-    // Non-fatal: the global git config may be read-only (e.g. Nix store symlink).
-    if let Err(e) = configure_daemon_trace2(options.dry_run) {
-        eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
+    if options.apply_system {
+        // Daemon trace2 config must be in place before any install work starts.
+        // Non-fatal: the global git config may be read-only (e.g. Nix store symlink).
+        if let Err(e) = configure_daemon_trace2(options.dry_run) {
+            eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
+        }
+        ensure_daemon(options.dry_run);
     }
-    ensure_daemon(options.dry_run);
 
-    // Now that the daemon is (re)started, initialize the telemetry handle so
-    // that install-hooks metrics and observability events route through it.
+    // Now that the daemon is (re)started (when requested), initialize the telemetry
+    // handle so that install-hooks metrics and observability events route through it.
     if !options.dry_run {
         let _ = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
     }
@@ -348,6 +357,65 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
     Ok(to_hashmap(statuses))
 }
 
+/// Apply global git trace2 + start/restart the daemon. Called from onboard after
+/// the user consents to system integration.
+pub fn apply_system_integrations(dry_run: bool) -> Result<(), AutterError> {
+    if let Err(e) = configure_daemon_trace2(dry_run) {
+        eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
+    }
+    ensure_daemon(dry_run);
+    Ok(())
+}
+
+/// Full uninstall: agent hooks + global trace2 + stop daemon.
+pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
+    let mut dry_run = false;
+    let mut verbose = false;
+    for arg in args {
+        if arg == "--dry-run" || arg == "--dry-run=true" {
+            dry_run = true;
+        }
+        if arg == "--verbose" || arg == "-v" {
+            verbose = true;
+        }
+    }
+
+    let statuses = run_uninstall(&[
+        if dry_run {
+            "--dry-run".to_string()
+        } else {
+            String::new()
+        },
+        if verbose {
+            "--verbose".to_string()
+        } else {
+            String::new()
+        },
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>())?;
+
+    if !dry_run {
+        let git_cmd = config::Config::fresh().git_cmd().to_string();
+        if let Err(e) = remove_global_git_config_section(&git_cmd, "trace2") {
+            eprintln!("Warning: could not remove global trace2 config: {e}");
+        }
+        if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths()
+            && let Err(e) = crate::commands::daemon::stop_daemon(
+                &daemon_config,
+                std::time::Duration::from_secs(5),
+            )
+        {
+            eprintln!("Warning: could not stop background service: {e}");
+        }
+    } else {
+        eprintln!("[dry-run] would remove global git trace2 config and stop the background service");
+    }
+
+    Ok(statuses)
+}
+
 fn parse_install_options(args: &[String]) -> InstallOptions {
     let mut options = InstallOptions::default();
 
@@ -357,6 +425,7 @@ fn parse_install_options(args: &[String]) -> InstallOptions {
             "--verbose" | "-v" => options.verbose = true,
             "--skills" => options.install_skills = true,
             "--visual-studio-extension" => options.include_visual_studio_extension = true,
+            "--system" => options.apply_system = true,
             _ => {}
         }
     }

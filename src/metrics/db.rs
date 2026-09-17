@@ -282,6 +282,12 @@ impl MetricsDatabase {
         Ok(count as usize)
     }
 
+    /// Drop every queued metrics event (pre-upload backlog).
+    pub fn delete_all(&mut self) -> Result<usize, AutterError> {
+        let n = self.conn.execute("DELETE FROM metrics", [])?;
+        Ok(n)
+    }
+
     /// Returns whether an `agent_usage` event should be emitted for this prompt_id.
     ///
     /// If emitted, this method also updates the prompt's last-sent timestamp.

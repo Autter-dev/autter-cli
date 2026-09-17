@@ -98,6 +98,15 @@ pub fn handle_onboard(args: &[String]) {
     // Telemetry consent is asked regardless of the connected/local choice above.
     let telemetry_enabled = configure_telemetry(&mut file_config, telemetry_flag);
 
+    // System integrations (IDE hooks, global git trace2, daemon) require
+    // explicit consent — they are no longer applied by npm postinstall.
+    apply_system_integrations_with_consent(choose_connect || choose_local || force);
+
+    // After connect: offer to keep or discard any pre-login upload backlog.
+    if file_config.prompt_storage.as_deref() != Some("local") {
+        offer_historical_sync_consent();
+    }
+
     file_config.onboarding_completed = Some(true);
     if let Err(e) = config::save_file_config(&file_config) {
         eprintln!("Warning: could not save onboarding state: {e}");
@@ -370,5 +379,106 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
         eprintln!("  {local_log}");
     } else {
         eprintln!("Anonymous telemetry is OFF.");
+    }
+}
+
+/// Install IDE hooks + global git trace2 + start the daemon after consent.
+/// Non-interactive `--local` / `--connect` / `--force` flows apply system
+/// integrations automatically (scripted installs already opted in by flag).
+fn apply_system_integrations_with_consent(auto_apply: bool) {
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return;
+    }
+
+    let apply = if auto_apply {
+        true
+    } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprintln!();
+        eprintln!("{BOLD}System integrations{RESET}");
+        eprintln!(
+            "  Autter can install IDE/agent hooks, write git trace2 settings, and start a"
+        );
+        eprintln!("  background service so terminal commits get authorship notes.");
+        eprintln!();
+        let items = [
+            SelectItem::new(
+                "Yes — install hooks, configure git, and start the background service",
+                "Required for attribution on terminal commits and AI editor sessions.",
+            ),
+            SelectItem::new(
+                "Not now — I'll run `autter install --system` later",
+                "Binary stays installed; attribution will not capture until you opt in.",
+            ),
+        ];
+        match ui::select("Install system integrations?", &items, 0) {
+            0 => true,
+            _ => false,
+        }
+    } else {
+        // Non-interactive without flags: leave integrations off.
+        eprintln!("Skipping system integrations (non-interactive). Run `autter onboard` or `autter install --system` later.");
+        false
+    };
+
+    if !apply {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("Installing IDE/agent hooks…");
+    match crate::commands::install_hooks::run(&["--system".to_string()]) {
+        Ok(_) => {}
+        Err(e) => eprintln!("Warning: could not install hooks: {e}"),
+    }
+}
+
+/// When connecting, any pre-login backlog would upload on the next daemon drain.
+/// Offer to keep (import) or purge it first.
+fn offer_historical_sync_consent() {
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return;
+    }
+
+    let pending = crate::auth::notice::pending_sync_counts();
+    if pending.total() == 0 {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("{BOLD}Previously collected sessions{RESET}");
+    eprintln!(
+        "  Found local data queued for upload: {}.",
+        pending.summary()
+    );
+    eprintln!("  This may include sessions from before you connected this machine.");
+    eprintln!();
+
+    let import = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        let items = [
+            SelectItem::new(
+                "Import — upload this backlog to your Autter org",
+                "Recommended if you want historical attribution on the dashboard.",
+            ),
+            SelectItem::new(
+                "Discard — clear the local upload queue first",
+                "Runs `autter sync purge`. Nothing pre-dating this connect is uploaded.",
+            ),
+        ];
+        ui::select("What should we do with the backlog?", &items, 0) == 0
+    } else {
+        // Non-interactive connect: keep backlog (historical default) but print how to purge.
+        eprintln!("  Keeping the backlog. Run `autter sync purge` before the next daemon drain to discard it.");
+        true
+    };
+
+    if !import {
+        match crate::commands::sync::purge_sync_queues() {
+            Ok(summary) => {
+                eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
+            }
+            Err(e) => eprintln!("Warning: could not clear upload queue: {e}"),
+        }
+    } else {
+        eprintln!("  Backlog will upload in the background after setup.");
     }
 }

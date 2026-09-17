@@ -274,17 +274,11 @@ async function main() {
     return;
   }
 
-  // Mirror install.sh: wire up agent/editor integrations right away. The
-  // daemon re-checks hooks daily, so a failure here is non-fatal.
-  try {
-    execFileSync(result.bin, ['install-hooks'], { stdio: 'inherit', timeout: 120_000 });
-  } catch {
-    console.warn("autter: could not set up IDE/agent hooks; run 'autter install-hooks' manually");
-  }
-
+  // Do not mutate git config / IDE hooks / daemon from postinstall — that
+  // requires consent via `autter onboard` (or explicit `autter install --system`).
   console.log('');
   console.log(`autter installed at ${result.bin}`);
-  console.log("Run 'autter onboard' to finish setup (local-only mode or connect to autter.dev).");
+  console.log("Run 'autter onboard' to finish setup (consent for hooks, git config, and daemon).");
 }
 
 module.exports = { assetName, binaryDest, ensureBinary, releaseTag };

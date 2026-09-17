@@ -2,10 +2,14 @@
 //!
 //! Subcommands:
 //! - `status`  Show whether authorship data is reaching autter cloud.
+//! - `purge`   Discard the local upload backlog without uploading it.
+//! - `open`    Open the org dashboard.
 
-use crate::auth::notice::{CloudSyncState, collect_cloud_sync_status};
+use crate::auth::notice::{clear_sync_auth_blocked, collect_cloud_sync_status, CloudSyncState};
 use crate::commands::arg_parser::{self, ScanMode};
+use crate::error::AutterError;
 use serde::Serialize;
+use std::io::IsTerminal;
 
 #[derive(Debug, Serialize)]
 struct SyncStatusOutput {
@@ -17,6 +21,7 @@ pub fn handle_sync(args: &[String]) {
     match args.first().map(|s| s.as_str()) {
         None => print_status(args),
         Some("status") => print_status(&args[1..]),
+        Some("purge") | Some("clear") | Some("clear-queue") => purge_cli(&args[1..]),
         Some("open") => open_dashboard(),
         Some("--help") | Some("-h") | Some("help") => print_help(),
         Some(other) => {
@@ -25,6 +30,78 @@ pub fn handle_sync(args: &[String]) {
             std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     }
+}
+
+fn purge_cli(args: &[String]) {
+    let force = args
+        .iter()
+        .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+    if !force && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprintln!("This deletes local cloud-upload queues (notes, transcripts, metrics, …).");
+        eprintln!("It does not delete git notes already written to refs/notes/ai.");
+        eprintln!("Re-run with --force to confirm.");
+        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+    }
+
+    match purge_sync_queues() {
+        Ok(summary) => {
+            println!("Cleared local upload queue: {summary}");
+        }
+        Err(e) => {
+            eprintln!("Failed to clear upload queue: {e}");
+            std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+        }
+    }
+}
+
+/// Discard every durable cloud-sync queue on this machine.
+pub fn purge_sync_queues() -> Result<String, AutterError> {
+    let mut parts = Vec::new();
+
+    if let Ok(db) = crate::metrics::db::MetricsDatabase::global()
+        && let Ok(mut guard) = db.lock()
+    {
+        let n = guard.delete_all().unwrap_or(0);
+        if n > 0 {
+            parts.push(format!("{n} telemetry events"));
+        }
+    }
+    if let Ok(db) = crate::notes::db::NotesDatabase::global()
+        && let Ok(mut guard) = db.lock()
+    {
+        let notes = guard.delete_pending().unwrap_or(0);
+        let summaries = guard.delete_pending_commit_summaries().unwrap_or(0);
+        if notes > 0 {
+            parts.push(format!("{notes} authorship notes"));
+        }
+        if summaries > 0 {
+            parts.push(format!("{summaries} commit summaries"));
+        }
+    }
+    if let Ok(db) = crate::authorship::internal_db::InternalDatabase::global()
+        && let Ok(mut guard) = db.lock()
+    {
+        let n = guard.delete_pending_cas().unwrap_or(0);
+        if n > 0 {
+            parts.push(format!("{n} transcripts"));
+        }
+    }
+    if let Ok(db) = crate::file_changes::FileChangesDatabase::global()
+        && let Ok(mut guard) = db.lock()
+    {
+        let n = guard.delete_pending().unwrap_or(0);
+        if n > 0 {
+            parts.push(format!("{n} file-change records"));
+        }
+    }
+
+    clear_sync_auth_blocked();
+
+    Ok(if parts.is_empty() {
+        "nothing pending".to_string()
+    } else {
+        parts.join(", ")
+    })
 }
 
 fn print_status(args: &[String]) {
@@ -147,10 +224,14 @@ fn print_help() {
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  autter sync status [--json]");
+    eprintln!("  autter sync purge --force");
     eprintln!("  autter sync open");
     eprintln!();
     eprintln!("Shows whether authorship data is reaching autter cloud, how much is");
     eprintln!("queued locally, and what to do when uploads are blocked.");
+    eprintln!();
+    eprintln!("`purge` discards the local upload backlog without uploading it.");
+    eprintln!("Use this before `autter login` if you do not want historical sessions uploaded.");
     eprintln!();
     eprintln!("Status exits 0 when upload is off or no problem is detected.");
     eprintln!("It exits 1 when sign-in, upload, the service, or a queue read needs attention.");

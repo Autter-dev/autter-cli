@@ -283,7 +283,8 @@ autter stats [commit]
   Show AI authorship statistics for a commit or range.
 
   --json            Output in JSON format
-  --ignore <pat>    Ignore files matching the given pattern(s)",
+  --ignore <pat>    Ignore files matching the given pattern(s)
+  --wait[=secs]     Wait for the authorship note (default 30s); exit 1 if still pending",
     },
     HelpEntry {
         name: "file-changes",
@@ -371,10 +372,14 @@ autter config [<key> | set <key> <value> | unset <key>]
         aliases: &[],
         summary: "Inspect cloud upload health and local queue depth",
         body: "autter sync status [--json]
+autter sync purge --force
 autter sync open
 
   Show local upload queues, the last confirmed metrics batch, and the next
   action for a blocked upload. Open the dashboard for the reported organization.
+
+  `purge` discards the local upload backlog without uploading it — use before
+  login if you do not want historical sessions sent to the cloud.
 
   An empty queue does not confirm upload of every local change.
   Status exits 0 when upload is off or no problem is detected. It exits 1
@@ -395,8 +400,10 @@ autter sync open
         body: "\
 autter install-hooks [options]
 
-  Install git hooks for AI authorship tracking.
+  Install IDE/agent hooks for AI authorship tracking.
 
+  --system                    Also write global git trace2 config and start the daemon
+                              (preferred via `autter onboard`, which asks for consent)
   --skills                    Also install agent skill files
   --visual-studio-extension   Also install the Visual Studio extension (Windows)",
     },
@@ -405,6 +412,16 @@ autter install-hooks [options]
         aliases: &[],
         summary: "Remove autter hooks from all detected tools",
         body: "autter uninstall-hooks\n\n  Remove autter hooks from all detected tools.",
+    },
+    HelpEntry {
+        name: "uninstall",
+        aliases: &[],
+        summary: "Remove hooks, git trace2 config, and stop the background service",
+        body: "\
+autter uninstall [--dry-run]
+
+  Remove IDE/agent hooks, clear global git trace2 settings, and stop the
+  background service. Does not delete the binary or PATH entries.",
     },
     HelpEntry {
         name: "ci",

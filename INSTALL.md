@@ -35,7 +35,7 @@ The npm package is a thin bootstrapper that downloads the same release binary in
 
 Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autter.dev/cli/install) generates a single-use command that runs this same installer and signs the machine in automatically.
 
-The installer downloads Autter into `~/.autter/bin`, adds it to your user `PATH`, configures supported coding agents and editors, and starts the background service. On macOS, Linux, and WSL it then starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later.
+The installer downloads Autter into `~/.autter/bin` and adds it to your user `PATH`. IDE/agent hooks, global git capture settings, and the background service are applied during `autter onboard` (with consent) or with `autter install --system`. On macOS, Linux, and WSL the script starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later with `autter onboard`.
 
 ### System requirements
 

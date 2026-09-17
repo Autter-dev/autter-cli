@@ -37,7 +37,7 @@ const SECTION_E2E: &str = "End-to-end checkpoint";
 const SECTION_AGENTS: &str = "AI agent hooks";
 const SECTION_ACCOUNT: &str = "Account & sync";
 
-const REMEDIATION_TRACE2_THEN_ATTRIBUTION: &str = "a trace2 check failed above — attribution depends on it. run `autter install`, then `autter doctor`";
+const REMEDIATION_TRACE2_THEN_ATTRIBUTION: &str = "a trace2 check failed above — attribution depends on it. run `autter install --system` (or `autter onboard`), then `autter doctor`";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -708,11 +708,22 @@ fn check_auth() -> (DoctorCheck, bool) {
             DoctorCheck {
                 section: SECTION_ACCOUNT,
                 name,
-                status: DoctorStatus::Failed,
-                summary: "cloud sync is blocked because stored credentials cannot authenticate"
-                    .to_string(),
+                status: if Config::get().notes_backend_kind().uses_http() {
+                    DoctorStatus::Failed
+                } else {
+                    DoctorStatus::Warning
+                },
+                summary: if Config::get().notes_backend_kind().uses_http() {
+                    "cloud sync is blocked because stored credentials cannot authenticate"
+                        .to_string()
+                } else {
+                    "stored credentials cannot authenticate; ignored in local mode".to_string()
+                },
                 details,
-                remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
+                remediation: Some(
+                    "run `autter login`, then `autter daemon restart` (or ignore in local-only mode)"
+                        .to_string(),
+                ),
             },
             has_api_key,
         ),
@@ -720,12 +731,22 @@ fn check_auth() -> (DoctorCheck, bool) {
             DoctorCheck {
                 section: SECTION_ACCOUNT,
                 name,
-                status: DoctorStatus::Failed,
-                summary:
+                status: if Config::get().notes_backend_kind().uses_http() {
+                    DoctorStatus::Failed
+                } else {
+                    DoctorStatus::Warning
+                },
+                summary: if Config::get().notes_backend_kind().uses_http() {
                     "login session expired -- cloud sync is silently disabled until you log in again"
-                        .to_string(),
+                        .to_string()
+                } else {
+                    "login session expired; cloud sync is off in local mode".to_string()
+                },
                 details,
-                remediation: Some("run `autter login` to re-authenticate".to_string()),
+                remediation: Some(
+                    "run `autter login` to re-authenticate (ignore this in local-only mode)"
+                        .to_string(),
+                ),
             },
             has_api_key,
         ),
@@ -861,6 +882,20 @@ fn check_org_data_plane() -> DoctorCheck {
 
 fn check_sync_queue() -> DoctorCheck {
     let name = "durable sync queue".to_string();
+
+    // Local-only mode never drains cloud queues — leftover metrics/notes from a
+    // prior connected session (or telemetry) must not fail CI / doctor.
+    if !Config::get().notes_backend_kind().uses_http() {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Passed,
+            summary: "local mode — cloud upload queues are not drained (expected)".to_string(),
+            details: vec![crate::auth::notice::pending_sync_counts().summary()],
+            remediation: None,
+        };
+    }
+
     let pending = crate::auth::notice::pending_sync_counts();
     let details = vec![pending.summary()];
     if pending.total() == 0 {
@@ -882,7 +917,10 @@ fn check_sync_queue() -> DoctorCheck {
             summary: "queued data is not draining because cloud sync is authentication-blocked"
                 .to_string(),
             details,
-            remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
+            remediation: Some(
+                "run `autter login`, then `autter daemon restart` (or `autter bg restart`)"
+                    .to_string(),
+            ),
         }
     } else {
         DoctorCheck {

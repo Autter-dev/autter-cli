@@ -243,6 +243,20 @@ pub fn handle_autter(args: &[String]) {
                 std::process::exit(1);
             }
         },
+        "uninstall" => match commands::install_hooks::run_full_uninstall(&args[1..]) {
+            Ok(statuses) => {
+                if let Ok(statuses_value) = serde_json::to_value(&statuses) {
+                    log_message("uninstall", "info", Some(statuses_value));
+                }
+                eprintln!("Removed IDE/agent hooks, global git trace2 config, and stopped the background service.");
+                eprintln!("Binary and PATH entries were left in place. Delete them manually if desired.");
+            }
+            Err(e) => {
+                eprintln!("Uninstall failed: {}", e);
+                commands::suggest_autter_doctor();
+                std::process::exit(1);
+            }
+        },
         "git-hooks" => {
             handle_git_hooks(&args[1..]);
         }
@@ -994,6 +1008,7 @@ fn handle_stats(args: &[String]) {
     let mut commit_sha = None;
     let mut commit_range: Option<CommitRange> = None;
     let mut ignore_patterns: Vec<String> = Vec::new();
+    let mut wait_secs: Option<u64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -1024,6 +1039,21 @@ fn handle_stats(args: &[String]) {
                     eprintln!("--ignore requires at least one pattern argument");
                     std::process::exit(crate::commands::EXIT_USAGE_ERROR);
                 }
+            }
+            "--wait" => {
+                wait_secs = Some(30);
+                i += 1;
+            }
+            flag if flag.starts_with("--wait=") => {
+                let raw = &flag["--wait=".len()..];
+                match raw.parse::<u64>() {
+                    Ok(secs) => wait_secs = Some(secs.max(1)),
+                    Err(_) => {
+                        eprintln!("--wait expects a positive number of seconds");
+                        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                    }
+                }
+                i += 1;
             }
             _ => {
                 // First non-flag argument is treated as commit SHA or range
@@ -1083,6 +1113,56 @@ fn handle_stats(args: &[String]) {
             }
         }
         return;
+    }
+
+    if let Some(secs) = wait_secs {
+        let sha = match commit_sha.as_deref() {
+            Some(s) => match repo.revparse_single(s) {
+                Ok(obj) => obj.id(),
+                Err(e) => {
+                    eprintln!("Failed to resolve commit: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => match repo.head().and_then(|h| h.target()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to resolve HEAD: {e}");
+                    std::process::exit(1);
+                }
+            },
+        };
+        let timeout = std::time::Duration::from_secs(secs);
+        let poll = std::time::Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        let mut found = false;
+        while start.elapsed() < timeout {
+            if crate::git::notes_api::read_note(&repo, &sha).is_some() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(poll);
+        }
+        if !found {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "pending": true,
+                        "commit": sha,
+                        "waited_secs": secs,
+                        "error": "authorship note not ready"
+                    })
+                );
+            } else {
+                eprintln!(
+                    "pending: authorship note for {} not ready after {}s (daemon still processing?)",
+                    &sha[..std::cmp::min(8, sha.len())],
+                    secs
+                );
+            }
+            std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+        }
     }
 
     if let Err(e) = stats_command(

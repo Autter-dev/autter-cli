@@ -435,6 +435,12 @@ impl InternalDatabase {
         Ok(count)
     }
 
+    /// Drop every CAS object still waiting for upload.
+    pub fn delete_pending_cas(&mut self) -> Result<usize, AutterError> {
+        let n = self.conn.execute("DELETE FROM cas_sync_queue", [])?;
+        Ok(n)
+    }
+
     /// Delete a CAS sync record (on successful sync)
     pub fn delete_cas_sync_record(&mut self, id: i64) -> Result<(), AutterError> {
         self.conn

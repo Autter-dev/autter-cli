@@ -541,12 +541,8 @@ if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
     fi
 fi
 
-echo "Setting up IDE/agent hooks..."
-if ! ${INSTALL_DIR}/autter install-hooks; then
-    warn "Warning: Failed to set up IDE/agent hooks. Please try running 'autter install-hooks' manually."
-else
-    success "Successfully set up IDE/agent hooks"
-fi
+echo "IDE/agent hooks and git capture are configured during onboard (with consent)…"
+echo "  Run: ${INSTALL_DIR}/autter onboard"
 
 # Write the env files and point every detected shell configuration at them
 write_env_files

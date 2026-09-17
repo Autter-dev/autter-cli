@@ -377,6 +377,20 @@ impl NotesDatabase {
         Ok(count)
     }
 
+    /// Drop every note still waiting for upload (does not touch synced cache).
+    pub fn delete_pending(&mut self) -> Result<usize, AutterError> {
+        let n = self
+            .conn
+            .execute("DELETE FROM notes WHERE synced = 0", [])?;
+        Ok(n)
+    }
+
+    /// Drop every commit summary still waiting for upload.
+    pub fn delete_pending_commit_summaries(&mut self) -> Result<usize, AutterError> {
+        let n = self.conn.execute("DELETE FROM commit_summary_queue", [])?;
+        Ok(n)
+    }
+
     /// Lock and return a batch of pending notes for upload.
     ///
     /// Sets `processing_started_at` on selected rows so concurrent workers do not

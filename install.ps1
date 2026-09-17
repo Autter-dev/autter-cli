@@ -651,14 +651,9 @@ if ($env:INSTALL_NONCE -and $env:API_BASE) {
     }
 }
 
-# Install hooks
-Write-Host 'Setting up IDE/agent hooks...'
-try {
-    & $finalExe install-hooks | Out-Host
-    Write-Success 'Successfully set up IDE/agent hooks'
-} catch {
-    Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'autter install-hooks' manually."
-}
+# Hooks / git config / daemon are applied during onboard (with consent).
+Write-Host 'IDE/agent hooks and git capture are configured during onboard (with consent)…'
+Write-Host "  Run: $finalExe onboard"
 
 # Best-effort restart only for daemon-initiated self-updates.
 Start-DaemonIfRequested

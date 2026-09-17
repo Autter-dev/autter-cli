@@ -273,6 +273,14 @@ impl FileChangesDatabase {
         Ok(count)
     }
 
+    /// Drop every file-change row still waiting for upload.
+    pub fn delete_pending(&mut self) -> Result<usize, AutterError> {
+        let n = self
+            .conn
+            .execute("DELETE FROM file_change_counts WHERE synced = 0", [])?;
+        Ok(n)
+    }
+
     pub fn dequeue_pending(
         &mut self,
         limit: usize,
