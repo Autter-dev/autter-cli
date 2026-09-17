@@ -289,6 +289,33 @@ fn configure_daemon_trace2(dry_run: bool) -> Result<(), AutterError> {
     Ok(())
 }
 
+/// Align Git's native notes rewrite/display with Autter's authorship namespace
+/// so rebase/amend don't warn about a missing default notes ref.
+fn configure_authorship_notes_refs(dry_run: bool) {
+    if dry_run {
+        return;
+    }
+    let runtime_config = config::Config::fresh();
+    if let Err(e) = ensure_global_git_config_dirs() {
+        eprintln!("[autter] warning: could not prepare git config dirs (non-fatal): {e}");
+        return;
+    }
+    if let Err(e) = set_global_git_config_value(
+        runtime_config.git_cmd(),
+        "notes.rewriteRef",
+        "refs/notes/ai",
+    ) {
+        eprintln!("[autter] warning: could not set notes.rewriteRef (non-fatal): {e}");
+    }
+    if let Err(e) = set_global_git_config_value(
+        runtime_config.git_cmd(),
+        "notes.displayRef",
+        "refs/notes/ai",
+    ) {
+        eprintln!("[autter] warning: could not set notes.displayRef (non-fatal): {e}");
+    }
+}
+
 fn ensure_daemon(dry_run: bool) {
     if dry_run {
         return;
@@ -332,6 +359,10 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
         }
         ensure_daemon(options.dry_run);
     }
+
+    // Always align Git notes refs with Autter's authorship namespace — even when
+    // --system wasn't passed — so attribution works without notes warnings.
+    configure_authorship_notes_refs(options.dry_run);
 
     // Now that the daemon is (re)started (when requested), initialize the telemetry
     // handle so that install-hooks metrics and observability events route through it.

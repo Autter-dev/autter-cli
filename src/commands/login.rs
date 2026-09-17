@@ -244,13 +244,14 @@ fn derive_web_url_from_api(api_base_url: &str) -> Option<String> {
 }
 
 /// Print the PAT fallback for when the interactive device flow cannot complete.
-fn print_pat_fallback_instructions() {
-    eprintln!("You can retry with `autter login`, or sign in with a Personal Access Token:\n");
+pub fn print_pat_fallback_instructions() {
+    eprintln!("Interactive login didn't finish. Paste an access token on this same step:\n");
     eprintln!("  1. Open the Autter dashboard:");
     eprintln!("       {}", web_app_url());
     eprintln!("  2. Open any organization's Settings -> Access Tokens");
     eprintln!("  3. Click \"Create token\", copy it, and run:");
     eprintln!("       autter login --token <paste-your-token>\n");
+    eprintln!("  (This is a CLI/MCP access token — not a Runtime ingest key.)\n");
 }
 
 /// Handle the `autter login` command.

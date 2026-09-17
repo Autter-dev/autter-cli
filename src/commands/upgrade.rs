@@ -972,8 +972,9 @@ pub fn maybe_schedule_background_update_check() {
     let channel = config.update_channel();
     let cache = read_update_cache();
 
-    if config.auto_updates_disabled()
-        && let Some(cache) = cache.as_ref()
+    // Always surface a nudge when a newer release is cached — including when
+    // auto-updates are enabled (upgrade may still be pending / blocked).
+    if let Some(cache) = cache.as_ref()
         && cache.matches_channel(channel)
         && cache.update_available()
     {

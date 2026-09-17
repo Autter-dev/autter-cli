@@ -114,10 +114,15 @@ impl OAuthClient {
             .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
         if response.status_code != 200 {
+            let body = response.as_str().unwrap_or("").trim();
+            let detail = if body.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                body.chars().take(300).collect()
+            };
             return Err(format!(
-                "Server error ({}): {}",
-                response.status_code,
-                response.as_str().unwrap_or("Unknown error")
+                "Login could not start (HTTP {}). {}. Paste an access token instead: autter login --token <token>",
+                response.status_code, detail
             ));
         }
 
@@ -178,7 +183,16 @@ impl OAuthClient {
             let error: OAuthError = match serde_json::from_str(response_body) {
                 Ok(e) => e,
                 Err(_) => {
-                    return Err(format!("Server error ({})", response.status_code));
+                    let detail = response_body.trim();
+                    let snippet = if detail.is_empty() {
+                        "no details".to_string()
+                    } else {
+                        detail.chars().take(200).collect()
+                    };
+                    return Err(format!(
+                        "Login failed (HTTP {}): {}. Paste an access token instead: autter login --token <token>",
+                        response.status_code, snippet
+                    ));
                 }
             };
 

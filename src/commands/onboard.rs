@@ -264,8 +264,10 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
         if let Err(e) = run_device_login() {
             eprintln!();
             eprintln!("\u{2717} Could not connect: {e}");
+            eprintln!();
+            crate::commands::login::print_pat_fallback_instructions();
             eprintln!(
-                "  Setting up local mode for now \u{2014} run `autter onboard --connect` to retry."
+                "  Setting up local mode for now \u{2014} run `autter onboard --connect` or `autter login --token <token>` to retry."
             );
             setup_local(cfg);
             return;

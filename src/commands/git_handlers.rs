@@ -274,6 +274,11 @@ fn handle_git_inner(args: &[String]) {
         // minimum required version. Reads the cached releases payload — no network.
         crate::commands::upgrade::maybe_warn_below_min_version();
 
+        // Soft nudge + background check when a newer release is available.
+        // Previously only ran on push; git commands are frequent enough that
+        // older installs learn about upgrades without waiting for a push.
+        crate::commands::upgrade::maybe_schedule_background_update_check();
+
         // Remind the user when their login has expired and cloud sync is paused.
         crate::auth::notice::maybe_warn_logged_out();
     });
