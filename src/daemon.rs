@@ -3601,7 +3601,13 @@ fn now_unix_nanos() -> u128 {
 fn remove_socket_if_exists(path: &Path) -> Result<(), AutterError> {
     #[cfg(unix)]
     if path.exists() {
-        fs::remove_file(path)?;
+        fs::remove_file(path).map_err(|e| {
+            AutterError::Generic(format!(
+                "failed removing stale socket {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -3613,7 +3619,13 @@ fn set_socket_owner_only(path: &Path) -> Result<(), AutterError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            AutterError::Generic(format!(
+                "failed setting owner-only permissions on socket {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
     }
     #[cfg(not(unix))]
     {
