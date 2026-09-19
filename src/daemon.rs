@@ -331,17 +331,21 @@ fn is_trace_payload(payload: &Value) -> bool {
     payload.get("event").and_then(Value::as_str).is_some()
 }
 
-/// Returns true when the error indicates the git working directory vanished
+/// Returns true when the error indicates a git repository vanished
 /// mid-operation, typically when a temp/test repo is cleaned up while an async
 /// side effect is still in flight. These are benign races, so the daemon skips
 /// the side effect quietly rather than reporting a generic "command side effect
 /// failed" exception.
 ///
-/// The same race surfaces in three shapes:
+/// The same race surfaces in several shapes:
 /// - git cannot enter the directory: exit 128, stderr "No such file or
 ///   directory".
 /// - git finds no repository at or above the gone directory: exit 128, stderr
 ///   "not a git repository".
+/// - the directory still exists but its objects are gone, so an oid that was
+///   valid at read time no longer resolves: exit 128, stderr "not a tree
+///   object", "bad object", or "unknown revision". This happens when a snapshot
+///   side effect passes a tree oid to `ls-tree` after the object was deleted.
 /// - on Windows the directory read fails before git runs: an `IoError` with a
 ///   not-found kind ("The system cannot find the path specified").
 fn is_missing_working_dir_error(error: &AutterError) -> bool {
@@ -351,7 +355,11 @@ fn is_missing_working_dir_error(error: &AutterError) -> bool {
             stderr,
             ..
         } => {
-            stderr.contains("No such file or directory") || stderr.contains("not a git repository")
+            stderr.contains("No such file or directory")
+                || stderr.contains("not a git repository")
+                || stderr.contains("not a tree object")
+                || stderr.contains("bad object")
+                || stderr.contains("unknown revision")
         }
         AutterError::IoError(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
         _ => false,
@@ -9318,6 +9326,25 @@ mod tests {
             "The system cannot find the path specified. (os error 3)",
         ));
         assert!(is_missing_working_dir_error(&error));
+    }
+
+    #[test]
+    fn missing_working_dir_error_detects_missing_object() {
+        // The directory survives but its objects are gone: an oid that was valid
+        // when read no longer resolves. `ls-tree <tree oid>` reports "not a tree
+        // object", and oid lookups report "bad object" or "unknown revision".
+        for stderr in [
+            "fatal: not a tree object",
+            "fatal: bad object 0123456789abcdef0123456789abcdef01234567",
+            "fatal: ambiguous argument 'abc123': unknown revision or path not in the working tree.",
+        ] {
+            let error = AutterError::GitCliError {
+                code: Some(128),
+                stderr: stderr.to_string(),
+                args: vec!["ls-tree".to_string(), "-r".to_string()],
+            };
+            assert!(is_missing_working_dir_error(&error), "stderr: {stderr}");
+        }
     }
 
     #[test]
