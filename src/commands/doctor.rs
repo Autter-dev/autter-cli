@@ -527,6 +527,19 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
                     });
                 }
             }
+            Ok(result) if !result.hooks_installed && installer.id() == "jetbrains" => checks.push(DoctorCheck {
+                section: SECTION_AGENTS,
+                name: name.clone(),
+                status: DoctorStatus::Failed,
+                summary:
+                    "detected, but the autter JetBrains plugin is not installed -- edits are not captured"
+                        .to_string(),
+                details: Vec::new(),
+                remediation: Some(
+                    "run `autter install-hooks`, then install/enable the `autter` plugin from JetBrains Settings > Plugins and restart the IDE"
+                        .to_string(),
+                ),
+            }),
             Ok(result) if !result.hooks_installed => checks.push(DoctorCheck {
                 section: SECTION_AGENTS,
                 name: name.clone(),

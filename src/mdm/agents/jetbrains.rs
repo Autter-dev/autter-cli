@@ -160,10 +160,15 @@ impl HookInstaller for JetBrainsInstaller {
             });
         }
 
-        // Check if any compatible IDE exists
-        let has_compatible = installations.iter().any(|i| i.is_compatible());
+        // JetBrains integration is provided by the plugin, not a config-file
+        // hook. Report the actual plugin state so `doctor` does not claim the
+        // integration is missing after it has been installed.
+        let compatible_installations: Vec<_> = installations
+            .iter()
+            .filter(|installation| installation.is_compatible())
+            .collect();
 
-        if !has_compatible {
+        if compatible_installations.is_empty() {
             tracing::debug!(
                 "JetBrains: Found {} IDEs but none meet minimum version requirement (build {})",
                 installations.len(),
@@ -171,12 +176,16 @@ impl HookInstaller for JetBrainsInstaller {
             );
         }
 
-        // JetBrains doesn't have config file hooks - only the plugin via install_extras
-        // Always return hooks_installed: false so install_extras runs and shows proper messages
+        let plugin_installed = compatible_installations
+            .iter()
+            .any(|installation| is_plugin_installed(installation));
+
         Ok(HookCheckResult {
             tool_installed: true,
-            hooks_installed: false,
-            hooks_up_to_date: false,
+            hooks_installed: plugin_installed,
+            // The plugin installer currently has no version migration state;
+            // an installed plugin is the complete and current integration.
+            hooks_up_to_date: plugin_installed,
         })
     }
 
