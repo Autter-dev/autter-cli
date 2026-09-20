@@ -290,7 +290,7 @@ pub fn handle_autter(args: &[String]) {
         "exchange-nonce" => {
             commands::exchange_nonce::handle_exchange_nonce(&args[1..]);
         }
-        "dash" | "dashboard" => {
+        "dash" | "dashboard" | "personal-dashboard" | "personal_dashboard" => {
             commands::personal_dashboard::handle_personal_dashboard(&args[1..]);
         }
         "show-prompt" => {

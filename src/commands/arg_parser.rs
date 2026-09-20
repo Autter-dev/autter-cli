@@ -455,6 +455,16 @@ autter sync open
   --json   Machine-readable JSON report",
     },
     HelpEntry {
+        name: "dashboard",
+        aliases: &["dash", "personal-dashboard", "personal_dashboard"],
+        summary: "Open your personal dashboard in the browser",
+        body: "\
+autter dashboard
+
+  Open your personal dashboard in the browser
+  (https://app.autter.dev/me, or your configured web app URL).",
+    },
+    HelpEntry {
         name: "bg",
         aliases: &["d", "daemon"],
         summary: "Run and control autter background service",
@@ -634,4 +644,29 @@ pub fn print_overview() {
     eprintln!("  {:<18} Show this help message", "help, -h");
     eprintln!();
     eprintln!("Run 'autter <command> --help' for command-specific help.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_help_resolves_all_invocation_names() {
+        // `autter personal-dashboard` must not fall through to
+        // "Unknown autter command" (dispatch in autter_handlers.rs routes
+        // these same names to handle_personal_dashboard).
+        for name in [
+            "dashboard",
+            "dash",
+            "personal-dashboard",
+            "personal_dashboard",
+        ] {
+            assert!(
+                HELP_REGISTRY
+                    .iter()
+                    .any(|e| e.name == name || e.aliases.contains(&name)),
+                "help registry should resolve `{name}`"
+            );
+        }
+    }
 }
