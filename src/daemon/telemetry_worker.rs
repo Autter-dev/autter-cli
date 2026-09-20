@@ -351,7 +351,7 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
 
 /// Drain a bounded batch of durable commit provenance summaries.
 fn flush_commit_summaries() {
-    use crate::api::org_db::{self, CommitAuthorshipSummaryRow};
+    use crate::api::types::CommitAuthorshipSummary;
 
     let db = match crate::notes::db::NotesDatabase::global() {
         Ok(db) => db,
@@ -394,7 +394,7 @@ fn flush_commit_summaries() {
     };
 
     for pending_row in rows {
-        let row = match serde_json::from_str::<CommitAuthorshipSummaryRow>(&pending_row.payload) {
+        let row = match serde_json::from_str::<CommitAuthorshipSummary>(&pending_row.payload) {
             Ok(row) => row,
             Err(error) => {
                 let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -427,9 +427,7 @@ fn flush_commit_summaries() {
             ApiClient::new(ApiContext::new(None))
         };
 
-        let result = client.org_identity().and_then(|identity| {
-            org_db::upsert_commit_authorship_summary(&identity, &row, &get_or_create_distinct_id())
-        });
+        let result = client.upload_commit_authorship_summary(&row, &get_or_create_distinct_id());
         let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match result {
             Ok(()) => {
@@ -521,9 +519,8 @@ fn flush_metrics(events: &[MetricEvent]) {
     let context = ApiContext::new(None);
     let client = ApiClient::new(context);
 
-    // Metrics are written straight to the org database, which we reach via the
-    // `org_db_url` claim in the access token — so a write is only possible when
-    // logged in. Otherwise the events fall back to the local SQLite queue.
+    // Metrics are sent through the authenticated server-side API. Otherwise
+    // the events fall back to the local SQLite queue.
     let should_upload = client.is_logged_in();
 
     let mut upload_failed = false;

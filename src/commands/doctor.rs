@@ -867,14 +867,14 @@ fn check_org_data_plane() -> DoctorCheck {
         };
     }
 
-    match client.check_org_data_plane() {
+    match client.check_data_plane() {
         Ok(()) => {
             crate::auth::notice::clear_sync_auth_blocked();
             DoctorCheck {
                 section: SECTION_ACCOUNT,
                 name,
                 status: DoctorStatus::Passed,
-                summary: "organization database is reachable by the upload path".to_string(),
+                summary: "server-side upload API is reachable".to_string(),
                 details: Vec::new(),
                 remediation: None,
             }
@@ -883,10 +883,10 @@ fn check_org_data_plane() -> DoctorCheck {
             section: SECTION_ACCOUNT,
             name,
             status: DoctorStatus::Failed,
-            summary: "could not reach the organization database used for uploads".to_string(),
+            summary: "could not reach the server-side upload API".to_string(),
             details: vec![format!("error: {error}")],
             remediation: Some(
-                "check network access to the organization database, then run `autter bg restart` and `autter doctor`"
+                "check network access to the Autter API, then run `autter bg restart` and `autter doctor`"
                     .to_string(),
             ),
         },

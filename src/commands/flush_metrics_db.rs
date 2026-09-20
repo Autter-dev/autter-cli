@@ -11,8 +11,8 @@ const MAX_BATCH_SIZE: usize = 1000;
 
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {
-    // Metrics are written to the org database via the access token's
-    // `org_db_url` claim, so a write requires being logged in.
+    // Metrics are written through the authenticated server-side API, so a
+    // write requires being logged in.
     let context = ApiContext::new(None);
     let client = ApiClient::new(context);
 

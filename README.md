@@ -92,7 +92,7 @@ autter whoami
 
 Once a machine is connected:
 
-- **Authorship notes** (the AI-vs-human breakdown per commit) and **prompt transcripts** are written on commit straight into **your organization's own database**. They are never shared between organizations, and the CLI writes to that database directly using the connection URL embedded in your signed token — no Autter server sits in the data path.
+- **Authorship notes** (the AI-vs-human breakdown per commit) and **prompt transcripts** are written on commit to **your organization's own database** through the authenticated Autter API. The CLI never receives or stores a database connection URL.
 - A token is bound to your account. If you belong to more than one organization, each push is routed to whichever org owns the repository (resolved from its git remote), with your default org as the fallback.
 - Tokens can be managed or revoked, and CLI activity (token created, sign-in, data pushed) reviewed, under **Settings → Access Tokens** in the dashboard.
 
@@ -111,7 +111,7 @@ autter onboard --local --force
 |-------|---------|---------|
 | `api_base_url` | `https://api.autter.dev` | Auth + token exchange |
 | `notes_backend.kind` | `git_notes` (local) / `http` (connected) | Where authorship notes go |
-| `notes_backend.backend_url` | `https://cli.autter.dev` | Gate that enables cloud sync; the actual notes/prompt writes go straight to your org database (URL from your token), not to this host |
+| `notes_backend.backend_url` | `https://cli.autter.dev` | API endpoint used for authenticated notes, prompt, metrics, and attribution sync |
 | `prompt_storage` | `local` / `default` (connected) | `default` uploads prompts, `local` keeps them on-device |
 | `telemetry_oss` | `on` | `off` disables all anonymous usage analytics and error reporting |
 

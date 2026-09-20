@@ -111,16 +111,43 @@ impl CredentialStore {
 
     /// Load stored credentials
     pub fn load(&self) -> Result<Option<StoredCredentials>, String> {
-        let json = self.backend.load()?;
+        let Some(json) = self.backend.load()? else {
+            return Ok(None);
+        };
 
-        match json {
-            Some(json) => {
-                let creds: StoredCredentials = serde_json::from_str(&json)
-                    .map_err(|e| format!("Failed to parse credentials: {}", e))?;
-                Ok(Some(creds))
+        let creds: StoredCredentials = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse credentials: {}", e))?;
+
+        // Older versions persisted an access JWT whose payload contained a
+        // live org database URL. Never return that token to callers, and never
+        // leave it on disk after this migration runs. Preserve an opaque
+        // refresh token so the next authenticated request can transparently
+        // mint a new API-only access token.
+        if contains_database_connection_string(&json)
+            || token_contains_database_connection_string(&creds.access_token)
+        {
+            if creds.refresh_token.is_empty()
+                || token_contains_database_connection_string(&creds.refresh_token)
+            {
+                self.clear()?;
+                eprintln!(
+                    "Stored credentials used a legacy database token and could not be migrated; please sign in again."
+                );
+                return Ok(None);
             }
-            None => Ok(None),
+
+            let migrated = StoredCredentials {
+                access_token: String::new(),
+                refresh_token: creds.refresh_token,
+                access_token_expires_at: 0,
+                refresh_token_expires_at: creds.refresh_token_expires_at,
+            };
+            self.store(&migrated)?;
+            eprintln!("Migrated stored credentials to API-only authentication.");
+            return Ok(Some(migrated));
         }
+
+        Ok(Some(creds))
     }
 
     /// Clear stored credentials
@@ -139,6 +166,31 @@ impl CredentialStore {
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
+}
+
+/// Detect a database URL in serialized legacy credentials, including fields
+/// added by older versions that `StoredCredentials` intentionally ignores.
+fn contains_database_connection_string(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("postgres://") || lower.contains("postgresql://")
+}
+
+/// Inspect a JWT payload only to identify the legacy credential format. This
+/// is not authentication and must never be used to authorize a request.
+fn token_contains_database_connection_string(token: &str) -> bool {
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let payload = payload.trim_end_matches('=');
+    let Ok(bytes) =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+    else {
+        return false;
+    };
+    let Ok(payload) = String::from_utf8(bytes) else {
+        return false;
+    };
+    contains_database_connection_string(&payload)
 }
 
 impl Default for CredentialStore {
@@ -196,6 +248,44 @@ mod tests {
         store.clear().unwrap();
         assert!(!store.has_credentials());
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_legacy_database_credential_is_sanitized_and_refresh_preserved() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        let legacy = StoredCredentials {
+            access_token: "postgresql://user:secret@example.invalid/org".to_string(),
+            refresh_token: "opaque-refresh-token".to_string(),
+            access_token_expires_at: chrono::Utc::now().timestamp() + 3600,
+            refresh_token_expires_at: chrono::Utc::now().timestamp() + 86400,
+        };
+        store.store(&legacy).unwrap();
+
+        let migrated = store.load().unwrap().unwrap();
+        assert!(migrated.access_token.is_empty());
+        assert_eq!(migrated.access_token_expires_at, 0);
+        assert_eq!(migrated.refresh_token, legacy.refresh_token);
+        assert!(
+            !serde_json::to_string(&migrated)
+                .unwrap()
+                .contains("postgresql://")
+        );
+    }
+
+    #[test]
+    fn test_unmigratable_legacy_database_credential_is_cleared() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&StoredCredentials {
+                access_token: "postgresql://user:secret@example.invalid/org".to_string(),
+                refresh_token: String::new(),
+                access_token_expires_at: 1,
+                refresh_token_expires_at: 1,
+            })
+            .unwrap();
+
+        assert!(store.load().unwrap().is_none());
+        assert!(!store.has_credentials());
     }
 
     #[test]

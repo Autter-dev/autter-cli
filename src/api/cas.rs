@@ -1,31 +1,33 @@
-//! CAS (prompt-transcript) storage, written directly to the org's own Postgres.
-//!
-//! The connection URL comes from the `org_db_url` claim in the context's access
-//! token (see [`crate::api::org_db`]); there is no intermediate backend.
+//! CAS (prompt-transcript) storage through the authenticated Autter API.
 
 use crate::api::client::ApiClient;
-use crate::api::org_db;
 use crate::api::types::{CAPromptStoreReadResponse, CasUploadRequest, CasUploadResponse};
-use crate::config;
 use crate::error::AutterError;
 
 /// CAS API endpoints
 impl ApiClient {
-    /// Store CAS objects in the org's database (dedup by hash).
+    /// Store CAS objects in the server-side org database (dedup by hash).
     ///
     /// # Arguments
     /// * `request` - The CAS upload request containing objects to upload
     ///
     /// # Returns
     /// * `Ok(CasUploadResponse)` - Per-object results plus counts
-    /// * `Err(AutterError)` - When not authenticated or the DB write fails
+    /// * `Err(AutterError)` - On network or server errors
     pub fn upload_cas(&self, request: CasUploadRequest) -> Result<CasUploadResponse, AutterError> {
-        let identity = self.org_identity()?;
-        org_db::upsert_cas(
-            &identity,
-            &request.objects,
-            &config::get_or_create_distinct_id(),
-        )
+        let response = self.context().post_json("/worker/cas/upload", &request)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+        if status_code == 200 {
+            serde_json::from_str(body).map_err(AutterError::JsonError)
+        } else {
+            Err(AutterError::Generic(format!(
+                "CAS upload failed with status {}: {}",
+                status_code, body
+            )))
+        }
     }
 
     /// Read CAS objects by hash from the org's database.
@@ -50,7 +52,19 @@ impl ApiClient {
             }
         }
 
-        let identity = self.org_identity()?;
-        org_db::read_cas(&identity, hashes)
+        let endpoint = format!("/worker/cas/?hashes={}", hashes.join(","));
+        let response = self.context().get(&endpoint)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+        if status_code == 200 {
+            serde_json::from_str(body).map_err(AutterError::JsonError)
+        } else {
+            Err(AutterError::Generic(format!(
+                "CAS read failed with status {}: {}",
+                status_code, body
+            )))
+        }
     }
 }

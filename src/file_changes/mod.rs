@@ -57,7 +57,7 @@ pub fn top_changed_files(repo_key: &str, limit: usize) -> Result<Vec<FileChangeR
 /// Upload pending rows to the org database when authenticated.
 pub fn flush_pending_to_cloud() {
     use crate::api::client::{ApiClient, access_token_for_org, resolve_org_for_repo_cached};
-    use crate::api::org_db;
+    use crate::api::types::{FileChangeCount, FileChangeUploadResponse};
     use crate::config;
 
     let cfg = config::Config::fresh();
@@ -145,17 +145,9 @@ pub fn flush_pending_to_cloud() {
             ))),
         };
 
-        let identity = match client.org_identity() {
-            Ok(id) => id,
-            Err(e) => {
-                mark_batch_failed(&batch, &e.to_string(), 300);
-                continue;
-            }
-        };
-
-        let rows: Vec<org_db::FileChangeCountRow> = batch
+        let rows: Vec<FileChangeCount> = batch
             .iter()
-            .map(|row| org_db::FileChangeCountRow {
+            .map(|row| FileChangeCount {
                 repo_url: row.repo_url.clone(),
                 file_path: row.file_path.clone(),
                 change_count: row.change_count,
@@ -165,10 +157,12 @@ pub fn flush_pending_to_cloud() {
             })
             .collect();
 
-        match org_db::upsert_file_change_counts(&identity, &rows, &distinct_id) {
-            Ok(failed) => {
-                let failed_keys: std::collections::HashSet<(String, String)> =
-                    failed.into_iter().collect();
+        match client.upload_file_change_counts(&rows, &distinct_id) {
+            Ok(FileChangeUploadResponse { failed }) => {
+                let failed_keys: std::collections::HashSet<(String, String)> = failed
+                    .into_iter()
+                    .map(|row| (row.repo_url, row.file_path))
+                    .collect();
 
                 let mut by_repo: std::collections::HashMap<String, Vec<String>> =
                     std::collections::HashMap::new();

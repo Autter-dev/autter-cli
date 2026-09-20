@@ -541,23 +541,6 @@ impl ApiClient {
         self.context.auth_issue.as_ref()
     }
 
-    /// Decode the org routing identity (`org_db_url` + uploader identity) from the
-    /// context's access token. Used by the notes/CAS data path, which writes
-    /// straight to the org's own database. Errors when not authenticated.
-    pub fn org_identity(&self) -> Result<crate::api::org_db::OrgIdentity, AutterError> {
-        let token = self.context.auth_token.as_deref().ok_or_else(|| {
-            AutterError::Generic("not authenticated: no access token for org database".to_string())
-        })?;
-        crate::api::org_db::identity_from_token(token)
-    }
-
-    /// Probe the exact organization database used by notes, transcripts, and
-    /// telemetry uploads.
-    pub fn check_org_data_plane(&self) -> Result<(), AutterError> {
-        let identity = self.org_identity()?;
-        crate::api::org_db::ping(&identity)
-    }
-
     /// Check if an API key is configured
     pub fn has_api_key(&self) -> bool {
         self.context.api_key.is_some()

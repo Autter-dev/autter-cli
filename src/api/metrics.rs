@@ -1,8 +1,6 @@
 //! Metrics API endpoints
 
 use crate::api::client::ApiClient;
-use crate::api::org_db;
-use crate::config;
 use crate::error::AutterError;
 use crate::metrics::MetricsBatch;
 use crate::observability::log_error;
@@ -108,28 +106,36 @@ pub fn upload_metrics_with_retry(
 
 /// Metrics API endpoints
 impl ApiClient {
-    /// Write a metrics batch directly to the org's database.
-    ///
-    /// The destination database comes from the `org_db_url` claim in the
-    /// context's access token (see [`crate::api::org_db`]); there is no
-    /// intermediate backend.
+    /// Write a metrics batch through the authenticated server-side data plane.
     ///
     /// # Arguments
     /// * `batch` - The metrics batch to write
     ///
     /// # Returns
     /// * `Ok(MetricsUploadResponse)` - Response with per-event errors (empty = all success)
-    /// * `Err(AutterError)` - When not authenticated or the batch can't run
+    /// * `Err(AutterError)` - On network or server errors
     pub fn upload_metrics(
         &self,
         batch: &MetricsBatch,
     ) -> Result<MetricsUploadResponse, AutterError> {
-        let identity = self.org_identity()?;
-        let failed = org_db::insert_metrics(
-            &identity,
-            &batch.events,
-            &config::get_or_create_distinct_id(),
-        )?;
+        let response = self.context().post_json("/worker/metrics/upload", batch)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+        if status_code != 200 {
+            return Err(AutterError::Generic(format!(
+                "Metrics upload failed with status {}: {}",
+                status_code, body
+            )));
+        }
+        let response: MetricsUploadResponse =
+            serde_json::from_str(body).map_err(AutterError::JsonError)?;
+        let failed = response
+            .errors
+            .iter()
+            .map(|error| (error.index, error.error.clone()))
+            .collect::<Vec<_>>();
         if failed.is_empty()
             && !batch.events.is_empty()
             && let Some(access_token) = self.context().auth_token.as_deref()

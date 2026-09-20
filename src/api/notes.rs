@@ -1,35 +1,48 @@
-//! Authorship-note storage, written directly to the org's own Postgres.
-//!
-//! The connection URL comes from the `org_db_url` claim in the context's access
-//! token (see [`crate::api::org_db`]); there is no intermediate backend. Callers
-//! should still gate on `is_logged_in()` / `has_api_key()` so we only attempt a
-//! write when the user is authenticated (matching the CAS pattern).
+//! Authorship-note storage through the authenticated Autter API.
 
 use crate::api::client::ApiClient;
-use crate::api::org_db;
-use crate::api::types::{NotesReadResponse, NotesUploadRequest, NotesUploadResponse};
-use crate::config;
+use crate::api::types::{
+    ApiErrorResponse, NotesReadResponse, NotesUploadRequest, NotesUploadResponse,
+};
 use crate::error::AutterError;
 
 impl ApiClient {
-    /// Upload a batch of authorship notes to the org's database.
+    /// Upload a batch of authorship notes to the server-side org database.
     ///
     /// # Arguments
     /// * `request` - The notes upload request containing entries to upload
     ///
     /// # Returns
     /// * `Ok(NotesUploadResponse)` - Success response with counts
-    /// * `Err(AutterError)` - When not authenticated or the DB write fails
+    /// * `Err(AutterError)` - On network or server errors
     pub fn upload_notes(
         &self,
         request: NotesUploadRequest,
     ) -> Result<NotesUploadResponse, AutterError> {
-        let identity = self.org_identity()?;
-        org_db::upsert_notes(
-            &identity,
-            &request.entries,
-            &config::get_or_create_distinct_id(),
-        )
+        let response = self.context().post_json("/worker/notes/upload", &request)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+
+        match status_code {
+            200 => serde_json::from_str(body).map_err(AutterError::JsonError),
+            400 => {
+                let error: ApiErrorResponse =
+                    serde_json::from_str(body).unwrap_or(ApiErrorResponse {
+                        error: "Invalid request body".to_string(),
+                        details: Some(serde_json::Value::String(body.to_string())),
+                    });
+                Err(AutterError::Generic(format!(
+                    "Bad Request: {}",
+                    error.error
+                )))
+            }
+            _ => Err(AutterError::Generic(format!(
+                "Notes upload failed with status {}: {}",
+                status_code, body
+            ))),
+        }
     }
 
     /// Read authorship notes by commit SHAs.
@@ -53,8 +66,23 @@ impl ApiClient {
             }
         }
 
-        let identity = self.org_identity()?;
-        org_db::read_notes(&identity, commit_shas)
+        let endpoint = format!("/worker/notes/?commits={}", commit_shas.join(","));
+        let response = self.context().get(&endpoint)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+
+        match status_code {
+            200 => serde_json::from_str(body).map_err(AutterError::JsonError),
+            404 => Ok(NotesReadResponse {
+                notes: std::collections::HashMap::new(),
+            }),
+            _ => Err(AutterError::Generic(format!(
+                "Notes read failed with status {}: {}",
+                status_code, body
+            ))),
+        }
     }
 }
 

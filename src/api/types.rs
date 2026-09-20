@@ -149,6 +149,56 @@ pub struct NotesReadResponse {
     pub notes: std::collections::HashMap<String, String>,
 }
 
+/// Query-friendly per-commit authorship summary uploaded by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitAuthorshipSummary {
+    pub commit_sha: String,
+    pub repo_url: Option<String>,
+    pub branch: Option<String>,
+    pub base_commit_sha: String,
+    pub human_author: String,
+    pub git_diff_added_lines: u64,
+    pub git_diff_deleted_lines: u64,
+    pub human_additions: u64,
+    pub ai_additions: u64,
+    pub ai_accepted: u64,
+    pub unknown_additions: u64,
+    pub human_percent: f64,
+    pub ai_percent: f64,
+    pub unknown_percent: f64,
+    pub tool_model_breakdown: serde_json::Value,
+    pub prompts: serde_json::Value,
+    pub hunks: serde_json::Value,
+}
+
+/// Aggregated file-change count uploaded by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeCount {
+    pub repo_url: String,
+    pub file_path: String,
+    pub change_count: u64,
+    pub lines_added: u64,
+    pub lines_deleted: u64,
+    pub last_changed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeUploadRequest {
+    pub rows: Vec<FileChangeCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeUploadFailure {
+    pub repo_url: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeUploadResponse {
+    #[serde(default)]
+    pub failed: Vec<FileChangeUploadFailure>,
+}
+
 /// Single result from CA prompt store batch read
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CAPromptStoreReadResult {

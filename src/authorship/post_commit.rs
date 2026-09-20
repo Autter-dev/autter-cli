@@ -636,7 +636,7 @@ fn upload_commit_authorship_summary(
     use crate::api::client::{
         ApiClient, ApiContext, access_token_for_org, resolve_org_for_repo_cached,
     };
-    use crate::api::org_db::{self, CommitAuthorshipSummaryRow};
+    use crate::api::types::CommitAuthorshipSummary;
 
     let total = stats.git_diff_added_lines as f64;
     let percent = |count: u32| {
@@ -654,7 +654,7 @@ fn upload_commit_authorship_summary(
     let tool_model_breakdown =
         serde_json::to_value(&stats.tool_model_breakdown).unwrap_or_else(|_| serde_json::json!({}));
 
-    let row = CommitAuthorshipSummaryRow {
+    let row = CommitAuthorshipSummary {
         commit_sha: commit_sha.to_string(),
         repo_url: current_repo_url(repo),
         branch: current_branch(repo),
@@ -714,15 +714,8 @@ fn upload_commit_authorship_summary(
         return;
     }
 
-    let Ok(identity) = client.org_identity() else {
-        return;
-    };
-
-    match org_db::upsert_commit_authorship_summary(
-        &identity,
-        &row,
-        &crate::config::get_or_create_distinct_id(),
-    ) {
+    match client.upload_commit_authorship_summary(&row, &crate::config::get_or_create_distinct_id())
+    {
         Ok(()) => {
             if let Ok(db) = crate::notes::db::NotesDatabase::global() {
                 let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
