@@ -42,6 +42,16 @@ use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem};
 
 /// Entry point for the `autter onboard` command.
 pub fn handle_onboard(args: &[String]) {
+    // `--help` (in any position) prints help and returns before the flow
+    // starts, so requesting help never prompts, writes config, restarts the
+    // daemon, or records telemetry. Matches the per-command convention used
+    // by e.g. `login`/`whoami` (top-level `help onboard` is handled earlier
+    // in `handle_autter`).
+    if is_help_request(args) {
+        crate::commands::arg_parser::print_command_help("onboard");
+        return;
+    }
+
     let force = args.iter().any(|a| a == "--force" || a == "-f");
     let choose_connect = args.iter().any(|a| a == "--connect");
     let choose_local = args.iter().any(|a| a == "--local");
@@ -482,5 +492,34 @@ fn offer_historical_sync_consent() {
         }
     } else {
         eprintln!("  Backlog will upload in the background after setup.");
+    }
+}
+
+/// True when the args are only asking for help (`--help`/`-h`/`help` in any
+/// position). Checked at the top of [`handle_onboard`] so help never starts
+/// the interactive flow or touches local state.
+fn is_help_request(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(flags: &[&str]) -> Vec<String> {
+        flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn help_flag_is_detected_in_any_position() {
+        assert!(is_help_request(&args(&["--help"])));
+        assert!(is_help_request(&args(&["-h"])));
+        assert!(is_help_request(&args(&["help"])));
+        assert!(is_help_request(&args(&["--connect", "--help"])));
+        assert!(!is_help_request(&args(&[])));
+        assert!(!is_help_request(&args(&["--connect"])));
+        assert!(!is_help_request(&args(&["--local", "--force"])));
+        assert!(!is_help_request(&args(&["--helpful"])));
     }
 }
