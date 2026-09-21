@@ -20,8 +20,10 @@ use std::sync::RwLock;
 pub const DEFAULT_API_BASE_URL: &str = "https://api.autter.dev";
 
 /// Default data-plane (notes/CAS) endpoint used when the HTTP notes backend is
-/// enabled but no explicit `backend_url` is configured.
-pub const DEFAULT_NOTES_BACKEND_URL: &str = "https://cli.autter.dev";
+/// enabled but no explicit `backend_url` is configured. This is the API base:
+/// `/worker/*` upload endpoints live there. (A previous `cli.autter.dev`
+/// default no longer resolves in DNS and stalled all uploads.)
+pub const DEFAULT_NOTES_BACKEND_URL: &str = DEFAULT_API_BASE_URL;
 
 /// Which backend to use for storing authorship notes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

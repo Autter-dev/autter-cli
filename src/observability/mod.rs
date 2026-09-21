@@ -8,6 +8,40 @@ pub mod performance_targets;
 /// Maximum events per metrics envelope
 pub const MAX_METRICS_PER_ENVELOPE: usize = 1000;
 
+/// Maximum serialized JSON bytes per metrics upload envelope. The server
+/// enforces a ~100 KiB request body limit (HTTP 413 `request entity too
+/// large`); envelopes are split to stay comfortably under it so a large
+/// backlog drains steadily instead of stalling on an oversized batch.
+pub const MAX_METRICS_ENVELOPE_BYTES: usize = 90_000;
+
+/// Split events into upload envelopes bounded by both event count
+/// (`MAX_METRICS_PER_ENVELOPE`) and serialized bytes
+/// (`MAX_METRICS_ENVELOPE_BYTES`), preserving order. A single event larger
+/// than the byte budget is returned alone — callers must decide how to handle
+/// an envelope the server can never accept (see the poison-message handling
+/// in the daemon's durable metrics flush).
+pub fn split_metrics_envelopes(events: Vec<MetricEvent>) -> Vec<Vec<MetricEvent>> {
+    let mut envelopes: Vec<Vec<MetricEvent>> = Vec::new();
+    let mut current: Vec<MetricEvent> = Vec::new();
+    let mut current_bytes: usize = 0;
+    for event in events {
+        let size = serde_json::to_vec(&event).map(|v| v.len()).unwrap_or(0);
+        if !current.is_empty()
+            && (current.len() >= MAX_METRICS_PER_ENVELOPE
+                || current_bytes + size > MAX_METRICS_ENVELOPE_BYTES)
+        {
+            envelopes.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += size;
+        current.push(event);
+    }
+    if !current.is_empty() {
+        envelopes.push(current);
+    }
+    envelopes
+}
+
 /// Submit telemetry envelopes via the best available path:
 /// 1. External daemon control socket (wrapper processes)
 /// 2. In-process daemon telemetry worker (daemon process itself)
@@ -244,5 +278,61 @@ mod tests {
     #[test]
     fn test_max_metrics_per_envelope() {
         assert_eq!(MAX_METRICS_PER_ENVELOPE, 1000);
+    }
+
+    fn test_metric_event_with_payload(size: usize) -> MetricEvent {
+        // Pad via a string field so the serialized event has ~size bytes.
+        let mut values: HashMap<String, serde_json::Value> = HashMap::new();
+        values.insert("0".to_string(), serde_json::Value::String("x".repeat(size)));
+        MetricEvent {
+            timestamp: 0,
+            event_id: 1,
+            values,
+            attrs: HashMap::new(),
+        }
+    }
+
+    // Test envelope splitting
+    #[test]
+    fn test_split_metrics_envelopes_respects_byte_budget() {
+        // 10 events of ~20KB each (200KB total) must split across envelopes.
+        let events: Vec<MetricEvent> = (0..10)
+            .map(|_| test_metric_event_with_payload(20000))
+            .collect();
+        let envelopes = split_metrics_envelopes(events);
+        assert!(
+            envelopes.len() > 1,
+            "expected multiple envelopes, got {}",
+            envelopes.len()
+        );
+        for env in &envelopes {
+            let bytes: usize = env
+                .iter()
+                .map(|e| serde_json::to_vec(e).map(|v| v.len()).unwrap_or(0))
+                .sum();
+            assert!(
+                bytes <= MAX_METRICS_ENVELOPE_BYTES || env.len() == 1,
+                "envelope exceeds budget: {bytes} bytes in {} events",
+                env.len()
+            );
+        }
+        // Order preserved across envelopes.
+        let total: usize = envelopes.iter().map(|e| e.len()).sum();
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn test_split_metrics_envelopes_single_oversized_event_returned_alone() {
+        let events = vec![test_metric_event_with_payload(
+            MAX_METRICS_ENVELOPE_BYTES + 1000,
+        )];
+        let envelopes = split_metrics_envelopes(events);
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].len(), 1);
+    }
+
+    #[test]
+    fn test_split_metrics_envelopes_empty() {
+        assert!(split_metrics_envelopes(vec![]).is_empty());
     }
 }

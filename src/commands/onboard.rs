@@ -286,7 +286,7 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
 
     // Connected mode: upload prompts (CAS) and authorship notes to the hosted
     // data plane. `backend_url: None` resolves to DEFAULT_NOTES_BACKEND_URL
-    // (cli.autter.dev) via Config::notes_backend_url().
+    // (the API base) via Config::notes_backend_url().
     cfg.prompt_storage = Some("default".to_string());
     cfg.notes_backend = Some(NotesBackendConfig {
         kind: NotesBackendKind::Http,

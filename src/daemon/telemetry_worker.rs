@@ -8,7 +8,7 @@ use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::metrics::db::MetricsDatabase;
 use crate::metrics::{MetricEvent, MetricsBatch};
-use crate::observability::MAX_METRICS_PER_ENVELOPE;
+use crate::observability::{MAX_METRICS_PER_ENVELOPE, split_metrics_envelopes};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -526,9 +526,12 @@ fn flush_metrics(events: &[MetricEvent]) {
     let mut upload_failed = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
-    for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
+    // Envelopes are bounded by event count *and* serialized bytes: the server
+    // rejects bodies over ~100 KiB (HTTP 413), so a count-only chunk of large
+    // events would stall the queue on every tick.
+    for chunk in split_metrics_envelopes(events.to_vec()) {
         if should_upload && !upload_failed && std::time::Instant::now() < deadline {
-            let batch = MetricsBatch::new(chunk.to_vec());
+            let batch = MetricsBatch::new(chunk.clone());
             match client.upload_metrics(&batch) {
                 Ok(response) if response.errors.is_empty() => {
                     note_durable_sync_authenticated();
@@ -551,7 +554,7 @@ fn flush_metrics(events: &[MetricEvent]) {
                 }
             }
         }
-        store_metrics_in_db(chunk);
+        store_metrics_in_db(&chunk);
     }
 }
 
@@ -622,51 +625,92 @@ fn flush_stored_metrics() {
         return;
     }
 
-    match client.upload_metrics(&MetricsBatch::new(events)) {
-        Ok(response) => {
-            let accepted_ids: Vec<_> = response
-                .successful_indices(uploaded_ids.len())
-                .into_iter()
-                .map(|index| uploaded_ids[index])
-                .collect();
-            let retry_ids: Vec<_> = response
-                .errors
-                .iter()
-                .filter_map(|error| uploaded_ids.get(error.index).copied())
-                .collect();
-            let deleted = db
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .finish_upload(&accepted_ids, &retry_ids);
-            if deleted.is_ok() && response.errors.is_empty() {
-                note_durable_sync_authenticated();
-                if pending == accepted_ids.len() {
-                    crate::auth::notice::clear_metrics_upload_stalled();
-                }
-            } else {
-                crate::auth::notice::record_metrics_upload_stalled();
-                note_durable_sync_upload_failed();
-                tracing::warn!(
-                    rejected = response.errors.len(),
-                    "metrics: queue batch needs retry"
+    // Split into server-acceptable envelopes (bounded by count *and*
+    // serialized bytes): one oversized envelope fails the whole batch with
+    // HTTP 413 and the backlog never drains. Id slices track each envelope so
+    // per-envelope results map back to the right rows; order is preserved.
+    let envelopes = split_metrics_envelopes(events);
+    let mut id_offset = 0;
+    let mut accepted_ids: Vec<i64> = Vec::new();
+    let mut retry_ids: Vec<i64> = Vec::new();
+    let mut poisoned_ids: Vec<i64> = Vec::new();
+    let mut any_failure = false;
+    for envelope in envelopes {
+        let ids = &uploaded_ids[id_offset..id_offset + envelope.len()];
+        id_offset += envelope.len();
+        match client.upload_metrics(&MetricsBatch::new(envelope)) {
+            Ok(response) => {
+                accepted_ids.extend(
+                    response
+                        .successful_indices(ids.len())
+                        .into_iter()
+                        .map(|index| ids[index]),
                 );
+                let envelope_retries: Vec<i64> = response
+                    .errors
+                    .iter()
+                    .filter_map(|error| ids.get(error.index).copied())
+                    .collect();
+                if !envelope_retries.is_empty() {
+                    any_failure = true;
+                    tracing::warn!(
+                        rejected = envelope_retries.len(),
+                        "metrics: envelope batch needs retry"
+                    );
+                }
+                retry_ids.extend(envelope_retries);
             }
-            tracing::info!(
-                uploaded = accepted_ids.len(),
-                rejected = response.errors.len(),
-                remaining = pending.saturating_sub(if deleted.is_ok() {
-                    accepted_ids.len()
-                } else {
-                    0
-                }),
-                "metrics: replayed durable queue batch"
-            );
+            Err(error) => {
+                // Poison message: a lone event the server rejects by size can
+                // never upload through the ~100 KiB-limited endpoint. Drop it
+                // loudly instead of wedging thousands of events behind it.
+                if ids.len() == 1 && error.to_string().contains("413") {
+                    poisoned_ids.push(ids[0]);
+                    tracing::warn!(
+                        record_id = ids[0],
+                        "metrics: dropping oversized event the server cannot accept (HTTP 413)"
+                    );
+                    continue;
+                }
+                any_failure = true;
+                tracing::warn!(%error, "metrics: envelope upload failed; retained for retry");
+            }
         }
-        Err(error) => {
-            note_durable_sync_upload_failed();
+    }
+
+    if !accepted_ids.is_empty() || !retry_ids.is_empty() || !poisoned_ids.is_empty() {
+        let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deleted = lock.finish_upload(&accepted_ids, &retry_ids);
+        if deleted.is_ok() && !poisoned_ids.is_empty() {
+            let _ = lock.delete_records(&poisoned_ids);
+        }
+        if !any_failure && deleted.is_ok() {
+            note_durable_sync_authenticated();
+            if pending == accepted_ids.len() + poisoned_ids.len() {
+                crate::auth::notice::clear_metrics_upload_stalled();
+            }
+        } else {
             crate::auth::notice::record_metrics_upload_stalled();
-            tracing::warn!(%error, pending, "metrics: durable queue upload failed; retained for retry");
+            note_durable_sync_upload_failed();
         }
+        tracing::info!(
+            uploaded = accepted_ids.len(),
+            rejected = retry_ids.len(),
+            dropped_oversized = poisoned_ids.len(),
+            remaining = pending.saturating_sub(if deleted.is_ok() {
+                accepted_ids.len() + poisoned_ids.len()
+            } else {
+                0
+            }),
+            "metrics: replayed durable queue batch"
+        );
+    } else {
+        note_durable_sync_upload_failed();
+        crate::auth::notice::record_metrics_upload_stalled();
+        tracing::warn!(
+            pending,
+            "metrics: durable queue upload failed; retained for retry"
+        );
     }
 }
 
@@ -1060,8 +1104,9 @@ pub fn flush_notes() {
 /// possible (i.e. we have credentials when targeting the hosted plane).
 ///
 /// CAS (prompt transcripts) is data-plane traffic. When the HTTP notes backend
-/// is active, send it to the same hosted data plane as notes (cli.autter.dev);
-/// otherwise fall back to the API base URL (legacy behavior).
+/// is active, send it to the same hosted data plane as notes (the API base,
+/// via `Config::notes_backend_url()`); otherwise fall back to the API base
+/// URL (legacy behavior).
 fn cas_client() -> (ApiClient, bool) {
     let cfg = Config::fresh();
     let dataplane_url = if cfg.notes_backend_kind().uses_http() {
