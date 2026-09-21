@@ -111,6 +111,11 @@ where
 }
 
 pub fn handle_git(args: &[String]) {
+    // Record the git subcommand so any later panic report can name it.
+    if let Some(subcommand) = best_effort_subcommand(args) {
+        crate::observability::set_current_command(subcommand);
+    }
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_git_inner(args);
     }));

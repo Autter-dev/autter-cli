@@ -2748,6 +2748,26 @@ impl TestRepo {
         }
     }
 
+    /// Build a configured `autter` [`Command`] without running it, so tests can
+    /// control stdio (e.g. to exercise closed-pipe behavior). Mirrors the env
+    /// setup used by [`Self::autter_with_env`].
+    pub fn autter_command(&self, args: &[&str]) -> Command {
+        let binary_path = get_binary_path();
+        let normalized_args = normalize_test_autter_checkpoint_args(args);
+
+        let mut command = Command::new(binary_path);
+        command.args(&normalized_args).current_dir(&self.path);
+        self.configure_autter_env(&mut command);
+
+        if let Some(patch) = &self.config_patch
+            && let Ok(patch_json) = serde_json::to_string(patch)
+        {
+            command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
+        }
+
+        command
+    }
+
     pub fn autter_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
         if autter_command_requires_daemon_sync(args) {
             self.sync_daemon_force();

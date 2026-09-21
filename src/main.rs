@@ -36,6 +36,21 @@ fn is_superuser_exempt_command(args: &[String]) -> bool {
 }
 
 fn main() {
+    // Rust's runtime sets SIGPIPE to SIG_IGN before `main`. That turns a reader
+    // closing the other end of a pipe (e.g. `autter blame | head`) into an
+    // EPIPE error, which makes the `println!`/`print!` macros panic with
+    // "failed printing to stdout". Restore the Unix default so the process
+    // instead exits quietly on a closed pipe, like every other CLI tool. The
+    // long-lived daemon re-ignores SIGPIPE at startup (see
+    // commands::daemon::handle_run) so its socket writes keep returning EPIPE
+    // instead of terminating the process.
+    #[cfg(unix)]
+    // SAFETY: restoring SIG_DFL for SIGPIPE is async-signal-safe and only sets
+    // the platform's default disposition for the signal.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // Get the binary name that was called
     let binary_name = std::env::args_os()
         .next()

@@ -70,6 +70,9 @@ pub fn handle_autter(args: &[String]) {
         std::process::exit(0);
     }
 
+    // Record the subcommand so any later panic report can name it.
+    crate::observability::set_current_command(args[0].as_str());
+
     // Initialize the global telemetry handle so that observability and CAS
     // events are routed over the control socket instead of being written to
     // per-PID log files.
