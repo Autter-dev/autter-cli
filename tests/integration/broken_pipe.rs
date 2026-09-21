@@ -1,7 +1,7 @@
 //! A reader that closes a pipe early (e.g. `autter blame | head`) must not
 //! crash the CLI. Rust ignores SIGPIPE before `main`, which turns the closed
-//! pipe into an EPIPE that makes `println!` panic; `main` restores the Unix
-//! default so the process exits quietly instead.
+//! pipe into an EPIPE that makes `println!` panic; the panic hook recognizes
+//! that broken-pipe panic and exits quietly instead of crashing.
 
 #[cfg(unix)]
 #[test]
@@ -38,11 +38,11 @@ fn blame_into_closed_pipe_does_not_panic() {
         !stderr.contains("panicked") && !stderr.contains("failed printing to stdout"),
         "autter blame panicked on a closed pipe:\n{stderr}"
     );
-    // A panic exits with code 101; a clean SIGPIPE termination or graceful exit
-    // does not.
-    assert_ne!(
+    // The panic hook turns the broken-pipe panic into a quiet exit 0, rather
+    // than the crash's exit code 101.
+    assert_eq!(
         output.status.code(),
-        Some(101),
-        "autter blame exited via panic on a closed pipe"
+        Some(0),
+        "autter blame did not exit cleanly on a closed pipe (stderr:\n{stderr})"
     );
 }

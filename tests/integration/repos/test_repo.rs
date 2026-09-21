@@ -2775,19 +2775,7 @@ impl TestRepo {
 
         let is_checkpoint = autter_primary_command(args) == Some("checkpoint");
 
-        let binary_path = get_binary_path();
-        let normalized_args = normalize_test_autter_checkpoint_args(args);
-
-        let mut command = Command::new(binary_path);
-        command.args(&normalized_args).current_dir(&self.path);
-        self.configure_autter_env(&mut command);
-
-        // Add config patch as environment variable if present
-        if let Some(patch) = &self.config_patch
-            && let Ok(patch_json) = serde_json::to_string(patch)
-        {
-            command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
-        }
+        let mut command = self.autter_command(args);
 
         // Add custom environment variables
         for (key, value) in envs {
@@ -2844,24 +2832,11 @@ impl TestRepo {
 
         let is_checkpoint = autter_primary_command(args) == Some("checkpoint");
 
-        let binary_path = get_binary_path();
-        let normalized_args = normalize_test_autter_checkpoint_args(args);
-
-        let mut command = Command::new(binary_path);
+        let mut command = self.autter_command(args);
         command
-            .args(&normalized_args)
-            .current_dir(&self.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        self.configure_autter_env(&mut command);
-
-        // Add config patch as environment variable if present
-        if let Some(patch) = &self.config_patch
-            && let Ok(patch_json) = serde_json::to_string(patch)
-        {
-            command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
-        }
 
         let mut child = command
             .spawn()

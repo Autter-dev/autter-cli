@@ -174,16 +174,6 @@ fn daemon_config_from_env_or_default_paths() -> Result<DaemonConfig, String> {
 }
 
 fn handle_run(args: &[String]) -> Result<(), String> {
-    // The daemon is long-lived and writes to network and control sockets.
-    // `main` resets SIGPIPE to SIG_DFL for tidy CLI output on a closed pipe;
-    // re-ignore it here so a peer that closes a socket yields an EPIPE error we
-    // can handle, rather than a signal that would kill the whole daemon.
-    #[cfg(unix)]
-    // SAFETY: setting SIG_IGN for SIGPIPE is async-signal-safe.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-    }
-
     if has_flag(args, "--mode") {
         return Err("--mode is no longer supported; daemon always runs in write mode".to_string());
     }

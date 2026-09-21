@@ -111,8 +111,10 @@ where
 }
 
 pub fn handle_git(args: &[String]) {
-    // Record the git subcommand so any later panic report can name it.
-    if let Some(subcommand) = best_effort_subcommand(args) {
+    // Record the git subcommand so any later panic report (and the recovery
+    // telemetry below) can name it.
+    let subcommand = best_effort_subcommand(args);
+    if let Some(subcommand) = subcommand.as_deref() {
         crate::observability::set_current_command(subcommand);
     }
 
@@ -129,7 +131,6 @@ pub fn handle_git(args: &[String]) {
         // + the org database). The panic hook already emitted the raw `$exception`;
         // this complements it with the *recovery outcome* so we can see how often
         // the proxy degrades and on which subcommands. Best-effort and panic-safe.
-        let subcommand = best_effort_subcommand(args);
         crate::observability::report_cli_error(
             "git_proxy_panic_recovery",
             if git_already_ran {
