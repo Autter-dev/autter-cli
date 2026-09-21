@@ -527,7 +527,7 @@ fn flush_metrics(events: &[MetricEvent]) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     // Envelopes are bounded by event count *and* serialized bytes: the server
-    // rejects bodies over ~100 KiB (HTTP 413), so a count-only chunk of large
+    // rejects oversized bodies (HTTP 413), so a count-only chunk of large
     // events would stall the queue on every tick.
     for chunk in split_metrics_envelopes(events.to_vec()) {
         if should_upload && !upload_failed && std::time::Instant::now() < deadline {
@@ -564,8 +564,13 @@ fn flush_metrics(events: &[MetricEvent]) {
 /// must be dropped loudly rather than re-queued forever — otherwise a few
 /// stale oversized events keep the whole backlog (and the `upload_failing`
 /// state) stuck. Any other per-event error keeps the current retry behavior.
+///
+/// Matches the base verdict and its reason-suffixed variants (the server is
+/// rolling out machine-readable reasons such as
+/// `"invalid metric event: database_insert_failed"`); the prefix form keeps
+/// working against both the old opaque string and the new format.
 fn is_validation_rejection(message: &str) -> bool {
-    message == "invalid metric event"
+    message == "invalid metric event" || message.starts_with("invalid metric event:")
 }
 
 /// Replay one bounded batch from the durable metrics queue. A bounded batch on
@@ -694,7 +699,7 @@ fn flush_stored_metrics() {
             }
             Err(error) => {
                 // Poison message: a lone event the server rejects by size can
-                // never upload through the ~100 KiB-limited endpoint. Drop it
+                // never upload through the size-limited endpoint. Drop it
                 // loudly instead of wedging thousands of events behind it.
                 if ids.len() == 1 && error.to_string().contains("413") {
                     poisoned_ids.push(ids[0]);
@@ -1383,9 +1388,16 @@ mod tests {
     #[test]
     fn validation_rejection_matches_only_permanent_verdicts() {
         assert!(is_validation_rejection("invalid metric event"));
+        assert!(is_validation_rejection(
+            "invalid metric event: database_insert_failed"
+        ));
+        assert!(is_validation_rejection(
+            "invalid metric event: nul byte in values"
+        ));
         assert!(!is_validation_rejection(""));
         assert!(!is_validation_rejection("invalid metric event "));
         assert!(!is_validation_rejection("rate limited, retry later"));
         assert!(!is_validation_rejection("organization quota exceeded"));
+        assert!(!is_validation_rejection("database_insert_failed"));
     }
 }

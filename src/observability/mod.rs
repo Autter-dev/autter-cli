@@ -9,10 +9,11 @@ pub mod performance_targets;
 pub const MAX_METRICS_PER_ENVELOPE: usize = 1000;
 
 /// Maximum serialized JSON bytes per metrics upload envelope. The server
-/// enforces a ~100 KiB request body limit (HTTP 413 `request entity too
-/// large`); envelopes are split to stay comfortably under it so a large
-/// backlog drains steadily instead of stalling on an oversized batch.
-pub const MAX_METRICS_ENVELOPE_BYTES: usize = 90_000;
+/// enforces a 5 MB request body limit on `/worker/*` (HTTP 413 above it);
+/// envelopes stay comfortably under it so a large backlog drains steadily
+/// instead of stalling on an oversized batch. (Was 90 KB when the limit was
+/// 100 KiB; raised alongside the server.)
+pub const MAX_METRICS_ENVELOPE_BYTES: usize = 4_000_000;
 
 /// Split events into upload envelopes bounded by both event count
 /// (`MAX_METRICS_PER_ENVELOPE`) and serialized bytes
@@ -295,9 +296,9 @@ mod tests {
     // Test envelope splitting
     #[test]
     fn test_split_metrics_envelopes_respects_byte_budget() {
-        // 10 events of ~20KB each (200KB total) must split across envelopes.
+        // 10 events of ~1MB each (10MB total) must split across envelopes.
         let events: Vec<MetricEvent> = (0..10)
-            .map(|_| test_metric_event_with_payload(20000))
+            .map(|_| test_metric_event_with_payload(1_000_000))
             .collect();
         let envelopes = split_metrics_envelopes(events);
         assert!(
