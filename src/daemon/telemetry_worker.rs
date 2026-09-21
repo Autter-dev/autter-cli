@@ -558,6 +558,16 @@ fn flush_metrics(events: &[MetricEvent]) {
     }
 }
 
+/// True for per-event upload rejections that retrying can never fix: the
+/// server validated the event content and refused it (HTTP 200 with an error
+/// entry), so re-uploading identical bytes will fail identically. Such events
+/// must be dropped loudly rather than re-queued forever — otherwise a few
+/// stale oversized events keep the whole backlog (and the `upload_failing`
+/// state) stuck. Any other per-event error keeps the current retry behavior.
+fn is_validation_rejection(message: &str) -> bool {
+    message == "invalid metric event"
+}
+
 /// Replay one bounded batch from the durable metrics queue. A bounded batch on
 /// every three-second daemon tick drains backlogs steadily without monopolizing
 /// the worker or delaying new checkpoints.
@@ -634,6 +644,7 @@ fn flush_stored_metrics() {
     let mut accepted_ids: Vec<i64> = Vec::new();
     let mut retry_ids: Vec<i64> = Vec::new();
     let mut poisoned_ids: Vec<i64> = Vec::new();
+    let mut invalid_ids_all: Vec<i64> = Vec::new();
     let mut any_failure = false;
     for envelope in envelopes {
         let ids = &uploaded_ids[id_offset..id_offset + envelope.len()];
@@ -646,11 +657,31 @@ fn flush_stored_metrics() {
                         .into_iter()
                         .map(|index| ids[index]),
                 );
+                // Partition per-event rejections: validation verdicts on the
+                // content itself (e.g. stale oversized events the server will
+                // never accept) are dropped loudly; anything else keeps the
+                // existing retry behavior.
+                let mut envelope_invalid: Vec<i64> = Vec::new();
                 let envelope_retries: Vec<i64> = response
                     .errors
                     .iter()
-                    .filter_map(|error| ids.get(error.index).copied())
+                    .filter_map(|error| {
+                        let id = ids.get(error.index).copied()?;
+                        if is_validation_rejection(&error.error) {
+                            envelope_invalid.push(id);
+                            None
+                        } else {
+                            Some(id)
+                        }
+                    })
                     .collect();
+                if !envelope_invalid.is_empty() {
+                    any_failure = true;
+                    tracing::warn!(
+                        rejected = envelope_invalid.len(),
+                        "metrics: dropping events the server refused to validate"
+                    );
+                }
                 if !envelope_retries.is_empty() {
                     any_failure = true;
                     tracing::warn!(
@@ -658,6 +689,7 @@ fn flush_stored_metrics() {
                         "metrics: envelope batch needs retry"
                     );
                 }
+                invalid_ids_all.extend(envelope_invalid);
                 retry_ids.extend(envelope_retries);
             }
             Err(error) => {
@@ -678,15 +710,24 @@ fn flush_stored_metrics() {
         }
     }
 
-    if !accepted_ids.is_empty() || !retry_ids.is_empty() || !poisoned_ids.is_empty() {
+    if !accepted_ids.is_empty()
+        || !retry_ids.is_empty()
+        || !poisoned_ids.is_empty()
+        || !invalid_ids_all.is_empty()
+    {
         let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let deleted = lock.finish_upload(&accepted_ids, &retry_ids);
-        if deleted.is_ok() && !poisoned_ids.is_empty() {
-            let _ = lock.delete_records(&poisoned_ids);
+        // Permanently undeliverable rows (oversized singles rejected by size,
+        // events refused by validation) are deleted so they can't wedge the
+        // queue behind them.
+        let mut dropped_ids = poisoned_ids.clone();
+        dropped_ids.extend(invalid_ids_all.iter().copied());
+        if deleted.is_ok() && !dropped_ids.is_empty() {
+            let _ = lock.delete_records(&dropped_ids);
         }
         if !any_failure && deleted.is_ok() {
             note_durable_sync_authenticated();
-            if pending == accepted_ids.len() + poisoned_ids.len() {
+            if pending == accepted_ids.len() + dropped_ids.len() {
                 crate::auth::notice::clear_metrics_upload_stalled();
             }
         } else {
@@ -697,8 +738,9 @@ fn flush_stored_metrics() {
             uploaded = accepted_ids.len(),
             rejected = retry_ids.len(),
             dropped_oversized = poisoned_ids.len(),
+            dropped_invalid = invalid_ids_all.len(),
             remaining = pending.saturating_sub(if deleted.is_ok() {
-                accepted_ids.len() + poisoned_ids.len()
+                accepted_ids.len() + dropped_ids.len()
             } else {
                 0
             }),
@@ -1326,6 +1368,7 @@ impl SentryClient {
 
 #[cfg(test)]
 mod tests {
+    use super::is_validation_rejection;
     use super::panic_message;
 
     #[test]
@@ -1335,5 +1378,14 @@ mod tests {
 
         let string_panic = std::panic::catch_unwind(|| panic!("count is {}", 3)).unwrap_err();
         assert_eq!(panic_message(&string_panic), "count is 3");
+    }
+
+    #[test]
+    fn validation_rejection_matches_only_permanent_verdicts() {
+        assert!(is_validation_rejection("invalid metric event"));
+        assert!(!is_validation_rejection(""));
+        assert!(!is_validation_rejection("invalid metric event "));
+        assert!(!is_validation_rejection("rate limited, retry later"));
+        assert!(!is_validation_rejection("organization quota exceeded"));
     }
 }
