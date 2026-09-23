@@ -79,14 +79,28 @@ async function fetchBuffer(url) {
 }
 
 // Verify against the release's checksums.txt (`<sha256>  <asset>` lines).
-// Releases before v1.6.8 shipped no checksums file; skip with a warning then.
+// Releases before v1.6.8 predate checksum publication and are the only
+// releases for which verification may be skipped.
 async function verifyChecksum(buf, asset, tag) {
+  const version = tag.replace(/^v/, '').split(/[+-]/, 1)[0];
+  const versionMatch = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!versionMatch) {
+    throw new Error(`invalid release tag ${tag}; refusing to determine checksum policy`);
+  }
+  const [, majorText, minorText, patchText] = versionMatch;
+  const major = Number(majorText);
+  const minor = Number(minorText);
+  const patch = Number(patchText);
+  const checksumsRequired = major > 1 || (major === 1 && (minor > 6 || (minor === 6 && patch >= 8)));
   let checksums;
   try {
     checksums = (await fetchBuffer(downloadUrl(tag, 'checksums.txt'))).toString('utf8');
-  } catch {
-    console.warn(`autter: no checksums.txt for release ${tag}; skipping checksum verification`);
-    return;
+  } catch (err) {
+    if (!checksumsRequired) {
+      console.warn(`autter: release ${tag} predates checksum publishing; skipping checksum verification`);
+      return;
+    }
+    throw new Error(`could not fetch checksums.txt for release ${tag}; refusing to install an unverifiable binary (${err.message})`);
   }
   const entry = checksums
     .split('\n')
@@ -245,8 +259,8 @@ async function ensureBinary() {
   return { bin: dest, downloaded: true };
 }
 
-// postinstall entry point. Never fails the surrounding `npm install`: on any
-// error it warns and defers to bin/autter.js, which retries on first run.
+// postinstall entry point. Ordinary transient download/platform errors defer to
+// bin/autter.js, but an integrity failure must fail installation closed.
 async function main() {
   if (process.env.AUTTER_NPM_SKIP_DOWNLOAD === '1') {
     console.log('autter: AUTTER_NPM_SKIP_DOWNLOAD=1, skipping binary download');
@@ -265,6 +279,9 @@ async function main() {
   try {
     result = await ensureBinary();
   } catch (err) {
+    if (/checksums\.txt|checksum mismatch|no checksum entry/.test(err.message)) {
+      throw err;
+    }
     console.warn(`autter: could not install the native binary now (${err.message})`);
     console.warn('autter: it will be downloaded on first run instead');
     return;
@@ -281,11 +298,11 @@ async function main() {
   console.log("Run 'autter onboard' to finish setup (consent for hooks, git config, and daemon).");
 }
 
-module.exports = { assetName, binaryDest, ensureBinary, releaseTag };
+module.exports = { assetName, binaryDest, ensureBinary, releaseTag, verifyChecksum };
 
 if (require.main === module) {
   main().catch((err) => {
-    // Belt and braces: postinstall must never break `npm install`.
-    console.warn(`autter: postinstall failed (${err.message})`);
+    console.error(`autter: postinstall failed (${err.message})`);
+    process.exitCode = 1;
   });
 }
