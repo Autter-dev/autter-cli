@@ -1,9 +1,20 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::metrics::MetricEvent;
 
 pub mod performance_targets;
+
+/// The autter/git subcommand currently executing, recorded so the panic hook
+/// can attach it to reported panics. Set once per process at dispatch time.
+static CURRENT_COMMAND: OnceLock<String> = OnceLock::new();
+
+/// Record the subcommand being executed so a later panic report can name it.
+/// Best-effort and idempotent: the first call wins, later calls are ignored.
+pub fn set_current_command(command: impl Into<String>) {
+    let _ = CURRENT_COMMAND.set(command.into());
+}
 
 /// Maximum events per metrics envelope
 pub const MAX_METRICS_PER_ENVELOPE: usize = 1000;
@@ -116,9 +127,26 @@ pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Valu
     submit_telemetry_envelope(vec![envelope]);
 }
 
+/// Whether a panic payload is the one the `print!`/`println!` macros raise when
+/// a write to stdout/stderr fails because the reader closed the pipe (e.g.
+/// `autter blame | head`). Rust ignores SIGPIPE before `main`, so that write
+/// returns `EPIPE` and the macro panics with a fixed, locale-independent prefix
+/// from std; the `os error 32` (EPIPE) / "Broken pipe" tail confirms the cause
+/// rather than some other output failure worth surfacing.
+fn is_broken_pipe_print_panic(payload: &str) -> bool {
+    (payload.starts_with("failed printing to stdout")
+        || payload.starts_with("failed printing to stderr"))
+        && (payload.contains("Broken pipe") || payload.contains("os error 32"))
+}
+
 /// Install a panic hook that reports unexpected panics as error events
 /// (surfacing in PostHog Error Tracking via the daemon) while preserving the
 /// default behavior of printing the panic to stderr.
+///
+/// One case is handled specially: a broken-pipe failure from the print macros
+/// (a reader closing the pipe, as in `autter blame | head`) is not a real
+/// crash. Exit quietly like any other CLI tool instead of printing a panic or
+/// reporting telemetry noise.
 ///
 /// Reporting is best-effort and routes through the same consent-gated path as
 /// every other event: the daemon only forwards to PostHog when the user has
@@ -134,6 +162,10 @@ pub fn install_panic_hook() {
             "Box<dyn Any>".to_string()
         };
 
+        if is_broken_pipe_print_panic(&payload) {
+            std::process::exit(0);
+        }
+
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
@@ -144,6 +176,7 @@ pub fn install_panic_hook() {
             context: Some(serde_json::json!({
                 "kind": "panic",
                 "location": location,
+                "command": CURRENT_COMMAND.get(),
             })),
         };
         submit_telemetry_envelope(vec![envelope]);

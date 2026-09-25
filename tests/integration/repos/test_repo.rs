@@ -2748,13 +2748,10 @@ impl TestRepo {
         }
     }
 
-    pub fn autter_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
-        if autter_command_requires_daemon_sync(args) {
-            self.sync_daemon_force();
-        }
-
-        let is_checkpoint = autter_primary_command(args) == Some("checkpoint");
-
+    /// Build a configured `autter` [`Command`] without running it, so tests can
+    /// control stdio (e.g. to exercise closed-pipe behavior). Mirrors the env
+    /// setup used by [`Self::autter_with_env`].
+    pub fn autter_command(&self, args: &[&str]) -> Command {
         let binary_path = get_binary_path();
         let normalized_args = normalize_test_autter_checkpoint_args(args);
 
@@ -2762,12 +2759,23 @@ impl TestRepo {
         command.args(&normalized_args).current_dir(&self.path);
         self.configure_autter_env(&mut command);
 
-        // Add config patch as environment variable if present
         if let Some(patch) = &self.config_patch
             && let Ok(patch_json) = serde_json::to_string(patch)
         {
             command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
         }
+
+        command
+    }
+
+    pub fn autter_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+        if autter_command_requires_daemon_sync(args) {
+            self.sync_daemon_force();
+        }
+
+        let is_checkpoint = autter_primary_command(args) == Some("checkpoint");
+
+        let mut command = self.autter_command(args);
 
         // Add custom environment variables
         for (key, value) in envs {
@@ -2824,24 +2832,11 @@ impl TestRepo {
 
         let is_checkpoint = autter_primary_command(args) == Some("checkpoint");
 
-        let binary_path = get_binary_path();
-        let normalized_args = normalize_test_autter_checkpoint_args(args);
-
-        let mut command = Command::new(binary_path);
+        let mut command = self.autter_command(args);
         command
-            .args(&normalized_args)
-            .current_dir(&self.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        self.configure_autter_env(&mut command);
-
-        // Add config patch as environment variable if present
-        if let Some(patch) = &self.config_patch
-            && let Ok(patch_json) = serde_json::to_string(patch)
-        {
-            command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
-        }
 
         let mut child = command
             .spawn()
