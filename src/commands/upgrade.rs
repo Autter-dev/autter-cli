@@ -50,6 +50,10 @@ unsafe extern "system" {
 }
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
+/// How long a declined update prompt stays silent. Without this the prompt
+/// would reappear on every single git command, which reads as nagging rather
+/// than as an offer.
+const UPDATE_PROMPT_SNOOZE_HOURS: u64 = 24 * 7;
 const AUTTER_RELEASE_ENV: &str = "AUTTER_RELEASE_TAG";
 #[cfg(windows)]
 const AUTTER_RESTART_DAEMON_AFTER_INSTALL_ENV: &str = "AUTTER_RESTART_DAEMON_AFTER_INSTALL";
@@ -60,6 +64,10 @@ const ENV_BACKGROUND_UPGRADE_WORKER: &str = "AUTTER_BACKGROUND_UPGRADE_WORKER";
 static UPDATE_NOTICE_EMITTED: AtomicBool = AtomicBool::new(false);
 static MIN_VERSION_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 static LAST_BACKGROUND_SPAWN: AtomicU64 = AtomicU64::new(0);
+/// Set while a prompted upgrade is running so nested `autter` invocations
+/// (the installer runs `autter install`, which re-enters this module) can't
+/// stack a second prompt on top of the first.
+static UPDATE_PROMPT_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, PartialEq)]
 enum UpgradeAction {
@@ -856,6 +864,197 @@ fn run_impl_with_url(
     action
 }
 
+/// Offer the cached update for immediate install, in the style of a shell
+/// framework's update prompt. Returns `true` when the user was actually shown
+/// the prompt (accepted or declined), so the caller knows not to also print
+/// the passive "run autter upgrade" notice.
+fn maybe_prompt_to_upgrade(cache: &UpdateCache) -> bool {
+    let Some(available_version) = cache.available_semver.as_deref() else {
+        return false;
+    };
+
+    let config = crate::config::Config::get();
+    if config.update_prompt_disabled() {
+        return false;
+    }
+    // Someone who turned auto-updates off has already said no; drop them back
+    // to the passive notice rather than asking again on every git command.
+    if config.auto_updates_disabled() {
+        return false;
+    }
+    if read_prompt_snooze_until().is_some() {
+        return false;
+    }
+    if !update_prompt_context_allows_interaction() {
+        return false;
+    }
+    // Reading a keystroke needs a terminal on both ends: stdout is what the
+    // enclosing notice already gated on, stdin is where the answer arrives.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    if UPDATE_PROMPT_RUNNING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+
+    eprintln!();
+    eprintln!(
+        "{} {} {} {} {}",
+        paint_err("1;33", "[autter] Update available:"),
+        paint_err("1;32", &format!("v{}", env!("CARGO_PKG_VERSION"))),
+        paint_err("1;33", "→"),
+        paint_err("1;32", &format!("v{available_version}")),
+        paint_err("1;33", &format!("({})", cache.channel)),
+    );
+
+    let question = "Update autter now?";
+    if !crate::ui::confirm(question, true) {
+        snooze_update_prompt();
+        return true;
+    }
+
+    clear_prompt_snooze();
+    run_prompted_upgrade();
+    true
+}
+
+/// Run the upgrade in a child `autter upgrade` process.
+///
+/// A child (rather than calling [`run_impl_with_url`] in-process) for two
+/// reasons: the caller is autter's git proxy, which still owes git's exit
+/// status back to the shell, and `run_impl_with_url` exits the process on
+/// failure — in-process that would turn a successful `git push` into a
+/// failure. It also means the binary being replaced isn't the one running.
+fn run_prompted_upgrade() {
+    let Ok(exe) = crate::utils::current_autter_exe() else {
+        eprintln!(
+            "{}",
+            paint_err(
+                "1;31",
+                "[autter] Could not locate the autter binary; run `autter upgrade` yourself."
+            )
+        );
+        return;
+    };
+
+    eprintln!();
+    eprintln!(
+        "{} {}",
+        paint_err("1;33", "[autter] Running"),
+        paint_err("1;36", "autter upgrade")
+    );
+    eprintln!();
+
+    // Marks the child as upgrade-initiated so it isn't blocked by the Windows
+    // "don't upgrade from a git proxy" guard, and so it can't recurse into
+    // spawning another upgrade worker. `AUTTER` is stripped because debug
+    // builds use it to force git-proxy mode, and a child that inherited it
+    // would run `git upgrade` instead of `autter upgrade`.
+    let status = Command::new(exe)
+        .arg("upgrade")
+        .env(ENV_BACKGROUND_UPGRADE_WORKER, "1")
+        .env_remove("AUTTER")
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!(
+            "{}",
+            paint_err(
+                "1;31",
+                &format!(
+                    "[autter] Update failed (exit code {}). Run `autter upgrade` to retry.",
+                    status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
+            )
+        ),
+        Err(err) => eprintln!(
+            "{}",
+            paint_err(
+                "1;31",
+                &format!("[autter] Could not run `autter upgrade`: {err}")
+            )
+        ),
+    }
+}
+
+/// Contexts where blocking on a prompt is unacceptable: CI, AI agents, and
+/// internal invocations (background upgrade workers, daemon-driven upgrades,
+/// hook-suppressed runs). All of these can have a human-less "terminal".
+fn update_prompt_context_allows_interaction() -> bool {
+    if running_in_ci() {
+        return false;
+    }
+    if crate::utils::is_in_background_agent() {
+        return false;
+    }
+    [
+        ENV_BACKGROUND_UPGRADE_WORKER,
+        AUTTER_DAEMON_UPGRADE_ENV,
+        crate::commands::git_hook_handlers::ENV_SKIP_ALL_HOOKS,
+    ]
+    .iter()
+    .all(|var| std::env::var(var).as_deref() != Ok("1"))
+}
+
+fn running_in_ci() -> bool {
+    [
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITLAB_CI",
+        "JENKINS_URL",
+        "BUILDKITE",
+        "CIRCLECI",
+        "TEAMCITY_VERSION",
+        "TF_BUILD",
+    ]
+    .iter()
+    .any(|var| std::env::var_os(var).is_some())
+}
+
+fn get_update_prompt_snooze_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Ok(test_cache_dir) = std::env::var("AUTTER_TEST_CACHE_DIR") {
+            return Some(PathBuf::from(test_cache_dir).join("update_prompt_snooze"));
+        }
+    }
+
+    crate::config::update_prompt_snooze_path()
+}
+
+/// Unix timestamp the user asked not to be prompted again until, if that
+/// moment is still in the future.
+fn read_prompt_snooze_until() -> Option<u64> {
+    let bytes = fs::read(get_update_prompt_snooze_path()?).ok()?;
+    let until = std::str::from_utf8(&bytes)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    (until > current_timestamp()).then_some(until)
+}
+
+fn snooze_update_prompt() {
+    let Some(path) = get_update_prompt_snooze_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let until = current_timestamp() + UPDATE_PROMPT_SNOOZE_HOURS * 3600;
+    let _ = fs::write(path, until.to_string());
+}
+
+fn clear_prompt_snooze() {
+    if let Some(path) = get_update_prompt_snooze_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn print_cached_notice(cache: &UpdateCache) {
     if cache.available_semver.is_none() || cache.available_tag.is_none() {
         return;
@@ -870,6 +1069,12 @@ fn print_cached_notice(cache: &UpdateCache) {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        return;
+    }
+
+    // An interactive terminal gets the one-key prompt; everything else (CI,
+    // agents, snoozed, piped) falls through to the passive notice below.
+    if maybe_prompt_to_upgrade(cache) {
         return;
     }
 
@@ -2050,5 +2255,94 @@ mod tests {
             let result = check_for_update_available().unwrap();
             assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn test_prompt_snooze_suppresses_prompt_then_expires() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+
+        assert!(read_prompt_snooze_until().is_none());
+
+        snooze_update_prompt();
+        let until = read_prompt_snooze_until().expect("declining snoozes the prompt");
+        assert!(until > current_timestamp());
+
+        // An elapsed stamp is ignored, so the offer comes back around.
+        fs::write(
+            get_update_prompt_snooze_path().unwrap(),
+            (current_timestamp() - 1).to_string(),
+        )
+        .unwrap();
+        assert!(read_prompt_snooze_until().is_none());
+
+        // A corrupt stamp must not silence the prompt forever.
+        fs::write(get_update_prompt_snooze_path().unwrap(), "not-a-timestamp").unwrap();
+        assert!(read_prompt_snooze_until().is_none());
+
+        snooze_update_prompt();
+        clear_prompt_snooze();
+        assert!(read_prompt_snooze_until().is_none());
+        assert!(!get_update_prompt_snooze_path().unwrap().exists());
+
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_prompt_skipped_in_non_interactive_contexts() {
+        // Under `cargo test` stdin/stderr are not terminals, so the prompt is
+        // never offered regardless of the environment.
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.available_tag = Some("v99.99.99".to_string());
+        cache.available_semver = Some("99.99.99".to_string());
+
+        let patch = serde_json::json!({
+            "disable_version_checks": false,
+            "disable_update_prompt": false
+        })
+        .to_string();
+        unsafe { std::env::set_var("AUTTER_TEST_CONFIG_PATCH", &patch) };
+        assert!(!maybe_prompt_to_upgrade(&cache));
+        assert!(!maybe_prompt_to_upgrade(&UpdateCache::new(
+            UpdateChannel::Latest
+        )));
+
+        unsafe { std::env::set_var("CI", "1") };
+        assert!(!update_prompt_context_allows_interaction());
+        unsafe { std::env::remove_var("CI") };
+
+        unsafe { std::env::set_var(ENV_BACKGROUND_UPGRADE_WORKER, "1") };
+        assert!(!update_prompt_context_allows_interaction());
+        unsafe { std::env::remove_var(ENV_BACKGROUND_UPGRADE_WORKER) };
+
+        assert!(update_prompt_context_allows_interaction());
+
+        unsafe { std::env::remove_var("AUTTER_TEST_CONFIG_PATCH") };
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_prompt_disabled_by_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.available_tag = Some("v99.99.99".to_string());
+        cache.available_semver = Some("99.99.99".to_string());
+
+        let patch = serde_json::json!({
+            "disable_version_checks": false,
+            "disable_update_prompt": true
+        })
+        .to_string();
+        unsafe { std::env::set_var("AUTTER_TEST_CONFIG_PATCH", &patch) };
+        assert!(!maybe_prompt_to_upgrade(&cache));
+
+        unsafe { std::env::remove_var("AUTTER_TEST_CONFIG_PATCH") };
+        clear_test_cache_dir();
     }
 }

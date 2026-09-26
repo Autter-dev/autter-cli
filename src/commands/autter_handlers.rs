@@ -248,8 +248,12 @@ pub fn handle_autter(args: &[String]) {
                 if let Ok(statuses_value) = serde_json::to_value(&statuses) {
                     log_message("uninstall", "info", Some(statuses_value));
                 }
-                eprintln!("Removed IDE/agent hooks, global git trace2 config, and stopped the background service.");
-                eprintln!("Binary and PATH entries were left in place. Delete them manually if desired.");
+                eprintln!(
+                    "Removed IDE/agent hooks, global git trace2 config, and stopped the background service."
+                );
+                eprintln!(
+                    "Binary and PATH entries were left in place. Delete them manually if desired."
+                );
             }
             Err(e) => {
                 eprintln!("Uninstall failed: {}", e);

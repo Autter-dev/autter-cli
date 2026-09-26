@@ -285,7 +285,12 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
 }
 
 /// Extract a human-readable message from a caught panic payload.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+///
+/// Takes the `Box` rather than a `&(dyn Any + Send)`: materializing that
+/// reference replaces the object's vtable with the trait-object one, after
+/// which `downcast_ref` no longer sees the concrete payload type and every
+/// message comes back as "unknown panic".
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = panic.downcast_ref::<String>() {

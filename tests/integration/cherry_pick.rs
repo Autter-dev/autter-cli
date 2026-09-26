@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use crate::test_utils::assert_sessions_canonical;
 use autter::authorship::authorship_log::PromptRecord;
 use autter::authorship::authorship_log_serialization::AuthorshipLog;
 use autter::authorship::working_log::AgentId;
@@ -53,10 +54,7 @@ fn test_single_commit_cherry_pick() {
     )
     .unwrap();
 
-    assert!(
-        log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&log);
     assert!(
         !log.metadata.sessions.is_empty(),
         "Should have at least one session record"
@@ -263,10 +261,7 @@ fn test_multiple_commits_cherry_pick() {
     )
     .unwrap();
 
-    assert!(
-        log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&log);
     assert!(
         !log.metadata.sessions.is_empty(),
         "Should have session records"
@@ -465,10 +460,7 @@ fn test_cherry_pick_multiple_ai_sessions() {
     )
     .unwrap();
 
-    assert!(
-        log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&log);
     assert!(
         !log.metadata.sessions.is_empty(),
         "Should have at least one session record"
@@ -602,10 +594,7 @@ fn test_cherry_pick_preserves_custom_attributes_from_config() {
         .expect("original commit should have authorship note");
     let original_log =
         AuthorshipLog::deserialize_from_string(&original_note).expect("parse original note");
-    assert!(
-        original_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&original_log);
     assert!(
         !original_log.metadata.sessions.is_empty(),
         "precondition: original commit should have session records"
@@ -628,10 +617,7 @@ fn test_cherry_pick_preserves_custom_attributes_from_config() {
         .read_authorship_note(&new_commit)
         .expect("cherry-picked commit should have authorship note");
     let new_log = AuthorshipLog::deserialize_from_string(&new_note).expect("parse new note");
-    assert!(
-        new_log.metadata.prompts.is_empty(),
-        "cherry-picked commit should not have prompts"
-    );
+    assert_sessions_canonical(&new_log);
     assert!(
         !new_log.metadata.sessions.is_empty(),
         "cherry-picked commit should have session records"

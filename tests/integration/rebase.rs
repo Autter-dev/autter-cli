@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use crate::test_utils::assert_sessions_canonical;
 use autter::authorship::authorship_log::PromptRecord;
 use autter::authorship::authorship_log_serialization::AuthorshipLog;
 use autter::authorship::working_log::AgentId;
@@ -1475,10 +1476,7 @@ fn test_rebase_preserves_custom_attributes_from_config() {
         .expect("original commit should have authorship note");
     let original_log =
         AuthorshipLog::deserialize_from_string(&original_note).expect("parse original note");
-    assert!(
-        original_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&original_log);
     assert!(
         !original_log.metadata.sessions.is_empty(),
         "precondition: original commit should have session records"
@@ -1508,10 +1506,7 @@ fn test_rebase_preserves_custom_attributes_from_config() {
         .expect("rebased commit should have authorship note");
     let rebased_log =
         AuthorshipLog::deserialize_from_string(&rebased_note).expect("parse rebased note");
-    assert!(
-        rebased_log.metadata.prompts.is_empty(),
-        "rebased commit should not have prompts"
-    );
+    assert_sessions_canonical(&rebased_log);
     assert!(
         !rebased_log.metadata.sessions.is_empty(),
         "rebased commit should have session records"
@@ -1569,14 +1564,8 @@ fn test_rebase_prompt_metrics_update_per_commit() {
     let log2 = AuthorshipLog::deserialize_from_string(&note2).expect("parse note 2");
 
     // Session format: verify pre-rebase sessions exist and attestation line counts differ
-    assert!(
-        log1.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
-    assert!(
-        log2.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&log1);
+    assert_sessions_canonical(&log2);
     assert!(
         !log1.metadata.sessions.is_empty(),
         "precondition: commit 1 should have session records"
@@ -1643,14 +1632,8 @@ fn test_rebase_prompt_metrics_update_per_commit() {
         AuthorshipLog::deserialize_from_string(&rebased_note2).expect("parse rebased note 2");
 
     // Session format: verify sessions survive rebase and attestation line counts differ
-    assert!(
-        rebased_log1.metadata.prompts.is_empty(),
-        "rebased commit 1 should not have prompts"
-    );
-    assert!(
-        rebased_log2.metadata.prompts.is_empty(),
-        "rebased commit 2 should not have prompts"
-    );
+    assert_sessions_canonical(&rebased_log1);
+    assert_sessions_canonical(&rebased_log2);
     assert!(
         !rebased_log1.metadata.sessions.is_empty(),
         "regression: rebased commit 1 should have session records"

@@ -368,8 +368,10 @@ fn test_copilot_cli_claude_format_edit_update_attribution_and_diff_json() {
         .as_object()
         .expect("diff stats should include tool/model breakdown");
     assert!(
-        breakdown.contains_key("github-copilot-cli::unknown"),
-        "diff stats should include github-copilot-cli::unknown, got: {breakdown:#?}"
+        // No real model in the hook payload, so `AgentId::normalized` substitutes
+        // the tool's default rather than a bare "unknown".
+        breakdown.contains_key("github-copilot-cli::github-copilot-cli/unknown-model"),
+        "diff stats should include the normalized github-copilot-cli model, got: {breakdown:#?}"
     );
 }
 

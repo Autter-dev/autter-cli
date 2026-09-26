@@ -138,7 +138,9 @@ fn log_plain_rejects_http_backend() {
         .expect_err("autter log --plain should reject HTTP notes backend");
 
     assert!(
-        err.contains("plain git log --notes=ai only supports the git_notes backend"),
+        err.contains(
+            "plain git log --notes=ai only supports backends that store notes in git refs"
+        ),
         "error:\n{}",
         err
     );

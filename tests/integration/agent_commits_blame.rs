@@ -481,8 +481,10 @@ fn test_agent_blame_json_output() {
     );
     assert_eq!(
         prompt_entry["agent_id"]["model"].as_str().unwrap(),
-        "unknown",
-        "Prompt should have model=unknown"
+        // Email-detected authorship has no real model, so `AgentId::normalized`
+        // substitutes the tool's default rather than the bare "unknown" bucket.
+        "cursor-agent/unknown-model",
+        "Prompt should carry the tool's default model"
     );
 
     // Verify the agent_id.id is the commit SHA

@@ -407,9 +407,7 @@ fn apply_system_integrations_with_consent(auto_apply: bool) {
     } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
         eprintln!();
         eprintln!("{BOLD}System integrations{RESET}");
-        eprintln!(
-            "  Autter can install IDE/agent hooks, write git trace2 settings, and start a"
-        );
+        eprintln!("  Autter can install IDE/agent hooks, write git trace2 settings, and start a");
         eprintln!("  background service so terminal commits get authorship notes.");
         eprintln!();
         let items = [
@@ -422,13 +420,12 @@ fn apply_system_integrations_with_consent(auto_apply: bool) {
                 "Binary stays installed; attribution will not capture until you opt in.",
             ),
         ];
-        match ui::select("Install system integrations?", &items, 0) {
-            0 => true,
-            _ => false,
-        }
+        matches!(ui::select("Install system integrations?", &items, 0), 0)
     } else {
         // Non-interactive without flags: leave integrations off.
-        eprintln!("Skipping system integrations (non-interactive). Run `autter onboard` or `autter install --system` later.");
+        eprintln!(
+            "Skipping system integrations (non-interactive). Run `autter onboard` or `autter install --system` later."
+        );
         false
     };
 
@@ -479,7 +476,9 @@ fn offer_historical_sync_consent() {
         ui::select("What should we do with the backlog?", &items, 0) == 0
     } else {
         // Non-interactive connect: keep backlog (historical default) but print how to purge.
-        eprintln!("  Keeping the backlog. Run `autter sync purge` before the next daemon drain to discard it.");
+        eprintln!(
+            "  Keeping the backlog. Run `autter sync purge` before the next daemon drain to discard it."
+        );
         true
     };
 

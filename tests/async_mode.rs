@@ -242,7 +242,7 @@ fn install_hooks_async_mode_sets_daemon_trace2_global_config() {
     let repo =
         TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
 
-    let output = autter_with_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
+    let output = autter_with_daemon_env(&repo, &["install-hooks", "--system", "--dry-run=false"])
         .expect("install-hooks should succeed");
 
     assert!(
@@ -265,7 +265,7 @@ fn install_hooks_async_mode_dry_run_does_not_write_trace2_global_config() {
     let repo =
         TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
 
-    autter_with_daemon_env(&repo, &["install-hooks", "--dry-run=true"])
+    autter_with_daemon_env(&repo, &["install-hooks", "--system", "--dry-run=true"])
         .expect("install-hooks dry-run should succeed");
 
     let target = read_global_git_config(&repo, "trace2.eventTarget");
@@ -286,7 +286,7 @@ fn install_hooks_async_mode_trace2_target_routes_real_git_trace_to_daemon() {
     let repo =
         TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
 
-    autter_with_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
+    autter_with_daemon_env(&repo, &["install-hooks", "--system", "--dry-run=false"])
         .expect("install-hooks should succeed");
 
     let start_output = daemon_command_output(&repo, &["bg", "start"], repo.path());

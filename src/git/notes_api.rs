@@ -729,15 +729,12 @@ mod tests {
     #[test]
     #[serial_test::serial(notes_db_env)]
     fn http_write_then_read_uses_cache() {
-        use std::env;
-
         // Point the notes-db at a temp file so we don't pollute the real DB.
         let tmp = tempfile::NamedTempFile::new().expect("tmp file");
         let db_path = tmp.path().to_str().unwrap().to_string();
         // Safety: test-only env var manipulation.
-        unsafe {
-            env::set_var("AUTTER_TEST_NOTES_DB_PATH", &db_path);
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(&db_path))
+            .expect("install isolated notes-db");
 
         // Write directly via http helper (no repo needed).
         http_write_note(
@@ -762,24 +759,16 @@ mod tests {
             ),
             "expected pending row in notes-db"
         );
-
-        // Cleanup env var.
-        unsafe {
-            env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
-        }
     }
 
     /// http_read_notes returns a HashMap of all cached entries for requested SHAs.
     #[test]
     #[serial_test::serial(notes_db_env)]
     fn http_read_notes_returns_multiple() {
-        use std::env;
-
         let tmp = tempfile::NamedTempFile::new().expect("tmp file");
         let db_path = tmp.path().to_str().unwrap().to_string();
-        unsafe {
-            env::set_var("AUTTER_TEST_NOTES_DB_PATH", &db_path);
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(&db_path))
+            .expect("install isolated notes-db");
 
         let sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let sha2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
@@ -793,10 +782,6 @@ mod tests {
         assert_eq!(result.get(&sha1), Some(&"content-a".to_string()));
         assert_eq!(result.get(&sha2), Some(&"content-b".to_string()));
         assert!(!result.contains_key(&sha3));
-
-        unsafe {
-            env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
-        }
     }
 
     /// With kind=GitNotes (default), read_note_blob_oids delegates to git.
@@ -814,6 +799,7 @@ mod tests {
     /// because notes live in notes-db, not in git refs.
     /// We test this by calling the function through a fresh Config set to Http.
     #[test]
+    #[serial_test::serial(notes_db_env)]
     fn http_backend_read_note_blob_oids_returns_empty_map() {
         use crate::git::test_utils::TmpRepo;
 
@@ -857,14 +843,12 @@ mod tests {
     fn integration_http_write_note_goes_to_db_not_git() {
         use crate::git::repository::exec_git;
         use crate::git::test_utils::TmpRepo;
-        use std::env;
 
         // Isolated notes-db for this test.
         let tmp_db = tempfile::NamedTempFile::new().expect("tmp db file");
         let db_path = tmp_db.path().to_str().unwrap().to_string();
-        unsafe {
-            env::set_var("AUTTER_TEST_NOTES_DB_PATH", &db_path);
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(&db_path))
+            .expect("install isolated notes-db");
 
         let repo = TmpRepo::new().expect("TmpRepo::new");
 
@@ -902,10 +886,6 @@ mod tests {
             result.is_err(),
             "git notes --ref=ai show should fail (note not in git) for Http backend"
         );
-
-        unsafe {
-            env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
-        }
     }
 
     /// Integration test: the `Both` backend writes the note to git refs AND
@@ -915,14 +895,12 @@ mod tests {
     fn integration_both_write_note_goes_to_git_and_db() {
         use crate::git::repository::exec_git;
         use crate::git::test_utils::TmpRepo;
-        use std::env;
 
         // Isolated notes-db for this test.
         let tmp_db = tempfile::NamedTempFile::new().expect("tmp db file");
         let db_path = tmp_db.path().to_str().unwrap().to_string();
-        unsafe {
-            env::set_var("AUTTER_TEST_NOTES_DB_PATH", &db_path);
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(&db_path))
+            .expect("install isolated notes-db");
 
         let repo = TmpRepo::new().expect("TmpRepo::new");
 
@@ -961,10 +939,6 @@ mod tests {
         let output = exec_git(&args).expect("git notes show should succeed for Both backend");
         let shown = String::from_utf8_lossy(&output.stdout);
         assert_eq!(shown.trim(), "dual-note-content");
-
-        unsafe {
-            env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
-        }
     }
 
     /// Integration test: `materialize_notes_for_display` writes notes from the
@@ -975,13 +949,13 @@ mod tests {
     fn integration_materialize_notes_for_display() {
         use crate::git::repository::exec_git;
         use crate::git::test_utils::TmpRepo;
-        use std::env;
 
         // Isolated notes-db.
         let tmp_db = tempfile::NamedTempFile::new().expect("tmp db file");
-        unsafe {
-            env::set_var("AUTTER_TEST_NOTES_DB_PATH", tmp_db.path().to_str().unwrap());
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(
+            tmp_db.path().to_str().unwrap(),
+        ))
+        .expect("install isolated notes-db");
 
         let repo = TmpRepo::new().expect("TmpRepo::new");
 
@@ -1012,10 +986,6 @@ mod tests {
             "refs/notes/ai-display should contain the materialized note, got: {:?}",
             stdout
         );
-
-        unsafe {
-            env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
-        }
     }
 
     /// Verify that `run_pre_push_hook_managed` has the correct early-return guard for
@@ -1024,6 +994,7 @@ mod tests {
     /// `run_pre_push_hook_managed` would short-circuit. This is a compile-time
     /// regression guard for the code structure added in Phase 2.6.
     #[test]
+    #[serial_test::serial(notes_db_env)]
     fn push_pre_command_hook_http_guard_is_in_place() {
         use std::env;
 
@@ -1060,27 +1031,25 @@ mod tests {
     //
     // Design notes on the `NOTES_DB` `OnceLock` singleton:
     //
-    // `NotesDatabase::global()` uses a `OnceLock` that initialises the DB path
-    // *once per process*.  Both tests set `AUTTER_TEST_NOTES_DB_PATH` to a fresh
-    // temp file before their first DB call.  The first test to run initialises the
-    // OnceLock; subsequent tests in the same process reuse the same DB file path
-    // regardless of what `AUTTER_TEST_NOTES_DB_PATH` says.
+    // `NotesDatabase::global()` is a `OnceLock`, so the DB path is resolved
+    // *once per process*: setting `AUTTER_TEST_NOTES_DB_PATH` only reaches the
+    // test that happens to initialise it first, and every later test silently
+    // reuses that DB.  When that first initialiser isn't one of these tests, the
+    // path is the developer's real `~/.autter/internal/notes-db` and the running
+    // daemon drains freshly written rows before the assertions run.
     //
-    // Strategy: both tests use `NotesDatabase::global()` for all reads and writes
-    // (pre-population and post-call verification) rather than direct file-level
-    // connections.  Because the tests run serially (`#[serial]`) and each uses
-    // distinct commit SHAs, shared DB state doesn't cause false-negative assertions.
-    //
-    // Test 1 sets `AUTTER_TEST_NOTES_DB_PATH` which initialises the OnceLock if
-    // it hasn't been set yet.  Test 2 also sets it but will use whatever path was
-    // already locked.  Both tests clear DB state relevant to their own SHAs via
-    // `get_note` assertions on distinct SHAs, so they don't interfere.
+    // Strategy: each test calls `NotesDatabase::install_test_db_at()`, which
+    // swaps a fresh throwaway DB into the already-initialised mutex.  That
+    // sidesteps the `OnceLock` entirely, so isolation no longer depends on test
+    // ordering, and the real notes DB is never written to.  The `#[serial]`
+    // group still matters: the singleton is process-global, so only one test at
+    // a time may point it at its own file.
 
     /// Unit test: `warm_cache_for_remote` fetches notes from a mock HTTP server
     /// and stores them in `notes-db` with `synced = 1`.
     ///
     /// Steps:
-    /// 1. Point `NOTES_DB` at a fresh temp file (via `AUTTER_TEST_NOTES_DB_PATH`).
+    /// 1. Point `NOTES_DB` at a fresh temp file via `install_test_db_at`.
     /// 2. Spin up a mockito server returning two notes.
     /// 3. Create a `TmpRepo` with two commits.
     /// 4. Call `warm_cache_for_remote`.
@@ -1094,9 +1063,8 @@ mod tests {
 
         // Set the test DB path before the first DB call so the OnceLock picks it up.
         let tmp_db = NamedTempFile::new().expect("tmp notes-db");
-        unsafe {
-            std::env::set_var("AUTTER_TEST_NOTES_DB_PATH", tmp_db.path());
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(tmp_db.path()))
+            .expect("install isolated notes-db");
 
         // Build a TmpRepo with two commits.
         let repo = TmpRepo::new().expect("TmpRepo::new");
@@ -1178,7 +1146,6 @@ mod tests {
 
         // Cleanup.
         unsafe {
-            std::env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
             std::env::remove_var("AUTTER_API_KEY");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }
@@ -1206,9 +1173,8 @@ mod tests {
         // `warm_cache_for_remote_populates_db_with_synced_1` in the same process,
         // but we still set it for freshness when running this test in isolation).
         let tmp_db = NamedTempFile::new().expect("tmp notes-db");
-        unsafe {
-            std::env::set_var("AUTTER_TEST_NOTES_DB_PATH", tmp_db.path());
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(tmp_db.path()))
+            .expect("install isolated notes-db");
 
         // Build TmpRepo with two commits.
         let repo = TmpRepo::new().expect("TmpRepo::new");
@@ -1306,7 +1272,6 @@ mod tests {
 
         // Cleanup.
         unsafe {
-            std::env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
             std::env::remove_var("AUTTER_API_KEY");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }

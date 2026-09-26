@@ -187,6 +187,7 @@ pub struct Config {
     telemetry_enterprise_dsn: Option<String>,
     disable_version_checks: bool,
     disable_auto_updates: bool,
+    disable_update_prompt: bool,
     update_channel: UpdateChannel,
     feature_flags: FeatureFlags,
     api_base_url: String,
@@ -255,6 +256,11 @@ pub struct FileConfig {
     pub disable_version_checks: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_auto_updates: Option<bool>,
+    /// Suppress the interactive "update available, install now?" prompt,
+    /// falling back to the passive "run autter upgrade" notice. To silence
+    /// version messaging entirely, use `disable_version_checks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_update_prompt: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,6 +339,8 @@ pub struct ConfigPatch {
     pub disable_version_checks: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_auto_updates: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_update_prompt: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,6 +545,13 @@ impl Config {
 
     pub fn auto_updates_disabled(&self) -> bool {
         self.disable_auto_updates
+    }
+
+    /// True when the interactive "update available, install now?" prompt must
+    /// stay silent (config `disable_update_prompt` or
+    /// `AUTTER_DISABLE_UPDATE_PROMPT`).
+    pub fn update_prompt_disabled(&self) -> bool {
+        self.disable_update_prompt
     }
 
     pub fn update_channel(&self) -> UpdateChannel {
@@ -1034,6 +1049,15 @@ fn build_config() -> Config {
         .as_ref()
         .and_then(|c| c.disable_auto_updates)
         .unwrap_or(auto_update_flags_default_disabled);
+    // Opt-out. No need to inherit the non-OSS build's "don't nag" default
+    // here: every path that can show the prompt is already gated on
+    // `disable_version_checks`, so a build that opted out of version checks
+    // never reaches it.
+    let disable_update_prompt = file_cfg
+        .as_ref()
+        .and_then(|c| c.disable_update_prompt)
+        .unwrap_or(false)
+        || env_flag_enabled("AUTTER_DISABLE_UPDATE_PROMPT");
     let update_channel = file_cfg
         .as_ref()
         .and_then(|c| c.update_channel.as_deref())
@@ -1197,6 +1221,7 @@ fn build_config() -> Config {
             telemetry_enterprise_dsn,
             disable_version_checks,
             disable_auto_updates,
+            disable_update_prompt,
             update_channel,
             feature_flags,
             api_base_url,
@@ -1227,6 +1252,7 @@ fn build_config() -> Config {
         telemetry_enterprise_dsn,
         disable_version_checks,
         disable_auto_updates,
+        disable_update_prompt,
         update_channel,
         feature_flags,
         api_base_url,
@@ -1298,6 +1324,13 @@ fn build_feature_flags(file_cfg: &Option<FileConfig>) -> FeatureFlags {
     });
 
     FeatureFlags::from_env_and_file(file_flags)
+}
+
+/// Treats an env var as a boolean flag: on when set to a non-empty value other
+/// than `0`, so `FOO=1` and `FOO=true` both work. Unset, empty, and `0` are
+/// off.
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| !value.is_empty() && value != "0")
 }
 
 fn resolve_git_path(file_cfg: &Option<FileConfig>) -> String {
@@ -1498,6 +1531,12 @@ pub fn update_check_path() -> Option<PathBuf> {
     internal_dir_path().map(|dir| dir.join("update_check"))
 }
 
+/// Returns the path to the "don't prompt me again" stamp written when the user
+/// declines an update prompt (~/.autter/internal/update_prompt_snooze).
+pub fn update_prompt_snooze_path() -> Option<PathBuf> {
+    internal_dir_path().map(|dir| dir.join("update_prompt_snooze"))
+}
+
 /// Load the raw file config
 pub fn load_file_config_public() -> Result<FileConfig, String> {
     let path =
@@ -1641,6 +1680,9 @@ fn apply_test_config_patch(config: &mut Config) {
         if let Some(disable_auto_updates) = patch.disable_auto_updates {
             config.disable_auto_updates = disable_auto_updates;
         }
+        if let Some(disable_update_prompt) = patch.disable_update_prompt {
+            config.disable_update_prompt = disable_update_prompt;
+        }
         if let Some(prompt_storage) = patch.prompt_storage {
             // Validate the value
             if matches!(prompt_storage.as_str(), "default" | "notes" | "local") {
@@ -1714,6 +1756,7 @@ mod tests {
             telemetry_enterprise_dsn: None,
             disable_version_checks: false,
             disable_auto_updates: false,
+            disable_update_prompt: false,
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
@@ -1956,6 +1999,7 @@ mod tests {
             telemetry_enterprise_dsn: None,
             disable_version_checks: false,
             disable_auto_updates: false,
+            disable_update_prompt: false,
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
@@ -2101,6 +2145,7 @@ mod tests {
             telemetry_enterprise_dsn: None,
             disable_version_checks: false,
             disable_auto_updates: false,
+            disable_update_prompt: false,
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),

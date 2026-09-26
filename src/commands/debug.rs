@@ -1652,7 +1652,7 @@ where
 }
 
 fn is_debug_git_env_key(key: &str) -> bool {
-    key.starts_with("AUTTER_") || key.starts_with("AUTTER_") || key.starts_with("GIT_")
+    key.starts_with("AUTTER_") || key.starts_with("GIT_")
 }
 
 fn redact_env_value(key: &str, value: &str) -> String {
@@ -1766,8 +1766,8 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                "AUTTER_TEST_DB_PATH=/tmp/db",
                 "AUTTER_API_KEY=[REDACTED]",
+                "AUTTER_TEST_DB_PATH=/tmp/db",
                 "GIT_DIR=.git",
             ]
         );

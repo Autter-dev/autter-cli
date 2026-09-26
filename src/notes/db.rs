@@ -109,6 +109,26 @@ impl NotesDatabase {
         Ok(db_mutex)
     }
 
+    /// Point the global singleton at a throwaway database, replacing whatever it
+    /// was holding.
+    ///
+    /// [`Self::global`] is a `OnceLock`, so setting `AUTTER_TEST_NOTES_DB_PATH`
+    /// only takes effect for whichever test happens to initialize it first. Every
+    /// later test silently reuses that first DB — which, with no env var set
+    /// beforehand, is the developer's real `~/.autter/internal/notes-db`, and the
+    /// running daemon then drains rows out from under the assertions. Swapping the
+    /// contents of the already-initialized mutex sidesteps the `OnceLock` entirely.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_test_db_at(path: &std::path::Path) -> Result<(), AutterError> {
+        let db_mutex = Self::global()?;
+        let replacement = Self::open_at_path(path)?;
+        let mut guard = db_mutex
+            .lock()
+            .map_err(|e| AutterError::Generic(format!("notes-db lock: {}", e)))?;
+        *guard = replacement;
+        Ok(())
+    }
+
     /// Open a database at an explicit path. Useful for tests that need an isolated
     /// DB instance without relying on the process-global OnceLock singleton.
     pub fn open_at_path(path: &std::path::Path) -> Result<Self, AutterError> {

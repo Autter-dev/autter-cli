@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use crate::test_utils::assert_sessions_canonical;
 use autter::authorship::authorship_log_serialization::AuthorshipLog;
 use std::fs;
 
@@ -126,10 +127,7 @@ fn test_old_format_working_log_produces_prompts_not_sessions() {
     let log = AuthorshipLog::deserialize_from_string(&note).expect("should parse note");
 
     // set_contents produces sessions in the new format, not prompts
-    assert!(
-        log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&log);
     assert!(
         !log.metadata.sessions.is_empty(),
         "should have session records"
@@ -360,7 +358,7 @@ fn test_new_session_checkpoint_to_commit_to_blame() {
     // Deserialize and assert structure
     let log = AuthorshipLog::deserialize_from_string(&note).expect("should parse note");
 
-    assert!(log.metadata.prompts.is_empty(), "should not have prompts");
+    assert_sessions_canonical(&log);
     assert!(!log.metadata.sessions.is_empty(), "should have sessions");
 }
 

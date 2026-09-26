@@ -453,9 +453,8 @@ mod tests {
     fn migration_uploads_notes_and_caches_with_synced_1() {
         // Isolated notes-db.
         let tmp_db = NamedTempFile::new().expect("tmp notes-db");
-        unsafe {
-            std::env::set_var("AUTTER_TEST_NOTES_DB_PATH", tmp_db.path());
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(tmp_db.path()))
+            .expect("install isolated notes-db");
 
         // --- Build repo with commits and notes ---
         let repo = TmpRepo::new().expect("TmpRepo::new");
@@ -572,7 +571,6 @@ mod tests {
 
         // Cleanup.
         unsafe {
-            std::env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
             std::env::remove_var("AUTTER_API_KEY");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }
@@ -611,9 +609,8 @@ mod tests {
         use std::collections::HashSet;
 
         let tmp_db = NamedTempFile::new().expect("tmp notes-db");
-        unsafe {
-            std::env::set_var("AUTTER_TEST_NOTES_DB_PATH", tmp_db.path());
-        }
+        crate::notes::db::NotesDatabase::install_test_db_at(std::path::Path::new(tmp_db.path()))
+            .expect("install isolated notes-db");
 
         let repo = TmpRepo::new().expect("TmpRepo::new");
 
@@ -727,7 +724,6 @@ mod tests {
         drop(lock);
 
         unsafe {
-            std::env::remove_var("AUTTER_TEST_NOTES_DB_PATH");
             std::env::remove_var("AUTTER_API_KEY");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }

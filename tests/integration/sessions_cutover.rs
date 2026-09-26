@@ -9,6 +9,7 @@
 
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use crate::test_utils::{assert_json_sessions_canonical, assert_sessions_canonical};
 use autter::authorship::authorship_log_serialization::AuthorshipLog;
 use autter::git::refs::notes_add;
 use serde_json::Value;
@@ -400,11 +401,9 @@ fn test_current_system_produces_sessions_not_prompts() {
     let note = repo.read_authorship_note(&sha).expect("should have note");
     let log = AuthorshipLog::deserialize_from_string(&note).expect("parse note");
 
+    println!("NOTE>>>\n{}\n<<<NOTE", note);
     // Should have sessions, NOT prompts (this is the new default)
-    assert!(
-        log.metadata.prompts.is_empty(),
-        "new system should not produce prompts"
-    );
+    assert_sessions_canonical(&log);
     assert!(
         !log.metadata.sessions.is_empty(),
         "new system should produce sessions"
@@ -610,10 +609,7 @@ fn test_new_checkpoints_always_produce_sessions() {
     let log = AuthorshipLog::deserialize_from_string(&note).expect("parse note");
 
     // Should have sessions, NOT prompts
-    assert!(
-        log.metadata.prompts.is_empty(),
-        "new checkpoints should not produce prompts"
-    );
+    assert_sessions_canonical(&log);
     assert!(
         !log.metadata.sessions.is_empty(),
         "new checkpoints should produce sessions"
@@ -1557,12 +1553,9 @@ fn test_diff_json_all_prompts_includes_sessions() {
         json["sessions"]
     );
 
-    // prompts should be empty for new-format-only commits
-    let prompts = json["prompts"].as_object();
-    assert!(
-        prompts.is_none() || prompts.unwrap().is_empty(),
-        "new-format commit should not have entries in 'prompts'"
-    );
+    // `prompts` carries the note's deliberate per-session mirror (older readers
+    // consume it), but it must hold no entry that isn't a session.
+    assert_json_sessions_canonical(&json);
 
     // Session keys should use s_xxx format (session ID only, not combined with trace ID)
     let first_key = sessions.unwrap().keys().next().unwrap();
@@ -2447,10 +2440,9 @@ fn test_diff_json_history_with_mixed_old_and_new_format_commits() {
         "session key should be session ID only (s_xxx), not combined ID (s_xxx::t_yyy), got: {}",
         session_key
     );
-    assert!(
-        new_json["prompts"].as_object().is_none_or(|p| p.is_empty()),
-        "new commit should have no prompts"
-    );
+    // Same per-session mirror as the single-commit case above: present, but
+    // never carrying a key that isn't a session.
+    assert_json_sessions_canonical(&new_json);
 
     // Verify plain range diff (no --all-prompts, no --include-stats) includes hunks from both
     let range = format!("{}..{}", base.commit_sha, new_commit.commit_sha);

@@ -432,6 +432,21 @@ mod tests {
         let pending = db.dequeue_pending(10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].file_path, "lib.rs");
+        // `attempts` counts *previous* attempts: the increment this dequeue
+        // performs is persisted but not reflected in the rows it just read.
+        assert_eq!(pending[0].attempts, 0);
+
+        // A failure makes the row immediately eligible again, and the next
+        // dequeue reports the attempt that was already made.
+        db.mark_failed(
+            "https://github.com/user/repo",
+            &["lib.rs".to_string()],
+            "boom",
+            0,
+        )
+        .unwrap();
+        let pending = db.dequeue_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].attempts, 1);
 
         db.mark_synced("https://github.com/user/repo", &["lib.rs".to_string()])

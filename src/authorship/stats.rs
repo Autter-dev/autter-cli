@@ -78,13 +78,23 @@ pub fn stats_command(
 }
 
 pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> String {
+    // Honor the project-wide color decision (NO_COLOR / --no-color / non-TTY).
+    render_stats_output(
+        stats,
+        is_interactive,
+        crate::commands::arg_parser::use_color(),
+    )
+}
+
+/// Rendering half of [`write_stats_to_terminal`], with the color decision passed
+/// in rather than read from the environment. `use_color()` depends on stdout
+/// being a TTY, which is never true under `cargo test`, so snapshots have to
+/// drive this directly to stay stable across machines.
+fn render_stats_output(stats: &CommitStats, is_interactive: bool, colorize: bool) -> String {
     let mut output = String::new();
 
     // Set maximum bar width to 40 characters
     let bar_width: usize = 40;
-
-    // Honor the project-wide color decision (NO_COLOR / --no-color / non-TTY).
-    let colorize = crate::commands::arg_parser::use_color();
 
     // Handle deletion-only commits (no additions)
     if stats.git_diff_added_lines == 0 && stats.git_diff_deleted_lines > 0 {
@@ -680,7 +690,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let mixed_output = write_stats_to_terminal(&stats, false);
+        let mixed_output = render_stats_output(&stats, false, true);
         assert_debug_snapshot!(mixed_output);
 
         // Test with AI-only stats
@@ -694,7 +704,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let ai_only_output = write_stats_to_terminal(&ai_stats, false);
+        let ai_only_output = render_stats_output(&ai_stats, false, true);
         assert_debug_snapshot!(ai_only_output);
 
         // Test with human-only stats
@@ -708,7 +718,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let human_only_output = write_stats_to_terminal(&human_stats, false);
+        let human_only_output = render_stats_output(&human_stats, false, true);
         assert_debug_snapshot!(human_only_output);
 
         // Test with minimal human contribution (should get at least 2 blocks)
@@ -722,7 +732,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let minimal_human_output = write_stats_to_terminal(&minimal_human_stats, false);
+        let minimal_human_output = render_stats_output(&minimal_human_stats, false, true);
         assert_debug_snapshot!(minimal_human_output);
 
         // Test with deletion-only commit (no additions)
@@ -736,7 +746,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let deletion_only_output = write_stats_to_terminal(&deletion_only_stats, false);
+        let deletion_only_output = render_stats_output(&deletion_only_stats, false, true);
         assert_debug_snapshot!(deletion_only_output);
 
         // --- New test cases for untracked segment ---
@@ -751,7 +761,7 @@ mod tests {
             git_diff_added_lines: 1000,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let with_untracked_output = write_stats_to_terminal(&untracked_stats, false);
+        let with_untracked_output = render_stats_output(&untracked_stats, false, true);
         assert_debug_snapshot!(with_untracked_output);
 
         // untracked exactly at the 1% threshold — should NOT show untracked segment
@@ -764,7 +774,7 @@ mod tests {
             git_diff_added_lines: 100,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let untracked_at_threshold_output = write_stats_to_terminal(&threshold_stats, false);
+        let untracked_at_threshold_output = render_stats_output(&threshold_stats, false, true);
         assert_debug_snapshot!(untracked_at_threshold_output);
 
         // untracked just above 1% threshold (~2%) — should show untracked segment
@@ -777,7 +787,7 @@ mod tests {
             git_diff_added_lines: 99,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let untracked_just_above_output = write_stats_to_terminal(&above_threshold_stats, false);
+        let untracked_just_above_output = render_stats_output(&above_threshold_stats, false, true);
         assert_debug_snapshot!(untracked_just_above_output);
 
         // 100% untracked — entire bar is · chars
@@ -790,20 +800,19 @@ mod tests {
             git_diff_added_lines: 100,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let all_untracked_output = write_stats_to_terminal(&all_untracked_stats, false);
+        let all_untracked_output = render_stats_output(&all_untracked_stats, false, true);
         assert_debug_snapshot!(all_untracked_output);
 
         // OSC 8 hyperlink only when the terminal advertises hyperlink support
         // (see use_hyperlinks). In non-TTY unit tests this stays plain "untracked".
-        let interactive_output = write_stats_to_terminal(&untracked_stats, true);
+        let interactive_output = render_stats_output(&untracked_stats, true, true);
         assert!(
             interactive_output.contains("untracked"),
             "Expected 'untracked' label in interactive output"
         );
         if crate::commands::arg_parser::use_hyperlinks() {
             assert!(
-                interactive_output
-                    .contains("\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\"),
+                interactive_output.contains("\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\"),
                 "Expected OSC 8 hyperlink when hyperlinks are enabled, got: {:?}",
                 interactive_output
             );

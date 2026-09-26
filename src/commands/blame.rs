@@ -1695,6 +1695,10 @@ fn output_incremental_format(
     Ok(())
 }
 
+// Takes the same display context as the sibling formatters plus the prompt
+// records it needs for `--show-prompt`; bundling them would leave this one
+// formatter shaped differently from its siblings for no gain.
+#[allow(clippy::too_many_arguments)]
 fn output_default_format(
     repo: &Repository,
     line_authors: &HashMap<u32, String>,
@@ -1897,9 +1901,11 @@ fn output_default_format(
     // like it contradicts `autter stats` on the same commit. Keep porcelain /
     // pager-piped / scripted output byte-compatible with git blame.
     if unattested_git_author_lines > 0 && io::stdout().is_terminal() {
-        output.push_str(&crate::authorship::guidance::blame_git_author_fallback_notice(
-            unattested_git_author_lines,
-        ));
+        output.push_str(
+            &crate::authorship::guidance::blame_git_author_fallback_notice(
+                unattested_git_author_lines,
+            ),
+        );
     }
 
     // Output handling - respect pager environment variables

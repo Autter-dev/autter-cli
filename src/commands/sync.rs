@@ -5,7 +5,7 @@
 //! - `purge`   Discard the local upload backlog without uploading it.
 //! - `open`    Open the org dashboard.
 
-use crate::auth::notice::{clear_sync_auth_blocked, collect_cloud_sync_status, CloudSyncState};
+use crate::auth::notice::{CloudSyncState, clear_sync_auth_blocked, collect_cloud_sync_status};
 use crate::commands::arg_parser::{self, ScanMode};
 use crate::error::AutterError;
 use serde::Serialize;

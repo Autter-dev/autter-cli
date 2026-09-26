@@ -360,7 +360,9 @@ mod tests {
         let prompt = log.metadata.prompts.get(&prompt_hash).unwrap();
         assert_eq!(prompt.agent_id.tool, "cursor");
         assert_eq!(prompt.agent_id.id, "abc123def456");
-        assert_eq!(prompt.agent_id.model, "unknown");
+        // Simulated (email-detected) authorship has no real model, so
+        // `AgentId::normalized` substitutes the tool's default.
+        assert_eq!(prompt.agent_id.model, "cursor/unknown-model");
         assert_eq!(prompt.accepted_lines, 10);
         assert_eq!(prompt.total_additions, 10);
         assert_eq!(prompt.total_deletions, 0);

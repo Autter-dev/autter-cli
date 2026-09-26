@@ -59,40 +59,6 @@ pub fn commits_have_authorship_notes(
     Ok(!commits_with_authorship_notes(repo, commit_shas)?.is_empty())
 }
 
-/// Get all notes as (note_blob_sha, commit_sha) pairs
-#[cfg(test)]
-fn get_notes_list(global_args: &[String]) -> Result<Vec<(String, String)>, AutterError> {
-    let mut args = global_args.to_vec();
-    args.push("notes".to_string());
-    args.push("--ref=ai".to_string());
-    args.push("list".to_string());
-
-    let output = match exec_git(&args) {
-        Ok(output) => output,
-        Err(AutterError::GitCliError { code: Some(1), .. }) => {
-            // No notes exist yet
-            return Ok(Vec::new());
-        }
-        Err(e) => return Err(e),
-    };
-
-    let stdout = String::from_utf8(output.stdout)?;
-
-    // Parse notes list output: "<note_blob_sha> <commit_sha>"
-    let mut mappings = Vec::new();
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            mappings.push((parts[0].to_string(), parts[1].to_string()));
-        }
-    }
-
-    Ok(mappings)
-}
-
 fn batch_read_blobs_with_oids(
     global_args: &[String],
     blob_oids: &[String],
@@ -192,61 +158,104 @@ fn extract_file_paths_from_note(content: &str, files: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{find_repository_in_path, sync_authorship::fetch_authorship_notes};
-    use std::time::Instant;
+    use crate::git::find_repository_in_path;
+
+    /// Build a throwaway repo with one commit and an AI authorship note on
+    /// `refs/notes/ai`, returning `(repo, commit_sha)`.
+    fn repo_with_ai_note(paths: &[&str]) -> (Repository, String) {
+        use crate::authorship::authorship_log::LineRange;
+        use crate::authorship::authorship_log_serialization::{AttestationEntry, AuthorshipLog};
+
+        // Keep the TempDir alive for the whole test: `Repository` only holds
+        // the path, and the caller reads from it after this helper returns.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.keep();
+
+        let git = |args: &[&str]| -> String {
+            let mut argv = vec!["-C".to_string(), dir.to_string_lossy().to_string()];
+            argv.extend(args.iter().map(|a| a.to_string()));
+            let out = exec_git(&argv).unwrap_or_else(|e| panic!("git {args:?} failed: {e}"));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("file.txt"), "hello\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-qm", "add file"]);
+        let commit_sha = git(&["rev-parse", "HEAD"]);
+
+        let mut log = AuthorshipLog::new();
+        for path in paths {
+            log.get_or_create_file(path)
+                .entries
+                .push(AttestationEntry::new(
+                    "abc123hash".to_string(),
+                    vec![LineRange::Range(1, 5)],
+                ));
+        }
+        let note = log.serialize_to_string().unwrap();
+
+        let mut argv = vec!["-C".to_string(), dir.to_string_lossy().to_string()];
+        argv.extend([
+            "notes".to_string(),
+            "--ref=ai".to_string(),
+            "add".to_string(),
+            "-f".to_string(),
+            "-F".to_string(),
+            "-".to_string(),
+            commit_sha.clone(),
+        ]);
+        let out = exec_git_stdin(&argv, note.as_bytes()).unwrap();
+        assert!(
+            out.status.success(),
+            "failed to attach note: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let repo = find_repository_in_path(&dir.to_string_lossy()).unwrap();
+        (repo, commit_sha)
+    }
+
+    // Pins the notes backend to git notes for the duration of `f`. Without
+    // this the developer's own `notes_backend: { kind: "http" }` config makes
+    // `read_note_blob_oids` short-circuit to an empty map and the test asserts
+    // nothing. Env vars are process-global, so callers must hold the
+    // `serial_test` lock (see the `#[serial]` on the tests below).
+    fn with_git_notes_backend(f: impl FnOnce()) {
+        const ENV: &str = "AUTTER_NOTES_BACKEND_KIND";
+        let old = std::env::var(ENV).ok();
+        unsafe { std::env::set_var(ENV, "git_notes") };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match old {
+            Some(v) => unsafe { std::env::set_var(ENV, v) },
+            None => unsafe { std::env::remove_var(ENV) },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 
     #[test]
-    fn test_load_ai_touched_files_for_specific_commits() {
-        smol::block_on(async {
-            let repo = find_repository_in_path(".").unwrap();
+    #[serial_test::serial(notes_db_env)]
+    fn test_load_ai_touched_files_reads_paths_from_ai_notes() {
+        with_git_notes_backend(|| {
+            smol::block_on(async {
+                let (repo, commit_sha) = repo_with_ai_note(&["src/ai.rs", "docs/notes.md"]);
 
-            fetch_authorship_notes(&repo, "origin").unwrap();
+                let files = load_ai_touched_files_for_commits(&repo, vec![commit_sha])
+                    .await
+                    .unwrap();
 
-            // Get all notes to find commits that have notes attached
-            let global_args = repo.global_args_for_exec();
-            let all_notes = get_notes_list(&global_args).unwrap();
-
-            if all_notes.len() < 3 {
-                println!(
-                    "Skipping test: only {} notes available, need at least 3",
-                    all_notes.len()
+                assert_eq!(
+                    files,
+                    HashSet::from(["src/ai.rs".to_string(), "docs/notes.md".to_string()])
                 );
-                return;
-            }
-
-            // Pick 3 commits that have notes
-            let selected_commits: Vec<String> = all_notes
-                .iter()
-                .take(3)
-                .map(|(_, commit_sha)| commit_sha.clone())
-                .collect();
-
-            println!("Testing with commits: {:?}", selected_commits);
-
-            let start = Instant::now();
-            let files = load_ai_touched_files_for_commits(&repo, selected_commits.clone())
-                .await
-                .unwrap();
-            let elapsed = start.elapsed();
-
-            println!(
-                "Found {} unique AI-touched files from 3 commits in {:?}",
-                files.len(),
-                elapsed
-            );
-
-            // Show the files found
-            let mut sorted_files: Vec<_> = files.iter().collect();
-            sorted_files.sort();
-            for file in sorted_files.iter() {
-                println!("  {}", file);
-            }
-
-            // Verify we got some results (since we picked commits with notes)
-            assert!(
-                !files.is_empty(),
-                "Should find files from commits with notes"
-            );
+            });
         });
     }
 

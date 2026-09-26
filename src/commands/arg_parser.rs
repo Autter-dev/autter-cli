@@ -217,10 +217,10 @@ pub fn use_hyperlinks() -> bool {
             _ => {}
         }
     }
-    if let Ok(term) = std::env::var("TERM") {
-        if term.contains("kitty") || term.contains("vte") || term == "xterm-kitty" {
-            return true;
-        }
+    if let Ok(term) = std::env::var("TERM")
+        && (term.contains("kitty") || term.contains("vte") || term == "xterm-kitty")
+    {
+        return true;
     }
     // Windows Terminal sets WT_SESSION; classic cmd/ConHost does not.
     if std::env::var_os("WT_SESSION").is_some() {
@@ -237,7 +237,7 @@ pub fn use_hyperlinks() -> bool {
     // interactive behavior there. On Windows, require an explicit signal above.
     #[cfg(not(windows))]
     {
-        return true;
+        true
     }
     #[cfg(windows)]
     {

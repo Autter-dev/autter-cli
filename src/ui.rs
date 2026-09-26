@@ -6,6 +6,7 @@
 //! so command output on stdout stays scriptable.
 
 use std::io::{IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
@@ -182,6 +183,95 @@ fn select_numbered(question: &str, items: &[SelectItem], default: usize) -> usiz
     }
 }
 
+/// How long a yes/no prompt waits for a keystroke before giving up and taking
+/// the default. Callers run these from git's post-command path, so a prompt
+/// must never be able to wedge a `git` invocation indefinitely.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Yes/no prompt in the style of a shell framework's update prompt
+/// (`[Y/n]`), answered with a single keystroke: `y`/`n`, Enter for the
+/// default, Esc or Ctrl-C to decline.
+///
+/// Returns `default` without reading stdin when stdin or stderr isn't a
+/// terminal, when raw mode can't be enabled, or when nothing is typed within
+/// [`CONFIRM_TIMEOUT`]. Unlike [`select`], a decline never exits the process:
+/// this runs after git has already succeeded, so a non-zero exit here would
+/// misreport git's status.
+pub fn confirm(question: &str, default: bool) -> bool {
+    confirm_with_timeout(question, default, CONFIRM_TIMEOUT)
+}
+
+fn confirm_with_timeout(question: &str, default: bool, timeout: Duration) -> bool {
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return default;
+    }
+    let Some(guard) = RawModeGuard::enable() else {
+        return default;
+    };
+
+    let mut err = std::io::stderr();
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    if write!(err, "{BOLD}{question}{RESET} {DIM}{hint}{RESET}").is_err() || err.flush().is_err() {
+        drop(guard);
+        return default;
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut answer = None;
+    let mut timed_out = false;
+    while answer.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        match event::poll(remaining) {
+            Ok(true) => {}
+            Ok(false) => {
+                timed_out = true;
+                break;
+            }
+            Err(_) => break,
+        }
+        let Ok(Event::Key(key)) = event::read() else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        answer = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+            KeyCode::Char('n') | KeyCode::Char('N') => Some(false),
+            KeyCode::Enter => Some(default),
+            KeyCode::Esc => Some(false),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
+            _ => None,
+        };
+    }
+
+    let answer = answer.unwrap_or(default);
+    // Collapse the in-progress question into a single answered line.
+    let _ = execute!(
+        err,
+        cursor::MoveToColumn(0),
+        terminal::Clear(ClearType::CurrentLine)
+    );
+    drop(guard);
+
+    let (mark, label) = if answer {
+        (format!("{GREEN}✓{RESET}"), "yes")
+    } else {
+        (format!("{DIM}·{RESET}"), "no")
+    };
+    let suffix = if timed_out {
+        format!(" {DIM}(no answer, assuming {label}){RESET}")
+    } else {
+        String::new()
+    };
+    eprintln!("{mark} {BOLD}{question}{RESET} {DIM}{label}{RESET}{suffix}");
+    answer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +292,15 @@ mod tests {
         let items = [SelectItem::new("only", "one")];
         assert_eq!(select("pick", &items, 5), 0);
         assert_eq!(select("pick", &[], 3), 0);
+    }
+
+    #[test]
+    fn confirm_returns_default_when_not_a_terminal() {
+        assert!(confirm_with_timeout("go?", true, Duration::from_millis(10)));
+        assert!(!confirm_with_timeout(
+            "go?",
+            false,
+            Duration::from_millis(10)
+        ));
     }
 }

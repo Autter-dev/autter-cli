@@ -60,6 +60,7 @@ AuthorshipLogV3 {
             "development",
         ),
         base_commit_sha: "abc123",
+        branch: None,
         prompts: {},
         humans: {},
         sessions: {},

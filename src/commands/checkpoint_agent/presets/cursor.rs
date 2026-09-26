@@ -189,27 +189,27 @@ fn resolve_cursor_model(data: &serde_json::Value, transcript_path: Option<&str>)
     let hook_model = parse::optional_str(data, "model");
     let hook_model_id = parse::optional_str(data, "model_id");
 
-    if let Some(model) = hook_model {
-        if !is_cursor_placeholder_model(model) {
-            return model.to_string();
-        }
+    if let Some(model) = hook_model
+        && !is_cursor_placeholder_model(model)
+    {
+        return model.to_string();
     }
 
-    if let Some(model_id) = hook_model_id {
-        if !is_cursor_placeholder_model(model_id) {
-            return model_id.to_string();
-        }
+    if let Some(model_id) = hook_model_id
+        && !is_cursor_placeholder_model(model_id)
+    {
+        return model_id.to_string();
     }
 
-    if let Some(path) = transcript_path {
-        if let Ok(Some(model)) = crate::streams::model_extraction::extract_model(
+    if let Some(path) = transcript_path
+        && let Ok(Some(model)) = crate::streams::model_extraction::extract_model(
             Path::new(path),
             crate::streams::sweep::StreamFormat::CursorJsonl,
             None,
-        ) && !is_cursor_placeholder_model(&model)
-        {
-            return model;
-        }
+        )
+        && !is_cursor_placeholder_model(&model)
+    {
+        return model;
     }
 
     "unknown".to_string()

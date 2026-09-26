@@ -10,6 +10,7 @@ AuthorshipLogV3 {
             "development",
         ),
         base_commit_sha: "abc123",
+        branch: None,
         prompts: {
             "c9883b05a2487d6d": PromptRecord {
                 agent_id: AgentId {

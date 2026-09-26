@@ -411,21 +411,23 @@ pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, Au
         }
     }
 
-    let statuses = run_uninstall(&[
-        if dry_run {
-            "--dry-run".to_string()
-        } else {
-            String::new()
-        },
-        if verbose {
-            "--verbose".to_string()
-        } else {
-            String::new()
-        },
-    ]
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .collect::<Vec<_>>())?;
+    let statuses = run_uninstall(
+        &[
+            if dry_run {
+                "--dry-run".to_string()
+            } else {
+                String::new()
+            },
+            if verbose {
+                "--verbose".to_string()
+            } else {
+                String::new()
+            },
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>(),
+    )?;
 
     if !dry_run {
         let git_cmd = config::Config::fresh().git_cmd().to_string();
@@ -441,7 +443,9 @@ pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, Au
             eprintln!("Warning: could not stop background service: {e}");
         }
     } else {
-        eprintln!("[dry-run] would remove global git trace2 config and stop the background service");
+        eprintln!(
+            "[dry-run] would remove global git trace2 config and stop the background service"
+        );
     }
 
     Ok(statuses)
@@ -453,6 +457,7 @@ fn parse_install_options(args: &[String]) -> InstallOptions {
     for arg in args {
         match arg.as_str() {
             "--dry-run" | "--dry-run=true" => options.dry_run = true,
+            "--dry-run=false" => options.dry_run = false,
             "--verbose" | "-v" => options.verbose = true,
             "--skills" => options.install_skills = true,
             "--visual-studio-extension" => options.include_visual_studio_extension = true,

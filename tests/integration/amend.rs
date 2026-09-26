@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use crate::test_utils::assert_sessions_canonical;
 use autter::authorship::authorship_log_serialization::AuthorshipLog;
 use std::collections::HashMap;
 
@@ -541,10 +542,7 @@ fn test_amend_preserves_custom_attributes_from_config() {
         .expect("original commit should have authorship note");
     let original_log =
         AuthorshipLog::deserialize_from_string(&original_note).expect("parse original note");
-    assert!(
-        original_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&original_log);
     assert!(
         !original_log.metadata.sessions.is_empty(),
         "precondition: original commit should have session records"
@@ -570,10 +568,7 @@ fn test_amend_preserves_custom_attributes_from_config() {
         .expect("amended commit should have authorship note");
     let amended_log =
         AuthorshipLog::deserialize_from_string(&amended_note).expect("parse amended note");
-    assert!(
-        amended_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&amended_log);
     assert!(
         !amended_log.metadata.sessions.is_empty(),
         "amended commit should have session records"
@@ -621,10 +616,7 @@ fn test_amend_delete_ai_line_removes_prompt_from_note() {
         .expect("original commit should have a note");
     let original_log =
         AuthorshipLog::deserialize_from_string(&original_note).expect("should parse original note");
-    assert!(
-        original_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&original_log);
     assert!(
         !original_log.metadata.sessions.is_empty(),
         "precondition: original commit should have session records"
@@ -683,10 +675,7 @@ fn test_amend_delete_prior_commit_ai_line_no_foreign_prompt_in_note() {
         .expect("commit A should have a note");
     let commit_a_log =
         AuthorshipLog::deserialize_from_string(&commit_a_note).expect("should parse commit A note");
-    assert!(
-        commit_a_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&commit_a_log);
     let commit_a_session_ids: Vec<String> =
         commit_a_log.metadata.sessions.keys().cloned().collect();
     assert!(

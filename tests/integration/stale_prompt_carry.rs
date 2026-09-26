@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use crate::test_utils::assert_sessions_canonical;
 use autter::authorship::authorship_log_serialization::AuthorshipLog;
 use std::fs;
 
@@ -62,10 +63,7 @@ fn test_stale_prompt_not_carried_to_subsequent_human_commits() {
         "AI line 3".ai(),
     ]);
     let ai_commit = repo.stage_all_and_commit("AI commit").unwrap();
-    assert!(
-        ai_commit.authorship_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&ai_commit.authorship_log);
     assert!(
         !ai_commit.authorship_log.metadata.sessions.is_empty(),
         "precondition: AI commit must have session records"
@@ -141,10 +139,7 @@ fn test_prompt_present_when_ai_lines_committed() {
     ]);
     let ai_commit = repo.stage_all_and_commit("AI adds code").unwrap();
 
-    assert!(
-        ai_commit.authorship_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&ai_commit.authorship_log);
     assert!(
         !ai_commit.authorship_log.metadata.sessions.is_empty(),
         "AI commit should have session records when AI lines are committed"
@@ -172,10 +167,7 @@ fn test_unstaged_ai_lines_prompt_not_in_human_commit_note() {
 
     // Commit only the staged AI lines
     let first_commit = repo.commit("Commit with AI lines").unwrap();
-    assert!(
-        first_commit.authorship_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&first_commit.authorship_log);
     let ai_session_ids: Vec<String> = first_commit
         .authorship_log
         .metadata
@@ -250,10 +242,7 @@ fn test_amend_stale_initial_prompt_not_in_amended_human_commit() {
     base_file.insert_at(3, crate::lines!["unstaged AI".ai()]);
 
     let ai_commit = repo.commit("Commit A with AI lines").unwrap();
-    assert!(
-        ai_commit.authorship_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&ai_commit.authorship_log);
     let ai_session_ids: Vec<String> = ai_commit
         .authorship_log
         .metadata
@@ -323,10 +312,7 @@ fn test_amend_stale_blame_prompt_not_in_amended_human_commit() {
         "}".ai(),
     ]);
     let ai_commit = repo.stage_all_and_commit("Commit A: AI code").unwrap();
-    assert!(
-        ai_commit.authorship_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&ai_commit.authorship_log);
     let ai_session_ids: Vec<String> = ai_commit
         .authorship_log
         .metadata
@@ -393,10 +379,7 @@ fn test_amend_preserves_prompt_when_ai_lines_survive() {
         .unwrap();
 
     let amended_log = head_authorship_log(&repo);
-    assert!(
-        amended_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&amended_log);
     assert!(
         !amended_log.metadata.sessions.is_empty(),
         "Amended commit with surviving AI lines must still have session records"
@@ -445,10 +428,7 @@ fn test_rebase_stale_prompt_not_in_rebased_human_commit() {
     let ai_commit = repo
         .stage_all_and_commit("Feature commit A: AI code")
         .unwrap();
-    assert!(
-        ai_commit.authorship_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&ai_commit.authorship_log);
     let ai_session_ids: Vec<String> = ai_commit
         .authorship_log
         .metadata
@@ -525,10 +505,7 @@ fn test_rebase_preserves_prompt_when_ai_lines_present() {
         .expect("rebase should succeed");
 
     let rebased_log = head_authorship_log(&repo);
-    assert!(
-        rebased_log.metadata.prompts.is_empty(),
-        "new-format test should produce sessions, not prompts"
-    );
+    assert_sessions_canonical(&rebased_log);
     assert!(
         !rebased_log.metadata.sessions.is_empty(),
         "Rebased AI commit must still have session records"

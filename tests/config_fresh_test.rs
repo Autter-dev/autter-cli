@@ -205,7 +205,7 @@ fn test_config_fresh_respects_env_vars() {
 
     // Without env var, should use default
     let config1 = Config::fresh();
-    assert_eq!(config1.api_base_url(), "https://autter.dev");
+    assert_eq!(config1.api_base_url(), autter::config::DEFAULT_API_BASE_URL);
 
     // With env var set, should use env var
     unsafe {
@@ -219,7 +219,7 @@ fn test_config_fresh_respects_env_vars() {
         env::remove_var("AUTTER_API_BASE_URL");
     }
     let config3 = Config::fresh();
-    assert_eq!(config3.api_base_url(), "https://autter.dev");
+    assert_eq!(config3.api_base_url(), autter::config::DEFAULT_API_BASE_URL);
 
     // Restore original AUTTER_API_BASE_URL (home guard restores home vars via Drop)
     unsafe {
