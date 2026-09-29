@@ -104,14 +104,104 @@ pub fn record_sync_auth_blocked() {
 }
 
 /// Clear the blocked stamp after a successful authenticated sync.
+/// Does not clear an upload failure: a reachable login is not a successful
+/// drain of the queue that just failed.
 pub fn clear_sync_auth_blocked() {
     let _ = std::fs::remove_file(sync_blocked_stamp_path());
+}
+
+/// One durable queue's most recent non-auth upload failure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UploadFailure {
+    pub at: i64,
+    pub queue: String,
+    pub detail: String,
+}
+
+fn upload_failure_path() -> PathBuf {
+    sync_upload_stalled_stamp_path().with_file_name("sync-upload-failure.json")
+}
+
+/// Record that a durable-queue upload failed for a reason other than missing
+/// auth (network error, rejected batch, org database unreachable, etc.).
+pub fn record_upload_failure(queue: &str, detail: &str) {
+    let detail: String = detail.trim().chars().take(300).collect();
+    let failure = UploadFailure {
+        at: unix_now(),
+        queue: queue.to_string(),
+        detail: if detail.is_empty() {
+            "upload failed".to_string()
+        } else {
+            detail
+        },
+    };
+    let path = upload_failure_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_vec(&failure) {
+        let _ = std::fs::write(&path, content);
+    }
+    record_sync_upload_stalled();
+    if queue == "metrics" {
+        record_metrics_upload_stalled();
+    }
+}
+
+/// Drop the recorded failure when that same queue uploads successfully.
+pub fn clear_upload_failure_for(queue: &str) {
+    let Some(current) = read_upload_failure() else {
+        return;
+    };
+    if current.queue != queue {
+        return;
+    }
+    clear_upload_failures();
+}
+
+/// Drop every upload-failure stamp, including the legacy timestamp files.
+pub fn clear_upload_failures() {
+    let _ = std::fs::remove_file(upload_failure_path());
     clear_sync_upload_stalled();
+    clear_metrics_upload_stalled();
+}
+
+fn read_upload_failure() -> Option<UploadFailure> {
+    let content = std::fs::read(upload_failure_path()).ok()?;
+    serde_json::from_slice(&content).ok()
+}
+
+/// The fresh upload failure, if the background service recorded one.
+pub fn current_upload_failure() -> Option<UploadFailure> {
+    if let Some(failure) = read_upload_failure()
+        && unix_now() - failure.at < SYNC_BLOCKED_FRESH_SECS
+    {
+        return Some(failure);
+    }
+    let metrics_at = stamp_time(&metrics_upload_stalled_stamp_path());
+    let generic_at = stamp_time(&sync_upload_stalled_stamp_path());
+    let (queue, at) = match (metrics_at, generic_at) {
+        (Some(metrics), Some(generic)) if metrics >= generic => ("metrics", metrics),
+        (Some(metrics), None) => ("metrics", metrics),
+        (_, Some(generic)) => ("upload", generic),
+        (None, None) => return None,
+    };
+    (unix_now() - at < SYNC_BLOCKED_FRESH_SECS).then(|| UploadFailure {
+        at,
+        queue: queue.to_string(),
+        detail: "the background upload failed; no error was recorded".to_string(),
+    })
+}
+
+fn stamp_time(path: &std::path::Path) -> Option<i64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
 }
 
 /// Record that a durable-queue upload failed for a reason other than missing
 /// auth (network error, org database unreachable, etc.).
-pub fn record_sync_upload_stalled() {
+fn record_sync_upload_stalled() {
     let path = sync_upload_stalled_stamp_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -124,7 +214,11 @@ pub fn clear_sync_upload_stalled() {
     let _ = std::fs::remove_file(sync_upload_stalled_stamp_path());
 }
 
-pub fn record_metrics_upload_stalled() {
+fn metrics_upload_stalled_stamp_path() -> PathBuf {
+    sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at")
+}
+
+fn record_metrics_upload_stalled() {
     let stamp = sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at");
     if let Some(parent) = stamp.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -132,9 +226,8 @@ pub fn record_metrics_upload_stalled() {
     let _ = std::fs::write(stamp, unix_now().to_string());
 }
 
-pub fn clear_metrics_upload_stalled() {
-    let stamp = sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at");
-    let _ = std::fs::remove_file(stamp);
+fn clear_metrics_upload_stalled() {
+    let _ = std::fs::remove_file(metrics_upload_stalled_stamp_path());
 }
 
 /// True when the daemon recently reported auth-blocked sync attempts.
@@ -150,17 +243,7 @@ pub fn sync_auth_blocked_recently() -> bool {
 
 /// True when the daemon recently reported non-auth upload failures.
 pub fn sync_upload_stalled_recently() -> bool {
-    [
-        sync_upload_stalled_stamp_path(),
-        sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at"),
-    ]
-    .iter()
-    .any(|stamp| {
-        std::fs::read_to_string(stamp)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<i64>().ok())
-            .is_some_and(|at| unix_now() - at < SYNC_BLOCKED_FRESH_SECS)
-    })
+    current_upload_failure().is_some()
 }
 
 /// Why cloud sync needs user attention, if anything.
@@ -241,6 +324,9 @@ pub struct CloudSyncStatusReport {
     pub queue_status_available: bool,
     pub auth_blocked_recently: bool,
     pub upload_stalled_recently: bool,
+    /// Which queue failed, and the error the worker recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_failure: Option<UploadFailure>,
     pub last_metrics_upload_at: Option<i64>,
     pub organization_slug: Option<String>,
     pub dashboard_url: Option<String>,
@@ -269,7 +355,8 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
     let pending = queue_counts.unwrap_or_default();
     let pending_json = PendingSyncCountsJson::from(pending);
     let auth_blocked_recently = sync_auth_blocked_recently();
-    let upload_stalled_recently = sync_upload_stalled_recently();
+    let upload_failure = current_upload_failure();
+    let upload_stalled_recently = upload_failure.is_some();
     let attention = cloud_sync_attention();
 
     let state = if !enabled {
@@ -288,10 +375,19 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
         CloudSyncState::Healthy
     };
 
-    let remediation = attention.map(remediation_for).or_else(|| {
-        (state == CloudSyncState::StatusUnavailable)
-            .then(|| "run `autter doctor` to check the local upload queue".to_string())
-    });
+    let remediation = upload_failure
+        .as_ref()
+        .map(|failure| {
+            format!(
+                "{} upload failed: {}. Run `autter doctor`, then `autter bg restart`",
+                failure.queue, failure.detail
+            )
+        })
+        .or_else(|| attention.map(remediation_for))
+        .or_else(|| {
+            (state == CloudSyncState::StatusUnavailable)
+                .then(|| "run `autter doctor` to check the local upload queue".to_string())
+        });
     let receipt = current_metrics_receipt();
     let last_metrics_upload_at = receipt.as_ref().map(|receipt| receipt.uploaded_at);
     let organization_slug = receipt
@@ -321,6 +417,7 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
         queue_status_available,
         auth_blocked_recently,
         upload_stalled_recently,
+        upload_failure,
         last_metrics_upload_at,
         organization_slug,
         dashboard_url,
@@ -455,6 +552,12 @@ fn print_sync_attention_message(attention: CloudSyncAttention, pending: PendingS
             eprintln!(
                 "\x1b[1;33m⚠ Cloud sync is failing — your data is not reaching autter.\x1b[0m"
             );
+            if let Some(failure) = current_upload_failure() {
+                eprintln!(
+                    "\x1b[1;33m  Failing queue: {} — {}\x1b[0m",
+                    failure.queue, failure.detail
+                );
+            }
             if pending.total() > 0 {
                 eprintln!(
                     "\x1b[1;33m  {} are queued locally.\x1b[0m",
@@ -466,7 +569,7 @@ fn print_sync_attention_message(attention: CloudSyncAttention, pending: PendingS
                 );
             }
             eprintln!(
-                "\x1b[1;33m  Fix: run \x1b[1;36mautter doctor\x1b[0m\x1b[1;33m (checks network + org database), then \x1b[1;36mautter bg restart\x1b[0m\x1b[1;33m.\x1b[0m"
+                "\x1b[1;33m  Fix: run \x1b[1;36mautter doctor\x1b[0m\x1b[1;33m, then \x1b[1;36mautter bg restart\x1b[0m\x1b[1;33m.\x1b[0m"
             );
         }
         CloudSyncAttention::DaemonNotRunning => {
@@ -547,6 +650,14 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
     if report.enabled && report.pending.total > 0 {
         summary.push_str(&format!(" ({} records waiting)", report.pending.total));
     }
+    if report.state == CloudSyncState::UploadFailing
+        && let Some(failure) = &report.upload_failure
+    {
+        summary.push_str(&format!(
+            "\nFailing queue: {} — {}",
+            failure.queue, failure.detail
+        ));
+    }
     if report.enabled {
         if let Some(uploaded_at) = report.last_metrics_upload_at {
             summary.push_str(&format!(
@@ -576,6 +687,7 @@ mod tests {
             queue_status_available: state != CloudSyncState::StatusUnavailable,
             auth_blocked_recently: false,
             upload_stalled_recently: false,
+            upload_failure: None,
             last_metrics_upload_at: None,
             organization_slug: None,
             dashboard_url: None,
@@ -602,6 +714,20 @@ mod tests {
         ] {
             assert!(format_sync_report(&status_report(state)).contains(command));
         }
+    }
+
+    #[test]
+    fn upload_failure_names_the_queue_and_error() {
+        let mut report = status_report(CloudSyncState::UploadFailing);
+        report.upload_failure = Some(UploadFailure {
+            at: 1,
+            queue: "metrics".to_string(),
+            detail: "batch not fully accepted (2 rejected)".to_string(),
+        });
+        let summary = format_sync_report(&report);
+        assert!(summary.contains("autter doctor"));
+        assert!(summary.contains("Failing queue: metrics"));
+        assert!(summary.contains("batch not fully accepted (2 rejected)"));
     }
 
     #[test]

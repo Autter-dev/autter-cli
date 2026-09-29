@@ -80,7 +80,10 @@ pub fn upload_metrics_with_retry(
                     );
                 }
                 if !response.errors.is_empty() {
-                    crate::auth::notice::record_metrics_upload_stalled();
+                    crate::auth::notice::record_upload_failure(
+                        "metrics",
+                        &format!("{} metric records were not accepted", response.errors.len()),
+                    );
                     return Err(AutterError::Generic(format!(
                         "{} metric records were not accepted; upload is incomplete",
                         response.errors.len(),

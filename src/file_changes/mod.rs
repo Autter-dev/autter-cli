@@ -178,6 +178,9 @@ pub fn flush_pending_to_cloud() {
 
                 if !by_repo.is_empty() {
                     crate::daemon::telemetry_worker::note_durable_sync_authenticated();
+                    if failed_keys.is_empty() {
+                        crate::auth::notice::clear_upload_failure_for("file_changes");
+                    }
                 }
 
                 if let Ok(db) = FileChangesDatabase::global()
@@ -188,6 +191,12 @@ pub fn flush_pending_to_cloud() {
                     }
                 }
 
+                if !failed_keys.is_empty() {
+                    crate::auth::notice::record_upload_failure(
+                        "file_changes",
+                        "org database upsert failed",
+                    );
+                }
                 if !failed_keys.is_empty()
                     && let Ok(db) = FileChangesDatabase::global()
                     && let Ok(mut lock) = db.lock()
@@ -203,7 +212,7 @@ pub fn flush_pending_to_cloud() {
                 }
             }
             Err(e) => {
-                crate::auth::notice::record_sync_upload_stalled();
+                crate::auth::notice::record_upload_failure("file_changes", &e.to_string());
                 mark_batch_failed(&batch, &e.to_string(), 300);
             }
         }

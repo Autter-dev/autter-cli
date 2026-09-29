@@ -440,12 +440,13 @@ fn flush_commit_summaries() {
                     tracing::warn!(commit_sha = %pending_row.commit_sha, %error, "commit summaries: uploaded row remains queued");
                 } else {
                     note_durable_sync_authenticated();
+                    crate::auth::notice::clear_upload_failure_for("commit_summaries");
                 }
             }
             Err(error) => {
                 let _ =
                     lock.mark_commit_summary_failed(&pending_row.commit_sha, &error.to_string());
-                note_durable_sync_upload_failed();
+                note_durable_sync_upload_failed("commit_summaries", &error.to_string());
                 tracing::warn!(commit_sha = %pending_row.commit_sha, %error, "commit summaries: upload failed; retained for retry");
             }
         }
@@ -512,8 +513,8 @@ pub(crate) fn note_durable_sync_authenticated() {
 }
 
 /// Record that a durable-queue upload failed after auth was available.
-pub(crate) fn note_durable_sync_upload_failed() {
-    crate::auth::notice::record_sync_upload_stalled();
+pub(crate) fn note_durable_sync_upload_failed(queue: &str, detail: &str) {
+    crate::auth::notice::record_upload_failure(queue, detail);
 }
 
 fn flush_metrics(events: &[MetricEvent]) {
@@ -540,6 +541,7 @@ fn flush_metrics(events: &[MetricEvent]) {
             match client.upload_metrics(&batch) {
                 Ok(response) if response.errors.is_empty() => {
                     note_durable_sync_authenticated();
+                    crate::auth::notice::clear_upload_failure_for("metrics");
                     continue;
                 }
                 Ok(response) => {
@@ -547,14 +549,18 @@ fn flush_metrics(events: &[MetricEvent]) {
                         rejected = response.errors.len(),
                         "metrics: batch not fully accepted; queued for retry"
                     );
-                    crate::auth::notice::record_metrics_upload_stalled();
-                    note_durable_sync_upload_failed();
+                    note_durable_sync_upload_failed(
+                        "metrics",
+                        &format!(
+                            "batch not fully accepted ({} rejected)",
+                            response.errors.len()
+                        ),
+                    );
                     upload_failed = true;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "metrics: live upload failed; queued for retry");
-                    crate::auth::notice::record_metrics_upload_stalled();
-                    note_durable_sync_upload_failed();
+                    note_durable_sync_upload_failed("metrics", &error.to_string());
                     upload_failed = true;
                 }
             }
@@ -738,11 +744,13 @@ fn flush_stored_metrics() {
         if !any_failure && deleted.is_ok() {
             note_durable_sync_authenticated();
             if pending == accepted_ids.len() + dropped_ids.len() {
-                crate::auth::notice::clear_metrics_upload_stalled();
+                crate::auth::notice::clear_upload_failure_for("metrics");
             }
         } else {
-            crate::auth::notice::record_metrics_upload_stalled();
-            note_durable_sync_upload_failed();
+            note_durable_sync_upload_failed(
+                "metrics",
+                "durable metrics replay failed; events kept for retry",
+            );
         }
         tracing::info!(
             uploaded = accepted_ids.len(),
@@ -757,8 +765,10 @@ fn flush_stored_metrics() {
             "metrics: replayed durable queue batch"
         );
     } else {
-        note_durable_sync_upload_failed();
-        crate::auth::notice::record_metrics_upload_stalled();
+        note_durable_sync_upload_failed(
+            "metrics",
+            "durable metrics replay produced no accepted batch",
+        );
         tracing::warn!(
             pending,
             "metrics: durable queue upload failed; retained for retry"
@@ -1100,6 +1110,9 @@ pub fn flush_notes() {
             Ok(resp) => {
                 if resp.success_count > 0 {
                     note_durable_sync_authenticated();
+                    if resp.failure_count == 0 {
+                        crate::auth::notice::clear_upload_failure_for("notes");
+                    }
                 }
                 tracing::debug!(
                     success = resp.success_count,
@@ -1116,6 +1129,14 @@ pub fn flush_notes() {
                         // Server reported partial failures but doesn't identify which
                         // entries failed. Mark the whole group failed so all entries
                         // retry on the next flush cycle.
+                        note_durable_sync_upload_failed(
+                            "notes",
+                            &format!(
+                                "partial failure: {}/{} entries failed",
+                                resp.failure_count,
+                                commit_shas.len()
+                            ),
+                        );
                         let _ = lock.mark_failed(
                             &commit_shas,
                             &format!(
@@ -1128,7 +1149,7 @@ pub fn flush_notes() {
                 }
             }
             Err(e) => {
-                note_durable_sync_upload_failed();
+                note_durable_sync_upload_failed("notes", &e.to_string());
                 tracing::warn!(%e, "notes: upload error");
                 if let Ok(db) = crate::notes::db::NotesDatabase::global()
                     && let Ok(mut lock) = db.lock()
@@ -1232,6 +1253,7 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
                 {
                     let _ = db_lock.delete_cas_by_hashes(&successful_hashes);
                     note_durable_sync_authenticated();
+                    crate::auth::notice::clear_upload_failure_for("transcripts");
                 }
                 let failed_hashes: Vec<String> = response
                     .results
@@ -1257,7 +1279,7 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
 }
 
 fn mark_cas_upload_failed(hashes: &[String], error: &str) {
-    note_durable_sync_upload_failed();
+    note_durable_sync_upload_failed("transcripts", error);
     if let Ok(db) = crate::authorship::internal_db::InternalDatabase::global() {
         let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = lock.mark_cas_failed(hashes, error, DURABLE_SYNC_AUTH_RETRY_SECS);

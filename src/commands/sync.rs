@@ -96,6 +96,7 @@ pub fn purge_sync_queues() -> Result<String, AutterError> {
     }
 
     clear_sync_auth_blocked();
+    crate::auth::notice::clear_upload_failures();
 
     Ok(if parts.is_empty() {
         "nothing pending".to_string()
