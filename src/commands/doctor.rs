@@ -74,6 +74,10 @@ struct DoctorOutput {
     checks: Vec<DoctorCheck>,
     summary: DoctorSummary,
     ok: bool,
+    /// The one command to run next: the first failed check's remediation, or
+    /// the first warning when nothing failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_step: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -997,6 +1001,27 @@ fn version_string() -> String {
     }
 }
 
+/// First failed check that names a fix, otherwise the first warning that does.
+/// Checks are already in dependency order (git, hooks, trace2, daemon, agents,
+/// account, checkpoint), so the first failure is the one to fix before the rest.
+fn next_step_from_checks(checks: &[DoctorCheck]) -> Option<String> {
+    for check in checks {
+        if check.status == DoctorStatus::Failed
+            && let Some(step) = &check.remediation
+        {
+            return Some(step.clone());
+        }
+    }
+    for check in checks {
+        if check.status == DoctorStatus::Warning
+            && let Some(step) = &check.remediation
+        {
+            return Some(step.clone());
+        }
+    }
+    None
+}
+
 fn summarize(checks: &[DoctorCheck]) -> DoctorSummary {
     let mut summary = DoctorSummary {
         passed: 0,
@@ -1047,11 +1072,13 @@ impl Reporter {
 
     fn finish(self) -> DoctorOutput {
         let summary = summarize(&self.checks);
+        let next_step = next_step_from_checks(&self.checks);
         let output = DoctorOutput {
             autter_version: version_string(),
             checks: self.checks,
             summary,
             ok: summary.failed == 0,
+            next_step,
         };
 
         if self.json {
@@ -1102,6 +1129,9 @@ impl Reporter {
             println!("No failures. Review the warnings above if capture or sync seems off.");
         } else {
             println!("All checks passed -- autter is capturing and attributing correctly.");
+        }
+        if let Some(step) = &output.next_step {
+            println!("Next step: {}", step);
         }
 
         output
@@ -1201,11 +1231,13 @@ mod tests {
             failed
         }];
         let summary = summarize(&checks);
+        let next_step = next_step_from_checks(&checks);
         let output = DoctorOutput {
             autter_version: "test".to_string(),
             checks,
             summary,
             ok: summary.failed == 0,
+            next_step,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
@@ -1215,7 +1247,22 @@ mod tests {
         assert_eq!(value["checks"][0]["status"], "passed");
         assert_eq!(value["checks"][1]["status"], "failed");
         assert_eq!(value["checks"][1]["remediation"], "do the thing");
+        assert_eq!(value["next_step"], "do the thing");
         // Passed checks with no remediation omit the key entirely.
         assert!(value["checks"][0].get("remediation").is_none());
+    }
+
+    #[test]
+    fn next_step_prefers_the_first_failure_over_a_warning() {
+        let mut warning = make_check(DoctorStatus::Warning);
+        warning.remediation = Some("review the warning".to_string());
+        let mut failed = make_check(DoctorStatus::Failed);
+        failed.remediation = Some("run autter install --system".to_string());
+        let checks = vec![warning, failed];
+        assert_eq!(
+            next_step_from_checks(&checks).as_deref(),
+            Some("run autter install --system")
+        );
+        assert_eq!(next_step_from_checks(&[make_check(DoctorStatus::Passed)]), None);
     }
 }
