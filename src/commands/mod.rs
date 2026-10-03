@@ -1,4 +1,5 @@
 pub mod arg_parser;
+pub mod ask;
 pub mod autter_handlers;
 pub mod blame;
 pub mod checkpoint_agent;

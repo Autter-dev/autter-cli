@@ -596,6 +596,24 @@ autter login [--token <token>]
         body: "autter whoami\n\n  Show auth state and login identity.",
     },
     HelpEntry {
+        name: "ask",
+        aliases: &[],
+        summary: "Investigate your system with Runtime evidence",
+        body: "autter ask <question> [--repo <name>] [--org <slug>] [--thread <id>] [--mode system|codebase|reviews] [--json]\n\n  Get root causes, impact, and recommended fixes. Questions and answers are\n  saved in the same private thread history as Dashboard Ask. Use --thread to resume.\n  Sign in with autter login. Default mode: system.",
+    },
+    HelpEntry {
+        name: "logs",
+        aliases: &[],
+        summary: "Query captured Runtime logs in a readable table",
+        body: "autter logs [--repo <name>] [--org <slug>] [--severity <level>] [--service <name>]\n            [--environment <name>] [--since 1h|7d] [--from <ISO date>] [--to <ISO date>]\n            [--query <text>] [--field field=value] [--filter field:operator:value]\n            [--limit 1..200] [--json]\n\n  Search captured errors, warnings and info (default: last 24h). Custom fields\n  use attributes.<name>. Repeat --field or --filter to combine filters with AND.\n  Operators: eq, neq, contains, gt, gte, lt, lte, exists. Use --json for all fields.",
+    },
+    HelpEntry {
+        name: "threads",
+        aliases: &[],
+        summary: "Search and read saved debugging investigations",
+        body: "autter threads [search <keywords>] [--repo <name>] [--org <slug>] [--offset <n>] [--json]\nautter threads show <id> [--org <slug>] [--json]\n\n  Search your questions and answers across Dashboard and CLI. Lists 50 threads\n  at a time. Continue an investigation with autter ask <question> --thread <id>.",
+    },
+    HelpEntry {
         name: "telemetry",
         aliases: &[],
         summary: "Inspect or change anonymous telemetry",

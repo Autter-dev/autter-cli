@@ -357,3 +357,7 @@ The key idea we carried forward and built on is **Git Notes**. Git Notes let you
 
 ## License
 Apache 2.0
+
+### System investigations
+
+Use `autter ask` for evidence-backed system questions, `autter logs` for structured Runtime log queries, and `autter threads` to search and resume the same private debugging history as Dashboard Ask. See [usage and examples](docs/system-investigations.md).
