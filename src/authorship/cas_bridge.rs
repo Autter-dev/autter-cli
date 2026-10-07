@@ -8,8 +8,9 @@
 //! so the authorship note can point back at the full conversation that produced
 //! each AI attribution.
 //!
-//! The durable queue (`cas_sync_queue` in the internal DB) is drained and
-//! uploaded by the daemon's telemetry flush loop.
+//! In connected mode the durable queue (`cas_sync_queue` in the internal DB)
+//! is drained and uploaded by the daemon's telemetry flush loop. In local
+//! mode transcripts go only to the local `cas_cache` and are never queued.
 //!
 //! This is best-effort: any failure for a single session is swallowed so that
 //! note generation is never blocked by transcript handling.
@@ -32,7 +33,18 @@ use crate::error::AutterError;
 /// (PR review, blame, etc.) can evolve the shape over time.
 const TRANSCRIPT_SCHEMA: &str = "cas/transcript/1.0.0";
 
-/// For every AI prompt/session that has a captured transcript, enqueue the
+/// Where a bridged transcript goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptDestination {
+    /// Durable `cas_sync_queue`, drained to the platform by the daemon
+    /// (connected mode with `prompt_storage = "default"`).
+    UploadQueue,
+    /// Local `cas_cache` only; never queued for upload (local mode, or
+    /// `prompt_storage = "local"` for this repository).
+    LocalOnly,
+}
+
+/// For every AI prompt/session that has a captured transcript, store the
 /// transcript as a CAS object and record the `cas:<hash>` on `messages_url`.
 ///
 /// `checkpoints` is the working log for the commit being processed; it is the
@@ -41,6 +53,7 @@ pub fn enqueue_prompt_transcripts(
     prompts: &mut BTreeMap<String, PromptRecord>,
     sessions: &mut BTreeMap<String, SessionRecord>,
     checkpoints: &[Checkpoint],
+    destination: TranscriptDestination,
 ) {
     if prompts.is_empty() && sessions.is_empty() {
         return;
@@ -58,7 +71,7 @@ pub fn enqueue_prompt_transcripts(
         let Some(path) = transcript_paths.get(hash) else {
             continue;
         };
-        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id) {
+        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id, destination) {
             record.messages_url = Some(format!("cas:{cas_hash}"));
         }
     }
@@ -70,7 +83,7 @@ pub fn enqueue_prompt_transcripts(
         let Some(path) = transcript_paths.get(session_key) else {
             continue;
         };
-        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id) {
+        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id, destination) {
             record.messages_url = Some(format!("cas:{cas_hash}"));
         }
     }
@@ -100,7 +113,11 @@ fn transcript_paths_from_checkpoints(checkpoints: &[Checkpoint]) -> HashMap<Stri
 /// Read and normalize a single transcript file, then enqueue it as a CAS object.
 /// Returns the canonical content hash on success, or `None` when there is
 /// nothing worth storing (file gone, empty, or unparseable).
-fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<String>, AutterError> {
+fn enqueue_transcript_file(
+    path: &str,
+    agent_id: &AgentId,
+    destination: TranscriptDestination,
+) -> Result<Option<String>, AutterError> {
     let Some(messages) = messages_from_transcript_file(path)? else {
         return Ok(None);
     };
@@ -129,9 +146,17 @@ fn enqueue_transcript_file(path: &str, agent_id: &AgentId) -> Result<Option<Stri
     let mut db_lock = db
         .lock()
         .map_err(|_| AutterError::Generic("CAS internal DB lock poisoned".to_string()))?;
-    let cas_hash = db_lock.enqueue_cas_object(&payload, Some(&metadata))?;
+    let cas_hash = match destination {
+        TranscriptDestination::UploadQueue => {
+            db_lock.enqueue_cas_object(&payload, Some(&metadata))?
+        }
+        TranscriptDestination::LocalOnly => {
+            crate::authorship::internal_db::canonical_cas_hash(&payload)?.0
+        }
+    };
 
-    // Cache locally so show-prompt can resolve before cloud upload completes.
+    // Cache locally so show-prompt/blame can resolve it (before the cloud
+    // upload completes, or forever in local-only storage).
     if let Ok(messages_json) = serde_json::to_string(&messages) {
         let _ = db_lock.set_cas_cache(&cas_hash, &messages_json);
     }
@@ -207,6 +232,10 @@ pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, 
     }
 
     let cfg = config::Config::fresh();
+    // Local mode does not contact the platform at all.
+    if !cfg.platform_sync_enabled() {
+        return Ok(None);
+    }
     let dataplane_url = if cfg.notes_backend_kind().uses_http() {
         cfg.notes_backend_url().map(|s| s.to_string())
     } else {

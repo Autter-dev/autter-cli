@@ -303,7 +303,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 fn flush_telemetry_batch(batch: TelemetryBuffer) {
     let config = Config::get();
 
-    // Flush metrics (always processed — uploaded or stored in SQLite)
+    // Flush metrics (uploaded or stored in SQLite for retry; dropped in local mode)
     if !batch.metrics.is_empty() {
         flush_metrics(&batch.metrics);
     }
@@ -357,6 +357,12 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
 /// Drain a bounded batch of durable commit provenance summaries.
 fn flush_commit_summaries() {
     use crate::api::types::CommitAuthorshipSummary;
+
+    // Local mode never uploads; leave any queued rows untouched so they only
+    // leave the machine if the user reconnects and agrees to import them.
+    if !crate::config::platform_sync_enabled_now() {
+        return;
+    }
 
     let db = match crate::notes::db::NotesDatabase::global() {
         Ok(db) => db,
@@ -518,6 +524,15 @@ pub(crate) fn note_durable_sync_upload_failed(queue: &str, detail: &str) {
 }
 
 fn flush_metrics(events: &[MetricEvent]) {
+    // Local mode: metric events exist only to be uploaded, so drop them
+    // instead of uploading or adding them to the durable retry queue.
+    if !crate::config::platform_sync_enabled_now() {
+        tracing::debug!(
+            dropped = events.len(),
+            "metrics: local mode; not uploading or queueing"
+        );
+        return;
+    }
     if durable_sync_auth_backoff_active() {
         store_metrics_in_db(events);
         return;
@@ -588,6 +603,12 @@ fn is_validation_rejection(message: &str) -> bool {
 /// every three-second daemon tick drains backlogs steadily without monopolizing
 /// the worker or delaying new checkpoints.
 fn flush_stored_metrics() {
+    // Local mode never uploads. A backlog left by an earlier connected session
+    // stays queued (and visible in `autter doctor`) until the user reconnects
+    // and chooses to import it, or purges it with `autter sync purge`.
+    if !crate::config::platform_sync_enabled_now() {
+        return;
+    }
     let db = match MetricsDatabase::global() {
         Ok(db) => db,
         Err(error) => {
@@ -989,12 +1010,17 @@ fn flush_sentry_and_posthog(
 /// Flush pending notes from `notes-db` to the remote HTTP backend.
 ///
 /// Skips silently when:
+/// - the machine is in local mode (`Config::platform_sync_enabled`)
 /// - `notes_backend.kind != Http`
 /// - Not authenticated (no API key and not logged in)
 pub fn flush_notes() {
     use crate::api::types::{NoteEntry, NotesUploadRequest};
 
     let cfg = Config::fresh();
+    if !cfg.platform_sync_enabled() {
+        tracing::debug!("notes: skipping flush, local mode never uploads");
+        return;
+    }
     if !cfg.notes_backend_kind().uses_http() {
         tracing::debug!("notes: skipping flush, backend does not use Http");
         return;
@@ -1198,6 +1224,14 @@ fn cas_client() -> (ApiClient, bool) {
 }
 
 fn flush_cas(records: Vec<CasSyncPayload>) {
+    // Local mode: transcripts never leave the machine.
+    if !crate::config::platform_sync_enabled_now() {
+        tracing::debug!(
+            dropped = records.len(),
+            "telemetry: local mode; not uploading CAS objects"
+        );
+        return;
+    }
     let (client, enabled) = cas_client();
     if !enabled {
         tracing::debug!("telemetry: skipping CAS flush, not logged in");
@@ -1291,6 +1325,11 @@ fn mark_cas_upload_failed(hashes: &[String], error: &str) {
 /// that fail to upload stay locked as `processing` and are recovered to
 /// `pending` by `dequeue_cas_batch`'s stale-lock sweep on a later tick.
 fn flush_cas_queue() {
+    // Local mode never uploads transcripts, including a backlog queued by an
+    // earlier connected session.
+    if !crate::config::platform_sync_enabled_now() {
+        return;
+    }
     let Ok(db) = crate::authorship::internal_db::InternalDatabase::global() else {
         return;
     };

@@ -264,6 +264,23 @@ fn setup_local(cfg: &mut config::FileConfig) {
     eprintln!("  detailed prompt usage and team/user usage dashboards.");
     eprintln!();
     eprintln!("  Run `autter onboard --connect` anytime to link your Autter account.{RESET}");
+
+    // Data queued while this machine was connected (or by older versions)
+    // stays on disk. Local mode never uploads it; reconnecting asks before
+    // importing it. Tell the user it exists and how to delete it.
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_none() {
+        let pending = crate::auth::notice::pending_sync_counts();
+        if pending.total() > 0 {
+            eprintln!();
+            eprintln!(
+                "  {DIM}Found records queued for upload earlier ({}). They will not be",
+                pending.summary()
+            );
+            eprintln!(
+                "  uploaded in local mode. Delete them with `autter sync purge --force`.{RESET}"
+            );
+        }
+    }
 }
 
 /// Log the user in (if needed) and configure connected mode.
@@ -350,6 +367,15 @@ fn print_finished(connected: bool) {
 
 fn print_status_summary() {
     let status = collect_auth_status();
+    if !config::Config::fresh().platform_sync_enabled() {
+        eprintln!("Autter is running in local mode: nothing is uploaded to the Autter platform.");
+        if matches!(status.state, AuthState::LoggedIn) {
+            eprintln!("  You are signed in, but local mode keeps all data on this machine.");
+        }
+        eprintln!();
+        eprintln!("  To connect:  autter onboard --connect");
+        return;
+    }
     if matches!(status.state, AuthState::LoggedIn) {
         let who = status
             .email

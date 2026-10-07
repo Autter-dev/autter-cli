@@ -900,14 +900,41 @@ fn check_org_data_plane() -> DoctorCheck {
 fn check_sync_queue() -> DoctorCheck {
     let name = "durable sync queue".to_string();
 
-    // Local-only mode never drains cloud queues — leftover metrics/notes from a
-    // prior connected session (or telemetry) must not fail CI / doctor.
-    if !Config::get().notes_backend_kind().uses_http() {
+    // Local mode never uploads anything. Leftover records queued by an earlier
+    // connected session (or by older versions) stay on disk and are only
+    // uploaded if the user reconnects and agrees to import them, so they must
+    // not fail CI / doctor.
+    if !Config::fresh().platform_sync_enabled() {
+        let pending = crate::auth::notice::pending_sync_counts();
+        let mut details = Vec::new();
+        if pending.total() > 0 {
+            details.push(format!(
+                "left over from an earlier connected session: {}",
+                pending.summary()
+            ));
+            details.push(
+                "not uploaded in local mode; `autter onboard --connect` asks before importing them"
+                    .to_string(),
+            );
+            details.push("delete them with `autter sync purge --force`".to_string());
+        }
         return DoctorCheck {
             section: SECTION_ACCOUNT,
             name,
             status: DoctorStatus::Passed,
-            summary: "local mode — cloud upload queues are not drained (expected)".to_string(),
+            summary: "local mode — nothing is uploaded to the Autter platform".to_string(),
+            details,
+            remediation: None,
+        };
+    }
+
+    // Notes stay in git notes; cloud upload queues are not checked.
+    if !Config::fresh().notes_backend_kind().uses_http() {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Passed,
+            summary: "git-notes backend — cloud upload queues are not checked".to_string(),
             details: vec![crate::auth::notice::pending_sync_counts().summary()],
             remediation: None,
         };

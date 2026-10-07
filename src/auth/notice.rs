@@ -259,9 +259,8 @@ pub enum CloudSyncAttention {
 }
 
 fn cloud_sync_enabled() -> bool {
-    crate::config::Config::fresh()
-        .notes_backend_kind()
-        .uses_http()
+    let cfg = crate::config::Config::fresh();
+    cfg.platform_sync_enabled() && cfg.notes_backend_kind().uses_http()
 }
 
 fn background_service_running() -> bool {

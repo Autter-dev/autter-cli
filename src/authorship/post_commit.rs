@@ -198,15 +198,28 @@ pub fn post_commit_with_final_state(
     // links back to the conversation that produced the code. In `Default` mode
     // the daemon uploads queued objects to the cloud; in `Local` mode they stay
     // on disk only. `Notes` mode stores transcripts in git notes instead.
+    //
+    // Only `Default` storage in connected mode adds transcripts to the upload
+    // queue. `Local` storage (local mode, or a repo excluded from prompt
+    // sharing) keeps them in the local CAS cache only, so they never sit in a
+    // queue the daemon could later upload.
     let storage_mode = config.effective_prompt_storage(&Some(repo.clone()));
     if matches!(
         storage_mode,
         crate::config::PromptStorageMode::Default | crate::config::PromptStorageMode::Local
     ) {
+        let destination = if storage_mode == crate::config::PromptStorageMode::Default
+            && config.platform_sync_enabled()
+        {
+            crate::authorship::cas_bridge::TranscriptDestination::UploadQueue
+        } else {
+            crate::authorship::cas_bridge::TranscriptDestination::LocalOnly
+        };
         crate::authorship::cas_bridge::enqueue_prompt_transcripts(
             &mut authorship_log.metadata.prompts,
             &mut authorship_log.metadata.sessions,
             &parent_working_log,
+            destination,
         );
     }
 
@@ -637,6 +650,12 @@ fn upload_commit_authorship_summary(
         ApiClient, ApiContext, access_token_for_org, resolve_org_for_repo_cached,
     };
     use crate::api::types::CommitAuthorshipSummary;
+
+    // The summary queue is upload-only (nothing local reads it), so local mode
+    // neither enqueues nor uploads it.
+    if !crate::config::platform_sync_enabled_now() {
+        return;
+    }
 
     let total = stats.git_diff_added_lines as f64;
     let percent = |count: u32| {

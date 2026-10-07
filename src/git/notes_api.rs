@@ -563,6 +563,10 @@ pub fn warm_cache_for_remote(repo: &Repository, remote: &str) -> Result<(), Autt
 
     // 3. Batch-fetch from the HTTP backend (chunks of 100).
     let cfg = crate::config::Config::fresh();
+    if !cfg.platform_sync_enabled() {
+        tracing::debug!("warm_cache_for_remote: local mode; not contacting the platform");
+        return Ok(());
+    }
     let backend_url = match cfg.notes_backend_url() {
         Some(url) => url.to_string(),
         None => {
@@ -678,6 +682,10 @@ fn http_fetch_and_cache_notes(commit_shas: &[String]) -> HashMap<String, String>
     }
 
     let cfg = Config::fresh();
+    // Local mode does not contact the platform at all.
+    if !cfg.platform_sync_enabled() {
+        return HashMap::new();
+    }
     let Some(backend_url) = cfg.notes_backend_url().map(str::to_string) else {
         return HashMap::new();
     };

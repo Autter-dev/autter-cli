@@ -78,6 +78,20 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
+/// Canonicalize JSON (RFC 8785) and return `(sha256 hex, canonical text)`.
+///
+/// This is the content address used for `cas:<hash>` references, whether the
+/// object is queued for upload or only cached locally.
+pub fn canonical_cas_hash(json_data: &serde_json::Value) -> Result<(String, String), AutterError> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json_canonicalizer::to_string(json_data)
+        .map_err(|e| AutterError::Generic(format!("Failed to canonicalize JSON: {}", e)))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Ok((format!("{:x}", hasher.finalize()), canonical))
+}
+
 /// Global database singleton
 static INTERNAL_DB: OnceLock<Mutex<InternalDatabase>> = OnceLock::new();
 
@@ -330,16 +344,7 @@ impl InternalDatabase {
         json_data: &serde_json::Value,
         metadata: Option<&HashMap<String, String>>,
     ) -> Result<String, AutterError> {
-        use sha2::{Digest, Sha256};
-
-        // Canonicalize JSON (RFC 8785)
-        let canonical = serde_json_canonicalizer::to_string(json_data)
-            .map_err(|e| AutterError::Generic(format!("Failed to canonicalize JSON: {}", e)))?;
-
-        // Hash the canonicalized content
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let (hash, canonical) = canonical_cas_hash(json_data)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

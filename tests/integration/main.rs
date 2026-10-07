@@ -81,6 +81,7 @@ mod internal_spawn_safety;
 mod issue_1204_multi_agent;
 mod jetbrains_download;
 mod jetbrains_ide_types;
+mod local_mode_privacy;
 mod log;
 mod merge_rebase;
 mod multi_repo_workspace;

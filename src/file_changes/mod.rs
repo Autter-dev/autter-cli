@@ -1,7 +1,8 @@
 //! Track which repository files are changed most often.
 //!
 //! Counts are aggregated locally in SQLite and synced to the org database when
-//! the user is logged in to Autter Cloud.
+//! the machine is in connected mode and the user is logged in to Autter Cloud.
+//! Local mode keeps the counts on the machine only.
 
 pub mod db;
 
@@ -36,12 +37,16 @@ pub fn record_checkpoint_file(
     let Ok(mut lock) = db.lock() else {
         return;
     };
+    // Local mode keeps the counts (they power `autter file-changes`) but does
+    // not mark them for upload.
+    let queue_for_upload = crate::config::platform_sync_enabled_now();
     let _ = lock.record_change(
         &repo_key,
         &normalized_path,
         lines_added,
         lines_deleted,
         changed_at,
+        queue_for_upload,
     );
 }
 
@@ -54,13 +59,18 @@ pub fn top_changed_files(repo_key: &str, limit: usize) -> Result<Vec<FileChangeR
     lock.top_files(repo_key, limit)
 }
 
-/// Upload pending rows to the org database when authenticated.
+/// Upload pending rows to the org database when in connected mode and authenticated.
 pub fn flush_pending_to_cloud() {
     use crate::api::client::{ApiClient, access_token_for_org, resolve_org_for_repo_cached};
     use crate::api::types::{FileChangeCount, FileChangeUploadResponse};
     use crate::config;
 
     let cfg = config::Config::fresh();
+    // Local mode never uploads, including rows queued by an earlier connected
+    // session.
+    if !cfg.platform_sync_enabled() {
+        return;
+    }
     let backend_url = match cfg.notes_backend_url() {
         Some(url) => url.to_string(),
         None => return,

@@ -11,6 +11,13 @@ const MAX_BATCH_SIZE: usize = 1000;
 
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {
+    if !crate::config::platform_sync_enabled_now() {
+        eprintln!(
+            "flush-metrics-db: skipping (local mode never uploads; run `autter onboard --connect` to connect)"
+        );
+        return;
+    }
+
     // Metrics are written through the authenticated server-side API, so a
     // write requires being logged in.
     let context = ApiContext::new(None);
