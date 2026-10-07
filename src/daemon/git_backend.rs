@@ -732,7 +732,8 @@ fn parse_alias_tokens(value: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitBackend, SystemGitBackend, clone_init_positionals, default_clone_target_from_source,
+        GitBackend, SystemGitBackend, clone_init_positionals, command_args,
+        default_clone_target_from_source,
     };
     use std::path::PathBuf;
 
@@ -880,6 +881,118 @@ mod tests {
             clone_init_positionals(&args),
             vec!["https://example.com/org/test-repo.git".to_string()],
             "--dissociate is boolean and must not consume the following URL"
+        );
+    }
+
+    // --- Remaining value-taking clone/init options missing from `takes_value`, and
+    // global options before the subcommand that `command_args` mistook for it.
+
+    #[test]
+    fn clone_positionals_skip_values_for_short_origin_and_upload_pack() {
+        for flag in ["-o", "-u"] {
+            let args = argv(&[flag, "value", "https://example.com/org/test-repo.git"]);
+            assert_eq!(
+                clone_init_positionals(&args),
+                vec!["https://example.com/org/test-repo.git".to_string()],
+                "{flag} should consume its value"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_positionals_skip_values_for_ref_format_revision_and_initial_branch() {
+        for flag in ["--ref-format", "--revision", "--initial-branch"] {
+            let args = argv(&[flag, "value", "target"]);
+            assert_eq!(
+                clone_init_positionals(&args),
+                vec!["target".to_string()],
+                "{flag} should consume its value"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_positionals_keep_equals_and_optional_value_forms_intact() {
+        let args = argv(&[
+            "--depth=1",
+            "--recurse-submodules",
+            "--shallow-submodules",
+            "--single-branch",
+            "https://example.com/org/test-repo.git",
+            "dest",
+        ]);
+        assert_eq!(
+            clone_init_positionals(&args),
+            vec![
+                "https://example.com/org/test-repo.git".to_string(),
+                "dest".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_target_with_depth_branch_and_explicit_dir() {
+        let backend = SystemGitBackend::new();
+        let cwd = PathBuf::from("/home/testuser/projects");
+        let args = argv(&[
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "main",
+            "https://example.com/org/test-repo.git",
+            "checkout",
+        ]);
+        assert_eq!(
+            backend.clone_target(&args, Some(&cwd)),
+            Some(PathBuf::from("/home/testuser/projects/checkout"))
+        );
+    }
+
+    #[test]
+    fn clone_target_with_short_origin_flag() {
+        let backend = SystemGitBackend::new();
+        let cwd = PathBuf::from("/home/testuser/projects");
+        let args = argv(&[
+            "git",
+            "clone",
+            "-o",
+            "upstream",
+            "https://example.com/org/test-repo.git",
+        ]);
+        assert_eq!(
+            backend.clone_target(&args, Some(&cwd)),
+            Some(PathBuf::from("/home/testuser/projects/test-repo"))
+        );
+    }
+
+    #[test]
+    fn command_args_skip_global_option_value_equal_to_subcommand() {
+        // `-C clone` is a directory named "clone"; the subcommand is the second "clone".
+        let args = argv(&[
+            "git",
+            "-C",
+            "clone",
+            "clone",
+            "--depth",
+            "1",
+            "https://example.com/org/test-repo.git",
+        ]);
+        assert_eq!(
+            command_args(&args, "clone"),
+            argv(&["--depth", "1", "https://example.com/org/test-repo.git"])
+        );
+    }
+
+    #[test]
+    fn init_target_with_initial_branch_value() {
+        let backend = SystemGitBackend::new();
+        let cwd = PathBuf::from("/home/testuser/projects");
+        let args = argv(&["git", "init", "--initial-branch", "main", "newrepo"]);
+        assert_eq!(
+            backend.init_target(&args, Some(&cwd)),
+            Some(PathBuf::from("/home/testuser/projects/newrepo"))
         );
     }
 
