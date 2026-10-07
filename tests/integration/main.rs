@@ -88,6 +88,7 @@ mod multi_repo_workspace;
 mod non_utf8_files;
 mod notes_backend_mode_switch;
 mod notes_merge_mixed_fanout;
+mod onboard_setup_report;
 mod opencode;
 mod pending_ai_edit_suppression;
 mod performance;

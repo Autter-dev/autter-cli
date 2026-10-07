@@ -42,7 +42,7 @@ use serde_json::json;
 use crate::auth::{AuthState, collect_auth_status};
 use crate::commands::login::run_device_login;
 use crate::config::{self, NotesBackendConfig, NotesBackendKind};
-use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem};
+use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem, YELLOW};
 
 /// Entry point for the `autter onboard` command.
 pub fn handle_onboard(args: &[String]) {
@@ -106,8 +106,19 @@ pub fn handle_onboard(args: &[String]) {
         return;
     };
 
+    // Every step that does not complete is recorded here, so onboarding never
+    // ends with "You're all set!" after something went wrong.
+    let mut report = SetupReport::default();
+
     if connect {
-        setup_connected(&mut file_config, logged_in);
+        if let Err(e) = setup_connected(&mut file_config, logged_in) {
+            report.problem(
+                format!(
+                    "Could not connect to the Autter platform ({e}); set up in local mode instead"
+                ),
+                "autter onboard --connect",
+            );
+        }
     } else {
         setup_local(&mut file_config);
     }
@@ -118,16 +129,34 @@ pub fn handle_onboard(args: &[String]) {
     // System integrations (IDE hooks, global git trace2, daemon) require
     // explicit consent. Picking a mode (`--local`/`--connect`) or re-running
     // (`--force`) is not consent; only an interactive "yes" or `--yes` is.
-    let _integrations_applied = apply_system_integrations_with_consent(assume_yes);
+    if let Err(e) = apply_system_integrations_with_consent(assume_yes) {
+        report.problem(
+            format!("Could not install IDE/agent hooks and git capture settings ({e})"),
+            "autter install --system",
+        );
+    }
 
     // After connect: offer to keep or discard any pre-login upload backlog.
-    if file_config.prompt_storage.as_deref() != Some("local") {
-        offer_historical_sync_consent();
+    if file_config.prompt_storage.as_deref() != Some("local")
+        && let Err(e) = offer_historical_sync_consent()
+    {
+        report.problem(
+            format!("Could not clear the local upload queue ({e})"),
+            "autter sync purge --force",
+        );
     }
 
     file_config.onboarding_completed = Some(true);
     if let Err(e) = config::save_file_config(&file_config) {
-        eprintln!("Warning: could not save onboarding state: {e}");
+        let path = config::config_file_path_public()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.autter/config.json".to_string());
+        report.problem(
+            format!(
+                "Could not save your choice to {path} ({e}); the mode was not applied. Make sure that file is writable, then re-run"
+            ),
+            "autter onboard --force",
+        );
     }
 
     // The background service is what persists authorship notes, and it may
@@ -135,44 +164,80 @@ pub fn handle_onboard(args: &[String]) {
     // new notes backend / prompt storage take effect immediately. A service
     // that is not running is left alone: starting it is a system integration
     // that needs consent (installing integrations above starts it).
-    restart_daemon_for_mode_change();
+    if let Err(e) = restart_daemon_for_mode_change() {
+        report.problem(
+            format!(
+                "Could not restart the background service ({e}), so it may still use the previous mode"
+            ),
+            crate::commands::daemon::RESTART_COMMAND,
+        );
+    }
 
     // Reflect the mode actually configured: a connect attempt can fall back
     // to local if the device login fails.
     let connected = file_config.prompt_storage.as_deref() != Some("local");
-    print_finished(connected);
+    eprint!(
+        "{}",
+        render_finished(connected, &report, std::io::stderr().is_terminal())
+    );
 
     // Fire a one-off install/onboard event so we can count installs by version
     // and platform. Only when the user just opted in.
     if telemetry_enabled {
         record_install_event(connected);
     }
+
+    // A degraded setup is a runtime failure for scripts (installers run
+    // `autter onboard || true`, so this never aborts an install).
+    if !report.is_clean() {
+        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    }
+}
+
+/// One onboarding step that did not complete, with the exact command that
+/// fixes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupProblem {
+    what: String,
+    fix: String,
+}
+
+/// Degraded steps collected during onboarding.
+#[derive(Debug, Default)]
+struct SetupReport {
+    problems: Vec<SetupProblem>,
+}
+
+impl SetupReport {
+    fn problem(&mut self, what: impl Into<String>, fix: impl Into<String>) {
+        self.problems.push(SetupProblem {
+            what: what.into(),
+            fix: fix.into(),
+        });
+    }
+
+    fn is_clean(&self) -> bool {
+        self.problems.is_empty()
+    }
 }
 
 /// Restart an already-running daemon so it re-reads the freshly-saved mode
 /// config. Never starts a daemon that is not running: starting the background
 /// service is a system integration that needs consent. Skipped in test
-/// harnesses, which manage their own daemon lifecycle. Best-effort: a failed
-/// restart must not fail onboarding.
-fn restart_daemon_for_mode_change() {
+/// harnesses, which manage their own daemon lifecycle. A failure is reported
+/// to the caller, which lists it in the closing summary.
+fn restart_daemon_for_mode_change() -> Result<(), String> {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
+        return Ok(());
     }
 
-    let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
-        return;
-    };
+    let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths()
+        .map_err(|e| format!("could not locate the background service: {e}"))?;
     if !crate::commands::daemon::daemon_is_up(&daemon_config) {
-        return;
+        return Ok(());
     }
 
-    if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
-        eprintln!("Warning: could not restart the background service: {e}");
-        eprintln!(
-            "  Run `{}` to apply the new mode to the background service.",
-            crate::commands::daemon::RESTART_COMMAND
-        );
-    }
+    crate::commands::daemon::restart_daemon(&daemon_config)
 }
 
 /// The interactive connected-vs-local choice, as an arrow-key selector.
@@ -301,8 +366,10 @@ fn setup_local(cfg: &mut config::FileConfig) {
     }
 }
 
-/// Log the user in (if needed) and configure connected mode.
-fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
+/// Log the user in (if needed) and configure connected mode. On a failed
+/// login, falls back to local mode and returns the error so the closing
+/// summary can report it.
+fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) -> Result<(), String> {
     if !already_logged_in {
         eprintln!();
         eprintln!("Connecting to the Autter platform...");
@@ -311,11 +378,13 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
             eprintln!("\u{2717} Could not connect: {e}");
             eprintln!();
             crate::commands::login::print_pat_fallback_instructions();
+            // `autter login` alone does not switch modes: local mode never
+            // uploads, so the retry has to go through onboarding.
             eprintln!(
-                "  Setting up local mode for now \u{2014} run `autter onboard --connect` or `autter login --token <token>` to retry."
+                "  Setting up local mode for now \u{2014} run `autter onboard --connect` to retry."
             );
             setup_local(cfg);
-            return;
+            return Err(e.to_string());
         }
     }
 
@@ -342,6 +411,7 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
     eprintln!("    so you get detailed prompt usage and team/user analytics.");
     eprintln!();
     eprintln!("  {DIM}Manage your account with `autter whoami` / `autter logout`.{RESET}");
+    Ok(())
 }
 
 fn print_welcome() {
@@ -356,31 +426,74 @@ fn print_welcome() {
     eprintln!();
 }
 
-/// Closing summary: confirmation that nothing else is required, plus the first
-/// commands worth trying.
-fn print_finished(connected: bool) {
-    eprintln!();
-    eprintln!("{GREEN}{BOLD}\u{2713} You're all set!{RESET}");
-    eprintln!();
-    eprintln!("  Just keep coding \u{2014} authorship is recorded automatically on every commit.");
-    eprintln!();
-    eprintln!("  Try it on any repo:");
-    eprintln!(
-        "    {CYAN}autter stats{RESET}          {DIM}AI vs human share of your latest commit{RESET}"
+/// Closing summary. With no problems: the green "all set" message plus the
+/// first commands worth trying. With problems: a yellow "Set up with
+/// warnings" summary listing each problem and the exact command that fixes
+/// it, and no claim that everything is ready.
+fn render_finished(connected: bool, report: &SetupReport, color: bool) -> String {
+    use std::fmt::Write as _;
+    let paint = |code: &'static str| if color { code } else { "" };
+    let (green, yellow, bold, cyan, dim, reset) = (
+        paint(GREEN),
+        paint(YELLOW),
+        paint(BOLD),
+        paint(CYAN),
+        paint(DIM),
+        paint(RESET),
     );
-    eprintln!(
-        "    {CYAN}autter blame <file>{RESET}   {DIM}who \u{2014} you or an agent \u{2014} wrote each line{RESET}"
-    );
-    eprintln!(
-        "    {CYAN}autter log{RESET}            {DIM}git log with AI authorship stats{RESET}"
-    );
-    if connected {
-        eprintln!(
-            "    {CYAN}autter dash{RESET}           {DIM}open your personal dashboard{RESET}"
+    let mut out = String::new();
+    let _ = writeln!(out);
+    if report.is_clean() {
+        let _ = writeln!(out, "{green}{bold}\u{2713} You're all set!{reset}");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  Just keep coding \u{2014} authorship is recorded automatically on every commit."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "{yellow}{bold}\u{26a0} Set up with warnings{reset} \u{2014} {} step{} did not complete:",
+            report.problems.len(),
+            if report.problems.len() == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(out);
+        for problem in &report.problems {
+            let _ = writeln!(out, "  {yellow}\u{2022}{reset} {}", problem.what);
+            let _ = writeln!(out, "    Fix: {cyan}{}{reset}", problem.fix);
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  Then run {cyan}autter doctor{reset} to confirm everything works."
         );
     }
-    eprintln!();
-    eprintln!("  {DIM}All commands: `autter help` \u{2022} Docs: https://autter.dev/docs{RESET}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  Try it on any repo:");
+    let _ = writeln!(
+        out,
+        "    {cyan}autter stats{reset}          {dim}AI vs human share of your latest commit{reset}"
+    );
+    let _ = writeln!(
+        out,
+        "    {cyan}autter blame <file>{reset}   {dim}who \u{2014} you or an agent \u{2014} wrote each line{reset}"
+    );
+    let _ = writeln!(
+        out,
+        "    {cyan}autter log{reset}            {dim}git log with AI authorship stats{reset}"
+    );
+    if connected {
+        let _ = writeln!(
+            out,
+            "    {cyan}autter dash{reset}           {dim}open your personal dashboard{reset}"
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {dim}All commands: `autter help` \u{2022} Docs: https://autter.dev/docs{reset}"
+    );
+    out
 }
 
 fn print_status_summary() {
@@ -439,13 +552,13 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
 }
 
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
-/// Returns whether the integrations were installed.
+/// Returns whether the integrations were installed, or the install error.
 ///
 /// Only `assume_yes` (`--yes`) applies them without asking. Interactive runs
 /// ask; non-interactive runs without `--yes` leave them off.
-fn apply_system_integrations_with_consent(assume_yes: bool) -> bool {
+fn apply_system_integrations_with_consent(assume_yes: bool) -> Result<bool, String> {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return false;
+        return Ok(false);
     }
 
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
@@ -481,18 +594,14 @@ fn apply_system_integrations_with_consent(assume_yes: bool) -> bool {
     };
 
     if !apply {
-        return false;
+        return Ok(false);
     }
 
     eprintln!();
     eprintln!("Installing IDE/agent hooks…");
-    match crate::commands::install_hooks::run(&["--system".to_string()]) {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("Warning: could not install hooks: {e}");
-            false
-        }
-    }
+    crate::commands::install_hooks::run(&["--system".to_string()])
+        .map(|_| true)
+        .map_err(|e| e.to_string())
 }
 
 /// Parsed `autter onboard` flags.
@@ -539,14 +648,14 @@ fn integration_decision(assume_yes: bool, interactive: bool) -> IntegrationDecis
 
 /// When connecting, any pre-login backlog would upload on the next daemon drain.
 /// Offer to keep (import) or purge it first.
-fn offer_historical_sync_consent() {
+fn offer_historical_sync_consent() -> Result<(), String> {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
+        return Ok(());
     }
 
     let pending = crate::auth::notice::pending_sync_counts();
     if pending.total() == 0 {
-        return;
+        return Ok(());
     }
 
     eprintln!();
@@ -579,15 +688,12 @@ fn offer_historical_sync_consent() {
     };
 
     if !import {
-        match crate::commands::sync::purge_sync_queues() {
-            Ok(summary) => {
-                eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
-            }
-            Err(e) => eprintln!("Warning: could not clear upload queue: {e}"),
-        }
+        let summary = crate::commands::sync::purge_sync_queues().map_err(|e| e.to_string())?;
+        eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
     } else {
         eprintln!("  Backlog will upload in the background after setup.");
     }
+    Ok(())
 }
 
 /// True when the args are only asking for help (`--help`/`-h`/`help` in any
@@ -640,6 +746,37 @@ mod tests {
                 IntegrationDecision::Apply
             );
         }
+    }
+
+    #[test]
+    fn clean_setup_ends_with_all_set() {
+        let text = render_finished(false, &SetupReport::default(), false);
+        assert!(text.contains("You're all set!"), "{text}");
+        assert!(!text.contains("Set up with warnings"), "{text}");
+    }
+
+    #[test]
+    fn degraded_setup_lists_each_problem_with_its_fix_instead_of_all_set() {
+        let mut report = SetupReport::default();
+        report.problem(
+            "Could not restart the background service (timed out)",
+            crate::commands::daemon::RESTART_COMMAND,
+        );
+        report.problem(
+            "Could not install hooks (denied)",
+            "autter install --system",
+        );
+        let text = render_finished(true, &report, false);
+        assert!(!text.contains("You're all set"), "{text}");
+        assert!(text.contains("Set up with warnings"), "{text}");
+        assert!(text.contains("2 steps did not complete"), "{text}");
+        assert!(
+            text.contains("Could not restart the background service (timed out)"),
+            "{text}"
+        );
+        // The daemon fix is the canonical restart command.
+        assert!(text.contains("Fix: autter bg restart"), "{text}");
+        assert!(text.contains("Fix: autter install --system"), "{text}");
     }
 
     #[test]

@@ -758,3 +758,9 @@ if ($needLogin) {
 # when the console isn't interactive (CI, scripted installs).
 Write-Host ''
 & $finalExe onboard
+# Onboarding exits 1 when a step needs attention ("Set up with warnings"); it
+# has already printed each fix. The install itself succeeded, so don't let
+# that exit code become the installer's (mirrors `|| true` in install.sh).
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Autter is installed. Onboarding listed the remaining steps above.'
+}
