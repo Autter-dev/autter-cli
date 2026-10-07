@@ -573,19 +573,14 @@ fn git_invocation_tokens(argv: &[String]) -> &[String] {
 }
 
 fn command_args(argv: &[String], command: &str) -> Vec<String> {
-    let slice = git_invocation_tokens(argv);
-    let mut seen = false;
-    let mut out = Vec::new();
-    for token in slice {
-        if !seen {
-            if token == command {
-                seen = true;
-            }
-            continue;
-        }
-        out.push(token.clone());
+    // Parse global options first so a global option's value (e.g. `-C clone`) is
+    // not mistaken for the subcommand.
+    let parsed = parse_git_cli_args(git_invocation_tokens(argv));
+    if parsed.command.as_deref() == Some(command) {
+        parsed.command_args
+    } else {
+        Vec::new()
     }
-    out
 }
 
 fn clone_init_positionals(args: &[String]) -> Vec<String> {
@@ -615,7 +610,9 @@ fn takes_value(arg: &str) -> bool {
     matches!(
         arg,
         "-b" | "--branch"
+            | "-o"
             | "--origin"
+            | "-u"
             | "--upload-pack"
             | "--template"
             | "--separate-git-dir"
@@ -624,6 +621,9 @@ fn takes_value(arg: &str) -> bool {
             | "-c"
             | "--config"
             | "--object-format"
+            | "--ref-format"
+            | "--revision"
+            | "--initial-branch"
             | "--depth"
             | "--shallow-since"
             | "--shallow-exclude"
@@ -741,13 +741,10 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
-    // --- Bug: `takes_value` is incomplete — options like --depth, -j, -c are not listed.
-    // When `git clone --depth 1 <url>` is parsed, "1" is treated as a positional arg and
-    // the URL ends up as positional[1] (the "target directory"), triggering the error:
+    // --- Regression: value-taking options must consume their value. Before `--depth`,
+    // `-j` and `-c` were listed in `takes_value`, `git clone --depth 1 <url>` parsed "1"
+    // as the repository and the URL as the target directory, triggering:
     //   "failed to resolve clone/init target family from filesystem: <url>"
-    //
-    // These tests pin the CORRECT behaviour (URL-derived name as the only positional)
-    // and will FAIL until `takes_value` includes those options.
 
     #[test]
     fn clone_positionals_skips_value_for_depth_flag() {
