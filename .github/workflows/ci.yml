@@ -6,6 +6,9 @@ name: CI
 #
 # Deliberately just `cargo check`: fast enough to gate every PR, and it
 # compiles the lib, bins, tests, and benches without running anything.
+#
+# Plus one Windows job for install.ps1, which users run as `irm <url> | iex`
+# under Windows PowerShell 5.1 or PowerShell 7 (issues #9 and #11).
 
 on:
   pull_request:
@@ -35,3 +38,46 @@ jobs:
 
       - name: Check (lib, bins, tests, benches)
         run: cargo check --locked --all-targets
+
+  windows-installer:
+    name: install.ps1 (Windows PowerShell 5.1 + pwsh)
+    runs-on: blacksmith-4vcpu-windows-2025
+    env:
+      # Don't count CI runs as installs.
+      AUTTER_NO_INSTALL_PING: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pure ASCII, AST parse with this engine's parser, and no constructs that
+      # break under iex (exit, top-level param(), $PSScriptRoot, unwrapped body).
+      # 5.1's parser is the one that rejects PowerShell 7-only syntax.
+      - name: Static checks (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
+            throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          }
+          & ./scripts/check-install-ps1.ps1
+          exit $LASTEXITCODE
+
+      - name: Static checks (pwsh)
+        shell: pwsh
+        run: |
+          & ./scripts/check-install-ps1.ps1
+          exit $LASTEXITCODE
+
+      # Runs `Get-Content -Raw install.ps1 | iex` dot-sourced into the step's
+      # session, exactly like a user's shell: installs the latest published
+      # release through the normal checksum-verified download path, then
+      # asserts `autter --version` resolves in the same session (PATH refresh),
+      # a failing install throws instead of exiting the shell, and no
+      # StrictMode/preferences/functions leak into the caller.
+      - name: End-to-end irm | iex install (Windows PowerShell 5.1)
+        shell: powershell
+        run: . ./scripts/test-install-ps1-iex.ps1
+
+      # Same under PowerShell 7, as a reinstall over the 5.1 install above.
+      - name: End-to-end irm | iex reinstall (pwsh)
+        shell: pwsh
+        run: . ./scripts/test-install-ps1-iex.ps1
