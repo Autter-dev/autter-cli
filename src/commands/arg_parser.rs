@@ -566,9 +566,17 @@ autter onboard [options]
 
   Set up Autter (connect to the platform or run local).
 
-  --connect   Connect to the Autter platform (runs login)
-  --local     Use local-only mode (no uploads)
-  --force     Re-run onboarding even if already completed",
+  --connect         Connect to the Autter platform (runs login)
+  --local           Use local-only mode (no uploads)
+  --force           Re-run onboarding even if already completed
+  --yes, -y         Install system integrations (IDE/agent hooks, global git
+                    trace2 settings, background service) without asking
+  --telemetry       Enable anonymous telemetry without asking
+  --no-telemetry    Disable anonymous telemetry without asking
+
+  Choosing a mode never changes system configuration on its own. Without
+  --yes, onboarding asks first in a terminal and skips the integrations in
+  non-interactive runs (install them later with `autter install --system`).",
     },
     HelpEntry {
         name: "login",

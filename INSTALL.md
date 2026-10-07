@@ -138,7 +138,9 @@ In local-only mode:
 - line-level attribution is stored in local Git notes under `refs/notes/ai`;
 - prompts remain in local storage on your machine;
 - local commands such as `autter blame` and `autter stats` continue to work; and
-- no code, prompts, or agent usage data is uploaded to the Autter platform.
+- no code, prompts, or agent usage data is uploaded to the Autter platform, even if this machine is signed in.
+
+Choosing a mode does not change system configuration by itself. In a terminal, onboarding asks before it installs IDE/agent hooks, writes global git trace2 settings, or starts the background service. In scripts, add `--yes` to consent to those changes up front (for example `autter onboard --local --yes`); without it a non-interactive run leaves them off, and you can apply them later with `autter install --system`.
 
 Open source error and exception telemetry is enabled by default. If you want Autter to send no telemetry at all, turn it off:
 

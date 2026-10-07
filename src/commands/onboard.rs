@@ -25,6 +25,10 @@
 //! `--telemetry`/`--no-telemetry` drive scripted installs, and with no flags
 //! the flow defers itself until the user has a real terminal.
 //!
+//! Choosing a mode is not consent to change system configuration. IDE/agent
+//! hooks, global git trace2 settings and the background service are applied
+//! only after an interactive "yes", or with an explicit `--yes`.
+//!
 //! Note: the full authorship-note → Postgres dual-write (keeping local git
 //! notes while also uploading the note itself) is delivered alongside the
 //! in-repo backend. Today, connected mode keeps local git notes and uploads
@@ -52,9 +56,12 @@ pub fn handle_onboard(args: &[String]) {
         return;
     }
 
-    let force = args.iter().any(|a| a == "--force" || a == "-f");
-    let choose_connect = args.iter().any(|a| a == "--connect");
-    let choose_local = args.iter().any(|a| a == "--local");
+    let OnboardFlags {
+        force,
+        choose_connect,
+        choose_local,
+        assume_yes,
+    } = OnboardFlags::parse(args);
     // Non-interactive telemetry overrides (for scripted installs).
     let telemetry_flag = if args.iter().any(|a| a == "--telemetry") {
         Some(true)
@@ -109,8 +116,9 @@ pub fn handle_onboard(args: &[String]) {
     let telemetry_enabled = configure_telemetry(&mut file_config, telemetry_flag);
 
     // System integrations (IDE hooks, global git trace2, daemon) require
-    // explicit consent — they are no longer applied by npm postinstall.
-    apply_system_integrations_with_consent(choose_connect || choose_local || force);
+    // explicit consent. Picking a mode (`--local`/`--connect`) or re-running
+    // (`--force`) is not consent; only an interactive "yes" or `--yes` is.
+    let _integrations_applied = apply_system_integrations_with_consent(assume_yes);
 
     // After connect: offer to keep or discard any pre-login upload backlog.
     if file_config.prompt_storage.as_deref() != Some("local") {
@@ -124,7 +132,9 @@ pub fn handle_onboard(args: &[String]) {
 
     // The background service is what persists authorship notes, and it may
     // have been started under the previous mode's config. Restart it so the
-    // new notes backend / prompt storage take effect immediately.
+    // new notes backend / prompt storage take effect immediately. A service
+    // that is not running is left alone: starting it is a system integration
+    // that needs consent (installing integrations above starts it).
     restart_daemon_for_mode_change();
 
     // Reflect the mode actually configured: a connect attempt can fall back
@@ -139,9 +149,11 @@ pub fn handle_onboard(args: &[String]) {
     }
 }
 
-/// Restart the daemon so it re-reads the freshly-saved mode config. Skipped in
-/// test harnesses, which manage their own daemon lifecycle. Best-effort: a
-/// failed restart must not fail onboarding.
+/// Restart an already-running daemon so it re-reads the freshly-saved mode
+/// config. Never starts a daemon that is not running: starting the background
+/// service is a system integration that needs consent. Skipped in test
+/// harnesses, which manage their own daemon lifecycle. Best-effort: a failed
+/// restart must not fail onboarding.
 fn restart_daemon_for_mode_change() {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
         return;
@@ -150,6 +162,9 @@ fn restart_daemon_for_mode_change() {
     let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
         return;
     };
+    if !crate::commands::daemon::daemon_is_up(&daemon_config) {
+        return;
+    }
 
     if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
         eprintln!("Warning: could not restart the background service: {e}");
@@ -421,49 +436,101 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
 }
 
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
-/// Non-interactive `--local` / `--connect` / `--force` flows apply system
-/// integrations automatically (scripted installs already opted in by flag).
-fn apply_system_integrations_with_consent(auto_apply: bool) {
+/// Returns whether the integrations were installed.
+///
+/// Only `assume_yes` (`--yes`) applies them without asking. Interactive runs
+/// ask; non-interactive runs without `--yes` leave them off.
+fn apply_system_integrations_with_consent(assume_yes: bool) -> bool {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
+        return false;
     }
 
-    let apply = if auto_apply {
-        true
-    } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        eprintln!();
-        eprintln!("{BOLD}System integrations{RESET}");
-        eprintln!("  Autter can install IDE/agent hooks, write git trace2 settings, and start a");
-        eprintln!("  background service so terminal commits get authorship notes.");
-        eprintln!();
-        let items = [
-            SelectItem::new(
-                "Yes — install hooks, configure git, and start the background service",
-                "Required for attribution on terminal commits and AI editor sessions.",
-            ),
-            SelectItem::new(
-                "Not now — I'll run `autter install --system` later",
-                "Binary stays installed; attribution will not capture until you opt in.",
-            ),
-        ];
-        matches!(ui::select("Install system integrations?", &items, 0), 0)
-    } else {
-        // Non-interactive without flags: leave integrations off.
-        eprintln!(
-            "Skipping system integrations (non-interactive). Run `autter onboard` or `autter install --system` later."
-        );
-        false
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let apply = match integration_decision(assume_yes, interactive) {
+        IntegrationDecision::Apply => true,
+        IntegrationDecision::Ask => {
+            eprintln!();
+            eprintln!("{BOLD}System integrations{RESET}");
+            eprintln!(
+                "  Autter can install IDE/agent hooks, write git trace2 settings, and start a"
+            );
+            eprintln!("  background service so terminal commits get authorship notes.");
+            eprintln!();
+            let items = [
+                SelectItem::new(
+                    "Yes — install hooks, configure git, and start the background service",
+                    "Required for attribution on terminal commits and AI editor sessions.",
+                ),
+                SelectItem::new(
+                    "Not now — I'll run `autter install --system` later",
+                    "Binary stays installed; attribution will not capture until you opt in.",
+                ),
+            ];
+            matches!(ui::select("Install system integrations?", &items, 0), 0)
+        }
+        IntegrationDecision::Skip => {
+            // Non-interactive without `--yes`: leave integrations off.
+            eprintln!(
+                "Skipping system integrations (non-interactive, no --yes). Run `autter install --system` to install them."
+            );
+            false
+        }
     };
 
     if !apply {
-        return;
+        return false;
     }
 
     eprintln!();
     eprintln!("Installing IDE/agent hooks…");
     match crate::commands::install_hooks::run(&["--system".to_string()]) {
-        Ok(_) => {}
-        Err(e) => eprintln!("Warning: could not install hooks: {e}"),
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("Warning: could not install hooks: {e}");
+            false
+        }
+    }
+}
+
+/// Parsed `autter onboard` flags.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OnboardFlags {
+    /// `--force`/`-f`: re-run onboarding even if it was completed.
+    force: bool,
+    choose_connect: bool,
+    choose_local: bool,
+    /// `--yes`/`-y`: consent to system integrations without a prompt. The
+    /// only flag that counts as consent.
+    assume_yes: bool,
+}
+
+impl OnboardFlags {
+    fn parse(args: &[String]) -> Self {
+        Self {
+            force: args.iter().any(|a| a == "--force" || a == "-f"),
+            choose_connect: args.iter().any(|a| a == "--connect"),
+            choose_local: args.iter().any(|a| a == "--local"),
+            assume_yes: args.iter().any(|a| a == "--yes" || a == "-y"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IntegrationDecision {
+    Apply,
+    Ask,
+    Skip,
+}
+
+/// Whether to install system integrations: only explicit consent applies
+/// them; otherwise ask when there is a terminal, and skip when there is not.
+fn integration_decision(assume_yes: bool, interactive: bool) -> IntegrationDecision {
+    if assume_yes {
+        IntegrationDecision::Apply
+    } else if interactive {
+        IntegrationDecision::Ask
+    } else {
+        IntegrationDecision::Skip
     }
 }
 
@@ -534,6 +601,42 @@ mod tests {
 
     fn args(flags: &[&str]) -> Vec<String> {
         flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn choosing_a_mode_is_not_consent_to_system_integrations() {
+        for flags in [
+            &["--local"][..],
+            &["--connect"][..],
+            &["--force"][..],
+            &["--local", "--force"][..],
+            &["--connect", "--telemetry"][..],
+        ] {
+            let parsed = OnboardFlags::parse(&args(flags));
+            assert!(!parsed.assume_yes, "{flags:?} must not imply consent");
+            assert_eq!(
+                integration_decision(parsed.assume_yes, false),
+                IntegrationDecision::Skip,
+                "non-interactive {flags:?} must leave integrations off"
+            );
+            assert_eq!(
+                integration_decision(parsed.assume_yes, true),
+                IntegrationDecision::Ask,
+                "interactive {flags:?} must ask"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_yes_applies_system_integrations() {
+        for flags in [&["--local", "--yes"][..], &["--connect", "-y"][..]] {
+            let parsed = OnboardFlags::parse(&args(flags));
+            assert!(parsed.assume_yes);
+            assert_eq!(
+                integration_decision(parsed.assume_yes, false),
+                IntegrationDecision::Apply
+            );
+        }
     }
 
     #[test]
