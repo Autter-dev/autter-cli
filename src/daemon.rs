@@ -8,8 +8,8 @@ use crate::git::cli_parser::{
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
-    HeadState, common_dir_for_worktree, git_dir_for_worktree, latest_reflog_old_oid_for_worktree,
-    read_head_state_for_worktree, read_ref_oid_for_worktree,
+    HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
+    latest_reflog_old_oid_for_worktree, read_head_state_for_worktree, read_ref_oid_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -344,7 +344,19 @@ fn is_trace_payload(payload: &Value) -> bool {
 ///   "not a git repository".
 /// - on Windows the directory read fails before git runs: an `IoError` with a
 ///   not-found kind ("The system cannot find the path specified").
-fn is_missing_working_dir_error(error: &AutterError) -> bool {
+///
+/// git reports the race in more shapes than these (for example `git diff` exits
+/// 1 with "Could not access <oid>" when the objects are already gone). So any
+/// git or IO failure also counts when the command's repository is no longer on
+/// disk.
+fn is_missing_working_dir_error(error: &AutterError, worktree: Option<&Path>) -> bool {
+    if matches!(
+        error,
+        AutterError::GitCliError { .. } | AutterError::IoError(_)
+    ) && worktree.is_some_and(repository_is_gone)
+    {
+        return true;
+    }
     match error {
         AutterError::GitCliError {
             code: Some(128),
@@ -356,6 +368,30 @@ fn is_missing_working_dir_error(error: &AutterError) -> bool {
         AutterError::IoError(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
+}
+
+/// Returns true when the worktree, its git dir, or its object store no longer
+/// exists.
+fn repository_is_gone(worktree: &Path) -> bool {
+    if !worktree.is_dir() {
+        return true;
+    }
+    let dot_git = worktree.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        match git_dir_for_worktree(worktree) {
+            Some(git_dir) => git_dir,
+            None => return false,
+        }
+    } else if worktree.join("HEAD").is_file() {
+        worktree.to_path_buf()
+    } else {
+        // A subdirectory of a live repo is not a vanished repo.
+        return worktree_root_for_path(worktree).is_none();
+    };
+    let common_dir = common_dir_for_git_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+    !git_dir.join("HEAD").is_file() || !common_dir.join("objects").is_dir()
 }
 
 fn trace_root_sid(sid: &str) -> &str {
@@ -4275,6 +4311,13 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    fn inflight_family_effects(&self, family: &str) -> usize {
+        self.inflight_effects_by_family
+            .lock()
+            .map(|map| map.get(family).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     /// Garbage-collect empty or idle entries from per-family and per-root maps
     /// to prevent unbounded memory growth in long-running daemon processes.
     fn gc_stale_family_state(&self) {
@@ -7216,12 +7259,14 @@ impl ActorDaemonCoordinator {
             .maybe_apply_side_effects_for_applied_command_inner(family, applied)
             .await
         {
-            // A working directory that vanished mid-operation (e.g. a temp repo
-            // cleaned up while this async side effect was still in flight) makes
-            // git commands fail with exit 128 / "No such file or directory".
-            // That is a benign race, not a real fault, so skip quietly instead
-            // of surfacing a reported "command side effect failed" error.
-            Err(error) if is_missing_working_dir_error(&error) => {
+            // A repository that vanished mid-operation (e.g. a temp repo cleaned
+            // up while this async side effect was still in flight) makes git
+            // commands fail. That is a benign race, not a real fault, so skip
+            // quietly instead of surfacing a reported "command side effect
+            // failed" error.
+            Err(error)
+                if is_missing_working_dir_error(&error, applied.command.worktree.as_deref()) =>
+            {
                 tracing::debug!(
                     %error,
                     ?family,
@@ -7834,6 +7879,7 @@ impl ActorDaemonCoordinator {
             last_error: status
                 .last_error
                 .or_else(|| self.latest_side_effect_error(&family_key).ok().flatten()),
+            inflight_effects: self.inflight_family_effects(&family_key),
         })
     }
 
@@ -9291,7 +9337,7 @@ mod tests {
                 .to_string(),
             args: vec!["ls-tree".to_string(), "HEAD".to_string()],
         };
-        assert!(is_missing_working_dir_error(&error));
+        assert!(is_missing_working_dir_error(&error, None));
     }
 
     #[test]
@@ -9305,7 +9351,7 @@ mod tests {
                 .to_string(),
             args: vec!["ls-tree".to_string(), "-r".to_string()],
         };
-        assert!(is_missing_working_dir_error(&error));
+        assert!(is_missing_working_dir_error(&error, None));
     }
 
     #[test]
@@ -9317,7 +9363,7 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "The system cannot find the path specified. (os error 3)",
         ));
-        assert!(is_missing_working_dir_error(&error));
+        assert!(is_missing_working_dir_error(&error, None));
     }
 
     #[test]
@@ -9328,7 +9374,7 @@ mod tests {
             stderr: "fatal: not a valid object name HEAD".to_string(),
             args: vec!["ls-tree".to_string(), "HEAD".to_string()],
         };
-        assert!(!is_missing_working_dir_error(&bad_object));
+        assert!(!is_missing_working_dir_error(&bad_object, None));
 
         // Wrong exit code, even with matching stderr text.
         let other_code = AutterError::GitCliError {
@@ -9336,19 +9382,75 @@ mod tests {
             stderr: "No such file or directory".to_string(),
             args: vec![],
         };
-        assert!(!is_missing_working_dir_error(&other_code));
+        assert!(!is_missing_working_dir_error(&other_code, None));
 
         // An IoError with a different kind is a real fault, not a vanished dir.
         let permission_denied = AutterError::IoError(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "access denied",
         ));
-        assert!(!is_missing_working_dir_error(&permission_denied));
+        assert!(!is_missing_working_dir_error(&permission_denied, None));
 
         // Non-git errors never qualify.
-        assert!(!is_missing_working_dir_error(&AutterError::Generic(
-            "No such file or directory".to_string()
-        )));
+        assert!(!is_missing_working_dir_error(
+            &AutterError::Generic("No such file or directory".to_string()),
+            None
+        ));
+    }
+
+    fn init_fake_repo(worktree: &Path) {
+        fs::create_dir_all(worktree.join(".git").join("objects")).unwrap();
+        fs::write(worktree.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn missing_working_dir_error_detects_any_git_failure_once_repo_is_gone() {
+        // `git diff` exits 1 with "Could not access <oid>" when the repo is
+        // deleted while the post-commit side effect runs.
+        let could_not_access = AutterError::GitCliError {
+            code: Some(1),
+            stderr: "error: Could not access '0123456789abcdef0123456789abcdef01234567'"
+                .to_string(),
+            args: vec!["diff".to_string()],
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        init_fake_repo(&worktree);
+
+        assert!(!is_missing_working_dir_error(
+            &could_not_access,
+            Some(&worktree)
+        ));
+
+        fs::remove_dir_all(worktree.join(".git").join("objects")).unwrap();
+        assert!(is_missing_working_dir_error(
+            &could_not_access,
+            Some(&worktree)
+        ));
+
+        fs::remove_dir_all(&worktree).unwrap();
+        assert!(is_missing_working_dir_error(
+            &could_not_access,
+            Some(&worktree)
+        ));
+
+        // Non-git errors never qualify, even when the repo is gone.
+        assert!(!is_missing_working_dir_error(
+            &AutterError::Generic("boom".to_string()),
+            Some(&worktree)
+        ));
+    }
+
+    #[test]
+    fn repository_is_gone_keeps_subdirectory_of_live_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        init_fake_repo(&worktree);
+        let subdir = worktree.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+
+        assert!(!repository_is_gone(&worktree));
+        assert!(!repository_is_gone(&subdir));
     }
 
     struct EnvVarGuard {

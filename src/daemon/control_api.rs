@@ -111,6 +111,10 @@ pub struct FamilyStatus {
     pub family_key: String,
     pub latest_seq: u64,
     pub last_error: Option<String>,
+    /// Side effects that are still running for this family. Older daemons do
+    /// not send this field, so it reads as 0.
+    #[serde(default)]
+    pub inflight_effects: usize,
 }
 
 /// A telemetry envelope sent from client to daemon.
