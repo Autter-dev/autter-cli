@@ -41,13 +41,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 // reports. Keep them to concrete next commands a stuck user can run without
 // support.
 const REMEDIATION_DAEMON_PATHS: &str = "check that your home directory is set and writable (HOME on macOS/Linux, USERPROFILE on Windows), then re-run `autter doctor`";
-const REMEDIATION_DAEMON_FAILED: &str = "run `autter daemon status` for details, then `autter daemon restart`; if it keeps failing, re-run `autter install --system` and then `autter doctor`";
+const REMEDIATION_DAEMON_FAILED: &str = concat!(
+    "run `",
+    crate::commands::daemon::restart_command!(),
+    "`; if it keeps failing, re-run `autter install --system` and then `autter doctor`"
+);
+const REMEDIATION_TRACE2_INGESTION: &str = concat!(
+    "if a trace2 config check below failed, run `autter install --system`; otherwise run `",
+    crate::commands::daemon::restart_command!(),
+    "`, then `autter doctor`"
+);
 const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter doctor`";
 const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install --system` (or `autter onboard`) to write the required trace2 settings to your global git config, then re-run `autter doctor`";
 const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter doctor`; if the trace2 config check also failed, run `autter install --system`";
 
 /// Fallback when the attribution self-check fails for an unrecognized reason.
-const REMEDIATION_ATTRIBUTION_FALLBACK: &str = "likely cause: the checkpoint → daemon → commit → notes pipeline is broken end-to-end. next: run `autter daemon restart`, then `autter doctor`; if any trace2 check also failed, run `autter install --system` first";
+const REMEDIATION_ATTRIBUTION_FALLBACK: &str = "likely cause: the checkpoint → daemon → commit → notes pipeline is broken end-to-end. next: run `autter bg restart`, then `autter doctor`; if any trace2 check also failed, run `autter install --system` first";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticStatus {
@@ -162,9 +171,16 @@ impl GitDiagnosticTarget {
     }
 }
 
-pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticCheckResult {
-    let mut commands = Vec::new();
-    let mut details = Vec::new();
+/// Doctor/debug readiness for the background service.
+///
+/// The verdict comes from [`crate::commands::daemon::probe_daemon_health`],
+/// the same probe `autter bg status` reports, so the two commands agree. Like
+/// before, this also fixes what it can: a stopped service is started and an
+/// unresponsive or outdated one restarted, and the result is re-probed.
+pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
+    use crate::commands::daemon::{DaemonHealthState, probe_daemon_health};
+
+    let commands = Vec::new();
     let config = match crate::daemon::DaemonConfig::from_env_or_default_paths() {
         Ok(config) => config,
         Err(err) => {
@@ -177,75 +193,83 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
         }
     };
 
-    details.push(format!(
-        "control socket: {}",
-        config.control_socket_path.display()
-    ));
-    details.push(format!(
-        "trace2 socket: {}",
-        config.trace_socket_path.display()
-    ));
-    details.push(format!("lock: {}", config.lock_path.display()));
+    let initial = probe_daemon_health(&config);
+    let mut details = initial.details(&config);
+    details.push(format!("initial state: {}", initial.summary));
 
-    let initially_up = crate::commands::daemon::daemon_is_up(&config);
-    details.push(format!("initial daemon running: {}", initially_up));
-
-    let mut restarted = false;
-    if initially_up && daemon_binary_is_stale(&config).unwrap_or(false) {
-        details.push("running daemon was started before the current autter binary was written; restarting daemon".to_string());
-        if let Err(err) = crate::commands::daemon::restart_daemon(&config) {
-            details.push(format!("restart failed: {}", err));
-            return DiagnosticCheckResult::failed(
-                "daemon readiness check failed",
-                details,
-                commands,
-            )
-            .with_remediation(REMEDIATION_DAEMON_FAILED);
-        }
-        restarted = true;
-    } else if !initially_up {
-        details.push("daemon was not running; starting daemon".to_string());
-        if let Err(err) = crate::commands::daemon::ensure_daemon_running(DEBUG_CHECK_TIMEOUT) {
-            details.push(format!("start failed: {}", err));
-            return DiagnosticCheckResult::failed(
-                "daemon readiness check failed",
-                details,
-                commands,
-            )
-            .with_remediation(REMEDIATION_DAEMON_FAILED);
+    let fix = match initial.state {
+        DaemonHealthState::Healthy => None,
+        DaemonHealthState::NotRunning => Some((
+            "starting the background service",
+            crate::commands::daemon::ensure_daemon_running(DEBUG_CHECK_TIMEOUT).map(|_| ()),
+        )),
+        DaemonHealthState::Outdated | DaemonHealthState::Unresponsive => Some((
+            "restarting the background service",
+            crate::commands::daemon::restart_daemon(&config),
+        )),
+    };
+    if let Some((action, result)) = fix {
+        details.push(format!("doctor fix: {action}"));
+        if let Err(err) = result {
+            details.push(format!("fix failed: {err}"));
         }
     }
-    // Fresh budget for the ingestion probe (warm daemon included).
-    let probe_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
 
-    match run_daemon_trace2_ingestion_probe(&mut commands, git_program, &config, probe_deadline) {
+    let health = if initial.is_healthy() {
+        initial
+    } else {
+        let after = probe_daemon_health(&config);
+        details.push(format!("state after fix: {}", after.summary));
+        after
+    };
+
+    if health.is_healthy() {
+        DiagnosticCheckResult::passed(&health.summary, details, commands)
+    } else {
+        DiagnosticCheckResult::failed(&health.summary, details, commands)
+            .with_remediation(REMEDIATION_DAEMON_FAILED)
+    }
+}
+
+/// End-to-end trace2 ingestion: a real `git init` must reach the background
+/// service through the global trace2 config. Separate from service health on
+/// purpose: a healthy service with missing trace2 config used to fail the
+/// "background service" check and suggest a restart that could not help.
+pub fn check_daemon_trace2_ingestion(git_program: &str) -> DiagnosticCheckResult {
+    let mut commands = Vec::new();
+    let mut details = Vec::new();
+    let config = match crate::daemon::DaemonConfig::from_env_or_default_paths() {
+        Ok(config) => config,
+        Err(err) => {
+            return DiagnosticCheckResult::failed(
+                "trace2 ingestion could not be inspected",
+                vec![format!("failed to determine daemon paths: {}", err)],
+                commands,
+            )
+            .with_remediation(REMEDIATION_DAEMON_PATHS);
+        }
+    };
+
+    match run_daemon_trace2_ingestion_probe(
+        &mut commands,
+        git_program,
+        &config,
+        Instant::now() + DEBUG_CHECK_TIMEOUT,
+    ) {
         Ok(mut probe_details) => {
             details.append(&mut probe_details);
-            details.push(format!("daemon restarted: {}", restarted));
             DiagnosticCheckResult::passed(
-                "daemon is ready for debug self-checks",
+                "background service is ingesting git trace2 events",
                 details,
                 commands,
             )
         }
-        Err(first_err) if !restarted => {
-            details.push(format!(
-                "initial trace2 daemon ingestion probe failed: {}",
-                first_err
-            ));
-            details
-                .push("restarting daemon and retrying trace2 daemon ingestion probe".to_string());
-            if let Err(restart_err) = crate::commands::daemon::restart_daemon(&config) {
-                details.push(format!("restart failed: {}", restart_err));
-                return DiagnosticCheckResult::failed(
-                    "daemon readiness check failed",
-                    details,
-                    commands,
-                )
-                .with_remediation(REMEDIATION_DAEMON_FAILED);
+        Err(first_err) => {
+            details.push(format!("trace2 ingestion probe failed: {first_err}"));
+            details.push("restarting the background service and retrying".to_string());
+            if let Err(err) = crate::commands::daemon::restart_daemon(&config) {
+                details.push(format!("restart failed: {err}"));
             }
-            restarted = true;
-
             match run_daemon_trace2_ingestion_probe(
                 &mut commands,
                 git_program,
@@ -254,34 +278,43 @@ pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticChec
             ) {
                 Ok(mut probe_details) => {
                     details.append(&mut probe_details);
-                    details.push(format!("daemon restarted: {}", restarted));
+                    details.push("passed after restart".to_string());
                     DiagnosticCheckResult::passed(
-                        "daemon is ready for debug self-checks",
+                        "background service is ingesting git trace2 events",
                         details,
                         commands,
                     )
                 }
                 Err(retry_err) => {
-                    details.push(format!(
-                        "trace2 daemon ingestion probe failed after restart: {}",
-                        retry_err
-                    ));
-                    details.push(format!("daemon restarted: {}", restarted));
+                    details.push(format!("probe failed after restart: {retry_err}"));
                     DiagnosticCheckResult::failed(
-                        "daemon readiness check failed",
+                        "git trace2 events are not reaching the background service",
                         details,
                         commands,
                     )
-                    .with_remediation(REMEDIATION_DAEMON_FAILED)
+                    .with_remediation(REMEDIATION_TRACE2_INGESTION)
                 }
             }
         }
-        Err(err) => {
-            details.push(format!("trace2 daemon ingestion probe failed: {}", err));
-            details.push(format!("daemon restarted: {}", restarted));
-            DiagnosticCheckResult::failed("daemon readiness check failed", details, commands)
-                .with_remediation(REMEDIATION_DAEMON_FAILED)
-        }
+    }
+}
+
+/// Service readiness plus trace2 ingestion, combined for `autter debug`.
+pub fn prepare_daemon_for_debug_self_checks(git_program: &str) -> DiagnosticCheckResult {
+    let mut ready = ensure_daemon_ready_for_self_checks();
+    if ready.status != DiagnosticStatus::Passed {
+        return ready;
+    }
+    let mut ingestion = check_daemon_trace2_ingestion(git_program);
+    ready.details.append(&mut ingestion.details);
+    ready.commands.append(&mut ingestion.commands);
+    if ingestion.status == DiagnosticStatus::Passed {
+        ready.summary = "daemon is ready for debug self-checks".to_string();
+        ready
+    } else {
+        ingestion.details = ready.details;
+        ingestion.commands = ready.commands;
+        ingestion
     }
 }
 
@@ -509,7 +542,7 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
         || err_l.contains("checkpoint(s) visible")
     {
         let mut msg = String::from(
-            "likely cause: checkpoints are not persisting to the working log (daemon not draining or checkpoint write failing). next: run `autter daemon status`, then `autter daemon restart`, then re-run `autter doctor`",
+            "likely cause: checkpoints are not persisting to the working log (daemon not draining or checkpoint write failing). next: run `autter bg status`, then `autter bg restart`, then re-run `autter doctor`",
         );
         if let Some(daemon_err) = daemon_error {
             msg.push_str(&format!(" (daemon last_error: {})", daemon_err));
@@ -521,7 +554,7 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
         && (err_l.contains("command failed") || err_l.contains("command timed out"))
     {
         return String::from(
-            "likely cause: the `autter checkpoint` command itself failed or hung before writing. next: run `autter daemon restart`, then `autter doctor`; if it keeps failing, re-run `autter install --system` and check `autter debug` for the checkpoint command log",
+            "likely cause: the `autter checkpoint` command itself failed or hung before writing. next: run `autter bg restart`, then `autter doctor`; if it keeps failing, re-run `autter install --system` and check `autter debug` for the checkpoint command log",
         );
     }
 
@@ -541,7 +574,7 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
 
     if err_l.contains("blame analysis failed") {
         return String::from(
-            "likely cause: blame/notes could not be read after the self-check commit. next: run `autter install --system`, then `autter doctor`; if notes backend errors appear in the details, re-run `autter daemon restart` and try again",
+            "likely cause: blame/notes could not be read after the self-check commit. next: run `autter install --system`, then `autter doctor`; if notes backend errors appear in the details, re-run `autter bg restart` and try again",
         );
     }
 
@@ -556,13 +589,13 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
 
     if err_l.contains("timed out") && err_l.contains("before this command could start") {
         return String::from(
-            "likely cause: earlier self-check steps exhausted the time budget (often a stuck daemon). next: run `autter daemon restart`, then `autter doctor`",
+            "likely cause: earlier self-check steps exhausted the time budget (often a stuck daemon). next: run `autter bg restart`, then `autter doctor`",
         );
     }
 
     if let Some(daemon_err) = daemon_error {
         return format!(
-            "likely cause: daemon reported an error while the self-check ran ({daemon_err}). next: run `autter daemon status`, then `autter daemon restart`, then `autter doctor`; if a trace2 check also failed, run `autter install --system` first"
+            "likely cause: daemon reported an error while the self-check ran ({daemon_err}). next: run `autter bg status`, then `autter bg restart`, then `autter doctor`; if a trace2 check also failed, run `autter install --system` first"
         );
     }
 
@@ -1068,7 +1101,7 @@ fn daemon_family_status_detail(repo_path: &Path) -> String {
     }
 }
 
-fn daemon_binary_is_stale(config: &crate::daemon::DaemonConfig) -> Result<bool, String> {
+pub(crate) fn daemon_binary_is_stale(config: &crate::daemon::DaemonConfig) -> Result<bool, String> {
     let Some(started_at_ns) = read_daemon_started_at_ns(config)? else {
         return Ok(false);
     };
@@ -1614,7 +1647,7 @@ mod tests {
             msg.contains("likely cause: checkpoints are not persisting"),
             "{msg}"
         );
-        assert!(msg.contains("autter daemon restart"), "{msg}");
+        assert!(msg.contains("autter bg restart"), "{msg}");
     }
 
     #[test]

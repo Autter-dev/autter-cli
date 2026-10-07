@@ -138,20 +138,32 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     reporter.add(check_config_file());
     reporter.add(check_repository());
 
-    // Background service: readiness plus a real trace2 ingestion probe. This
-    // starts (or restarts) the daemon when needed, so it must run before the
-    // end-to-end checkpoint check.
-    let mut daemon_check = check_from_diagnostic(
+    // Background service health uses the same probe as `autter bg status`, so
+    // the two commands always agree. This starts (or restarts) the service
+    // when needed, so it must run before the end-to-end checkpoint check.
+    let daemon_check = check_from_diagnostic(
         SECTION_SERVICE,
         "background service",
-        crate::diagnostics::prepare_daemon_for_debug_self_checks(&git_cmd),
+        crate::diagnostics::ensure_daemon_ready_for_self_checks(),
     );
-    if daemon_check.status == DoctorStatus::Passed {
-        daemon_check.summary =
-            "background service is running and ingesting git trace2 events".to_string();
-    }
     let daemon_ok = daemon_check.status != DoctorStatus::Failed;
     reporter.add(daemon_check);
+
+    // Separately: do real git trace2 events reach the service? A failure here
+    // is usually missing trace2 config, not an unhealthy service.
+    if daemon_ok {
+        reporter.add(check_from_diagnostic(
+            SECTION_SERVICE,
+            "trace2 ingestion",
+            crate::diagnostics::check_daemon_trace2_ingestion(&git_cmd),
+        ));
+    } else {
+        reporter.add(skipped_check(
+            SECTION_SERVICE,
+            "trace2 ingestion",
+            "skipped -- fix the background service check first",
+        ));
+    }
 
     // Git capture: the trace2 global config every git invocation depends on,
     // checked for both the git autter runs and the git on the user's PATH.
@@ -738,7 +750,7 @@ fn check_auth() -> (DoctorCheck, bool) {
                 },
                 details,
                 remediation: Some(
-                    "run `autter login`, then `autter daemon restart` (or ignore in local-only mode)"
+                    "run `autter login`, then `autter bg restart` (or ignore in local-only mode)"
                         .to_string(),
                 ),
             },
@@ -980,10 +992,7 @@ fn check_sync_queue() -> DoctorCheck {
             summary: "queued data is not draining because cloud sync is authentication-blocked"
                 .to_string(),
             details,
-            remediation: Some(
-                "run `autter login`, then `autter daemon restart` (or `autter bg restart`)"
-                    .to_string(),
-            ),
+            remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
         }
     } else {
         DoctorCheck {

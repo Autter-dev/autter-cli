@@ -250,7 +250,7 @@ autter onboard --force
 `autter doctor` prints a `fix:` line with a likely cause and next command for each failure. Common cases:
 
 1. **Checkpoints not persisting** (timeout waiting for working-log entries):  
-   `autter daemon status`, then `autter daemon restart`, then `autter doctor`.
+   `autter bg status`, then `autter bg restart`, then `autter doctor`.
 2. **Trace2 config / event capture failed**:  
    `autter install`, then `autter doctor`. Attribution depends on the git proxy and trace2 settings.
 3. **Commit succeeded but blame lines are all untracked / wrong class**:  

@@ -168,7 +168,10 @@ fn restart_daemon_for_mode_change() {
 
     if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
         eprintln!("Warning: could not restart the background service: {e}");
-        eprintln!("  Run `autter install` to apply the new mode to the background service.");
+        eprintln!(
+            "  Run `{}` to apply the new mode to the background service.",
+            crate::commands::daemon::RESTART_COMMAND
+        );
     }
 }
 

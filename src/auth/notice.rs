@@ -434,7 +434,7 @@ fn remediation_for(attention: CloudSyncAttention) -> String {
                 .to_string()
         }
         CloudSyncAttention::DaemonNotRunning => {
-            "run `autter bg start`, then `autter doctor` to verify".to_string()
+            "run `autter bg restart`, then `autter doctor` to verify".to_string()
         }
     }
 }
@@ -580,7 +580,7 @@ fn print_sync_attention_message(attention: CloudSyncAttention, pending: PendingS
                 pending.summary(),
             );
             eprintln!(
-                "\x1b[1;33m  Fix: run \x1b[1;36mautter bg start\x1b[0m\x1b[1;33m, then \x1b[1;36mautter doctor\x1b[0m\x1b[1;33m to verify.\x1b[0m"
+                "\x1b[1;33m  Fix: run \x1b[1;36mautter bg restart\x1b[0m\x1b[1;33m, then \x1b[1;36mautter doctor\x1b[0m\x1b[1;33m to verify.\x1b[0m"
             );
         }
     }
@@ -640,7 +640,7 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
         CloudSyncState::Disabled => "off; records stay on this computer. Connect: `autter onboard`",
         CloudSyncState::AuthBlocked => "blocked; sign in with `autter login`",
         CloudSyncState::UploadFailing => "upload failed; run `autter doctor`",
-        CloudSyncState::DaemonNotRunning => "background service stopped; run `autter bg start`",
+        CloudSyncState::DaemonNotRunning => "background service stopped; run `autter bg restart`",
         CloudSyncState::Draining => "upload pending; check `autter sync status`",
         CloudSyncState::Healthy => "no queued uploads; open the dashboard with `autter sync open`",
         CloudSyncState::StatusUnavailable => "queue status unavailable; run `autter doctor`",
@@ -708,7 +708,7 @@ mod tests {
             (CloudSyncState::Disabled, "autter onboard"),
             (CloudSyncState::AuthBlocked, "autter login"),
             (CloudSyncState::UploadFailing, "autter doctor"),
-            (CloudSyncState::DaemonNotRunning, "autter bg start"),
+            (CloudSyncState::DaemonNotRunning, "autter bg restart"),
             (CloudSyncState::StatusUnavailable, "autter doctor"),
         ] {
             assert!(format_sync_report(&status_report(state)).contains(command));

@@ -64,7 +64,7 @@ fn append_capture_steps(out: &mut String) {
     out.push_str("  autter install-hooks    # wire up agent and editor hooks\n");
     out.push_str("  autter install          # ensure git proxy + trace2 are configured\n");
     out.push_str("  autter doctor           # verify checkpoint → attribution round-trip\n");
-    out.push_str("  autter daemon restart    # if doctor says checkpoints are not persisting\n");
+    out.push_str("  autter bg restart       # if doctor says checkpoints are not persisting\n");
     out.push_str("  autter debug            # full support dump if doctor still fails\n");
 }
 
@@ -76,7 +76,7 @@ mod tests {
     fn capture_steps_point_at_doctor_and_daemon() {
         let footer = diff_missing_data_footer();
         assert!(footer.contains("autter doctor"), "{footer}");
-        assert!(footer.contains("autter daemon restart"), "{footer}");
+        assert!(footer.contains("autter bg restart"), "{footer}");
         assert!(footer.contains("Likely cause:"), "{footer}");
         assert!(footer.contains("autter install-hooks"), "{footer}");
     }

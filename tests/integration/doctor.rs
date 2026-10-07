@@ -61,6 +61,7 @@ fn doctor_validates_checkpoint_round_trip_end_to_end() {
         "configuration file",
         "repository",
         "background service",
+        "trace2 ingestion",
         "trace2 config (configured git)",
         "trace2 config (terminal git)",
         "trace2 event capture",
@@ -129,6 +130,32 @@ fn doctor_validates_checkpoint_round_trip_end_to_end() {
     );
     assert_eq!(report["ok"].as_bool().unwrap(), failed == 0, "{}", raw);
     assert_eq!(exited_zero, failed == 0, "{}", raw);
+}
+
+/// `autter doctor` and `autter bg status` share one health probe, so they
+/// must reach the same verdict about the background service.
+#[test]
+fn doctor_and_bg_status_agree_on_service_health() {
+    let repo = TestRepo::new();
+    write_trace2_global_config(&repo);
+
+    let raw_status = repo
+        .autter(&["bg", "status"])
+        .expect("bg status should succeed for a running service");
+    let start = raw_status.find('{').expect("bg status prints JSON");
+    let end = raw_status.rfind('}').expect("bg status prints JSON");
+    let status: serde_json::Value =
+        serde_json::from_str(&raw_status[start..=end]).expect("valid bg status JSON");
+    assert_eq!(status["health"]["state"], "healthy", "{raw_status}");
+    assert_eq!(status["ok"], true, "{raw_status}");
+
+    let raw = repo
+        .autter(&["doctor", "--json"])
+        .unwrap_or_else(|output| output);
+    let report = parse_doctor_json(&raw);
+    let service = check(&report, "background service");
+    assert_eq!(service["status"], "passed", "{raw}");
+    assert_eq!(service["summary"], "background service is running", "{raw}");
 }
 
 #[test]
