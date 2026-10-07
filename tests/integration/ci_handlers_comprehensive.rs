@@ -564,6 +564,109 @@ fn test_github_workflow_file_creation() {
     assert!(workflow_file.exists());
 }
 
+// ==============================================================================
+// `--help` must never have side effects
+// ==============================================================================
+
+fn workflow_path(repo: &TestRepo) -> std::path::PathBuf {
+    repo.path()
+        .join(".github")
+        .join("workflows")
+        .join("autter.yaml")
+}
+
+#[test]
+fn test_ci_github_install_help_writes_no_workflow() {
+    let repo = TestRepo::new();
+    for help in ["--help", "-h"] {
+        let output = repo
+            .autter(&["ci", "github", "install", help])
+            .unwrap_or_else(|e| panic!("ci github install {help} should exit 0: {e}"));
+        assert!(
+            output.contains("autter ci github install"),
+            "should print install help for {help}: {output}"
+        );
+        assert!(
+            !workflow_path(&repo).exists(),
+            "`ci github install {help}` must not write the workflow file"
+        );
+        assert!(
+            !repo.path().join(".github").exists(),
+            "`ci github install {help}` must not create .github/"
+        );
+    }
+}
+
+#[test]
+fn test_ci_github_install_without_help_still_writes_workflow() {
+    // Control: the real install path still works.
+    let repo = TestRepo::new();
+    repo.autter(&["ci", "github", "install"])
+        .expect("ci github install should succeed");
+    assert!(workflow_path(&repo).exists());
+}
+
+#[test]
+fn test_ci_github_help_prints_github_help() {
+    let repo = TestRepo::new();
+    for args in [
+        &["ci", "github", "--help"][..],
+        &["ci", "github", "-h"][..],
+        &["ci", "github", "help"][..],
+    ] {
+        let output = repo
+            .autter(args)
+            .unwrap_or_else(|e| panic!("{args:?} should exit 0: {e}"));
+        assert!(
+            output.contains("autter ci github - GitHub CI utilities"),
+            "{args:?} should print the github help: {output}"
+        );
+        assert!(
+            !output.contains("Unknown ci github subcommand"),
+            "{args:?}: {output}"
+        );
+    }
+}
+
+#[test]
+fn test_ci_gitlab_and_local_help_have_no_side_effects() {
+    let repo = TestRepo::new();
+    let output = repo
+        .autter(&["ci", "gitlab", "install", "--help"])
+        .expect("ci gitlab install --help should exit 0");
+    assert!(output.contains("autter ci gitlab install"), "{output}");
+    assert!(
+        !output.contains("Add the following to your .gitlab-ci.yml"),
+        "help must not print the YAML snippet: {output}"
+    );
+
+    let output = repo
+        .autter(&["ci", "gitlab", "--help"])
+        .expect("ci gitlab --help should exit 0");
+    assert!(
+        output.contains("autter ci gitlab - GitLab CI utilities"),
+        "{output}"
+    );
+
+    // `ci local merge --help` must print help, not complain about missing
+    // required flags or touch the repository.
+    let head_before = repo.git(&["rev-parse", "HEAD"]).ok();
+    let output = repo
+        .autter(&["ci", "local", "merge", "--help"])
+        .expect("ci local merge --help should exit 0");
+    assert!(output.contains("autter ci local"), "{output}");
+    assert!(!output.contains("is required"), "{output}");
+    assert_eq!(repo.git(&["rev-parse", "HEAD"]).ok(), head_before);
+
+    let output = repo
+        .autter(&["ci", "--help"])
+        .expect("ci --help should exit 0");
+    assert!(
+        output.contains("autter ci - Continuous integration utilities"),
+        "{output}"
+    );
+}
+
 #[test]
 fn test_github_workflow_path_structure() {
     let repo = TestRepo::new();

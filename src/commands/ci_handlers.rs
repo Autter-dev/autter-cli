@@ -39,9 +39,45 @@ fn print_ci_result(result: &CiRunResult, prefix: &str) {
     }
 }
 
+/// True when `arg` asks for help. `help` counts only as the first token of a
+/// (sub)command; `--help`/`-h` count in any position.
+fn is_help_flag(arg: &str) -> bool {
+    arg == "--help" || arg == "-h"
+}
+
+/// True when the args of a `ci` (sub)command ask for help anywhere. Checked
+/// before any work so `--help` never writes files, fetches, or pushes.
+fn wants_help(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a == "help") || args.iter().any(|a| is_help_flag(a))
+}
+
+/// How a help screen was reached: an explicit request prints to stdout and
+/// exits 0; a usage error prints to stderr and exits with the usage code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelpReason {
+    Requested,
+    UsageError,
+}
+
+fn print_help_and_exit(text: &str, reason: HelpReason) -> ! {
+    match reason {
+        HelpReason::Requested => {
+            print!("{text}");
+            std::process::exit(0);
+        }
+        HelpReason::UsageError => {
+            eprint!("{text}");
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        }
+    }
+}
+
 pub fn handle_ci(args: &[String]) {
     if args.is_empty() {
-        print_ci_help_and_exit();
+        print_help_and_exit(CI_HELP, HelpReason::UsageError);
+    }
+    if args[0] == "help" || is_help_flag(&args[0]) {
+        print_help_and_exit(CI_HELP, HelpReason::Requested);
     }
 
     match args[0].as_str() {
@@ -56,14 +92,22 @@ pub fn handle_ci(args: &[String]) {
         }
         _ => {
             eprintln!("Unknown ci subcommand: {}", args[0]);
-            print_ci_help_and_exit();
+            print_help_and_exit(CI_HELP, HelpReason::UsageError);
         }
     }
 }
 
 fn handle_ci_github(args: &[String]) {
     if args.is_empty() {
-        print_ci_github_help_and_exit();
+        print_help_and_exit(CI_GITHUB_HELP, HelpReason::UsageError);
+    }
+    if wants_help(args) {
+        let text = match args[0].as_str() {
+            "install" => CI_GITHUB_INSTALL_HELP,
+            "run" => CI_GITHUB_RUN_HELP,
+            _ => CI_GITHUB_HELP,
+        };
+        print_help_and_exit(text, HelpReason::Requested);
     }
     // Subcommands: install | (default: run in CI context)
     match args[0].as_str() {
@@ -119,14 +163,22 @@ fn handle_ci_github(args: &[String]) {
         },
         other => {
             eprintln!("Unknown ci github subcommand: {}", other);
-            print_ci_help_and_exit();
+            print_help_and_exit(CI_GITHUB_HELP, HelpReason::UsageError);
         }
     }
 }
 
 fn handle_ci_gitlab(args: &[String]) {
     if args.is_empty() {
-        print_ci_gitlab_help_and_exit();
+        print_help_and_exit(CI_GITLAB_HELP, HelpReason::UsageError);
+    }
+    if wants_help(args) {
+        let text = match args[0].as_str() {
+            "install" => CI_GITLAB_INSTALL_HELP,
+            "run" => CI_GITLAB_RUN_HELP,
+            _ => CI_GITLAB_HELP,
+        };
+        print_help_and_exit(text, HelpReason::Requested);
     }
     // Subcommands: install | run
     match args[0].as_str() {
@@ -173,14 +225,17 @@ fn handle_ci_gitlab(args: &[String]) {
         }
         other => {
             eprintln!("Unknown ci gitlab subcommand: {}", other);
-            print_ci_help_and_exit();
+            print_help_and_exit(CI_GITLAB_HELP, HelpReason::UsageError);
         }
     }
 }
 
 fn handle_ci_local(args: &[String]) {
     if args.is_empty() {
-        print_ci_local_help_and_exit();
+        print_help_and_exit(CI_LOCAL_HELP, HelpReason::UsageError);
+    }
+    if wants_help(args) {
+        print_help_and_exit(CI_LOCAL_HELP, HelpReason::Requested);
     }
 
     let event = args[0].as_str();
@@ -374,82 +429,126 @@ fn handle_ci_local(args: &[String]) {
         }
         other => {
             eprintln!("Unknown local CI event: {}", other);
-            print_ci_local_help_and_exit();
+            print_help_and_exit(CI_LOCAL_HELP, HelpReason::UsageError);
         }
     }
 }
 
-fn print_ci_help_and_exit() -> ! {
-    eprintln!("autter ci - Continuous integration utilities");
-    eprintln!();
-    eprintln!("Usage: autter ci <subcommand> [args...]");
-    eprintln!();
-    eprintln!("Subcommands:");
-    eprintln!("  github           GitHub CI");
-    eprintln!("    run [--no-cleanup]  Run GitHub CI in current repo");
-    eprintln!("    install        Install/update workflow in current repo");
-    eprintln!("  gitlab           GitLab CI");
-    eprintln!("    run [--no-cleanup]  Run GitLab CI in current repo");
-    eprintln!("    install        Print YAML snippet to add to .gitlab-ci.yml");
-    eprintln!("  local            Run CI locally by event name and flags");
-    eprintln!("                   Usage: autter ci local <event> [flags]");
-    eprintln!("                   Events:");
-    eprintln!(
-        "                     merge  --merge-commit-sha <sha> --base-ref <ref> --head-ref <ref> --head-sha <sha> --base-sha <sha> [--fork-clone-url <url>]"
-    );
-    eprintln!(
-        "                            [--skip-fetch-notes] [--skip-fetch-base] [--skip-fetch-fork-notes] [--skip-fetch] [--skip-push]"
-    );
-    eprintln!(
-        "                     sync   --previous-head-sha <sha> --head-sha <sha> --base-ref <ref> [--base-sha <sha>]"
-    );
-    eprintln!(
-        "                            [--remote <name-or-url>] [--skip-fetch-notes] [--skip-fetch-sync-refs] [--skip-fetch] [--skip-push]"
-    );
-    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-}
+const CI_HELP: &str = "\
+autter ci - Continuous integration utilities
 
-fn print_ci_local_help_and_exit() -> ! {
-    eprintln!("autter ci local - Run CI locally by event name and flags");
-    eprintln!();
-    eprintln!("Usage: autter ci local <event> [flags]");
-    eprintln!();
-    eprintln!("Events:");
-    eprintln!(
-        "  merge  --merge-commit-sha <sha> --base-ref <ref> --head-ref <ref> --head-sha <sha> --base-sha <sha> [--fork-clone-url <url>]"
-    );
-    eprintln!(
-        "         [--skip-fetch-notes] [--skip-fetch-base] [--skip-fetch-fork-notes] [--skip-fetch] [--skip-push]"
-    );
-    eprintln!(
-        "  sync   --previous-head-sha <sha> --head-sha <sha> --base-ref <ref> [--base-sha <sha>]"
-    );
-    eprintln!(
-        "         [--remote <name-or-url>] [--skip-fetch-notes] [--skip-fetch-sync-refs] [--skip-fetch] [--skip-push]"
-    );
-    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-}
+Usage: autter ci <subcommand> [args...]
 
-fn print_ci_github_help_and_exit() -> ! {
-    eprintln!("autter ci github - GitHub CI utilities");
-    eprintln!();
-    eprintln!("Usage: autter ci github <subcommand> [args...]");
-    eprintln!();
-    eprintln!("Subcommands:");
-    eprintln!("  run [--no-cleanup]   Run GitHub CI in current repo");
-    eprintln!("                       --no-cleanup  Skip teardown after run");
-    eprintln!("  install              Install/update workflow in current repo");
-    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-}
+Subcommands:
+  github           GitHub CI
+    run [--no-cleanup]  Run GitHub CI in current repo
+    install        Install/update workflow in current repo
+  gitlab           GitLab CI
+    run [--no-cleanup]  Run GitLab CI in current repo
+    install        Print YAML snippet to add to .gitlab-ci.yml
+  local            Run CI locally by event name and flags
+                   Usage: autter ci local <event> [flags]
+                   Events:
+                     merge  --merge-commit-sha <sha> --base-ref <ref> --head-ref <ref> --head-sha <sha> --base-sha <sha> [--fork-clone-url <url>]
+                            [--skip-fetch-notes] [--skip-fetch-base] [--skip-fetch-fork-notes] [--skip-fetch] [--skip-push]
+                     sync   --previous-head-sha <sha> --head-sha <sha> --base-ref <ref> [--base-sha <sha>]
+                            [--remote <name-or-url>] [--skip-fetch-notes] [--skip-fetch-sync-refs] [--skip-fetch] [--skip-push]
 
-fn print_ci_gitlab_help_and_exit() -> ! {
-    eprintln!("autter ci gitlab - GitLab CI utilities");
-    eprintln!();
-    eprintln!("Usage: autter ci gitlab <subcommand> [args...]");
-    eprintln!();
-    eprintln!("Subcommands:");
-    eprintln!("  run [--no-cleanup]   Run GitLab CI in current repo");
-    eprintln!("                       --no-cleanup  Skip teardown after run");
-    eprintln!("  install              Print YAML snippet to add to .gitlab-ci.yml");
-    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+Add --help to any subcommand for its help. Help never changes anything.
+";
+
+const CI_LOCAL_HELP: &str = "\
+autter ci local - Run CI locally by event name and flags
+
+Usage: autter ci local <event> [flags]
+
+Events:
+  merge  --merge-commit-sha <sha> --base-ref <ref> --head-ref <ref> --head-sha <sha> --base-sha <sha> [--fork-clone-url <url>]
+         [--skip-fetch-notes] [--skip-fetch-base] [--skip-fetch-fork-notes] [--skip-fetch] [--skip-push]
+  sync   --previous-head-sha <sha> --head-sha <sha> --base-ref <ref> [--base-sha <sha>]
+         [--remote <name-or-url>] [--skip-fetch-notes] [--skip-fetch-sync-refs] [--skip-fetch] [--skip-push]
+";
+
+const CI_GITHUB_HELP: &str = "\
+autter ci github - GitHub CI utilities
+
+Usage: autter ci github <subcommand> [args...]
+
+Subcommands:
+  run [--no-cleanup]   Run GitHub CI in current repo
+                       --no-cleanup  Skip teardown after run
+  install              Install/update workflow in current repo
+";
+
+const CI_GITHUB_RUN_HELP: &str = "\
+autter ci github run - Run GitHub CI in the current repo
+
+Usage: autter ci github run [--no-cleanup]
+
+  Rewrites authorship notes for the pull request event in the GitHub
+  Actions environment, then cleans up.
+
+  --no-cleanup   Skip teardown after the run
+";
+
+const CI_GITHUB_INSTALL_HELP: &str = "\
+autter ci github install - Install/update the GitHub Actions workflow
+
+Usage: autter ci github install
+
+  Writes .github/workflows/autter.yaml in the current repository,
+  overwriting an existing copy.
+";
+
+const CI_GITLAB_HELP: &str = "\
+autter ci gitlab - GitLab CI utilities
+
+Usage: autter ci gitlab <subcommand> [args...]
+
+Subcommands:
+  run [--no-cleanup]   Run GitLab CI in current repo
+                       --no-cleanup  Skip teardown after run
+  install              Print YAML snippet to add to .gitlab-ci.yml
+";
+
+const CI_GITLAB_RUN_HELP: &str = "\
+autter ci gitlab run - Run GitLab CI in the current repo
+
+Usage: autter ci gitlab run [--no-cleanup]
+
+  Rewrites authorship notes for the merge request in the GitLab CI
+  environment, then cleans up.
+
+  --no-cleanup   Skip teardown after the run
+";
+
+const CI_GITLAB_INSTALL_HELP: &str = "\
+autter ci gitlab install - Print the GitLab CI snippet
+
+Usage: autter ci gitlab install
+
+  Prints a YAML snippet to add to .gitlab-ci.yml. Writes no files.
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(flags: &[&str]) -> Vec<String> {
+        flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn help_is_detected_anywhere_in_subcommand_args() {
+        assert!(wants_help(&args(&["install", "--help"])));
+        assert!(wants_help(&args(&["install", "-h"])));
+        assert!(wants_help(&args(&["--help"])));
+        assert!(wants_help(&args(&["help"])));
+        assert!(wants_help(&args(&["merge", "--base-ref", "main", "-h"])));
+        assert!(!wants_help(&args(&["install"])));
+        assert!(!wants_help(&args(&["run", "--no-cleanup"])));
+        assert!(!wants_help(&args(&["run", "--helpful"])));
+        // `help` is a help request only as the subcommand itself.
+        assert!(!wants_help(&args(&["merge", "--base-ref", "help"])));
+    }
 }
