@@ -598,7 +598,25 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
         }
     }
 
-    if checks.is_empty() && !not_detected.is_empty() {
+    // Agents autter has no preset for: their edits land as untracked and
+    // blame credits the user. A warning, not a failure -- nothing is broken,
+    // but attribution for that tool is missing.
+    let unsupported = crate::mdm::unsupported_agents::detect_unsupported_agents();
+    for agent in &unsupported {
+        checks.push(DoctorCheck {
+            section: SECTION_AGENTS,
+            name: agent.name.to_string(),
+            status: DoctorStatus::Warning,
+            summary: crate::mdm::unsupported_agents::not_captured_message(agent),
+            details: vec![
+                agent.evidence.clone(),
+                "autter has no integration for this tool yet; edits made with it show as untracked in `autter stats` and as yours in `autter blame`".to_string(),
+            ],
+            remediation: None,
+        });
+    }
+
+    if checks.len() == unsupported.len() && !not_detected.is_empty() {
         checks.push(DoctorCheck {
             section: SECTION_AGENTS,
             name: "AI agents".to_string(),
