@@ -358,6 +358,14 @@ fn is_missing_working_dir_error(error: &AutterError) -> bool {
     }
 }
 
+/// Returns true when the error comes from a full disk on the host (ENOSPC on
+/// Unix, ERROR_DISK_FULL on Windows). That is an environment condition on the
+/// user's machine, not a daemon fault, so side-effect failures with this cause
+/// log at warn level and do not become error-tracking exceptions.
+fn is_storage_full_error(error: &AutterError) -> bool {
+    matches!(error, AutterError::IoError(io_error) if io_error.kind() == std::io::ErrorKind::StorageFull)
+}
+
 fn trace_root_sid(sid: &str) -> &str {
     sid.split('/').next().unwrap_or(sid)
 }
@@ -6001,12 +6009,21 @@ impl ActorDaemonCoordinator {
                         Ok(Ok((applied, side_effect_result))) => {
                             if let Err(error) = &side_effect_result {
                                 let _ = self.record_side_effect_error(family, order, error);
-                                tracing::error!(
-                                    %error,
-                                    %family,
-                                    seq = applied.seq,
-                                    "command side effect failed"
-                                );
+                                if is_storage_full_error(error) {
+                                    tracing::warn!(
+                                        %error,
+                                        %family,
+                                        seq = applied.seq,
+                                        "command side effect failed: host disk is full"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        %error,
+                                        %family,
+                                        seq = applied.seq,
+                                        "command side effect failed"
+                                    );
+                                }
                             }
                             if let Err(error) = self.append_command_completion_log(
                                 family,
@@ -7768,12 +7785,21 @@ impl ActorDaemonCoordinator {
                     let _ = self.end_family_effect(&family);
                     if let Err(error) = result {
                         let _ = self.record_side_effect_error(&family, applied.seq, &error);
-                        tracing::error!(
-                            %error,
-                            %family,
-                            seq = applied.seq,
-                            "async side-effect error"
-                        );
+                        if is_storage_full_error(&error) {
+                            tracing::warn!(
+                                %error,
+                                %family,
+                                seq = applied.seq,
+                                "async side-effect error: host disk is full"
+                            );
+                        } else {
+                            tracing::error!(
+                                %error,
+                                %family,
+                                seq = applied.seq,
+                                "async side-effect error"
+                            );
+                        }
                     } else if let Err(error) =
                         self.append_command_completion_log(&family, &applied, &Ok(()), applied.seq)
                     {
@@ -9348,6 +9374,29 @@ mod tests {
         // Non-git errors never qualify.
         assert!(!is_missing_working_dir_error(&AutterError::Generic(
             "No such file or directory".to_string()
+        )));
+    }
+
+    #[test]
+    fn storage_full_error_detects_disk_full_io_errors() {
+        let disk_full = AutterError::IoError(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "No space left on device (os error 28)",
+        ));
+        assert!(is_storage_full_error(&disk_full));
+
+        #[cfg(unix)]
+        assert!(is_storage_full_error(&AutterError::IoError(
+            std::io::Error::from_raw_os_error(28)
+        )));
+
+        let permission_denied = AutterError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        assert!(!is_storage_full_error(&permission_denied));
+        assert!(!is_storage_full_error(&AutterError::Generic(
+            "No space left on device".to_string()
         )));
     }
 
