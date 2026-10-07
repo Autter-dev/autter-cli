@@ -111,6 +111,17 @@ pub fn handle_onboard(args: &[String]) {
     let mut report = SetupReport::default();
 
     if connect {
+        // Freeze any backlog before signing in: once credentials exist the
+        // background service would start draining it, before the user has been
+        // asked about it below. Held items are never uploaded until released.
+        if let Err(e) = hold_backlog_before_connecting() {
+            report.problem(
+                format!(
+                    "Could not hold the existing upload backlog ({e}); it may upload without being reviewed"
+                ),
+                crate::upload_hold::PURGE_COMMAND,
+            );
+        }
         if let Err(e) = setup_connected(&mut file_config, logged_in) {
             report.problem(
                 format!(
@@ -138,11 +149,11 @@ pub fn handle_onboard(args: &[String]) {
 
     // After connect: offer to keep or discard any pre-login upload backlog.
     if file_config.prompt_storage.as_deref() != Some("local")
-        && let Err(e) = offer_historical_sync_consent()
+        && let Err(e) = offer_historical_sync_consent(assume_yes)
     {
         report.problem(
-            format!("Could not clear the local upload queue ({e})"),
-            "autter sync purge --force",
+            format!("Could not apply your choice for the held upload backlog ({e})"),
+            crate::upload_hold::PURGE_COMMAND,
         );
     }
 
@@ -353,11 +364,12 @@ fn setup_local(cfg: &mut config::FileConfig) {
     // importing it. Tell the user it exists and how to delete it.
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_none() {
         let pending = crate::auth::notice::pending_sync_counts();
-        if pending.total() > 0 {
+        let held = crate::upload_hold::held_counts();
+        if pending.total() + held.total() > 0 {
             eprintln!();
             eprintln!(
-                "  {DIM}Found records queued for upload earlier ({}). They will not be",
-                pending.summary()
+                "  {DIM}Found {} records queued for upload earlier. They will not be",
+                pending.total() + held.total()
             );
             eprintln!(
                 "  uploaded in local mode. Delete them with `autter sync purge --force`.{RESET}"
@@ -646,54 +658,82 @@ fn integration_decision(assume_yes: bool, interactive: bool) -> IntegrationDecis
     }
 }
 
-/// When connecting, any pre-login backlog would upload on the next daemon drain.
-/// Offer to keep (import) or purge it first.
-fn offer_historical_sync_consent() -> Result<(), String> {
-    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return Ok(());
-    }
+/// Hold every queued upload item before connecting (see `crate::upload_hold`).
+/// Applies the one-time legacy migration first so it can never later mistake
+/// data queued after connecting for pre-upgrade backlog.
+fn hold_backlog_before_connecting() -> Result<(), String> {
+    crate::upload_hold::ensure_legacy_migration()?;
+    crate::upload_hold::hold_all().map(|_| ())
+}
 
-    let pending = crate::auth::notice::pending_sync_counts();
-    if pending.total() == 0 {
+/// Ask what to do with the backlog that predates this connect, which
+/// [`hold_backlog_before_connecting`] has already held. Nothing in it uploads
+/// without explicit consent: an interactive "Import", or `--yes` in a
+/// non-interactive run. Otherwise it stays held, and the commands to import
+/// or delete it are printed.
+fn offer_historical_sync_consent(assume_yes: bool) -> Result<(), String> {
+    let held = crate::upload_hold::held_counts();
+    if held.total() == 0 {
         return Ok(());
     }
 
     eprintln!();
     eprintln!("{BOLD}Previously collected sessions{RESET}");
-    eprintln!(
-        "  Found local data queued for upload: {}.",
-        pending.summary()
-    );
-    eprintln!("  This may include sessions from before you connected this machine.");
+    eprintln!("  Found local data queued for upload: {}.", held.summary());
+    eprintln!("  It was queued before you connected this machine (or by an older autter) and");
+    eprintln!("  may include sessions recorded in local mode. It is held and has not been sent.");
     eprintln!();
 
-    let import = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+    let decision = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
         let items = [
             SelectItem::new(
                 "Import — upload this backlog to your Autter org",
                 "Recommended if you want historical attribution on the dashboard.",
             ),
             SelectItem::new(
-                "Discard — clear the local upload queue first",
+                "Discard — delete it from this machine",
                 "Runs `autter sync purge`. Nothing pre-dating this connect is uploaded.",
             ),
         ];
-        ui::select("What should we do with the backlog?", &items, 0) == 0
+        if ui::select("What should we do with the backlog?", &items, 0) == 0 {
+            BacklogDecision::Import
+        } else {
+            BacklogDecision::Discard
+        }
+    } else if assume_yes {
+        BacklogDecision::Import
     } else {
-        // Non-interactive connect: keep backlog (historical default) but print how to purge.
-        eprintln!(
-            "  Keeping the backlog. Run `autter sync purge` before the next daemon drain to discard it."
-        );
-        true
+        BacklogDecision::KeepHeld
     };
 
-    if !import {
-        let summary = crate::commands::sync::purge_sync_queues().map_err(|e| e.to_string())?;
-        eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
-    } else {
-        eprintln!("  Backlog will upload in the background after setup.");
+    match decision {
+        BacklogDecision::Import => {
+            let released = crate::upload_hold::release_all()?;
+            eprintln!(
+                "  Backlog released ({} records); it uploads in the background after setup.",
+                released.total()
+            );
+        }
+        BacklogDecision::Discard => {
+            let summary = crate::commands::sync::purge_sync_queues().map_err(|e| e.to_string())?;
+            eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
+        }
+        BacklogDecision::KeepHeld => {
+            eprintln!(
+                "  Kept on this machine and NOT uploaded (non-interactive run without --yes)."
+            );
+            eprintln!("    Upload it:  {}", crate::upload_hold::IMPORT_COMMAND);
+            eprintln!("    Delete it:  {}", crate::upload_hold::PURGE_COMMAND);
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BacklogDecision {
+    Import,
+    Discard,
+    KeepHeld,
 }
 
 /// True when the args are only asking for help (`--help`/`-h`/`help` in any

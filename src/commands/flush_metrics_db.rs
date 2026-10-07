@@ -11,6 +11,10 @@ const MAX_BATCH_SIZE: usize = 1000;
 
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {
+    if let Err(e) = crate::upload_hold::ensure_legacy_migration() {
+        eprintln!("flush-metrics-db: skipping (could not apply the upload hold: {e})");
+        return;
+    }
     if !crate::config::platform_sync_enabled_now() {
         eprintln!(
             "flush-metrics-db: skipping (local mode never uploads; run `autter onboard --connect` to connect)"

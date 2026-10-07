@@ -85,8 +85,22 @@ impl MetricsDatabase {
 
         let mut db = Self { conn };
         db.initialize_schema()?;
+        db.ensure_held_table()?;
 
         Ok(db)
+    }
+
+    /// Held events live in a side table outside the versioned migrations, so
+    /// older binaries (which never read it) cannot upload them, and opening
+    /// the database with an older binary does not fail on a newer version.
+    fn ensure_held_table(&self) -> Result<(), AutterError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS metrics_held (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_json TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
     }
 
     /// Get database path: ~/.autter/internal/metrics-db
@@ -282,10 +296,43 @@ impl MetricsDatabase {
         Ok(count as usize)
     }
 
-    /// Drop every queued metrics event (pre-upload backlog).
+    /// Drop every queued metrics event (pre-upload backlog), held or not.
     pub fn delete_all(&mut self) -> Result<usize, AutterError> {
         let n = self.conn.execute("DELETE FROM metrics", [])?;
+        let held = self.conn.execute("DELETE FROM metrics_held", [])?;
+        Ok(n + held)
+    }
+
+    /// Move every queued event to the held table, where no flush reads it.
+    pub fn hold_all(&mut self) -> Result<usize, AutterError> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "INSERT INTO metrics_held (event_json) SELECT event_json FROM metrics ORDER BY id",
+            [],
+        )?;
+        tx.execute("DELETE FROM metrics", [])?;
+        tx.commit()?;
         Ok(n)
+    }
+
+    /// Move held events back into the upload queue.
+    pub fn release_held(&mut self) -> Result<usize, AutterError> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "INSERT INTO metrics (event_json) SELECT event_json FROM metrics_held ORDER BY id",
+            [],
+        )?;
+        tx.execute("DELETE FROM metrics_held", [])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Number of held events.
+    pub fn count_held(&self) -> Result<usize, AutterError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM metrics_held", [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     /// Returns whether an `agent_usage` event should be emitted for this prompt_id.
@@ -344,8 +391,34 @@ mod tests {
 
         let mut db = MetricsDatabase { conn };
         db.initialize_schema().unwrap();
+        db.ensure_held_table().unwrap();
 
         (db, temp_dir)
+    }
+
+    #[test]
+    fn test_hold_and_release_keep_events_out_of_the_upload_batch() {
+        let (mut db, _temp_dir) = create_test_db();
+        db.insert_events(&["{\"a\":1}".to_string(), "{\"a\":2}".to_string()])
+            .unwrap();
+        assert_eq!(db.hold_all().unwrap(), 2);
+        assert!(
+            db.get_batch(10).unwrap().is_empty(),
+            "held events must not be dequeued"
+        );
+        assert_eq!(db.count().unwrap(), 0);
+        assert_eq!(db.count_held().unwrap(), 2);
+
+        // New events after the hold are not held.
+        db.insert_events(&["{\"a\":3}".to_string()]).unwrap();
+        assert_eq!(db.get_batch(10).unwrap().len(), 1);
+
+        assert_eq!(db.release_held().unwrap(), 2);
+        assert_eq!(db.count_held().unwrap(), 0);
+        assert_eq!(db.get_batch(10).unwrap().len(), 3);
+
+        db.hold_all().unwrap();
+        assert_eq!(db.delete_all().unwrap(), 3, "purge removes held events too");
     }
 
     #[test]

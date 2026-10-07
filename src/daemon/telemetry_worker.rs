@@ -329,8 +329,17 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
     }
 
     // Drain the durable queues. Skipped while the auth backoff is active so an
-    // expired login doesn't trigger a token-refresh network call on every tick.
-    if !durable_sync_auth_backoff_active() {
+    // expired login doesn't trigger a token-refresh network call on every tick,
+    // and until the one-time hold of the pre-upgrade backlog has been applied
+    // (held items are never dequeued; see crate::upload_hold).
+    let legacy_backlog_held = match crate::upload_hold::ensure_legacy_migration() {
+        Ok(done) => done,
+        Err(error) => {
+            tracing::warn!(%error, "upload hold: legacy backlog migration failed; skipping durable uploads");
+            false
+        }
+    };
+    if legacy_backlog_held && !durable_sync_auth_backoff_active() {
         // Metrics that failed while offline or while the org database was
         // unavailable must be replayed automatically. Historically this queue
         // was only drained by a hidden manual command, which could leave users

@@ -320,6 +320,10 @@ pub struct CloudSyncStatusReport {
     /// Overall state: healthy, draining a backlog, or blocked.
     pub state: CloudSyncState,
     pub pending: PendingSyncCountsJson,
+    /// Items held until the user consents to upload them (backlog from an
+    /// earlier autter version, or from before connecting). Never drained
+    /// automatically; see `crate::upload_hold`.
+    pub held: crate::upload_hold::QueueCounts,
     pub queue_status_available: bool,
     pub auth_blocked_recently: bool,
     pub upload_stalled_recently: bool,
@@ -413,6 +417,7 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
         daemon_running,
         state,
         pending: pending_json,
+        held: crate::upload_hold::held_counts(),
         queue_status_available,
         auth_blocked_recently,
         upload_stalled_recently,
@@ -649,6 +654,14 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
     if report.enabled && report.pending.total > 0 {
         summary.push_str(&format!(" ({} records waiting)", report.pending.total));
     }
+    if report.held.total() > 0 {
+        summary.push_str(&format!(
+            "\n{} records queued before you connected (or by an older autter) are held and will not upload. Upload: `{}`. Delete: `{}`.",
+            report.held.total(),
+            crate::upload_hold::IMPORT_COMMAND,
+            crate::upload_hold::PURGE_COMMAND
+        ));
+    }
     if report.state == CloudSyncState::UploadFailing
         && let Some(failure) = &report.upload_failure
     {
@@ -683,6 +696,7 @@ mod tests {
             daemon_running: true,
             state,
             pending: PendingSyncCountsJson::from(PendingSyncCounts::default()),
+            held: crate::upload_hold::QueueCounts::default(),
             queue_status_available: state != CloudSyncState::StatusUnavailable,
             auth_blocked_recently: false,
             upload_stalled_recently: false,

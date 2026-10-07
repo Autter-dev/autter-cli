@@ -936,11 +936,13 @@ fn check_sync_queue() -> DoctorCheck {
     // not fail CI / doctor.
     if !Config::fresh().platform_sync_enabled() {
         let pending = crate::auth::notice::pending_sync_counts();
+        let held = crate::upload_hold::held_counts();
         let mut details = Vec::new();
-        if pending.total() > 0 {
+        if pending.total() + held.total() > 0 {
             details.push(format!(
-                "left over from an earlier connected session: {}",
-                pending.summary()
+                "left over from an earlier connected session or autter version: {} (plus {} held)",
+                pending.summary(),
+                held.total()
             ));
             details.push(
                 "not uploaded in local mode; `autter onboard --connect` asks before importing them"
@@ -972,6 +974,13 @@ fn check_sync_queue() -> DoctorCheck {
 
     let pending = crate::auth::notice::pending_sync_counts();
     let mut details = vec![pending.summary()];
+    let held = crate::upload_hold::held_counts();
+    if held.total() > 0 {
+        details.push(format!(
+            "held until you decide (queued before connecting or by an older autter): {}",
+            held.summary()
+        ));
+    }
     // Auth-blocked is reported on its own. The upload-failure stamp is the
     // case `bg status` calls `upload_failing` while this check used to pass.
     if !crate::auth::notice::sync_auth_blocked_recently()
@@ -988,6 +997,23 @@ fn check_sync_queue() -> DoctorCheck {
             remediation: Some(format!(
                 "{} upload failed ({}); fix that error, then run `autter bg restart` and `autter doctor`",
                 failure.queue, failure.detail
+            )),
+        };
+    }
+    if pending.total() == 0 && held.total() > 0 {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: format!(
+                "{} records are held and will not upload until you decide",
+                held.total()
+            ),
+            details,
+            remediation: Some(format!(
+                "upload them with `{}`, or delete them with `{}`",
+                crate::upload_hold::IMPORT_COMMAND,
+                crate::upload_hold::PURGE_COMMAND
             )),
         };
     }

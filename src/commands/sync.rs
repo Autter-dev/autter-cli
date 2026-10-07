@@ -22,6 +22,7 @@ pub fn handle_sync(args: &[String]) {
         None => print_status(args),
         Some("status") => print_status(&args[1..]),
         Some("purge") | Some("clear") | Some("clear-queue") => purge_cli(&args[1..]),
+        Some("import") => import_cli(&args[1..]),
         Some("open") => open_dashboard(),
         Some("--help") | Some("-h") | Some("help") => print_help(),
         Some(other) => {
@@ -54,7 +55,53 @@ fn purge_cli(args: &[String]) {
     }
 }
 
-/// Discard every durable cloud-sync queue on this machine.
+/// `autter sync import`: upload the held backlog (explicit consent).
+fn import_cli(args: &[String]) {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+    if let Err(e) = crate::upload_hold::ensure_legacy_migration() {
+        eprintln!("Could not read the upload hold: {e}");
+        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    }
+    let held = crate::upload_hold::held_counts();
+    if held.total() == 0 {
+        println!("Nothing is held; there is no backlog waiting for your consent.");
+        return;
+    }
+    if !crate::config::platform_sync_enabled_now() {
+        eprintln!(
+            "This machine is in local mode, so nothing is uploaded. Connect first with `autter onboard --connect`."
+        );
+        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    }
+    let consent = args.iter().any(|a| a == "--yes" || a == "-y");
+    if !consent {
+        println!("Held for your consent: {}.", held.summary());
+        println!("These were queued before you connected this machine, or by an older autter");
+        println!("version, and may include transcripts recorded in local mode or from");
+        println!("repositories excluded from prompt sharing.");
+        println!();
+        println!("Upload them:  {}", crate::upload_hold::IMPORT_COMMAND);
+        println!("Delete them:  {}", crate::upload_hold::PURGE_COMMAND);
+        return;
+    }
+    match crate::upload_hold::release_all() {
+        Ok(released) => {
+            println!(
+                "Released for upload: {}. The background service uploads them shortly.",
+                released.summary()
+            );
+        }
+        Err(e) => {
+            eprintln!("Failed to release the held backlog: {e}");
+            std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+        }
+    }
+}
+
+/// Discard every durable cloud-sync queue on this machine, held or not.
 pub fn purge_sync_queues() -> Result<String, AutterError> {
     let mut parts = Vec::new();
 
@@ -226,6 +273,7 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  autter sync status [--json]");
     eprintln!("  autter sync purge --force");
+    eprintln!("  autter sync import --yes");
     eprintln!("  autter sync open");
     eprintln!();
     eprintln!("Shows whether authorship data is reaching autter cloud, how much is");
@@ -233,6 +281,10 @@ fn print_help() {
     eprintln!();
     eprintln!("`purge` discards the local upload backlog without uploading it.");
     eprintln!("Use this before `autter login` if you do not want historical sessions uploaded.");
+    eprintln!();
+    eprintln!("`import` uploads the held backlog: records queued before you connected this");
+    eprintln!("machine, or by an older autter version. Held records never upload on their own.");
+    eprintln!("Without --yes it only shows what is held.");
     eprintln!();
     eprintln!("Status exits 0 when upload is off or no problem is detected.");
     eprintln!("It exits 1 when sign-in, upload, the service, or a queue read needs attention.");

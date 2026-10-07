@@ -390,8 +390,8 @@ impl NotesDatabase {
     /// an empty queue never triggers an auth check.
     pub fn count_pending(&self) -> Result<i64, AutterError> {
         let count = self.conn.query_row(
-            "SELECT COUNT(*) FROM notes WHERE synced = 0 AND attempts < 6",
-            [],
+            "SELECT COUNT(*) FROM notes WHERE synced = 0 AND attempts < 6 AND next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -584,11 +584,61 @@ impl NotesDatabase {
     }
 
     pub fn count_pending_commit_summaries(&self) -> Result<i64, AutterError> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM commit_summary_queue", [], |row| {
-                row.get(0)
-            })?)
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM commit_summary_queue WHERE next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+            |row| row.get(0),
+        )?)
+    }
+
+    // ----- Upload hold (see crate::upload_hold) -----
+
+    /// Hold every note and commit summary waiting for upload: they stay on
+    /// disk but no flush dequeues them until [`Self::release_held_uploads`].
+    /// Returns `(notes, commit_summaries)` newly held.
+    pub fn hold_pending_uploads(&mut self) -> Result<(usize, usize), AutterError> {
+        let held = crate::upload_hold::HELD_RETRY_AT;
+        let notes = self.conn.execute(
+            "UPDATE notes SET next_retry_at = ?1, processing_started_at = NULL
+             WHERE synced = 0 AND next_retry_at < ?1",
+            params![held],
+        )?;
+        let summaries = self.conn.execute(
+            "UPDATE commit_summary_queue SET next_retry_at = ?1, processing_started_at = NULL
+             WHERE next_retry_at < ?1",
+            params![held],
+        )?;
+        Ok((notes, summaries))
+    }
+
+    /// Make held notes and commit summaries eligible for upload again.
+    pub fn release_held_uploads(&mut self) -> Result<(usize, usize), AutterError> {
+        let held = crate::upload_hold::HELD_RETRY_AT;
+        let notes = self.conn.execute(
+            "UPDATE notes SET next_retry_at = 0 WHERE synced = 0 AND next_retry_at = ?1",
+            params![held],
+        )?;
+        let summaries = self.conn.execute(
+            "UPDATE commit_summary_queue SET next_retry_at = 0 WHERE next_retry_at = ?1",
+            params![held],
+        )?;
+        Ok((notes, summaries))
+    }
+
+    /// `(notes, commit_summaries)` currently held.
+    pub fn count_held_uploads(&self) -> Result<(i64, i64), AutterError> {
+        let held = crate::upload_hold::HELD_RETRY_AT;
+        let notes = self.conn.query_row(
+            "SELECT COUNT(*) FROM notes WHERE synced = 0 AND next_retry_at = ?1",
+            params![held],
+            |row| row.get(0),
+        )?;
+        let summaries = self.conn.query_row(
+            "SELECT COUNT(*) FROM commit_summary_queue WHERE next_retry_at = ?1",
+            params![held],
+            |row| row.get(0),
+        )?;
+        Ok((notes, summaries))
     }
 
     pub fn dequeue_commit_summaries(
@@ -794,6 +844,28 @@ mod tests {
         db.initialize_schema().unwrap();
 
         (db, temp_dir)
+    }
+
+    #[test]
+    fn test_held_notes_and_summaries_are_never_dequeued_until_released() {
+        let (mut db, _temp) = create_test_db();
+        db.upsert_note("aaa", "note a").unwrap();
+        db.enqueue_commit_summary("aaa", r#"{"commit_sha":"aaa"}"#)
+            .unwrap();
+        assert_eq!(db.hold_pending_uploads().unwrap(), (1, 1));
+        assert_eq!(db.count_pending().unwrap(), 0);
+        assert_eq!(db.count_pending_commit_summaries().unwrap(), 0);
+        assert_eq!(db.count_held_uploads().unwrap(), (1, 1));
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+        assert!(db.dequeue_commit_summaries(10).unwrap().is_empty());
+
+        // Re-writing the same note content keeps it held.
+        db.upsert_note("aaa", "note a").unwrap();
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+
+        assert_eq!(db.release_held_uploads().unwrap(), (1, 1));
+        assert_eq!(db.dequeue_pending(10).unwrap().len(), 1);
+        assert_eq!(db.dequeue_commit_summaries(10).unwrap().len(), 1);
     }
 
     // --- Schema tests ---

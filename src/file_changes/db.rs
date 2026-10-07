@@ -276,11 +276,40 @@ impl FileChangesDatabase {
     /// flush loop so an empty queue never triggers an auth check.
     pub fn count_pending(&self) -> Result<i64, AutterError> {
         let count = self.conn.query_row(
-            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0",
-            [],
+            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0 AND next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Hold every row waiting for upload. Local counts are unaffected; the
+    /// rows are just never dequeued until [`Self::release_held`]. A held row
+    /// touched again stays held, because its aggregate includes held data.
+    pub fn hold_pending(&mut self) -> Result<usize, AutterError> {
+        Ok(self.conn.execute(
+            "UPDATE file_change_counts SET next_retry_at = ?1
+             WHERE synced = 0 AND next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+        )?)
+    }
+
+    /// Make held rows eligible for upload again.
+    pub fn release_held(&mut self) -> Result<usize, AutterError> {
+        Ok(self.conn.execute(
+            "UPDATE file_change_counts SET next_retry_at = 0
+             WHERE synced = 0 AND next_retry_at = ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+        )?)
+    }
+
+    /// Number of held rows.
+    pub fn count_held(&self) -> Result<i64, AutterError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0 AND next_retry_at = ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+            |row| row.get(0),
+        )?)
     }
 
     /// Drop every file-change row still waiting for upload.
@@ -471,6 +500,34 @@ mod tests {
 
         let pending = db.dequeue_pending(10).unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_held_rows_are_counted_locally_but_never_dequeued() {
+        let (mut db, _temp) = create_test_db();
+        let repo = "https://github.com/user/repo";
+        db.record_change(repo, "old.rs", 1, 0, 5000, true).unwrap();
+        assert_eq!(db.hold_pending().unwrap(), 1);
+        assert_eq!(db.count_pending().unwrap(), 0);
+        assert_eq!(db.count_held().unwrap(), 1);
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+        // Touching a held row keeps it held (its aggregate includes held data)
+        // and local counts still update.
+        db.record_change(repo, "old.rs", 1, 0, 5001, true).unwrap();
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+        assert_eq!(db.top_files(repo, 10).unwrap()[0].change_count, 2);
+        // A new file after the hold uploads normally.
+        db.record_change(repo, "new.rs", 1, 0, 5002, true).unwrap();
+        assert_eq!(db.dequeue_pending(10).unwrap().len(), 1);
+
+        assert_eq!(db.release_held().unwrap(), 1);
+        assert_eq!(db.count_held().unwrap(), 0);
+        assert!(
+            db.dequeue_pending(10)
+                .unwrap()
+                .iter()
+                .any(|r| r.file_path == "old.rs")
+        );
     }
 
     #[test]
