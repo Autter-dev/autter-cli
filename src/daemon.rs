@@ -366,6 +366,14 @@ fn is_storage_full_error(error: &AutterError) -> bool {
     matches!(error, AutterError::IoError(io_error) if io_error.kind() == std::io::ErrorKind::StorageFull)
 }
 
+fn log_side_effect_error(error: &AutterError, family: &str, seq: u64, message: &str) {
+    if is_storage_full_error(error) {
+        tracing::warn!(%error, %family, seq, "{message}: host disk is full");
+    } else {
+        tracing::error!(%error, %family, seq, "{message}");
+    }
+}
+
 fn trace_root_sid(sid: &str) -> &str {
     sid.split('/').next().unwrap_or(sid)
 }
@@ -6009,21 +6017,12 @@ impl ActorDaemonCoordinator {
                         Ok(Ok((applied, side_effect_result))) => {
                             if let Err(error) = &side_effect_result {
                                 let _ = self.record_side_effect_error(family, order, error);
-                                if is_storage_full_error(error) {
-                                    tracing::warn!(
-                                        %error,
-                                        %family,
-                                        seq = applied.seq,
-                                        "command side effect failed: host disk is full"
-                                    );
-                                } else {
-                                    tracing::error!(
-                                        %error,
-                                        %family,
-                                        seq = applied.seq,
-                                        "command side effect failed"
-                                    );
-                                }
+                                log_side_effect_error(
+                                    error,
+                                    family,
+                                    applied.seq,
+                                    "command side effect failed",
+                                );
                             }
                             if let Err(error) = self.append_command_completion_log(
                                 family,
@@ -7785,21 +7784,12 @@ impl ActorDaemonCoordinator {
                     let _ = self.end_family_effect(&family);
                     if let Err(error) = result {
                         let _ = self.record_side_effect_error(&family, applied.seq, &error);
-                        if is_storage_full_error(&error) {
-                            tracing::warn!(
-                                %error,
-                                %family,
-                                seq = applied.seq,
-                                "async side-effect error: host disk is full"
-                            );
-                        } else {
-                            tracing::error!(
-                                %error,
-                                %family,
-                                seq = applied.seq,
-                                "async side-effect error"
-                            );
-                        }
+                        log_side_effect_error(
+                            &error,
+                            &family,
+                            applied.seq,
+                            "async side-effect error",
+                        );
                     } else if let Err(error) =
                         self.append_command_completion_log(&family, &applied, &Ok(()), applied.seq)
                     {
