@@ -3609,6 +3609,23 @@ fn socket_label(path: &Path) -> std::borrow::Cow<'_, str> {
         .unwrap_or(std::borrow::Cow::Borrowed("socket"))
 }
 
+#[cfg(all(test, unix))]
+mod socket_label_tests {
+    use super::socket_label;
+    use std::path::Path;
+
+    #[test]
+    fn socket_label_omits_the_absolute_path() {
+        assert_eq!(
+            socket_label(Path::new(
+                "/Users/someone/.autter/internal/daemon/control.sock"
+            )),
+            "control.sock"
+        );
+        assert_eq!(socket_label(Path::new("/")), "socket");
+    }
+}
+
 fn remove_socket_if_exists(path: &Path) -> Result<(), AutterError> {
     #[cfg(unix)]
     if path.exists() {
@@ -9481,18 +9498,6 @@ mod tests {
             message.contains("rebase missing stable carryover heads sid=abc"),
             "{message}"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn socket_label_omits_the_absolute_path() {
-        assert_eq!(
-            socket_label(Path::new(
-                "/Users/someone/.autter/internal/daemon/control.sock"
-            )),
-            "control.sock"
-        );
-        assert_eq!(socket_label(Path::new("/")), "socket");
     }
 
     #[test]
