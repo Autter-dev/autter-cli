@@ -4,4 +4,5 @@ pub mod hook_installer;
 pub mod jetbrains;
 pub mod skills_installer;
 pub mod spinner;
+pub mod unsupported_agents;
 pub mod utils;

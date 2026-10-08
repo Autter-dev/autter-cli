@@ -259,9 +259,8 @@ pub enum CloudSyncAttention {
 }
 
 fn cloud_sync_enabled() -> bool {
-    crate::config::Config::fresh()
-        .notes_backend_kind()
-        .uses_http()
+    let cfg = crate::config::Config::fresh();
+    cfg.platform_sync_enabled() && cfg.notes_backend_kind().uses_http()
 }
 
 fn background_service_running() -> bool {
@@ -321,6 +320,10 @@ pub struct CloudSyncStatusReport {
     /// Overall state: healthy, draining a backlog, or blocked.
     pub state: CloudSyncState,
     pub pending: PendingSyncCountsJson,
+    /// Items held until the user consents to upload them (backlog from an
+    /// earlier autter version, or from before connecting). Never drained
+    /// automatically; see `crate::upload_hold`.
+    pub held: crate::upload_hold::QueueCounts,
     pub queue_status_available: bool,
     pub auth_blocked_recently: bool,
     pub upload_stalled_recently: bool,
@@ -414,6 +417,7 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
         daemon_running,
         state,
         pending: pending_json,
+        held: crate::upload_hold::held_counts(),
         queue_status_available,
         auth_blocked_recently,
         upload_stalled_recently,
@@ -435,7 +439,7 @@ fn remediation_for(attention: CloudSyncAttention) -> String {
                 .to_string()
         }
         CloudSyncAttention::DaemonNotRunning => {
-            "run `autter bg start`, then `autter doctor` to verify".to_string()
+            "run `autter bg restart`, then `autter doctor` to verify".to_string()
         }
     }
 }
@@ -581,7 +585,7 @@ fn print_sync_attention_message(attention: CloudSyncAttention, pending: PendingS
                 pending.summary(),
             );
             eprintln!(
-                "\x1b[1;33m  Fix: run \x1b[1;36mautter bg start\x1b[0m\x1b[1;33m, then \x1b[1;36mautter doctor\x1b[0m\x1b[1;33m to verify.\x1b[0m"
+                "\x1b[1;33m  Fix: run \x1b[1;36mautter bg restart\x1b[0m\x1b[1;33m, then \x1b[1;36mautter doctor\x1b[0m\x1b[1;33m to verify.\x1b[0m"
             );
         }
     }
@@ -641,7 +645,7 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
         CloudSyncState::Disabled => "off; records stay on this computer. Connect: `autter onboard`",
         CloudSyncState::AuthBlocked => "blocked; sign in with `autter login`",
         CloudSyncState::UploadFailing => "upload failed; run `autter doctor`",
-        CloudSyncState::DaemonNotRunning => "background service stopped; run `autter bg start`",
+        CloudSyncState::DaemonNotRunning => "background service stopped; run `autter bg restart`",
         CloudSyncState::Draining => "upload pending; check `autter sync status`",
         CloudSyncState::Healthy => "no queued uploads; open the dashboard with `autter sync open`",
         CloudSyncState::StatusUnavailable => "queue status unavailable; run `autter doctor`",
@@ -649,6 +653,14 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
     let mut summary = format!("Cloud upload: {detail}");
     if report.enabled && report.pending.total > 0 {
         summary.push_str(&format!(" ({} records waiting)", report.pending.total));
+    }
+    if report.held.total() > 0 {
+        summary.push_str(&format!(
+            "\n{} records queued before you connected (or by an older autter) are held and will not upload. Upload: `{}`. Delete: `{}`.",
+            report.held.total(),
+            crate::upload_hold::IMPORT_COMMAND,
+            crate::upload_hold::PURGE_COMMAND
+        ));
     }
     if report.state == CloudSyncState::UploadFailing
         && let Some(failure) = &report.upload_failure
@@ -684,6 +696,7 @@ mod tests {
             daemon_running: true,
             state,
             pending: PendingSyncCountsJson::from(PendingSyncCounts::default()),
+            held: crate::upload_hold::QueueCounts::default(),
             queue_status_available: state != CloudSyncState::StatusUnavailable,
             auth_blocked_recently: false,
             upload_stalled_recently: false,
@@ -709,7 +722,7 @@ mod tests {
             (CloudSyncState::Disabled, "autter onboard"),
             (CloudSyncState::AuthBlocked, "autter login"),
             (CloudSyncState::UploadFailing, "autter doctor"),
-            (CloudSyncState::DaemonNotRunning, "autter bg start"),
+            (CloudSyncState::DaemonNotRunning, "autter bg restart"),
             (CloudSyncState::StatusUnavailable, "autter doctor"),
         ] {
             assert!(format_sync_report(&status_report(state)).contains(command));

@@ -362,6 +362,14 @@ pub fn classify_tool(agent: Agent, tool_name: &str) -> ToolClass {
             "Shell" => ToolClass::Bash,
             _ => ToolClass::Skip,
         },
+        // Tool names from https://antigravity.google/docs/hooks ("Supported tools").
+        Agent::Antigravity => match tool_name {
+            "write_to_file" | "replace_file_content" | "multi_replace_file_content" => {
+                ToolClass::FileEdit
+            }
+            "run_command" => ToolClass::Bash,
+            _ => ToolClass::Skip,
+        },
     }
 }
 
@@ -379,6 +387,7 @@ pub enum Agent {
     Pi,
     Windsurf,
     Cursor,
+    Antigravity,
 }
 
 // ---------------------------------------------------------------------------

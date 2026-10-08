@@ -440,6 +440,7 @@ autter config [<key> | set <key> <value> | unset <key>]
         summary: "Inspect cloud upload health and local queue depth",
         body: "autter sync status [--json]
 autter sync purge --force
+autter sync import --yes
 autter sync open
 
   Show local upload queues, the last confirmed metrics batch, and the next
@@ -447,6 +448,10 @@ autter sync open
 
   `purge` discards the local upload backlog without uploading it — use before
   login if you do not want historical sessions sent to the cloud.
+
+  `import` uploads the held backlog: records queued before you connected this
+  machine, or by an older autter version. Held records never upload on their
+  own. Without --yes it only shows what is held.
 
   An empty queue does not confirm upload of every local change.
   Status exits 0 when upload is off or no problem is detected. It exits 1
@@ -566,9 +571,20 @@ autter onboard [options]
 
   Set up Autter (connect to the platform or run local).
 
-  --connect   Connect to the Autter platform (runs login)
-  --local     Use local-only mode (no uploads)
-  --force     Re-run onboarding even if already completed",
+  --connect         Connect to the Autter platform (runs login)
+  --local           Use local-only mode (no uploads)
+  --force           Re-run onboarding even if already completed
+  --yes, -y         Install system integrations (IDE/agent hooks, global git
+                    trace2 settings, background service) without asking. With
+                    --connect, also upload data queued before connecting
+  --telemetry       Enable anonymous telemetry without asking
+  --no-telemetry    Disable anonymous telemetry without asking
+
+  Choosing a mode never changes system configuration on its own. Without
+  --yes, onboarding asks first in a terminal and skips the integrations in
+  non-interactive runs (install them later with `autter install --system`).
+  Data queued before connecting is held until you agree to upload it
+  (`autter sync import --yes`) or delete it (`autter sync purge --force`).",
     },
     HelpEntry {
         name: "login",

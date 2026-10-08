@@ -250,6 +250,13 @@ pub fn log_metrics(
             return;
         }
 
+        // Metric events exist only to be uploaded to the Autter platform. In
+        // local mode don't even hand them to the daemon, so nothing piles up
+        // in an upload queue (the daemon also drops them as a backstop).
+        if !crate::config::platform_sync_enabled_now() {
+            return;
+        }
+
         // Split into chunks of MAX_METRICS_PER_ENVELOPE
         for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
             let envelope = crate::daemon::TelemetryEnvelope::Metrics {

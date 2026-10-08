@@ -8966,6 +8966,14 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
 
     let mut coordinator_inner = ActorDaemonCoordinator::new();
 
+    // Before anything can queue or drain upload data: hold any backlog left by
+    // an earlier autter version until the user consents (one-time, marker
+    // gated). If this fails, the flush loop retries it and drains nothing
+    // until it succeeds.
+    if let Err(error) = crate::upload_hold::ensure_legacy_migration() {
+        tracing::warn!(%error, "upload hold: legacy backlog migration failed; durable uploads paused");
+    }
+
     // Spawn the telemetry worker inside the daemon's tokio runtime.
     let telemetry_handle = crate::daemon::telemetry_worker::spawn_telemetry_worker();
     crate::daemon::telemetry_worker::set_daemon_internal_telemetry(telemetry_handle.clone());

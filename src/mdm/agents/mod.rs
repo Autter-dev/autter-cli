@@ -1,4 +1,5 @@
 mod amp;
+mod antigravity;
 mod claude_code;
 mod codex;
 mod cursor;
@@ -15,6 +16,7 @@ mod vscode;
 mod windsurf;
 
 pub use amp::AmpInstaller;
+pub use antigravity::AntigravityInstaller;
 pub use claude_code::ClaudeCodeInstaller;
 pub use codex::CodexInstaller;
 pub use cursor::CursorInstaller;
@@ -47,6 +49,7 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
         Box::new(DroidInstaller),
         Box::new(FirebenderInstaller),
         Box::new(JetBrainsInstaller),
+        Box::new(AntigravityInstaller),
     ];
 
     #[cfg(windows)]

@@ -25,6 +25,10 @@
 //! `--telemetry`/`--no-telemetry` drive scripted installs, and with no flags
 //! the flow defers itself until the user has a real terminal.
 //!
+//! Choosing a mode is not consent to change system configuration. IDE/agent
+//! hooks, global git trace2 settings and the background service are applied
+//! only after an interactive "yes", or with an explicit `--yes`.
+//!
 //! Note: the full authorship-note → Postgres dual-write (keeping local git
 //! notes while also uploading the note itself) is delivered alongside the
 //! in-repo backend. Today, connected mode keeps local git notes and uploads
@@ -38,7 +42,7 @@ use serde_json::json;
 use crate::auth::{AuthState, collect_auth_status};
 use crate::commands::login::run_device_login;
 use crate::config::{self, NotesBackendConfig, NotesBackendKind};
-use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem};
+use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem, YELLOW};
 
 /// Entry point for the `autter onboard` command.
 pub fn handle_onboard(args: &[String]) {
@@ -52,9 +56,12 @@ pub fn handle_onboard(args: &[String]) {
         return;
     }
 
-    let force = args.iter().any(|a| a == "--force" || a == "-f");
-    let choose_connect = args.iter().any(|a| a == "--connect");
-    let choose_local = args.iter().any(|a| a == "--local");
+    let OnboardFlags {
+        force,
+        choose_connect,
+        choose_local,
+        assume_yes,
+    } = OnboardFlags::parse(args);
     // Non-interactive telemetry overrides (for scripted installs).
     let telemetry_flag = if args.iter().any(|a| a == "--telemetry") {
         Some(true)
@@ -99,8 +106,30 @@ pub fn handle_onboard(args: &[String]) {
         return;
     };
 
+    // Every step that does not complete is recorded here, so onboarding never
+    // ends with "You're all set!" after something went wrong.
+    let mut report = SetupReport::default();
+
     if connect {
-        setup_connected(&mut file_config, logged_in);
+        // Freeze any backlog before signing in: once credentials exist the
+        // background service would start draining it, before the user has been
+        // asked about it below. Held items are never uploaded until released.
+        if let Err(e) = hold_backlog_before_connecting() {
+            report.problem(
+                format!(
+                    "Could not hold the existing upload backlog ({e}); it may upload without being reviewed"
+                ),
+                crate::upload_hold::PURGE_COMMAND,
+            );
+        }
+        if let Err(e) = setup_connected(&mut file_config, logged_in) {
+            report.problem(
+                format!(
+                    "Could not connect to the Autter platform ({e}); set up in local mode instead"
+                ),
+                "autter onboard --connect",
+            );
+        }
     } else {
         setup_local(&mut file_config);
     }
@@ -109,52 +138,117 @@ pub fn handle_onboard(args: &[String]) {
     let telemetry_enabled = configure_telemetry(&mut file_config, telemetry_flag);
 
     // System integrations (IDE hooks, global git trace2, daemon) require
-    // explicit consent — they are no longer applied by npm postinstall.
-    apply_system_integrations_with_consent(choose_connect || choose_local || force);
+    // explicit consent. Picking a mode (`--local`/`--connect`) or re-running
+    // (`--force`) is not consent; only an interactive "yes" or `--yes` is.
+    if let Err(e) = apply_system_integrations_with_consent(assume_yes) {
+        report.problem(
+            format!("Could not install IDE/agent hooks and git capture settings ({e})"),
+            "autter install --system",
+        );
+    }
 
     // After connect: offer to keep or discard any pre-login upload backlog.
-    if file_config.prompt_storage.as_deref() != Some("local") {
-        offer_historical_sync_consent();
+    if file_config.prompt_storage.as_deref() != Some("local")
+        && let Err(e) = offer_historical_sync_consent(assume_yes)
+    {
+        report.problem(
+            format!("Could not apply your choice for the held upload backlog ({e})"),
+            crate::upload_hold::PURGE_COMMAND,
+        );
     }
 
     file_config.onboarding_completed = Some(true);
     if let Err(e) = config::save_file_config(&file_config) {
-        eprintln!("Warning: could not save onboarding state: {e}");
+        let path = config::config_file_path_public()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.autter/config.json".to_string());
+        report.problem(
+            format!(
+                "Could not save your choice to {path} ({e}); the mode was not applied. Make sure that file is writable, then re-run"
+            ),
+            "autter onboard --force",
+        );
     }
 
     // The background service is what persists authorship notes, and it may
     // have been started under the previous mode's config. Restart it so the
-    // new notes backend / prompt storage take effect immediately.
-    restart_daemon_for_mode_change();
+    // new notes backend / prompt storage take effect immediately. A service
+    // that is not running is left alone: starting it is a system integration
+    // that needs consent (installing integrations above starts it).
+    if let Err(e) = restart_daemon_for_mode_change() {
+        report.problem(
+            format!(
+                "Could not restart the background service ({e}), so it may still use the previous mode"
+            ),
+            crate::commands::daemon::RESTART_COMMAND,
+        );
+    }
 
     // Reflect the mode actually configured: a connect attempt can fall back
     // to local if the device login fails.
     let connected = file_config.prompt_storage.as_deref() != Some("local");
-    print_finished(connected);
+    eprint!(
+        "{}",
+        render_finished(connected, &report, std::io::stderr().is_terminal())
+    );
 
     // Fire a one-off install/onboard event so we can count installs by version
     // and platform. Only when the user just opted in.
     if telemetry_enabled {
         record_install_event(connected);
     }
+
+    // A degraded setup is a runtime failure for scripts (installers run
+    // `autter onboard || true`, so this never aborts an install).
+    if !report.is_clean() {
+        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    }
 }
 
-/// Restart the daemon so it re-reads the freshly-saved mode config. Skipped in
-/// test harnesses, which manage their own daemon lifecycle. Best-effort: a
-/// failed restart must not fail onboarding.
-fn restart_daemon_for_mode_change() {
+/// One onboarding step that did not complete, with the exact command that
+/// fixes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupProblem {
+    what: String,
+    fix: String,
+}
+
+/// Degraded steps collected during onboarding.
+#[derive(Debug, Default)]
+struct SetupReport {
+    problems: Vec<SetupProblem>,
+}
+
+impl SetupReport {
+    fn problem(&mut self, what: impl Into<String>, fix: impl Into<String>) {
+        self.problems.push(SetupProblem {
+            what: what.into(),
+            fix: fix.into(),
+        });
+    }
+
+    fn is_clean(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// Restart an already-running daemon so it re-reads the freshly-saved mode
+/// config. Never starts a daemon that is not running: starting the background
+/// service is a system integration that needs consent. Skipped in test
+/// harnesses, which manage their own daemon lifecycle. A failure is reported
+/// to the caller, which lists it in the closing summary.
+fn restart_daemon_for_mode_change() -> Result<(), String> {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
+        return Ok(());
     }
 
-    let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
-        return;
-    };
-
-    if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
-        eprintln!("Warning: could not restart the background service: {e}");
-        eprintln!("  Run `autter install` to apply the new mode to the background service.");
+    let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths()
+        .map_err(|e| format!("could not locate the background service: {e}"))?;
+    if !crate::commands::daemon::daemon_is_up(&daemon_config) {
+        return Ok(());
     }
+
+    crate::commands::daemon::restart_daemon(&daemon_config)
 }
 
 /// The interactive connected-vs-local choice, as an arrow-key selector.
@@ -264,10 +358,30 @@ fn setup_local(cfg: &mut config::FileConfig) {
     eprintln!("  detailed prompt usage and team/user usage dashboards.");
     eprintln!();
     eprintln!("  Run `autter onboard --connect` anytime to link your Autter account.{RESET}");
+
+    // Data queued while this machine was connected (or by older versions)
+    // stays on disk. Local mode never uploads it; reconnecting asks before
+    // importing it. Tell the user it exists and how to delete it.
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_none() {
+        let pending = crate::auth::notice::pending_sync_counts();
+        let held = crate::upload_hold::held_counts();
+        if pending.total() + held.total() > 0 {
+            eprintln!();
+            eprintln!(
+                "  {DIM}Found {} records queued for upload earlier. They will not be",
+                pending.total() + held.total()
+            );
+            eprintln!(
+                "  uploaded in local mode. Delete them with `autter sync purge --force`.{RESET}"
+            );
+        }
+    }
 }
 
-/// Log the user in (if needed) and configure connected mode.
-fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
+/// Log the user in (if needed) and configure connected mode. On a failed
+/// login, falls back to local mode and returns the error so the closing
+/// summary can report it.
+fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) -> Result<(), String> {
     if !already_logged_in {
         eprintln!();
         eprintln!("Connecting to the Autter platform...");
@@ -276,11 +390,13 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
             eprintln!("\u{2717} Could not connect: {e}");
             eprintln!();
             crate::commands::login::print_pat_fallback_instructions();
+            // `autter login` alone does not switch modes: local mode never
+            // uploads, so the retry has to go through onboarding.
             eprintln!(
-                "  Setting up local mode for now \u{2014} run `autter onboard --connect` or `autter login --token <token>` to retry."
+                "  Setting up local mode for now \u{2014} run `autter onboard --connect` to retry."
             );
             setup_local(cfg);
-            return;
+            return Err(e.to_string());
         }
     }
 
@@ -307,6 +423,7 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) {
     eprintln!("    so you get detailed prompt usage and team/user analytics.");
     eprintln!();
     eprintln!("  {DIM}Manage your account with `autter whoami` / `autter logout`.{RESET}");
+    Ok(())
 }
 
 fn print_welcome() {
@@ -321,35 +438,87 @@ fn print_welcome() {
     eprintln!();
 }
 
-/// Closing summary: confirmation that nothing else is required, plus the first
-/// commands worth trying.
-fn print_finished(connected: bool) {
-    eprintln!();
-    eprintln!("{GREEN}{BOLD}\u{2713} You're all set!{RESET}");
-    eprintln!();
-    eprintln!("  Just keep coding \u{2014} authorship is recorded automatically on every commit.");
-    eprintln!();
-    eprintln!("  Try it on any repo:");
-    eprintln!(
-        "    {CYAN}autter stats{RESET}          {DIM}AI vs human share of your latest commit{RESET}"
+/// Closing summary. With no problems: the green "all set" message plus the
+/// first commands worth trying. With problems: a yellow "Set up with
+/// warnings" summary listing each problem and the exact command that fixes
+/// it, and no claim that everything is ready.
+fn render_finished(connected: bool, report: &SetupReport, color: bool) -> String {
+    use std::fmt::Write as _;
+    let paint = |code: &'static str| if color { code } else { "" };
+    let (green, yellow, bold, cyan, dim, reset) = (
+        paint(GREEN),
+        paint(YELLOW),
+        paint(BOLD),
+        paint(CYAN),
+        paint(DIM),
+        paint(RESET),
     );
-    eprintln!(
-        "    {CYAN}autter blame <file>{RESET}   {DIM}who \u{2014} you or an agent \u{2014} wrote each line{RESET}"
-    );
-    eprintln!(
-        "    {CYAN}autter log{RESET}            {DIM}git log with AI authorship stats{RESET}"
-    );
-    if connected {
-        eprintln!(
-            "    {CYAN}autter dash{RESET}           {DIM}open your personal dashboard{RESET}"
+    let mut out = String::new();
+    let _ = writeln!(out);
+    if report.is_clean() {
+        let _ = writeln!(out, "{green}{bold}\u{2713} You're all set!{reset}");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  Just keep coding \u{2014} authorship is recorded automatically on every commit."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "{yellow}{bold}\u{26a0} Set up with warnings{reset} \u{2014} {} step{} did not complete:",
+            report.problems.len(),
+            if report.problems.len() == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(out);
+        for problem in &report.problems {
+            let _ = writeln!(out, "  {yellow}\u{2022}{reset} {}", problem.what);
+            let _ = writeln!(out, "    Fix: {cyan}{}{reset}", problem.fix);
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  Then run {cyan}autter doctor{reset} to confirm everything works."
         );
     }
-    eprintln!();
-    eprintln!("  {DIM}All commands: `autter help` \u{2022} Docs: https://autter.dev/docs{RESET}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  Try it on any repo:");
+    let _ = writeln!(
+        out,
+        "    {cyan}autter stats{reset}          {dim}AI vs human share of your latest commit{reset}"
+    );
+    let _ = writeln!(
+        out,
+        "    {cyan}autter blame <file>{reset}   {dim}who \u{2014} you or an agent \u{2014} wrote each line{reset}"
+    );
+    let _ = writeln!(
+        out,
+        "    {cyan}autter log{reset}            {dim}git log with AI authorship stats{reset}"
+    );
+    if connected {
+        let _ = writeln!(
+            out,
+            "    {cyan}autter dash{reset}           {dim}open your personal dashboard{reset}"
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {dim}All commands: `autter help` \u{2022} Docs: https://autter.dev/docs{reset}"
+    );
+    out
 }
 
 fn print_status_summary() {
     let status = collect_auth_status();
+    if !config::Config::fresh().platform_sync_enabled() {
+        eprintln!("Autter is running in local mode: nothing is uploaded to the Autter platform.");
+        if matches!(status.state, AuthState::LoggedIn) {
+            eprintln!("  You are signed in, but local mode keeps all data on this machine.");
+        }
+        eprintln!();
+        eprintln!("  To connect:  autter onboard --connect");
+        return;
+    }
     if matches!(status.state, AuthState::LoggedIn) {
         let who = status
             .email
@@ -395,103 +564,176 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
 }
 
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
-/// Non-interactive `--local` / `--connect` / `--force` flows apply system
-/// integrations automatically (scripted installs already opted in by flag).
-fn apply_system_integrations_with_consent(auto_apply: bool) {
+/// Returns whether the integrations were installed, or the install error.
+///
+/// Only `assume_yes` (`--yes`) applies them without asking. Interactive runs
+/// ask; non-interactive runs without `--yes` leave them off.
+fn apply_system_integrations_with_consent(assume_yes: bool) -> Result<bool, String> {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
+        return Ok(false);
     }
 
-    let apply = if auto_apply {
-        true
-    } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        eprintln!();
-        eprintln!("{BOLD}System integrations{RESET}");
-        eprintln!("  Autter can install IDE/agent hooks, write git trace2 settings, and start a");
-        eprintln!("  background service so terminal commits get authorship notes.");
-        eprintln!();
-        let items = [
-            SelectItem::new(
-                "Yes — install hooks, configure git, and start the background service",
-                "Required for attribution on terminal commits and AI editor sessions.",
-            ),
-            SelectItem::new(
-                "Not now — I'll run `autter install --system` later",
-                "Binary stays installed; attribution will not capture until you opt in.",
-            ),
-        ];
-        matches!(ui::select("Install system integrations?", &items, 0), 0)
-    } else {
-        // Non-interactive without flags: leave integrations off.
-        eprintln!(
-            "Skipping system integrations (non-interactive). Run `autter onboard` or `autter install --system` later."
-        );
-        false
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let apply = match integration_decision(assume_yes, interactive) {
+        IntegrationDecision::Apply => true,
+        IntegrationDecision::Ask => {
+            eprintln!();
+            eprintln!("{BOLD}System integrations{RESET}");
+            eprintln!(
+                "  Autter can install IDE/agent hooks, write git trace2 settings, and start a"
+            );
+            eprintln!("  background service so terminal commits get authorship notes.");
+            eprintln!();
+            let items = [
+                SelectItem::new(
+                    "Yes — install hooks, configure git, and start the background service",
+                    "Required for attribution on terminal commits and AI editor sessions.",
+                ),
+                SelectItem::new(
+                    "Not now — I'll run `autter install --system` later",
+                    "Binary stays installed; attribution will not capture until you opt in.",
+                ),
+            ];
+            matches!(ui::select("Install system integrations?", &items, 0), 0)
+        }
+        IntegrationDecision::Skip => {
+            // Non-interactive without `--yes`: leave integrations off.
+            eprintln!(
+                "Skipping system integrations (non-interactive, no --yes). Run `autter install --system` to install them."
+            );
+            false
+        }
     };
 
     if !apply {
-        return;
+        return Ok(false);
     }
 
     eprintln!();
     eprintln!("Installing IDE/agent hooks…");
-    match crate::commands::install_hooks::run(&["--system".to_string()]) {
-        Ok(_) => {}
-        Err(e) => eprintln!("Warning: could not install hooks: {e}"),
+    crate::commands::install_hooks::run(&["--system".to_string()])
+        .map(|_| true)
+        .map_err(|e| e.to_string())
+}
+
+/// Parsed `autter onboard` flags.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OnboardFlags {
+    /// `--force`/`-f`: re-run onboarding even if it was completed.
+    force: bool,
+    choose_connect: bool,
+    choose_local: bool,
+    /// `--yes`/`-y`: consent to system integrations without a prompt. The
+    /// only flag that counts as consent.
+    assume_yes: bool,
+}
+
+impl OnboardFlags {
+    fn parse(args: &[String]) -> Self {
+        Self {
+            force: args.iter().any(|a| a == "--force" || a == "-f"),
+            choose_connect: args.iter().any(|a| a == "--connect"),
+            choose_local: args.iter().any(|a| a == "--local"),
+            assume_yes: args.iter().any(|a| a == "--yes" || a == "-y"),
+        }
     }
 }
 
-/// When connecting, any pre-login backlog would upload on the next daemon drain.
-/// Offer to keep (import) or purge it first.
-fn offer_historical_sync_consent() {
-    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
-    }
+#[derive(Debug, PartialEq, Eq)]
+enum IntegrationDecision {
+    Apply,
+    Ask,
+    Skip,
+}
 
-    let pending = crate::auth::notice::pending_sync_counts();
-    if pending.total() == 0 {
-        return;
+/// Whether to install system integrations: only explicit consent applies
+/// them; otherwise ask when there is a terminal, and skip when there is not.
+fn integration_decision(assume_yes: bool, interactive: bool) -> IntegrationDecision {
+    if assume_yes {
+        IntegrationDecision::Apply
+    } else if interactive {
+        IntegrationDecision::Ask
+    } else {
+        IntegrationDecision::Skip
+    }
+}
+
+/// Hold every queued upload item before connecting (see `crate::upload_hold`).
+/// Applies the one-time legacy migration first so it can never later mistake
+/// data queued after connecting for pre-upgrade backlog.
+fn hold_backlog_before_connecting() -> Result<(), String> {
+    crate::upload_hold::ensure_legacy_migration()?;
+    crate::upload_hold::hold_all().map(|_| ())
+}
+
+/// Ask what to do with the backlog that predates this connect, which
+/// [`hold_backlog_before_connecting`] has already held. Nothing in it uploads
+/// without explicit consent: an interactive "Import", or `--yes` in a
+/// non-interactive run. Otherwise it stays held, and the commands to import
+/// or delete it are printed.
+fn offer_historical_sync_consent(assume_yes: bool) -> Result<(), String> {
+    let held = crate::upload_hold::held_counts();
+    if held.total() == 0 {
+        return Ok(());
     }
 
     eprintln!();
     eprintln!("{BOLD}Previously collected sessions{RESET}");
-    eprintln!(
-        "  Found local data queued for upload: {}.",
-        pending.summary()
-    );
-    eprintln!("  This may include sessions from before you connected this machine.");
+    eprintln!("  Found local data queued for upload: {}.", held.summary());
+    eprintln!("  It was queued before you connected this machine (or by an older autter) and");
+    eprintln!("  may include sessions recorded in local mode. It is held and has not been sent.");
     eprintln!();
 
-    let import = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+    let decision = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
         let items = [
             SelectItem::new(
                 "Import — upload this backlog to your Autter org",
                 "Recommended if you want historical attribution on the dashboard.",
             ),
             SelectItem::new(
-                "Discard — clear the local upload queue first",
+                "Discard — delete it from this machine",
                 "Runs `autter sync purge`. Nothing pre-dating this connect is uploaded.",
             ),
         ];
-        ui::select("What should we do with the backlog?", &items, 0) == 0
+        if ui::select("What should we do with the backlog?", &items, 0) == 0 {
+            BacklogDecision::Import
+        } else {
+            BacklogDecision::Discard
+        }
+    } else if assume_yes {
+        BacklogDecision::Import
     } else {
-        // Non-interactive connect: keep backlog (historical default) but print how to purge.
-        eprintln!(
-            "  Keeping the backlog. Run `autter sync purge` before the next daemon drain to discard it."
-        );
-        true
+        BacklogDecision::KeepHeld
     };
 
-    if !import {
-        match crate::commands::sync::purge_sync_queues() {
-            Ok(summary) => {
-                eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
-            }
-            Err(e) => eprintln!("Warning: could not clear upload queue: {e}"),
+    match decision {
+        BacklogDecision::Import => {
+            let released = crate::upload_hold::release_all()?;
+            eprintln!(
+                "  Backlog released ({} records); it uploads in the background after setup.",
+                released.total()
+            );
         }
-    } else {
-        eprintln!("  Backlog will upload in the background after setup.");
+        BacklogDecision::Discard => {
+            let summary = crate::commands::sync::purge_sync_queues().map_err(|e| e.to_string())?;
+            eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
+        }
+        BacklogDecision::KeepHeld => {
+            eprintln!(
+                "  Kept on this machine and NOT uploaded (non-interactive run without --yes)."
+            );
+            eprintln!("    Upload it:  {}", crate::upload_hold::IMPORT_COMMAND);
+            eprintln!("    Delete it:  {}", crate::upload_hold::PURGE_COMMAND);
+        }
     }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BacklogDecision {
+    Import,
+    Discard,
+    KeepHeld,
 }
 
 /// True when the args are only asking for help (`--help`/`-h`/`help` in any
@@ -508,6 +750,73 @@ mod tests {
 
     fn args(flags: &[&str]) -> Vec<String> {
         flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn choosing_a_mode_is_not_consent_to_system_integrations() {
+        for flags in [
+            &["--local"][..],
+            &["--connect"][..],
+            &["--force"][..],
+            &["--local", "--force"][..],
+            &["--connect", "--telemetry"][..],
+        ] {
+            let parsed = OnboardFlags::parse(&args(flags));
+            assert!(!parsed.assume_yes, "{flags:?} must not imply consent");
+            assert_eq!(
+                integration_decision(parsed.assume_yes, false),
+                IntegrationDecision::Skip,
+                "non-interactive {flags:?} must leave integrations off"
+            );
+            assert_eq!(
+                integration_decision(parsed.assume_yes, true),
+                IntegrationDecision::Ask,
+                "interactive {flags:?} must ask"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_yes_applies_system_integrations() {
+        for flags in [&["--local", "--yes"][..], &["--connect", "-y"][..]] {
+            let parsed = OnboardFlags::parse(&args(flags));
+            assert!(parsed.assume_yes);
+            assert_eq!(
+                integration_decision(parsed.assume_yes, false),
+                IntegrationDecision::Apply
+            );
+        }
+    }
+
+    #[test]
+    fn clean_setup_ends_with_all_set() {
+        let text = render_finished(false, &SetupReport::default(), false);
+        assert!(text.contains("You're all set!"), "{text}");
+        assert!(!text.contains("Set up with warnings"), "{text}");
+    }
+
+    #[test]
+    fn degraded_setup_lists_each_problem_with_its_fix_instead_of_all_set() {
+        let mut report = SetupReport::default();
+        report.problem(
+            "Could not restart the background service (timed out)",
+            crate::commands::daemon::RESTART_COMMAND,
+        );
+        report.problem(
+            "Could not install hooks (denied)",
+            "autter install --system",
+        );
+        let text = render_finished(true, &report, false);
+        assert!(!text.contains("You're all set"), "{text}");
+        assert!(text.contains("Set up with warnings"), "{text}");
+        assert!(text.contains("2 steps did not complete"), "{text}");
+        assert!(
+            text.contains("Could not restart the background service (timed out)"),
+            "{text}"
+        );
+        // The daemon fix is the canonical restart command.
+        assert!(text.contains("Fix: autter bg restart"), "{text}");
+        assert!(text.contains("Fix: autter install --system"), "{text}");
     }
 
     #[test]

@@ -406,6 +406,20 @@ fn handle_checkpoint(args: &[String]) {
     commands::arg_parser::merge_global_flags(&pp.flags);
     let args = &pp.rest;
 
+    // Antigravity reads every hook's stdout as JSON
+    // (https://antigravity.google/docs/hooks). Answer `{}` up front so every
+    // exit path below, including failures, returns valid output that leaves
+    // the agent's behavior unchanged: PostToolUse expects `{}`, and a
+    // PreToolUse reply without a `decision` is treated as no decision.
+    if args
+        .first()
+        .is_some_and(|preset| preset.starts_with("antigravity-"))
+    {
+        use std::io::Write as _;
+        println!("{{}}");
+        let _ = std::io::stdout().flush();
+    }
+
     let mut hook_input = None;
     let mut i = 0;
     while i < args.len() {

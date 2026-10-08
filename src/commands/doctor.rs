@@ -138,20 +138,32 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     reporter.add(check_config_file());
     reporter.add(check_repository());
 
-    // Background service: readiness plus a real trace2 ingestion probe. This
-    // starts (or restarts) the daemon when needed, so it must run before the
-    // end-to-end checkpoint check.
-    let mut daemon_check = check_from_diagnostic(
+    // Background service health uses the same probe as `autter bg status`, so
+    // the two commands always agree. This starts (or restarts) the service
+    // when needed, so it must run before the end-to-end checkpoint check.
+    let daemon_check = check_from_diagnostic(
         SECTION_SERVICE,
         "background service",
-        crate::diagnostics::prepare_daemon_for_debug_self_checks(&git_cmd),
+        crate::diagnostics::ensure_daemon_ready_for_self_checks(),
     );
-    if daemon_check.status == DoctorStatus::Passed {
-        daemon_check.summary =
-            "background service is running and ingesting git trace2 events".to_string();
-    }
     let daemon_ok = daemon_check.status != DoctorStatus::Failed;
     reporter.add(daemon_check);
+
+    // Separately: do real git trace2 events reach the service? A failure here
+    // is usually missing trace2 config, not an unhealthy service.
+    if daemon_ok {
+        reporter.add(check_from_diagnostic(
+            SECTION_SERVICE,
+            "trace2 ingestion",
+            crate::diagnostics::check_daemon_trace2_ingestion(&git_cmd),
+        ));
+    } else {
+        reporter.add(skipped_check(
+            SECTION_SERVICE,
+            "trace2 ingestion",
+            "skipped -- fix the background service check first",
+        ));
+    }
 
     // Git capture: the trace2 global config every git invocation depends on,
     // checked for both the git autter runs and the git on the user's PATH.
@@ -554,6 +566,16 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
                 details: Vec::new(),
                 remediation: Some(format!("run `autter install-hooks`, then restart {}", name)),
             }),
+            Ok(result) if result.hooks_up_to_date && installer.id() == "antigravity" => {
+                checks.push(DoctorCheck {
+                    section: SECTION_AGENTS,
+                    name,
+                    status: DoctorStatus::Passed,
+                    summary: "hooks installed (up to date) -- captured in the Antigravity CLI and 2.0 app; the Antigravity IDE has been reported not to run hooks, see docs/unsupported-agents.md".to_string(),
+                    details: Vec::new(),
+                    remediation: None,
+                })
+            }
             Ok(result) if result.hooks_up_to_date => checks.push(DoctorCheck {
                 section: SECTION_AGENTS,
                 name,
@@ -586,7 +608,26 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
         }
     }
 
-    if checks.is_empty() && !not_detected.is_empty() {
+    // Agents autter has no preset for: their edits land as untracked and
+    // blame credits the user. A warning, not a failure -- nothing is broken,
+    // but attribution for that tool is missing.
+    let unsupported = crate::mdm::unsupported_agents::detect_unsupported_agents();
+    for agent in &unsupported {
+        checks.push(DoctorCheck {
+            section: SECTION_AGENTS,
+            name: agent.name.to_string(),
+            status: DoctorStatus::Warning,
+            summary: crate::mdm::unsupported_agents::not_captured_message(agent),
+            details: vec![
+                agent.evidence.clone(),
+                "autter has no integration for this tool yet; edits made with it show as untracked in `autter stats` and as yours in `autter blame`".to_string(),
+                "what is missing and what would unblock it: docs/unsupported-agents.md (https://github.com/Autter-dev/autter-cli/blob/main/docs/unsupported-agents.md)".to_string(),
+            ],
+            remediation: None,
+        });
+    }
+
+    if checks.len() == unsupported.len() && !not_detected.is_empty() {
         checks.push(DoctorCheck {
             section: SECTION_AGENTS,
             name: "AI agents".to_string(),
@@ -738,7 +779,7 @@ fn check_auth() -> (DoctorCheck, bool) {
                 },
                 details,
                 remediation: Some(
-                    "run `autter login`, then `autter daemon restart` (or ignore in local-only mode)"
+                    "run `autter login`, then `autter bg restart` (or ignore in local-only mode)"
                         .to_string(),
                 ),
             },
@@ -900,14 +941,43 @@ fn check_org_data_plane() -> DoctorCheck {
 fn check_sync_queue() -> DoctorCheck {
     let name = "durable sync queue".to_string();
 
-    // Local-only mode never drains cloud queues — leftover metrics/notes from a
-    // prior connected session (or telemetry) must not fail CI / doctor.
-    if !Config::get().notes_backend_kind().uses_http() {
+    // Local mode never uploads anything. Leftover records queued by an earlier
+    // connected session (or by older versions) stay on disk and are only
+    // uploaded if the user reconnects and agrees to import them, so they must
+    // not fail CI / doctor.
+    if !Config::fresh().platform_sync_enabled() {
+        let pending = crate::auth::notice::pending_sync_counts();
+        let held = crate::upload_hold::held_counts();
+        let mut details = Vec::new();
+        if pending.total() + held.total() > 0 {
+            details.push(format!(
+                "left over from an earlier connected session or autter version: {} (plus {} held)",
+                pending.summary(),
+                held.total()
+            ));
+            details.push(
+                "not uploaded in local mode; `autter onboard --connect` asks before importing them"
+                    .to_string(),
+            );
+            details.push("delete them with `autter sync purge --force`".to_string());
+        }
         return DoctorCheck {
             section: SECTION_ACCOUNT,
             name,
             status: DoctorStatus::Passed,
-            summary: "local mode — cloud upload queues are not drained (expected)".to_string(),
+            summary: "local mode — nothing is uploaded to the Autter platform".to_string(),
+            details,
+            remediation: None,
+        };
+    }
+
+    // Notes stay in git notes; cloud upload queues are not checked.
+    if !Config::fresh().notes_backend_kind().uses_http() {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Passed,
+            summary: "git-notes backend — cloud upload queues are not checked".to_string(),
             details: vec![crate::auth::notice::pending_sync_counts().summary()],
             remediation: None,
         };
@@ -915,6 +985,13 @@ fn check_sync_queue() -> DoctorCheck {
 
     let pending = crate::auth::notice::pending_sync_counts();
     let mut details = vec![pending.summary()];
+    let held = crate::upload_hold::held_counts();
+    if held.total() > 0 {
+        details.push(format!(
+            "held until you decide (queued before connecting or by an older autter): {}",
+            held.summary()
+        ));
+    }
     // Auth-blocked is reported on its own. The upload-failure stamp is the
     // case `bg status` calls `upload_failing` while this check used to pass.
     if !crate::auth::notice::sync_auth_blocked_recently()
@@ -931,6 +1008,23 @@ fn check_sync_queue() -> DoctorCheck {
             remediation: Some(format!(
                 "{} upload failed ({}); fix that error, then run `autter bg restart` and `autter doctor`",
                 failure.queue, failure.detail
+            )),
+        };
+    }
+    if pending.total() == 0 && held.total() > 0 {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: format!(
+                "{} records are held and will not upload until you decide",
+                held.total()
+            ),
+            details,
+            remediation: Some(format!(
+                "upload them with `{}`, or delete them with `{}`",
+                crate::upload_hold::IMPORT_COMMAND,
+                crate::upload_hold::PURGE_COMMAND
             )),
         };
     }
@@ -953,10 +1047,7 @@ fn check_sync_queue() -> DoctorCheck {
             summary: "queued data is not draining because cloud sync is authentication-blocked"
                 .to_string(),
             details,
-            remediation: Some(
-                "run `autter login`, then `autter daemon restart` (or `autter bg restart`)"
-                    .to_string(),
-            ),
+            remediation: Some("run `autter login`, then `autter bg restart`".to_string()),
         }
     } else {
         DoctorCheck {

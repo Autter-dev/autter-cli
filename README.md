@@ -45,6 +45,8 @@ curl -fsSL https://api.autter.dev/install.sh | bash
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
 ```
 
+Use the `api.autter.dev` URL exactly as shown (other hosts serve the website, which fails with parse errors). Afterwards, open a new terminal so `autter` is on your `PATH`; the installer also prints the full path to `autter.exe` if you want to run it right away.
+
 **npm (any platform, Node.js 18+)**
 
 ```bash

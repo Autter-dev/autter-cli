@@ -72,9 +72,43 @@ pub fn stats_command(
         println!("{}", json_str);
     } else {
         write_stats_to_terminal(&stats, true);
+        if untracked_share_is_high(&stats) {
+            let agents = crate::mdm::unsupported_agents::detect_unsupported_agents();
+            if let Some(notice) = unsupported_agent_notice(&agents) {
+                print!("{notice}");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Untracked share at or above which `autter stats` checks for AI tools that
+/// autter cannot capture.
+const HIGH_UNTRACKED_SHARE: f64 = 0.5;
+
+/// True when at least half of the added lines have no attestation.
+fn untracked_share_is_high(stats: &CommitStats) -> bool {
+    let total = stats.human_additions + stats.unknown_additions + stats.ai_additions;
+    total > 0 && f64::from(stats.unknown_additions) / f64::from(total) >= HIGH_UNTRACKED_SHARE
+}
+
+/// One-line notice naming detected agents whose edits autter cannot capture.
+fn unsupported_agent_notice(
+    agents: &[crate::mdm::unsupported_agents::UnsupportedAgent],
+) -> Option<String> {
+    let first = agents.first()?;
+    let names = agents.iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
+    Some(if agents.len() == 1 {
+        format!(
+            "\nNote: {}. If it wrote this code, that is why it shows as untracked. See `autter doctor`.\n",
+            crate::mdm::unsupported_agents::not_captured_message(first)
+        )
+    } else {
+        format!(
+            "\nNote: {names} detected — autter cannot capture their edits yet; they will be attributed to you. If one of them wrote this code, that is why it shows as untracked. See `autter doctor`.\n"
+        )
+    })
 }
 
 pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> String {
@@ -676,6 +710,49 @@ pub fn get_git_diff_stats(
 mod tests {
     use super::*;
     use insta::assert_debug_snapshot;
+
+    fn stats_with(human: u32, unknown: u32, ai: u32) -> CommitStats {
+        CommitStats {
+            human_additions: human,
+            unknown_additions: unknown,
+            ai_additions: ai,
+            git_diff_added_lines: human + unknown + ai,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn untracked_share_threshold() {
+        assert!(untracked_share_is_high(&stats_with(0, 10, 0)));
+        assert!(untracked_share_is_high(&stats_with(5, 5, 0)));
+        assert!(!untracked_share_is_high(&stats_with(6, 4, 0)));
+        assert!(!untracked_share_is_high(&stats_with(0, 0, 0)));
+    }
+
+    #[test]
+    fn unsupported_agent_notice_names_the_agent() {
+        use crate::mdm::unsupported_agents::UnsupportedAgent;
+        assert_eq!(unsupported_agent_notice(&[]), None);
+        let trae = UnsupportedAgent {
+            id: "trae",
+            name: "Trae",
+            evidence: "app".to_string(),
+        };
+        let notice = unsupported_agent_notice(std::slice::from_ref(&trae)).unwrap();
+        assert!(
+            notice.contains(
+                "Trae detected — its edits are not captured; they will be attributed to you"
+            ),
+            "{notice}"
+        );
+        let kiro = UnsupportedAgent {
+            id: "kiro",
+            name: "Kiro",
+            evidence: "app".to_string(),
+        };
+        let notice = unsupported_agent_notice(&[trae, kiro]).unwrap();
+        assert!(notice.contains("Trae, Kiro detected"), "{notice}");
+    }
 
     #[test]
     fn test_terminal_stats_display() {

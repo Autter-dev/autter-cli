@@ -575,6 +575,24 @@ impl Config {
         &self.prompt_storage
     }
 
+    /// Whether this machine may send data to the Autter platform at all.
+    ///
+    /// Local mode is `prompt_storage = "local"` (what `autter onboard --local`
+    /// writes, and what onboarding itself treats as "not connected"). In local
+    /// mode nothing is uploaded: metrics, transcripts (CAS), authorship notes,
+    /// commit summaries and file-change counts all stay on the machine, even
+    /// when credentials are present. Every platform uploader must check this
+    /// before it builds an API client or enqueues upload-only data.
+    ///
+    /// Connected mode is every other value. Uploads there still require valid
+    /// credentials; this predicate only says the mode permits them.
+    ///
+    /// Anonymous telemetry (`telemetry_oss`, PostHog/Sentry) is a separate,
+    /// separately consented setting and is not governed by this predicate.
+    pub fn platform_sync_enabled(&self) -> bool {
+        self.prompt_storage != PromptStorageMode::Local.as_str()
+    }
+
     /// Returns the effective prompt storage mode for a given repository.
     ///
     /// The resolution order is:
@@ -1481,6 +1499,31 @@ pub fn skills_dir_path() -> Option<PathBuf> {
     autter_dir_path().map(|dir| dir.join("skills"))
 }
 
+/// [`Config::platform_sync_enabled`] on a fresh config snapshot.
+///
+/// Long-lived processes (the daemon) must use this rather than
+/// `Config::get()`: switching connected -> local has to stop uploads
+/// immediately, even if the daemon restart that follows onboarding fails.
+///
+/// Deliberately cheaper than `Config::fresh()` (which probes for the git
+/// binary): it only reads `prompt_storage`, because it runs on hot paths such
+/// as every recorded metric event. The result must stay identical to
+/// `Config::fresh().platform_sync_enabled()`.
+pub fn platform_sync_enabled_now() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Ok(patch_json) = env::var("AUTTER_TEST_CONFIG_PATCH")
+        && let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json)
+        && let Some(prompt_storage) = patch.prompt_storage
+        && matches!(prompt_storage.as_str(), "default" | "notes" | "local")
+    {
+        return prompt_storage != PromptStorageMode::Local.as_str();
+    }
+
+    load_file_config()
+        .and_then(|cfg| cfg.prompt_storage)
+        .is_none_or(|prompt_storage| prompt_storage != PromptStorageMode::Local.as_str())
+}
+
 /// Public accessor for ID file path (~/.autter/internal/distinct_id)
 pub fn id_file_path() -> Option<PathBuf> {
     internal_dir_path().map(|dir| dir.join("distinct_id"))
@@ -2322,6 +2365,29 @@ mod tests {
         assert_eq!(PromptStorageMode::Default.as_str(), "default");
         assert_eq!(PromptStorageMode::Notes.as_str(), "notes");
         assert_eq!(PromptStorageMode::Local.as_str(), "local");
+    }
+
+    #[test]
+    fn test_platform_sync_disabled_only_in_local_mode() {
+        let local = create_test_config_with_include_prompts(vec![], vec![], "local", None);
+        assert!(
+            !local.platform_sync_enabled(),
+            "local mode must never upload to the platform"
+        );
+
+        // Local mode stays local even if an HTTP notes backend is configured
+        // (a contradictory config must fail closed).
+        let mut local_http = create_test_config_with_include_prompts(vec![], vec![], "local", None);
+        local_http.notes_backend.kind = NotesBackendKind::Http;
+        assert!(!local_http.platform_sync_enabled());
+
+        for connected in ["default", "notes"] {
+            let cfg = create_test_config_with_include_prompts(vec![], vec![], connected, None);
+            assert!(
+                cfg.platform_sync_enabled(),
+                "prompt_storage={connected} is connected mode"
+            );
+        }
     }
 
     #[test]

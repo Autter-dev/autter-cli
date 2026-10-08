@@ -78,6 +78,20 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
+/// Canonicalize JSON (RFC 8785) and return `(sha256 hex, canonical text)`.
+///
+/// This is the content address used for `cas:<hash>` references, whether the
+/// object is queued for upload or only cached locally.
+pub fn canonical_cas_hash(json_data: &serde_json::Value) -> Result<(String, String), AutterError> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json_canonicalizer::to_string(json_data)
+        .map_err(|e| AutterError::Generic(format!("Failed to canonicalize JSON: {}", e)))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Ok((format!("{:x}", hasher.finalize()), canonical))
+}
+
 /// Global database singleton
 static INTERNAL_DB: OnceLock<Mutex<InternalDatabase>> = OnceLock::new();
 
@@ -330,16 +344,7 @@ impl InternalDatabase {
         json_data: &serde_json::Value,
         metadata: Option<&HashMap<String, String>>,
     ) -> Result<String, AutterError> {
-        use sha2::{Digest, Sha256};
-
-        // Canonicalize JSON (RFC 8785)
-        let canonical = serde_json_canonicalizer::to_string(json_data)
-            .map_err(|e| AutterError::Generic(format!("Failed to canonicalize JSON: {}", e)))?;
-
-        // Hash the canonicalized content
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let (hash, canonical) = canonical_cas_hash(json_data)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -428,11 +433,39 @@ impl InternalDatabase {
     /// an empty queue never triggers an auth check.
     pub fn count_pending_cas(&self) -> Result<i64, AutterError> {
         let count = self.conn.query_row(
-            "SELECT COUNT(*) FROM cas_sync_queue WHERE attempts < 6",
-            [],
+            "SELECT COUNT(*) FROM cas_sync_queue WHERE attempts < 6 AND next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Hold every queued CAS object: it stays on disk (and readable by
+    /// `show-prompt`) but is never dequeued until [`Self::release_held_cas`].
+    pub fn hold_pending_cas(&mut self) -> Result<usize, AutterError> {
+        Ok(self.conn.execute(
+            "UPDATE cas_sync_queue
+             SET next_retry_at = ?1, status = 'pending', processing_started_at = NULL
+             WHERE next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+        )?)
+    }
+
+    /// Make held CAS objects eligible for upload again.
+    pub fn release_held_cas(&mut self) -> Result<usize, AutterError> {
+        Ok(self.conn.execute(
+            "UPDATE cas_sync_queue SET next_retry_at = 0 WHERE next_retry_at = ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+        )?)
+    }
+
+    /// Number of held CAS objects.
+    pub fn count_held_cas(&self) -> Result<i64, AutterError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM cas_sync_queue WHERE next_retry_at = ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+            |row| row.get(0),
+        )?)
     }
 
     /// Drop every CAS object still waiting for upload.
@@ -606,6 +639,23 @@ mod tests {
         db.initialize_schema().unwrap();
 
         (db, temp_dir)
+    }
+
+    #[test]
+    fn test_held_cas_objects_stay_readable_but_are_never_dequeued() {
+        let (mut db, _temp_dir) = create_test_db();
+        let hash = db
+            .enqueue_cas_object(&serde_json::json!({"messages": []}), None)
+            .unwrap();
+        assert_eq!(db.hold_pending_cas().unwrap(), 1);
+        assert_eq!(db.count_pending_cas().unwrap(), 0);
+        assert_eq!(db.count_held_cas().unwrap(), 1);
+        assert!(db.dequeue_cas_batch(10).unwrap().is_empty());
+        // Still the local transcript store for show-prompt.
+        assert!(db.get_cas_queue_data(&hash).unwrap().is_some());
+
+        assert_eq!(db.release_held_cas().unwrap(), 1);
+        assert_eq!(db.dequeue_cas_batch(10).unwrap().len(), 1);
     }
 
     #[test]

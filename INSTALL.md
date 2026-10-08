@@ -22,6 +22,10 @@ Run:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
 ```
 
+Use the `api.autter.dev` URL exactly as shown. Other hosts (such as `autter.dev/install.ps1`) serve the website, and piping that HTML into `iex` fails with PowerShell parse errors.
+
+The installer adds `%USERPROFILE%\.autter\bin` to your user `PATH`. That reaches terminals opened afterwards, not the window you ran the command from: open a new terminal (and restart your IDE) before running `autter`. The installer prints the full path to `autter.exe` at the end so you can run it straight away. If you are already in PowerShell, `irm https://api.autter.dev/install.ps1 | iex` runs the same installer inside your current window, and `autter` works there immediately.
+
 ### npm (any platform, Node.js 18+)
 
 ```bash
@@ -138,7 +142,9 @@ In local-only mode:
 - line-level attribution is stored in local Git notes under `refs/notes/ai`;
 - prompts remain in local storage on your machine;
 - local commands such as `autter blame` and `autter stats` continue to work; and
-- no code, prompts, or agent usage data is uploaded to the Autter platform.
+- no code, prompts, or agent usage data is uploaded to the Autter platform, even if this machine is signed in.
+
+Choosing a mode does not change system configuration by itself. In a terminal, onboarding asks before it installs IDE/agent hooks, writes global git trace2 settings, or starts the background service. In scripts, add `--yes` to consent to those changes up front (for example `autter onboard --local --yes`); without it a non-interactive run leaves them off, and you can apply them later with `autter install --system`.
 
 Open source error and exception telemetry is enabled by default. If you want Autter to send no telemetry at all, turn it off:
 
@@ -248,7 +254,7 @@ autter onboard --force
 `autter doctor` prints a `fix:` line with a likely cause and next command for each failure. Common cases:
 
 1. **Checkpoints not persisting** (timeout waiting for working-log entries):  
-   `autter daemon status`, then `autter daemon restart`, then `autter doctor`.
+   `autter bg status`, then `autter bg restart`, then `autter doctor`.
 2. **Trace2 config / event capture failed**:  
    `autter install`, then `autter doctor`. Attribution depends on the git proxy and trace2 settings.
 3. **Commit succeeded but blame lines are all untracked / wrong class**:  

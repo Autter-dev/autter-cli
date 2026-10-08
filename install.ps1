@@ -1,3 +1,26 @@
+# autter installer for Windows (Windows PowerShell 5.1 and PowerShell 7+).
+#
+# Usage (works from PowerShell, cmd.exe, and Git Bash):
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
+# or, already inside PowerShell (autter is then usable in that window at once):
+#   irm https://api.autter.dev/install.ps1 | iex
+#
+# Rules for editing this file, because it usually runs through `irm | iex`:
+#   - Keep it pure ASCII. irm decodes with whatever charset the server sends,
+#     and a mis-decoded em-dash or smart quote can become a quote character
+#     that PowerShell parses as a string delimiter. CI enforces this.
+#   - iex runs the text in the CALLER's scope (the user's own shell), so the
+#     whole body lives in the scriptblock below: preferences, StrictMode, and
+#     helper functions stay inside it instead of leaking into the session.
+#   - Never call `exit`: under iex it closes the user's terminal. Fail with
+#     Write-ErrorAndExit, which throws; -File/-Command runs still exit 1.
+#   - No param() block, $PSScriptRoot, or $MyInvocation paths (none exist
+#     under iex); take input from environment variables.
+#   - Windows PowerShell 5.1 syntax only: no ??, ?., ternaries, && / ||.
+#     CI parses this file with both powershell.exe and pwsh.
+#
+# The body below is intentionally not indented, to keep diffs readable.
+& {
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -25,7 +48,11 @@ function Write-ErrorAndExit {
     )
     Write-Host "Error: $Message" -ForegroundColor Red
     Start-DaemonIfRequested
-    exit 1
+    # Throw, never `exit`: under `irm | iex` exit would close the user's
+    # terminal. An uncaught throw still makes `powershell -File` and
+    # `powershell -Command` exit 1. Do not call this inside a try block whose
+    # catch would intercept the throw and report the failure a second time.
+    throw "autter install failed: $Message"
 }
 
 function Write-Success {
@@ -78,13 +105,14 @@ function Stop-AutterBackgroundService {
         return $false
     }
 
-    $args = @('bg', 'shutdown')
+    # Not $args: that is an automatic variable.
+    $bgArgs = @('bg', 'shutdown')
     if ($Hard) {
-        $args += '--hard'
+        $bgArgs += '--hard'
     }
 
     try {
-        & $AutterExe @args *> $null
+        & $AutterExe @bgArgs *> $null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -201,6 +229,7 @@ function Verify-Checksum {
     if ($null -ne $hashCommand) {
         $actual = (Get-FileHash -Path $File -Algorithm SHA256).Hash.ToLower()
     } else {
+        $sha256 = $null
         $stream = [System.IO.File]::OpenRead($File)
         try {
             $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -224,7 +253,7 @@ function Verify-Checksum {
 
 # Release-fill placeholders. The release workflow blindly string-replaces each
 # placeholder token EVERYWHERE in this file, so the guards below compare
-# against *Sentinel values built by concatenation — those survive the fill.
+# against *Sentinel values built by concatenation - those survive the fill.
 # Comparing against the literal token would self-destruct on fill: the pinned
 # copy would ignore its version pin and skip checksum verification.
 
@@ -244,9 +273,16 @@ $VersionSentinel = '__VERSION_' + 'PLACEHOLDER__'
 $EmbeddedChecksums = '__CHECKSUMS_PLACEHOLDER__'
 $ChecksumsSentinel = '__CHECKSUMS_' + 'PLACEHOLDER__'
 
-# Ensure TLS 1.2 for GitHub downloads on older PowerShell versions
+# Ensure TLS 1.2 for GitHub downloads on Windows PowerShell 5.1, whose .NET
+# Framework may default to SSL3/TLS 1.0 only. This setting is process-wide, so
+# under iex it is the user's own session: leave SystemDefault (0, the OS picks,
+# including TLS 1.3) alone and otherwise only add TLS 1.2 with -bor instead of
+# overwriting the list. (PowerShell 7's web cmdlets ignore this setting.)
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $securityProtocol = [Net.ServicePointManager]::SecurityProtocol
+    if ([int]$securityProtocol -ne 0 -and -not ($securityProtocol -band [Net.SecurityProtocolType]::Tls12)) {
+        [Net.ServicePointManager]::SecurityProtocol = $securityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
 } catch { }
 
 function Get-Architecture {
@@ -305,7 +341,11 @@ function Set-PathEnsureContains {
         $userStatus = 'Error'
     }
 
-    # Update current process PATH immediately for this session
+    # Also update the current process PATH. Under `irm | iex` this process IS
+    # the user's PowerShell window, so `autter` resolves there immediately
+    # (issue #11). Prepend, so a stale autter.exe elsewhere on PATH cannot
+    # shadow the one just installed. A child process (`powershell -Command`)
+    # cannot reach its parent shell; the final notice covers that case.
     try {
         $procPath = $env:PATH
         $procEntries = @()
@@ -315,7 +355,7 @@ function Set-PathEnsureContains {
             if ((NormalizePath $e) -eq $normalizedAdd) { $procHas = $true; break }
         }
         if (-not $procHas) {
-            $env:PATH = if ($procPath) { "$procPath$sep$PathToAdd" } else { $PathToAdd }
+            $env:PATH = if ($procPath) { "$PathToAdd$sep$procPath" } else { $PathToAdd }
         }
     } catch { }
 
@@ -335,13 +375,13 @@ if (-not $arch) {
 }
 $os = 'windows'
 
-# git is required — autter wraps git and cannot function without it.
+# git is required - autter wraps git and cannot function without it.
+$gitFound = $false
 try {
     $null = & git --version 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-ErrorAndExit 'git is required but not found. Install Git for Windows (https://git-scm.com/download/win) and re-run the installer.'
-    }
-} catch {
+    $gitFound = ($LASTEXITCODE -eq 0)
+} catch { }
+if (-not $gitFound) {
     Write-ErrorAndExit 'git is required but not found. Install Git for Windows (https://git-scm.com/download/win) and re-run the installer.'
 }
 
@@ -370,7 +410,11 @@ if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
 # Resolve a specific release and load the checksum file produced by release.yml
 # before downloading the executable. A missing/malformed checksum is fatal.
 if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
+    # Failures inside these try blocks are recorded and reported after them:
+    # Write-ErrorAndExit throws, and a surrounding catch would intercept it.
     if ($releaseTag -eq 'latest') {
+        $latestUrl = $null
+        $latestError = $null
         try {
             $latestResponse = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -Method Head -UseBasicParsing -ErrorAction Stop
             $latestResponseUriProperty = $latestResponse.BaseResponse.PSObject.Properties['ResponseUri']
@@ -379,16 +423,20 @@ if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
             } else {
                 $latestResponse.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
             }
-            if ($latestUrl -notmatch '/releases/tag/([^/?]+)') {
-                Write-ErrorAndExit 'Failed to resolve latest release to a specific version'
-            }
-            $releaseTag = $Matches[1]
         } catch {
-            Write-ErrorAndExit "Failed to resolve the latest release: $($_.Exception.Message)"
+            $latestError = $_.Exception.Message
         }
+        if ($latestError) {
+            Write-ErrorAndExit "Failed to resolve the latest release: $latestError"
+        }
+        if ("$latestUrl" -notmatch '/releases/tag/([^/?]+)') {
+            Write-ErrorAndExit 'Failed to resolve latest release to a specific version'
+        }
+        $releaseTag = $Matches[1]
     }
     $checksumsUrl = "https://github.com/$Repo/releases/download/$releaseTag/checksums.txt"
     $checksumsTmp = [IO.Path]::GetTempFileName()
+    $checksumsError = $null
     try {
         $oldProgressPreference = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
@@ -398,13 +446,16 @@ if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
             $ProgressPreference = $oldProgressPreference
         }
         $EmbeddedChecksums = ((Get-Content -LiteralPath $checksumsTmp) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '|'
-        if ([string]::IsNullOrWhiteSpace($EmbeddedChecksums)) {
-            Write-ErrorAndExit 'Release checksums are empty'
-        }
     } catch {
-        Write-ErrorAndExit "Failed to download release checksums: $($_.Exception.Message)"
+        $checksumsError = $_.Exception.Message
     } finally {
         Remove-Item -Force -ErrorAction SilentlyContinue $checksumsTmp
+    }
+    if ($checksumsError) {
+        Write-ErrorAndExit "Failed to download release checksums: $checksumsError"
+    }
+    if ([string]::IsNullOrWhiteSpace($EmbeddedChecksums)) {
+        Write-ErrorAndExit 'Release checksums are empty'
     }
     $downloadUrlExe = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName.exe"
     $downloadUrlNoExt = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName"
@@ -547,7 +598,7 @@ function Try-Download {
         try {
             # WebException (PowerShell 5.1) and HttpResponseException (7+) both
             # carry the response; pure network/TLS failures have none, and on
-            # some exception types even probing .Response throws — hence the
+            # some exception types even probing .Response throws - hence the
             # inner try/catch keeping the plain exception message.
             if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
                 $reason = 'HTTP {0} {1}' -f [int]$_.Exception.Response.StatusCode, $_.Exception.Response.StatusCode
@@ -588,14 +639,17 @@ if (-not $downloadedBinaryName) {
     Write-ErrorAndExit $message
 }
 
+$downloadedSize = $null
 try {
-    if ((Get-Item $tmpFile).Length -le 0) {
-        Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
-        Write-ErrorAndExit 'Downloaded file is empty'
-    }
-} catch {
+    $downloadedSize = (Get-Item -LiteralPath $tmpFile).Length
+} catch { }
+if ($null -eq $downloadedSize) {
     Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
     Write-ErrorAndExit 'Download failed'
+}
+if ($downloadedSize -le 0) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+    Write-ErrorAndExit 'Downloaded file is empty'
 }
 
 # Verify before the executable is moved into place or run.
@@ -615,18 +669,24 @@ Move-Item -Force -Path $tmpFile -Destination $finalExe
 try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
 
 # Verify the binary runs before reporting success.
+$installedVersion = ''
+$versionExitCode = $null
+$versionError = $null
 try {
-    $installedVersion = & $finalExe --version 2>&1 | Out-String
-    $installedVersion = $installedVersion.Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installedVersion)) {
-        Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
-        Write-ErrorAndExit "The autter binary could not run on this system:`n$installedVersion"
-    }
-    Write-Host "Installed autter $installedVersion"
+    $installedVersion = (& $finalExe --version 2>&1 | Out-String).Trim()
+    $versionExitCode = $LASTEXITCODE
 } catch {
-    Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
-    Write-ErrorAndExit "The autter binary could not run on this system: $($_.Exception.Message)"
+    $versionError = $_.Exception.Message
 }
+if ($versionError) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
+    Write-ErrorAndExit "The autter binary could not run on this system: $versionError"
+}
+if ($versionExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($installedVersion)) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
+    Write-ErrorAndExit "The autter binary could not run on this system:`n$installedVersion"
+}
+Write-Host "Installed autter $installedVersion"
 
 # Refresh git.exe for existing wrapper users (it's a copy, not a symlink on Windows)
 $gitShim = Join-Path $installDir 'git.exe'
@@ -652,7 +712,7 @@ if ($env:INSTALL_NONCE -and $env:API_BASE) {
 }
 
 # Hooks / git config / daemon are applied during onboard (with consent).
-Write-Host 'IDE/agent hooks and git capture are configured during onboard (with consent)…'
+Write-Host 'IDE/agent hooks and git capture are configured during onboard (with consent)...'
 Write-Host "  Run: $finalExe onboard"
 
 # Best-effort restart only for daemon-initiated self-updates.
@@ -676,7 +736,6 @@ if ($pathUpdate.UserStatus -eq 'Updated') {
 }
 
 Write-Success "Successfully installed autter into $installDir"
-Write-Success "You can now run 'autter' from your terminal"
 
 # Configure Git Bash shell profiles so autter takes precedence over /mingw64/bin/git
 # Git Bash (MSYS2/MinGW) prepends its own directories to PATH, which shadows
@@ -744,8 +803,6 @@ if ($gitBashConfigured) {
     Write-Success "Git Bash already configured ($targetBashConfig)"
 }
 
-Write-Host 'Close and reopen your terminal and IDE sessions to use autter.' -ForegroundColor Yellow
-
 # If nonce exchange failed, run interactive login
 if ($needLogin) {
     Write-Host ''
@@ -758,3 +815,31 @@ if ($needLogin) {
 # when the console isn't interactive (CI, scripted installs).
 Write-Host ''
 & $finalExe onboard
+# Onboarding exits 1 when a step needs attention ("Set up with warnings"); it
+# has already printed each fix. The install itself succeeded, so don't let
+# that exit code become the installer's (mirrors `|| true` in install.sh).
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Autter is installed. Onboarding listed the remaining steps above.'
+}
+
+# Final notice, printed last so it is not lost above the onboarding output.
+# The PATH change above reaches this PowerShell process (and so the user's
+# window under `irm | iex`), but never a parent cmd.exe or a terminal that
+# started this installer as a child (`powershell -Command ...`), nor IDE
+# terminals that are already open (issue #11).
+Write-Host ''
+Write-Host "autter is installed at: $finalExe"
+if ($pathUpdate.UserStatus -eq 'Updated' -or $pathUpdate.UserStatus -eq 'AlreadyPresent') {
+    Write-Host "If 'autter' is not found, open a new terminal (PATH was updated for new sessions)." -ForegroundColor Yellow
+    Write-Host 'Restart your IDE so its terminals and coding agents pick it up too.' -ForegroundColor Yellow
+} else {
+    Write-Host "PATH was not updated. Add $installDir to your PATH, or use the full path below." -ForegroundColor Yellow
+}
+Write-Host 'To run it right away with the full path:'
+Write-Host ("  PowerShell:  & '{0}' --version" -f $finalExe)
+Write-Host ("  cmd.exe:     ""{0}"" --version" -f $finalExe)
+
+# Onboarding's exit code was handled above; don't leave it in $LASTEXITCODE,
+# where `powershell -Command` and CI shell wrappers would report a failure.
+$global:LASTEXITCODE = 0
+}

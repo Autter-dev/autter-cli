@@ -38,8 +38,15 @@ pub fn handle_notes_migrate(args: &[String]) {
         }
     }
 
-    // 1. Refuse to run unless the backend syncs notes over HTTP.
+    // 1. Refuse to run in local mode, or unless the backend syncs notes over HTTP.
     let cfg = Config::fresh();
+    if !cfg.platform_sync_enabled() {
+        eprintln!(
+            "error: `autter notes migrate` uploads notes to the Autter platform, but this machine\n\
+             is in local mode (nothing is uploaded). Run `autter onboard --connect` first."
+        );
+        std::process::exit(1);
+    }
     if !cfg.notes_backend_kind().uses_http() {
         eprintln!(
             "error: `autter notes migrate` requires notes_backend.kind = http (or both).\n\

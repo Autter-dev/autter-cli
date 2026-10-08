@@ -269,6 +269,159 @@ fn daemon_startup_is_blocked(config: &DaemonConfig) -> bool {
     }
 }
 
+/// The one command every user-facing message suggests for a background
+/// service that is stopped, unresponsive, or running an outdated binary.
+/// `bg restart` also starts a service that is not running, so it covers every
+/// unhealthy state. Use [`RESTART_COMMAND`] in `format!`, or this macro inside
+/// `concat!` for `const` strings.
+macro_rules! restart_command {
+    () => {
+        "autter bg restart"
+    };
+}
+pub(crate) use restart_command;
+
+/// Canonical restart suggestion. See [`restart_command!`].
+pub const RESTART_COMMAND: &str = restart_command!();
+
+/// Canonical "show me the service state" command.
+pub const STATUS_COMMAND: &str = "autter bg status";
+
+/// Socket connect budget for [`probe_daemon_health`]. The readiness loops use
+/// [`daemon_is_up`] with a 100ms budget, which is too tight to *judge* health:
+/// a busy Windows named pipe can take longer to accept, which made `doctor`
+/// call a working service broken.
+const HEALTH_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Health of the background service, as reported by both `autter doctor` and
+/// `autter bg status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHealthState {
+    /// Both sockets accept connections and the binary is current.
+    Healthy,
+    /// Running fine, but started before the installed autter binary was
+    /// written, so it runs old code.
+    Outdated,
+    /// A service holds the lock or has one socket up, but does not accept
+    /// connections on both sockets.
+    Unresponsive,
+    /// No service process and no sockets.
+    NotRunning,
+}
+
+/// Result of [`probe_daemon_health`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DaemonHealth {
+    pub state: DaemonHealthState,
+    pub control_socket: bool,
+    pub trace_socket: bool,
+    pub lock_held: bool,
+    pub pid: Option<u32>,
+    pub binary_outdated: bool,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+impl DaemonHealth {
+    pub fn is_healthy(&self) -> bool {
+        self.state == DaemonHealthState::Healthy
+    }
+
+    /// Lines describing what the probe saw, for `doctor`/`debug` details.
+    pub fn details(&self, config: &DaemonConfig) -> Vec<String> {
+        vec![
+            format!(
+                "control socket: {} ({})",
+                config.control_socket_path.display(),
+                if self.control_socket {
+                    "accepting"
+                } else {
+                    "not accepting"
+                }
+            ),
+            format!(
+                "trace2 socket: {} ({})",
+                config.trace_socket_path.display(),
+                if self.trace_socket {
+                    "accepting"
+                } else {
+                    "not accepting"
+                }
+            ),
+            format!(
+                "lock: {} ({})",
+                config.lock_path.display(),
+                if self.lock_held { "held" } else { "free" }
+            ),
+            format!(
+                "pid: {}",
+                self.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            ),
+        ]
+    }
+}
+
+/// Pure classification behind [`probe_daemon_health`].
+pub(crate) fn classify_daemon_health(
+    control_socket: bool,
+    trace_socket: bool,
+    lock_held: bool,
+    binary_outdated: bool,
+) -> DaemonHealthState {
+    match (control_socket, trace_socket) {
+        (true, true) if binary_outdated => DaemonHealthState::Outdated,
+        (true, true) => DaemonHealthState::Healthy,
+        (false, false) if !lock_held => DaemonHealthState::NotRunning,
+        _ => DaemonHealthState::Unresponsive,
+    }
+}
+
+fn daemon_health_summary(state: DaemonHealthState) -> &'static str {
+    match state {
+        DaemonHealthState::Healthy => "background service is running",
+        DaemonHealthState::Outdated => {
+            "background service is running an older autter binary than the one installed"
+        }
+        DaemonHealthState::Unresponsive => {
+            "background service is not accepting connections on both of its sockets"
+        }
+        DaemonHealthState::NotRunning => "background service is not running",
+    }
+}
+
+/// Read-only health probe shared by `autter doctor` and `autter bg status`,
+/// so the two always reach the same verdict. Never starts, stops or restarts
+/// anything.
+pub fn probe_daemon_health(config: &DaemonConfig) -> DaemonHealth {
+    let socket_accepts = |path: &std::path::Path| {
+        path.exists()
+            && local_socket_connects_with_timeout(path, HEALTH_PROBE_CONNECT_TIMEOUT).is_ok()
+    };
+    let control_socket = socket_accepts(&config.control_socket_path);
+    let trace_socket = socket_accepts(&config.trace_socket_path);
+    let lock_held = daemon_startup_is_blocked(config);
+    let binary_outdated = control_socket
+        && trace_socket
+        && crate::diagnostics::daemon_binary_is_stale(config).unwrap_or(false);
+    let pid = read_daemon_pid(config).ok();
+    let state = classify_daemon_health(control_socket, trace_socket, lock_held, binary_outdated);
+    DaemonHealth {
+        state,
+        control_socket,
+        trace_socket,
+        lock_held,
+        pid,
+        binary_outdated,
+        summary: daemon_health_summary(state).to_string(),
+        remediation: (state != DaemonHealthState::Healthy)
+            .then(|| format!("run `{RESTART_COMMAND}`")),
+    }
+}
+
 pub(crate) fn daemon_is_up(config: &DaemonConfig) -> bool {
     if !config.control_socket_path.exists() || !config.trace_socket_path.exists() {
         return false;
@@ -440,30 +593,42 @@ fn spawn_daemon_run_with_piped_stderr(
 fn handle_status(repo_working_dir: String) -> Result<(), String> {
     let config = daemon_config_from_env_or_default_paths()?;
     let cloud_sync = crate::auth::notice::collect_cloud_sync_status();
+    // The same probe `autter doctor` uses for its "background service" check,
+    // so the two commands can no longer disagree about service health.
+    let health = probe_daemon_health(&config);
+    let daemon_running = health.control_socket || health.trace_socket || health.lock_held;
 
     // Check if the path is inside a git repository before contacting the daemon.
-    // When run outside a git repo, still check daemon health but skip the
+    // When run outside a git repo, still report service health but skip the
     // family-level status query which requires a valid repo.
-    if crate::git::find_repository_in_path(&repo_working_dir).is_err() {
-        let daemon_running = daemon_is_up(&config);
+    let in_repo = crate::git::find_repository_in_path(&repo_working_dir).is_ok();
+    if !in_repo || !health.control_socket {
         let response = serde_json::json!({
-            "ok": true,
-            "git_repo": false,
+            "ok": health.is_healthy(),
+            "git_repo": in_repo,
             "daemon_running": daemon_running,
+            "health": health,
             "cloud_sync": cloud_sync,
         });
         println!(
             "{}",
             serde_json::to_string_pretty(&response).map_err(|e| e.to_string())?
         );
+        if !health.is_healthy() {
+            eprintln!("{}. Fix: run `{RESTART_COMMAND}`.", health.summary);
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
     let request = ControlRequest::StatusFamily { repo_working_dir };
     let daemon_response =
         send_control_request(&config.control_socket_path, &request).map_err(|e| e.to_string())?;
+    let ok = daemon_response.ok && health.is_healthy();
     let response = serde_json::json!({
-        "ok": daemon_response.ok,
+        "ok": ok,
+        "daemon_running": daemon_running,
+        "health": health,
         "seq": daemon_response.seq,
         "data": daemon_response.data,
         "error": daemon_response.error,
@@ -473,6 +638,10 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
         "{}",
         serde_json::to_string_pretty(&response).map_err(|e| e.to_string())?
     );
+    if !health.is_healthy() {
+        eprintln!("{}. Fix: run `{RESTART_COMMAND}`.", health.summary);
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -789,4 +958,93 @@ fn print_help() {
     eprintln!("  autter bg shutdown [--hard]");
     eprintln!("  autter bg restart [--hard]");
     eprintln!("  autter bg tail [-n <lines>] [--full] [-f | --follow]");
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn classify_daemon_health_covers_every_state() {
+        use DaemonHealthState::*;
+        assert_eq!(classify_daemon_health(true, true, true, false), Healthy);
+        assert_eq!(classify_daemon_health(true, true, true, true), Outdated);
+        assert_eq!(
+            classify_daemon_health(false, false, false, false),
+            NotRunning
+        );
+        // Lock held but no socket accepts: a hung or half-started service.
+        assert_eq!(
+            classify_daemon_health(false, false, true, false),
+            Unresponsive
+        );
+        // Only one socket accepting (e.g. the trace2 socket is wedged): the
+        // old `bg status` reported this as healthy while doctor failed it.
+        assert_eq!(
+            classify_daemon_health(true, false, true, false),
+            Unresponsive
+        );
+        assert_eq!(
+            classify_daemon_health(false, true, true, false),
+            Unresponsive
+        );
+    }
+
+    /// Every user-facing restart suggestion must use the canonical command.
+    /// `bg`/`daemon`/`d` are aliases, but mixing them (and `bg start` for a
+    /// service that may be wedged) confused users comparing doctor output
+    /// with `bg status`.
+    #[test]
+    fn user_facing_text_uses_only_the_canonical_restart_command() {
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|e| e == "rs" || e == "snap" || e == "md")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect(&root.join("src"), &mut files);
+        files.push(root.join("README.md"));
+        files.push(root.join("INSTALL.md"));
+
+        let forbidden = [
+            concat!("`autter daemon ", "restart`"),
+            concat!("`autter daemon ", "status`"),
+            concat!("`autter bg ", "start`"),
+            concat!("autter daemon ", "restart "),
+            concat!("autter bg ", "start\\x1b"),
+        ];
+        let mut offenders = Vec::new();
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for needle in forbidden {
+                if text.contains(needle) {
+                    offenders.push(format!("{}: {needle}", file.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use `{RESTART_COMMAND}` for restart suggestions: {offenders:#?}"
+        );
+    }
+
+    #[test]
+    fn canonical_restart_command_is_bg_restart() {
+        assert_eq!(RESTART_COMMAND, "autter bg restart");
+        assert_eq!(
+            concat!("run `", restart_command!(), "`"),
+            "run `autter bg restart`"
+        );
+    }
 }

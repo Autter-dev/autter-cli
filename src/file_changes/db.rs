@@ -194,6 +194,12 @@ impl FileChangesDatabase {
         Ok(())
     }
 
+    /// Count one touch of `file_path`.
+    ///
+    /// `queue_for_upload` is false in local mode: the local counts (used by
+    /// `autter file-changes`) are still updated, but the row is not marked as
+    /// pending upload. A row already pending from an earlier connected session
+    /// keeps its pending state; it is never uploaded while in local mode.
     pub fn record_change(
         &mut self,
         repo_url: &str,
@@ -201,20 +207,23 @@ impl FileChangesDatabase {
         lines_added: u32,
         lines_deleted: u32,
         changed_at: u64,
+        queue_for_upload: bool,
     ) -> Result<(), AutterError> {
         let now = changed_at;
+        // `synced = 1` means "nothing waiting for upload".
+        let synced_on_insert: i64 = if queue_for_upload { 0 } else { 1 };
         self.conn.execute(
             r#"
             INSERT INTO file_change_counts (
                 repo_url, file_path, change_count, lines_added, lines_deleted,
                 last_changed_at, synced, created_at, updated_at
-            ) VALUES (?1, ?2, 1, ?3, ?4, ?5, 0, ?6, ?6)
+            ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?7, ?6, ?6)
             ON CONFLICT(repo_url, file_path) DO UPDATE SET
                 change_count = change_count + 1,
                 lines_added = lines_added + excluded.lines_added,
                 lines_deleted = lines_deleted + excluded.lines_deleted,
                 last_changed_at = excluded.last_changed_at,
-                synced = 0,
+                synced = CASE WHEN ?7 = 0 THEN 0 ELSE file_change_counts.synced END,
                 updated_at = excluded.updated_at
             "#,
             params![
@@ -223,7 +232,8 @@ impl FileChangesDatabase {
                 lines_added,
                 lines_deleted,
                 changed_at,
-                now
+                now,
+                synced_on_insert
             ],
         )?;
         Ok(())
@@ -266,11 +276,40 @@ impl FileChangesDatabase {
     /// flush loop so an empty queue never triggers an auth check.
     pub fn count_pending(&self) -> Result<i64, AutterError> {
         let count = self.conn.query_row(
-            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0",
-            [],
+            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0 AND next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Hold every row waiting for upload. Local counts are unaffected; the
+    /// rows are just never dequeued until [`Self::release_held`]. A held row
+    /// touched again stays held, because its aggregate includes held data.
+    pub fn hold_pending(&mut self) -> Result<usize, AutterError> {
+        Ok(self.conn.execute(
+            "UPDATE file_change_counts SET next_retry_at = ?1
+             WHERE synced = 0 AND next_retry_at < ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+        )?)
+    }
+
+    /// Make held rows eligible for upload again.
+    pub fn release_held(&mut self) -> Result<usize, AutterError> {
+        Ok(self.conn.execute(
+            "UPDATE file_change_counts SET next_retry_at = 0
+             WHERE synced = 0 AND next_retry_at = ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+        )?)
+    }
+
+    /// Number of held rows.
+    pub fn count_held(&self) -> Result<i64, AutterError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0 AND next_retry_at = ?1",
+            params![crate::upload_hold::HELD_RETRY_AT],
+            |row| row.get(0),
+        )?)
     }
 
     /// Drop every file-change row still waiting for upload.
@@ -406,11 +445,18 @@ mod tests {
     #[test]
     fn test_record_and_top_files() {
         let (mut db, _temp) = create_test_db();
-        db.record_change("https://github.com/user/repo", "src/a.rs", 10, 2, 1000)
+        db.record_change(
+            "https://github.com/user/repo",
+            "src/a.rs",
+            10,
+            2,
+            1000,
+            true,
+        )
+        .unwrap();
+        db.record_change("https://github.com/user/repo", "src/a.rs", 5, 1, 1001, true)
             .unwrap();
-        db.record_change("https://github.com/user/repo", "src/a.rs", 5, 1, 1001)
-            .unwrap();
-        db.record_change("https://github.com/user/repo", "src/b.rs", 3, 0, 1002)
+        db.record_change("https://github.com/user/repo", "src/b.rs", 3, 0, 1002, true)
             .unwrap();
 
         let top = db.top_files("https://github.com/user/repo", 10).unwrap();
@@ -426,7 +472,7 @@ mod tests {
     #[test]
     fn test_sync_queue_roundtrip() {
         let (mut db, _temp) = create_test_db();
-        db.record_change("https://github.com/user/repo", "lib.rs", 1, 0, 2000)
+        db.record_change("https://github.com/user/repo", "lib.rs", 1, 0, 2000, true)
             .unwrap();
 
         let pending = db.dequeue_pending(10).unwrap();
@@ -454,5 +500,65 @@ mod tests {
 
         let pending = db.dequeue_pending(10).unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_held_rows_are_counted_locally_but_never_dequeued() {
+        let (mut db, _temp) = create_test_db();
+        let repo = "https://github.com/user/repo";
+        db.record_change(repo, "old.rs", 1, 0, 5000, true).unwrap();
+        assert_eq!(db.hold_pending().unwrap(), 1);
+        assert_eq!(db.count_pending().unwrap(), 0);
+        assert_eq!(db.count_held().unwrap(), 1);
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+        // Touching a held row keeps it held (its aggregate includes held data)
+        // and local counts still update.
+        db.record_change(repo, "old.rs", 1, 0, 5001, true).unwrap();
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+        assert_eq!(db.top_files(repo, 10).unwrap()[0].change_count, 2);
+        // A new file after the hold uploads normally.
+        db.record_change(repo, "new.rs", 1, 0, 5002, true).unwrap();
+        assert_eq!(db.dequeue_pending(10).unwrap().len(), 1);
+
+        assert_eq!(db.release_held().unwrap(), 1);
+        assert_eq!(db.count_held().unwrap(), 0);
+        assert!(
+            db.dequeue_pending(10)
+                .unwrap()
+                .iter()
+                .any(|r| r.file_path == "old.rs")
+        );
+    }
+
+    #[test]
+    fn test_local_mode_counts_locally_without_queueing_upload() {
+        let (mut db, _temp) = create_test_db();
+        let repo = "https://github.com/user/repo";
+        db.record_change(repo, "local.rs", 4, 1, 3000, false)
+            .unwrap();
+        db.record_change(repo, "local.rs", 2, 0, 3001, false)
+            .unwrap();
+
+        // Local feature still works...
+        let top = db.top_files(repo, 10).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].change_count, 2);
+        assert_eq!(top[0].lines_added, 6);
+        // ...but nothing is waiting for upload.
+        assert_eq!(db.count_pending().unwrap(), 0);
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_local_mode_touch_does_not_clear_existing_backlog_state() {
+        let (mut db, _temp) = create_test_db();
+        let repo = "https://github.com/user/repo";
+        // Queued while connected...
+        db.record_change(repo, "old.rs", 1, 0, 4000, true).unwrap();
+        // ...then touched again after switching to local mode.
+        db.record_change(repo, "old.rs", 1, 0, 4001, false).unwrap();
+        // The backlog row stays pending (it is never uploaded in local mode;
+        // reconnecting offers to import or purge it).
+        assert_eq!(db.count_pending().unwrap(), 1);
     }
 }
