@@ -8916,6 +8916,10 @@ pub(crate) fn daemon_run_pending_self_update() -> DaemonSelfUpdateOutcome {
 }
 
 pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction, AutterError> {
+    // `autter bg run` reaches here through the CLI, which opts into exiting
+    // quietly on a broken-pipe print panic. The daemon must not: a stray print
+    // to a closed pipe would otherwise silently stop the whole daemon.
+    crate::observability::set_exit_quietly_on_broken_pipe(false);
     sanitize_git_env_for_daemon();
     disable_trace2_for_daemon_process();
     config.ensure_parent_dirs()?;
