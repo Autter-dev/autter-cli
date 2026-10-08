@@ -3598,13 +3598,24 @@ fn now_unix_nanos() -> u128 {
         .as_nanos()
 }
 
+/// Low-cardinality socket label for error messages: the file name only (e.g.
+/// `control.sock`), never the absolute path. These messages become exception
+/// values, so a home-directory path would split one cause into an issue per
+/// user and leak the username into error tracking.
+#[cfg(unix)]
+fn socket_label(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or(std::borrow::Cow::Borrowed("socket"))
+}
+
 fn remove_socket_if_exists(path: &Path) -> Result<(), AutterError> {
     #[cfg(unix)]
     if path.exists() {
         fs::remove_file(path).map_err(|e| {
             AutterError::Generic(format!(
                 "failed removing stale socket {}: {}",
-                path.display(),
+                socket_label(path),
                 e
             ))
         })?;
@@ -3622,7 +3633,7 @@ fn set_socket_owner_only(path: &Path) -> Result<(), AutterError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
             AutterError::Generic(format!(
                 "failed setting owner-only permissions on socket {}: {}",
-                path.display(),
+                socket_label(path),
                 e
             ))
         })?;
@@ -9470,6 +9481,18 @@ mod tests {
             message.contains("rebase missing stable carryover heads sid=abc"),
             "{message}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_label_omits_the_absolute_path() {
+        assert_eq!(
+            socket_label(Path::new(
+                "/Users/someone/.autter/internal/daemon/control.sock"
+            )),
+            "control.sock"
+        );
+        assert_eq!(socket_label(Path::new("/")), "socket");
     }
 
     #[test]
