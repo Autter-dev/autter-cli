@@ -259,6 +259,8 @@ impl CiContext {
                     println!("Fetched base branch.");
                 }
 
+                self.ensure_pr_history_available(head_sha, base_ref)?;
+
                 // Detect squash vs rebase merge by counting commits
                 // For squash: N original commits → 1 merge commit
                 // For rebase: N original commits → N rebased commits
@@ -689,6 +691,56 @@ impl CiContext {
             AI_AUTHORSHIP_FORK_TRACKING_REF
         );
         Ok(copied)
+    }
+
+    /// A shallow clone (e.g. `actions/checkout` with its default `fetch-depth: 1`)
+    /// may not contain the PR head or its merge base, and the rewrite below would
+    /// then fail with an unrelated-looking error. Name the cause instead.
+    fn ensure_pr_history_available(
+        &self,
+        head_sha: &str,
+        base_ref: &str,
+    ) -> Result<(), AutterError> {
+        let mut args = self.repo.global_args_for_exec();
+        args.extend([
+            "rev-parse".to_string(),
+            "--is-shallow-repository".to_string(),
+        ]);
+        let is_shallow = exec_git(&args)
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "true")
+            .unwrap_or(false);
+        if !is_shallow {
+            return Ok(());
+        }
+
+        let head_available = self
+            .repo
+            .revparse_single(&format!("{}^{{commit}}", head_sha))
+            .is_ok();
+        let merge_base_available = head_available
+            && self
+                .repo
+                .merge_base(head_sha.to_string(), base_ref.to_string())
+                .ok()
+                .flatten()
+                .is_some();
+        if merge_base_available {
+            return Ok(());
+        }
+
+        Err(AutterError::Generic(format!(
+            "Repository {} is a shallow clone and does not contain the PR history \
+             (head {} {}). autter ci needs full history to rewrite authorship: use \
+             `fetch-depth: 0` with actions/checkout, `GIT_DEPTH: 0` on GitLab, or run \
+             `git fetch --unshallow` first.",
+            self.repo.path().display(),
+            head_sha,
+            if head_available {
+                format!("has no merge base with {} in the fetched history", base_ref)
+            } else {
+                "is not available locally".to_string()
+            }
+        )))
     }
 
     /// True when every rewritten commit keeps the subject of the PR commit it is
