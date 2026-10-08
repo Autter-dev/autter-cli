@@ -8,14 +8,17 @@ use crate::git::cli_parser::{
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
-    HeadState, common_dir_for_worktree, git_dir_for_worktree, latest_reflog_old_oid_for_worktree,
-    read_head_state_for_worktree, read_ref_oid_for_worktree,
+    HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
+    latest_reflog_old_oid_for_worktree, read_head_state_for_worktree, read_ref_oid_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
     worktree_root_for_path,
 };
-use crate::git::repository::{Repository, discover_repository_in_path_no_git_exec, exec_git};
+use crate::git::repository::{
+    Repository, discover_repository_in_path_no_git_exec, exec_git,
+    is_no_repository_discovered_error,
+};
 use crate::git::rewrite_log::{
     CherryPickAbortEvent, CherryPickCompleteEvent, MergeSquashEvent, RebaseAbortEvent,
     RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent, StashOperation,
@@ -372,6 +375,34 @@ fn log_side_effect_error(error: &AutterError, family: &str, seq: u64, message: &
     } else {
         tracing::error!(%error, %family, seq, "{message}");
     }
+}
+
+/// Returns true when a side effect failed because its repository was deleted
+/// mid-operation. git reports this race in more shapes than
+/// `is_missing_working_dir_error` knows (for example `git diff` exits 1 with
+/// "Could not access <oid>" when the objects are already gone), so any git or
+/// IO failure counts when the repository is no longer on disk.
+fn is_vanished_repo_error(error: &AutterError, worktree: Option<&Path>) -> bool {
+    is_missing_working_dir_error(error)
+        || (matches!(
+            error,
+            AutterError::GitCliError { .. } | AutterError::IoError(_)
+        ) && worktree.is_some_and(repository_is_gone))
+}
+
+/// Returns true when the worktree, its git dir, or its object store no longer
+/// exists.
+fn repository_is_gone(worktree: &Path) -> bool {
+    if !worktree.is_dir() {
+        return true;
+    }
+    let git_dir = match git_dir_for_worktree(worktree) {
+        Some(git_dir) => git_dir,
+        None if worktree.join("HEAD").is_file() => worktree.to_path_buf(),
+        None => return true,
+    };
+    let common_dir = common_dir_for_git_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+    !git_dir.join("HEAD").is_file() || !common_dir.join("objects").is_dir()
 }
 
 fn trace_root_sid(sid: &str) -> &str {
@@ -1124,15 +1155,18 @@ fn resolve_stash_target_oid_for_command(
     }
 
     let target_spec = stash_target_spec(&parsed.command_args);
-    let resolved =
-        resolve_stash_target_oid_for_worktree(worktree, target_spec).ok_or_else(|| {
-            AutterError::Generic(format!(
-                "failed to resolve stash target oid from repo state (spec={:?}, worktree={})",
-                target_spec,
-                worktree.display()
-            ))
-        })?;
-    Ok(Some(resolved))
+    if let Some(resolved) = resolve_stash_target_oid_for_worktree(worktree, target_spec) {
+        return Ok(Some(resolved));
+    }
+    // On-disk resolution missed; for a top-of-stack target, recover from history.
+    if stash_target_spec_is_top_of_stack(target_spec) {
+        return Ok(recover_top_stash_target_oid_from_history(worktree));
+    }
+    Err(AutterError::Generic(format!(
+        "failed to resolve stash target oid from repo state (spec={:?}, worktree={})",
+        target_spec,
+        worktree.display()
+    )))
 }
 
 fn stash_target_spec_is_top_of_stack(target_spec: Option<&str>) -> bool {
@@ -1182,6 +1216,19 @@ fn inferred_top_stash_sha_from_rewrite_history(
     Ok(stack.last().cloned())
 }
 
+/// Recover the top stash sha from the daemon's own rewrite history.
+///
+/// Popping or dropping the last stash deletes both `refs/stash` and its reflog,
+/// so the on-disk resolvers find nothing. The rewrite history still records the
+/// stash, so the top of the reconstructed stack is the target that was just
+/// popped or dropped. Returns `None` when history cannot recover it, which the
+/// event builder treats as a benign data hole rather than an error.
+fn recover_top_stash_target_oid_from_history(worktree: &Path) -> Option<String> {
+    inferred_top_stash_sha_from_rewrite_history(worktree)
+        .ok()
+        .flatten()
+}
+
 fn resolve_stash_target_oid_for_terminal_payload(
     worktree: &Path,
     argv: &[String],
@@ -1216,16 +1263,13 @@ fn resolve_stash_target_oid_for_terminal_payload(
                 return Ok(Some(target_oid));
             }
             if stash_target_spec_is_top_of_stack(target_spec) {
-                return latest_reflog_old_oid_for_worktree(worktree, "refs/stash")
-                    .ok_or_else(|| {
-                        AutterError::Generic(format!(
-                            "failed to resolve stash {:?} target oid from terminal reflog state (spec={:?}, worktree={})",
-                            parsed.command_args.first().map(String::as_str).unwrap_or("stash"),
-                            target_spec,
-                            worktree.display()
-                        ))
-                    })
-                    .map(Some);
+                if let Some(target_oid) =
+                    latest_reflog_old_oid_for_worktree(worktree, "refs/stash")
+                {
+                    return Ok(Some(target_oid));
+                }
+                // Reflog lookup missed too; recover the top stash sha from history.
+                return Ok(recover_top_stash_target_oid_from_history(worktree));
             }
             Err(AutterError::Generic(format!(
                 "failed to resolve stash {:?} target oid from terminal state for non-top stash reference (spec={:?}, worktree={})",
@@ -3614,10 +3658,44 @@ fn now_unix_nanos() -> u128 {
         .as_nanos()
 }
 
+/// Low-cardinality socket label for error messages: the file name only (e.g.
+/// `control.sock`), never the absolute path. These messages become exception
+/// values, so a home-directory path would split one cause into an issue per
+/// user and leak the username into error tracking.
+#[cfg(unix)]
+fn socket_label(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or(std::borrow::Cow::Borrowed("socket"))
+}
+
+#[cfg(all(test, unix))]
+mod socket_label_tests {
+    use super::socket_label;
+    use std::path::Path;
+
+    #[test]
+    fn socket_label_omits_the_absolute_path() {
+        assert_eq!(
+            socket_label(Path::new(
+                "/Users/someone/.autter/internal/daemon/control.sock"
+            )),
+            "control.sock"
+        );
+        assert_eq!(socket_label(Path::new("/")), "socket");
+    }
+}
+
 fn remove_socket_if_exists(path: &Path) -> Result<(), AutterError> {
     #[cfg(unix)]
     if path.exists() {
-        fs::remove_file(path)?;
+        fs::remove_file(path).map_err(|e| {
+            AutterError::Generic(format!(
+                "failed removing stale socket {}: {}",
+                socket_label(path),
+                e
+            ))
+        })?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -3629,7 +3707,13 @@ fn set_socket_owner_only(path: &Path) -> Result<(), AutterError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            AutterError::Generic(format!(
+                "failed setting owner-only permissions on socket {}: {}",
+                socket_label(path),
+                e
+            ))
+        })?;
     }
     #[cfg(not(unix))]
     {
@@ -4289,6 +4373,13 @@ impl ActorDaemonCoordinator {
             }
         }
         Ok(())
+    }
+
+    fn inflight_family_effects(&self, family: &str) -> usize {
+        self.inflight_effects_by_family
+            .lock()
+            .map(|map| map.get(family).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Garbage-collect empty or idle entries from per-family and per-root maps
@@ -5012,8 +5103,16 @@ impl ActorDaemonCoordinator {
             carryover_capture_stage_error(stage, command, input.exit_code, error)
         };
 
-        let repo = discover_repository_in_path_no_git_exec(input.worktree)
-            .map_err(|error| with_stage("repo_discovery", error))?;
+        // The traced command may have run in a directory that is not a git
+        // repository — for example a temporary scratch directory. There is no
+        // carryover state to capture there, so treat "no repository found" as a
+        // benign no-snapshot case rather than a reported error. Real discovery
+        // faults (e.g. an unreadable git config) still surface.
+        let repo = match discover_repository_in_path_no_git_exec(input.worktree) {
+            Ok(repo) => repo,
+            Err(error) if is_no_repository_discovered_error(&error) => return Ok(None),
+            Err(error) => return Err(with_stage("repo_discovery", error)),
+        };
         let stable_heads = stable_carryover_heads_for_command(&repo, &input, &parsed)
             .map_err(|error| with_stage("stable_heads", error))?;
 
@@ -6460,11 +6559,8 @@ impl ActorDaemonCoordinator {
                 .filter(|oid| !oid.is_empty() && !is_zero_oid(oid)),
             StashOperation::Apply => cmd.stash_target_oid.clone().or_else(|| {
                 let worktree = cmd.worktree.as_deref()?;
-                resolve_stash_target_oid_for_worktree(worktree, stash_ref).or_else(|| {
-                    inferred_top_stash_sha_from_rewrite_history(worktree)
-                        .ok()
-                        .flatten()
-                })
+                resolve_stash_target_oid_for_worktree(worktree, stash_ref)
+                    .or_else(|| recover_top_stash_target_oid_from_history(worktree))
             }),
             StashOperation::Pop | StashOperation::Drop | StashOperation::Branch => {
                 cmd.stash_target_oid.clone().or_else(|| {
@@ -7232,12 +7328,12 @@ impl ActorDaemonCoordinator {
             .maybe_apply_side_effects_for_applied_command_inner(family, applied)
             .await
         {
-            // A working directory that vanished mid-operation (e.g. a temp repo
-            // cleaned up while this async side effect was still in flight) makes
-            // git commands fail with exit 128 / "No such file or directory".
-            // That is a benign race, not a real fault, so skip quietly instead
-            // of surfacing a reported "command side effect failed" error.
-            Err(error) if is_missing_working_dir_error(&error) => {
+            // A repository that vanished mid-operation (e.g. a temp repo cleaned
+            // up while this async side effect was still in flight) makes git
+            // commands fail. That is a benign race, not a real fault, so skip
+            // quietly instead of surfacing a reported "command side effect
+            // failed" error.
+            Err(error) if is_vanished_repo_error(&error, applied.command.worktree.as_deref()) => {
                 tracing::debug!(
                     %error,
                     ?family,
@@ -7850,6 +7946,7 @@ impl ActorDaemonCoordinator {
             last_error: status
                 .last_error
                 .or_else(|| self.latest_side_effect_error(&family_key).ok().flatten()),
+            inflight_effects: self.inflight_family_effects(&family_key),
         })
     }
 
@@ -9390,6 +9487,52 @@ mod tests {
         )));
     }
 
+    fn init_fake_repo(worktree: &Path) {
+        fs::create_dir_all(worktree.join(".git").join("objects")).unwrap();
+        fs::write(worktree.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn vanished_repo_error_detects_any_git_failure_once_repo_is_gone() {
+        // `git diff` exits 1 with "Could not access <oid>" when the repo is
+        // deleted while the post-commit side effect runs.
+        let could_not_access = AutterError::GitCliError {
+            code: Some(1),
+            stderr: "error: Could not access '0123456789abcdef0123456789abcdef01234567'"
+                .to_string(),
+            args: vec!["diff".to_string()],
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        init_fake_repo(&worktree);
+
+        assert!(!is_vanished_repo_error(&could_not_access, Some(&worktree)));
+
+        fs::remove_dir_all(worktree.join(".git").join("objects")).unwrap();
+        assert!(is_vanished_repo_error(&could_not_access, Some(&worktree)));
+
+        fs::remove_dir_all(&worktree).unwrap();
+        assert!(is_vanished_repo_error(&could_not_access, Some(&worktree)));
+
+        // Non-git errors never qualify, even when the repo is gone.
+        assert!(!is_vanished_repo_error(
+            &AutterError::Generic("boom".to_string()),
+            Some(&worktree)
+        ));
+    }
+
+    #[test]
+    fn repository_is_gone_keeps_subdirectory_of_live_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        init_fake_repo(&worktree);
+        let subdir = worktree.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+
+        assert!(!repository_is_gone(&worktree));
+        assert!(!repository_is_gone(&subdir));
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
@@ -9497,6 +9640,31 @@ mod tests {
             message.contains("rebase missing stable carryover heads sid=abc"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn carryover_capture_in_non_repository_worktree_returns_no_snapshot() {
+        // A git command traced in a temporary, non-repository directory has no
+        // carryover state to capture. Repo discovery finds nothing, which must
+        // be a benign no-snapshot result rather than a reported error — the
+        // daemon otherwise files its own failure into error tracking.
+        // ActorDaemonCoordinator::new() spawns Tokio tasks, so this runs inside
+        // a runtime.
+        let coordinator = ActorDaemonCoordinator::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let argv = vec!["git".to_string(), "commit".to_string()];
+        let result = coordinator.capture_carryover_snapshot_for_command(CarryoverCaptureInput {
+            root_sid: "sid-123",
+            worktree: tmp.path(),
+            primary_command: Some("commit"),
+            argv: &argv,
+            exit_code: 0,
+            finished_at_ns: 0,
+            post_repo: None,
+            ref_changes: &[],
+        });
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 
     #[test]
@@ -10089,5 +10257,59 @@ mod tests {
             tokio::task::yield_now().await;
         }
         coord.request_shutdown();
+    }
+
+    fn init_repo_with_stash_create_event(stash_sha: &str) -> crate::git::test_utils::TmpRepo {
+        let tmp = crate::git::test_utils::TmpRepo::new().unwrap();
+        tmp.autter_repo()
+            .storage
+            .append_rewrite_event(RewriteLogEvent::Stash {
+                stash: StashEvent::new(
+                    StashOperation::Create,
+                    Some("stash@{0}".to_string()),
+                    Some(stash_sha.to_string()),
+                    None,
+                    Vec::new(),
+                    true,
+                    Vec::new(),
+                ),
+            })
+            .unwrap();
+        tmp
+    }
+
+    // When the last stash is popped, git deletes both refs/stash and its reflog,
+    // so the on-disk resolvers find nothing. Both payload resolvers must recover
+    // the target sha from the daemon's rewrite history instead of erroring.
+    #[test]
+    fn stash_pop_target_oid_recovers_from_history_when_ref_and_reflog_absent() {
+        let stash_sha = "1111111111111111111111111111111111111111";
+        let tmp = init_repo_with_stash_create_event(stash_sha);
+        let worktree = tmp.path();
+        let argv = vec!["git".to_string(), "stash".to_string(), "pop".to_string()];
+
+        let from_command = resolve_stash_target_oid_for_command(worktree, &argv).unwrap();
+        assert_eq!(from_command.as_deref(), Some(stash_sha));
+
+        let from_terminal =
+            resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).unwrap();
+        assert_eq!(from_terminal.as_deref(), Some(stash_sha));
+    }
+
+    // A non-top-of-stack reference cannot be recovered from history, so it still
+    // surfaces as an error rather than being silently dropped.
+    #[test]
+    fn stash_drop_non_top_reference_still_errors_without_on_disk_state() {
+        let tmp = init_repo_with_stash_create_event("2222222222222222222222222222222222222222");
+        let worktree = tmp.path();
+        let argv = vec![
+            "git".to_string(),
+            "stash".to_string(),
+            "drop".to_string(),
+            "stash@{2}".to_string(),
+        ];
+
+        assert!(resolve_stash_target_oid_for_command(worktree, &argv).is_err());
+        assert!(resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).is_err());
     }
 }

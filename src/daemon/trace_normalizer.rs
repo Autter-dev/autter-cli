@@ -965,7 +965,10 @@ impl<B: GitBackend> TraceNormalizer<B> {
             }
 
             let mut resolved = false;
-            let mut last_error: Option<(PathBuf, AutterError)> = None;
+            let mut last_failed_target: Option<PathBuf> = None;
+            // A candidate that still exists on disk but does not resolve to a
+            // repository is not the vanished-target race; keep reporting it.
+            let mut unresolved_existing_target: Option<PathBuf> = None;
             for candidate in candidates {
                 if let Some(common_dir) = common_dir_for_repo_path(&candidate) {
                     let resolved_family = FamilyKey::new(
@@ -981,13 +984,10 @@ impl<B: GitBackend> TraceNormalizer<B> {
                     resolved = true;
                     break;
                 } else {
-                    last_error = Some((
-                        candidate.clone(),
-                        AutterError::Generic(format!(
-                            "failed to resolve clone/init target family from filesystem: {}",
-                            candidate.display()
-                        )),
-                    ));
+                    if candidate.exists() {
+                        unresolved_existing_target = Some(candidate.clone());
+                    }
+                    last_failed_target = Some(candidate.clone());
                 }
             }
 
@@ -996,13 +996,42 @@ impl<B: GitBackend> TraceNormalizer<B> {
                 if let Some(target) = target_from_def_repo.or(target_from_argv) {
                     pending.worktree = Some(target);
                 }
-                if let Some((target, error)) = last_error {
+                if let Some(target) = unresolved_existing_target {
+                    // The target is still on disk yet does not resolve to a
+                    // repository, so this is not the vanished-directory race
+                    // below: it is a real resolution failure worth reporting. The
+                    // path stays in structured context so occurrences group into
+                    // one issue.
                     observability::log_error(
-                        &error,
+                        &AutterError::Generic(
+                            "failed to resolve clone/init target family from filesystem"
+                                .to_string(),
+                        ),
                         Some(serde_json::json!({
                             "component": "trace_normalizer",
                             "phase": "resolve_clone_or_init_target_family",
                             "root_sid": pending.root_sid,
+                            "primary_command": primary_command,
+                            "target": target,
+                        })),
+                    );
+                } else if let Some(target) = last_failed_target {
+                    // A clone/init target that no longer exists at finalize is an
+                    // expected race, not a bug: the directory (an agent plugin
+                    // staging clone, or a throwaway test repo) was removed the moment
+                    // git exited. The best worktree hint is already kept above, so
+                    // attribution is unaffected. Log below error level, the same way
+                    // the vanished-working-dir guard above does, and keep the
+                    // absolute path in structured context so occurrences group into
+                    // one issue instead of one per directory.
+                    observability::log_message(
+                        "clone/init target family unresolved at finalize; target directory removed before daemon finalized",
+                        "warn",
+                        Some(serde_json::json!({
+                            "component": "trace_normalizer",
+                            "phase": "resolve_clone_or_init_target_family",
+                            "root_sid": pending.root_sid,
+                            "primary_command": primary_command,
                             "target": target,
                         })),
                     );
@@ -2107,6 +2136,91 @@ mod tests {
 
         assert_eq!(cmd.primary_command.as_deref(), Some("clone"));
         assert!(matches!(cmd.scope, CommandScope::Family(_)));
+    }
+
+    #[test]
+    fn clone_target_vanished_before_finalize_keeps_worktree_hint_and_does_not_error() {
+        // The clone target directory is removed before the daemon finalizes the
+        // trace (an expected race for staging clones and throwaway test repos).
+        // Family resolution fails, but finalize must still succeed, keep the best
+        // worktree hint, and fall back to Global scope rather than erroring.
+        let backend = Arc::new(MockBackend::default());
+        let mut normalizer = TraceNormalizer::new(backend);
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let outer = temp.path().join("outer");
+        let clone_dir = outer.join("nested").join("vanished-clone");
+        fs::create_dir_all(clone_dir.parent().expect("clone parent")).expect("create clone parent");
+
+        let start = serde_json::json!({
+            "event":"start",
+            "sid":"clone-vanished",
+            "ts":1,
+            "argv":["git","clone","ssh://example/repo.git","nested/vanished-clone"],
+            "worktree":outer
+        });
+        let def_repo = serde_json::json!({
+            "event":"def_repo",
+            "sid":"clone-vanished",
+            "ts":2,
+            "worktree":clone_dir
+        });
+        let cmd_name = serde_json::json!({
+            "event":"cmd_name",
+            "sid":"clone-vanished",
+            "ts":3,
+            "name":"clone"
+        });
+        let exit = serde_json::json!({
+            "event":"exit",
+            "sid":"clone-vanished",
+            "ts":4,
+            "code":0
+        });
+
+        assert!(normalizer.ingest_payload(&start).unwrap().is_none());
+        assert!(normalizer.ingest_payload(&def_repo).unwrap().is_none());
+        assert!(normalizer.ingest_payload(&cmd_name).unwrap().is_none());
+
+        // The target repo never materializes on disk, mirroring a directory that
+        // vanished the moment git exited.
+        let cmd = normalizer
+            .ingest_payload(&exit)
+            .expect("clone finalize should not error when the target vanished")
+            .expect("clone should still emit a normalized command");
+
+        assert_eq!(cmd.primary_command.as_deref(), Some("clone"));
+        assert_eq!(cmd.worktree.as_ref(), Some(&clone_dir));
+        assert!(matches!(cmd.scope, CommandScope::Global));
+    }
+
+    #[test]
+    fn clone_target_present_but_not_a_repo_still_finalizes() {
+        // The target directory exists but never became a repository. That is not
+        // the vanished-target race, so it takes the reported-error branch, but
+        // finalize must still succeed with the worktree hint and Global scope.
+        let backend = Arc::new(MockBackend::default());
+        let mut normalizer = TraceNormalizer::new(backend);
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let outer = temp.path().join("outer");
+        let clone_dir = outer.join("not-a-repo");
+        fs::create_dir_all(&clone_dir).expect("create clone dir");
+
+        for payload in [
+            serde_json::json!({"event":"start","sid":"clone-present","ts":1,"argv":["git","clone","ssh://example/repo.git","not-a-repo"],"worktree":outer}),
+            serde_json::json!({"event":"def_repo","sid":"clone-present","ts":2,"worktree":clone_dir}),
+            serde_json::json!({"event":"cmd_name","sid":"clone-present","ts":3,"name":"clone"}),
+        ] {
+            assert!(normalizer.ingest_payload(&payload).unwrap().is_none());
+        }
+        let cmd = normalizer
+            .ingest_payload(
+                &serde_json::json!({"event":"exit","sid":"clone-present","ts":4,"code":0}),
+            )
+            .expect("clone finalize should not error")
+            .expect("clone should still emit a normalized command");
+
+        assert_eq!(cmd.worktree.as_ref(), Some(&clone_dir));
+        assert!(matches!(cmd.scope, CommandScope::Global));
     }
 
     #[test]

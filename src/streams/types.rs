@@ -17,18 +17,27 @@ pub enum JsonlLineState {
 ///
 /// Returns `Eof` if no more data, `Partial` if the line lacks a trailing newline,
 /// or `Complete(bytes)` on success.
+///
+/// The line is read as raw bytes and decoded with `String::from_utf8_lossy`, so a
+/// byte sequence that is not valid UTF-8 yields replacement characters instead of an
+/// error. This keeps a single bad byte from permanently stalling ingestion at its
+/// offset; the caller advances by the returned raw byte count regardless. A line
+/// without a trailing newline is still `Partial`, which also covers a half-written
+/// multi-byte character at the tail of a growing file.
 pub fn read_jsonl_line(
     reader: &mut impl BufRead,
     line: &mut String,
 ) -> std::io::Result<JsonlLineState> {
     line.clear();
-    let bytes_read = reader.read_line(line)?;
+    let mut buf = Vec::new();
+    let bytes_read = reader.read_until(b'\n', &mut buf)?;
     if bytes_read == 0 {
         return Ok(JsonlLineState::Eof);
     }
-    if !line.ends_with('\n') {
+    if buf.last() != Some(&b'\n') {
         return Ok(JsonlLineState::Partial);
     }
+    line.push_str(&String::from_utf8_lossy(&buf));
     Ok(JsonlLineState::Complete(bytes_read))
 }
 
@@ -194,5 +203,45 @@ mod tests {
 
         let r2 = read_jsonl_line(&mut reader, &mut line).unwrap();
         assert!(matches!(r2, JsonlLineState::Partial));
+    }
+
+    #[test]
+    fn test_read_jsonl_line_invalid_utf8_complete() {
+        // A complete line (trailing newline) with a byte that is not valid UTF-8.
+        // The old read_line path returned InvalidData here, which stalled ingestion
+        // forever. It must now decode lossily and report the raw byte count.
+        let data = b"{\"a\":\"\xff\"}\n";
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+        let result = read_jsonl_line(&mut reader, &mut line).unwrap();
+        assert!(matches!(result, JsonlLineState::Complete(n) if n == data.len()));
+        assert!(line.ends_with('\n'));
+        assert!(line.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_read_jsonl_line_invalid_utf8_then_next_line() {
+        // A bad byte on one line must not block the following lines from being read.
+        let data = b"{\"a\":\"\xff\"}\n{\"b\":2}\n";
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+
+        let r1 = read_jsonl_line(&mut reader, &mut line).unwrap();
+        assert!(matches!(r1, JsonlLineState::Complete(_)));
+
+        let r2 = read_jsonl_line(&mut reader, &mut line).unwrap();
+        assert!(matches!(r2, JsonlLineState::Complete(8)));
+        assert_eq!(line, "{\"b\":2}\n");
+    }
+
+    #[test]
+    fn test_read_jsonl_line_partial_invalid_utf8() {
+        // A half-written multi-byte character at the tail of a growing file has no
+        // trailing newline, so it stays Partial (a genuinely transient state).
+        let data = b"{\"a\":\"\xe2\x82";
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+        let result = read_jsonl_line(&mut reader, &mut line).unwrap();
+        assert!(matches!(result, JsonlLineState::Partial));
     }
 }
