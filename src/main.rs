@@ -74,6 +74,11 @@ fn main() {
     }
 
     if binary_name == "autter" || binary_name == "autter.exe" {
+        // Exit quietly when a reader closes our output pipe early (e.g.
+        // `autter blame | head`) instead of crashing with a print panic. Only
+        // the direct CLI opts in; the git proxy keeps its own panic recovery
+        // and the daemon opts back out in `run_daemon`.
+        autter::observability::set_exit_quietly_on_broken_pipe(true);
         // Block elevated privileges to prevent creating root-owned files
         // that break normal-user daemon startup. Only applies to direct
         // `autter` commands (not the git proxy, which must stay transparent).

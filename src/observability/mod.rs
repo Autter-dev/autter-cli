@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::metrics::MetricEvent;
@@ -14,6 +15,19 @@ static CURRENT_COMMAND: OnceLock<String> = OnceLock::new();
 /// Best-effort and idempotent: the first call wins, later calls are ignored.
 pub fn set_current_command(command: impl Into<String>) {
     let _ = CURRENT_COMMAND.set(command.into());
+}
+
+/// Whether the panic hook may turn a broken-pipe print panic into a quiet
+/// `exit(0)`. Off by default: only the interactive `autter` CLI opts in. The
+/// git proxy must keep its own panic recovery (which mirrors git's exit code or
+/// falls back to running git), and the daemon must never exit just because a
+/// stray print hit a closed pipe.
+static EXIT_QUIETLY_ON_BROKEN_PIPE: AtomicBool = AtomicBool::new(false);
+
+/// Opt this process in or out of exiting quietly when a print to a closed pipe
+/// panics (e.g. `autter blame | head`). See [`install_panic_hook`].
+pub fn set_exit_quietly_on_broken_pipe(enabled: bool) {
+    EXIT_QUIETLY_ON_BROKEN_PIPE.store(enabled, Ordering::Relaxed);
 }
 
 /// Maximum events per metrics envelope
@@ -131,12 +145,15 @@ pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Valu
 /// a write to stdout/stderr fails because the reader closed the pipe (e.g.
 /// `autter blame | head`). Rust ignores SIGPIPE before `main`, so that write
 /// returns `EPIPE` and the macro panics with a fixed, locale-independent prefix
-/// from std; the `os error 32` (EPIPE) / "Broken pipe" tail confirms the cause
-/// rather than some other output failure worth surfacing.
+/// from std; the `os error 32` (EPIPE) / "Broken pipe" tail, or `os error 232`
+/// (ERROR_NO_DATA, a closed pipe on Windows), confirms the cause rather than
+/// some other output failure worth surfacing.
 fn is_broken_pipe_print_panic(payload: &str) -> bool {
     (payload.starts_with("failed printing to stdout")
         || payload.starts_with("failed printing to stderr"))
-        && (payload.contains("Broken pipe") || payload.contains("os error 32"))
+        && (payload.contains("Broken pipe")
+            || payload.contains("os error 32)")
+            || payload.contains("os error 232)"))
 }
 
 /// Install a panic hook that reports unexpected panics as error events
@@ -145,7 +162,8 @@ fn is_broken_pipe_print_panic(payload: &str) -> bool {
 ///
 /// One case is handled specially: a broken-pipe failure from the print macros
 /// (a reader closing the pipe, as in `autter blame | head`) is not a real
-/// crash. Exit quietly like any other CLI tool instead of printing a panic or
+/// crash. When the process opted in via [`set_exit_quietly_on_broken_pipe`],
+/// exit quietly like any other CLI tool instead of printing a panic or
 /// reporting telemetry noise.
 ///
 /// Reporting is best-effort and routes through the same consent-gated path as
@@ -162,7 +180,9 @@ pub fn install_panic_hook() {
             "Box<dyn Any>".to_string()
         };
 
-        if is_broken_pipe_print_panic(&payload) {
+        if EXIT_QUIETLY_ON_BROKEN_PIPE.load(Ordering::Relaxed)
+            && is_broken_pipe_print_panic(&payload)
+        {
             std::process::exit(0);
         }
 
@@ -245,6 +265,30 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    #[test]
+    fn broken_pipe_print_panic_matches_only_closed_pipe_prints() {
+        assert!(is_broken_pipe_print_panic(
+            "failed printing to stdout: Broken pipe (os error 32)"
+        ));
+        assert!(is_broken_pipe_print_panic(
+            "failed printing to stderr: Broken pipe (os error 32)"
+        ));
+        assert!(is_broken_pipe_print_panic(
+            "failed printing to stdout: The pipe is being closed. (os error 232)"
+        ));
+        // Other print failures are real and must still be reported.
+        assert!(!is_broken_pipe_print_panic(
+            "failed printing to stdout: No space left on device (os error 28)"
+        ));
+        assert!(!is_broken_pipe_print_panic(
+            "failed printing to stdout: Unknown error (os error 320)"
+        ));
+        // A broken pipe outside the print macros is not this case.
+        assert!(!is_broken_pipe_print_panic(
+            "called `Result::unwrap()` on an `Err` value: Broken pipe (os error 32)"
+        ));
+    }
 
     // Test error logging
     #[test]
