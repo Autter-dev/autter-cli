@@ -362,10 +362,10 @@ case $OS in
         echo "Install autter on Windows in one of two ways:" >&2
         echo "" >&2
         echo "  Native Windows - run the PowerShell installer. It works from PowerShell," >&2
-        echo "  Command Prompt, and Git Bash, and 'autter' is available in all of them" >&2
+        echo "  Command Prompt, and Git Bash, and 'autter' is available in new terminals" >&2
         echo "  afterwards:" >&2
         echo "" >&2
-        echo "    powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://api.autter.dev/install.ps1 | iex\"" >&2
+        echo "    powershell -NoProfile -ExecutionPolicy Bypass -Command \"iex (irm https://api.autter.dev/install.ps1)\"" >&2
         echo "" >&2
         echo "  WSL - open a WSL terminal and re-run this same command there." >&2
         echo "" >&2

@@ -22,6 +22,10 @@ Run:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
 ```
 
+Use the `api.autter.dev` URL exactly as shown. Other hosts (such as `autter.dev/install.ps1`) serve the website, and piping that HTML into `iex` fails with PowerShell parse errors.
+
+The installer adds `%USERPROFILE%\.autter\bin` to your user `PATH`. That reaches terminals opened afterwards, not the window you ran the command from: open a new terminal (and restart your IDE) before running `autter`. The installer prints the full path to `autter.exe` at the end so you can run it straight away. If you are already in PowerShell, `irm https://api.autter.dev/install.ps1 | iex` runs the same installer inside your current window, and `autter` works there immediately.
+
 ### npm (any platform, Node.js 18+)
 
 ```bash
