@@ -1034,6 +1034,13 @@ pub fn flush_notes() {
         tracing::debug!("notes: skipping flush, backend does not use Http");
         return;
     }
+    // `ControlRequest::FlushNotes` (sent after every note write) calls this
+    // directly, outside the periodic loop's gate: never drain before the
+    // pre-upgrade backlog is held (see crate::upload_hold).
+    if let Err(error) = crate::upload_hold::ensure_legacy_migration() {
+        tracing::warn!(%error, "notes: upload hold not applied; skipping flush");
+        return;
+    }
 
     let backend_url = match cfg.notes_backend_url() {
         Some(url) => url.to_string(),
