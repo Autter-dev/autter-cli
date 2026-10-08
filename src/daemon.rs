@@ -15,7 +15,10 @@ use crate::git::repo_state::{
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
     worktree_root_for_path,
 };
-use crate::git::repository::{Repository, discover_repository_in_path_no_git_exec, exec_git};
+use crate::git::repository::{
+    Repository, discover_repository_in_path_no_git_exec, exec_git,
+    is_no_repository_discovered_error,
+};
 use crate::git::rewrite_log::{
     CherryPickAbortEvent, CherryPickCompleteEvent, MergeSquashEvent, RebaseAbortEvent,
     RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent, StashOperation,
@@ -4996,8 +4999,16 @@ impl ActorDaemonCoordinator {
             carryover_capture_stage_error(stage, command, input.exit_code, error)
         };
 
-        let repo = discover_repository_in_path_no_git_exec(input.worktree)
-            .map_err(|error| with_stage("repo_discovery", error))?;
+        // The traced command may have run in a directory that is not a git
+        // repository — for example a temporary scratch directory. There is no
+        // carryover state to capture there, so treat "no repository found" as a
+        // benign no-snapshot case rather than a reported error. Real discovery
+        // faults (e.g. an unreadable git config) still surface.
+        let repo = match discover_repository_in_path_no_git_exec(input.worktree) {
+            Ok(repo) => repo,
+            Err(error) if is_no_repository_discovered_error(&error) => return Ok(None),
+            Err(error) => return Err(with_stage("repo_discovery", error)),
+        };
         let stable_heads = stable_carryover_heads_for_command(&repo, &input, &parsed)
             .map_err(|error| with_stage("stable_heads", error))?;
 
@@ -9458,6 +9469,31 @@ mod tests {
             message.contains("rebase missing stable carryover heads sid=abc"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn carryover_capture_in_non_repository_worktree_returns_no_snapshot() {
+        // A git command traced in a temporary, non-repository directory has no
+        // carryover state to capture. Repo discovery finds nothing, which must
+        // be a benign no-snapshot result rather than a reported error — the
+        // daemon otherwise files its own failure into error tracking.
+        // ActorDaemonCoordinator::new() spawns Tokio tasks, so this runs inside
+        // a runtime.
+        let coordinator = ActorDaemonCoordinator::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let argv = vec!["git".to_string(), "commit".to_string()];
+        let result = coordinator.capture_carryover_snapshot_for_command(CarryoverCaptureInput {
+            root_sid: "sid-123",
+            worktree: tmp.path(),
+            primary_command: Some("commit"),
+            argv: &argv,
+            exit_code: 0,
+            finished_at_ns: 0,
+            post_repo: None,
+            ref_changes: &[],
+        });
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 
     #[test]
