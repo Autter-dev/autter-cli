@@ -13,6 +13,7 @@ mod ai_reflow_attribution;
 mod ai_tab;
 mod amend;
 mod amp;
+mod antigravity;
 mod attribution_tracker_comprehensive;
 mod background_agent_attribution;
 mod bash_attribution;

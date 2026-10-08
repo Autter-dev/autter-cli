@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub struct UnsupportedAgent {
     pub id: &'static str,
     pub name: &'static str,
-    /// What was found, e.g. "app: /Applications/Antigravity.app".
+    /// What was found, e.g. "app: /Applications/Kiro.app".
     pub evidence: String,
 }
 
@@ -40,20 +40,13 @@ struct AgentSignature {
     extension_prefixes: &'static [&'static str],
 }
 
-/// Agents with no autter preset. Kept to tools that write code on their own;
-/// JetBrains Junie is not listed because the autter JetBrains plugin captures
-/// it.
+/// Agents with no autter preset. Kept to tools that write code on their own.
+/// Not listed: JetBrains Junie (captured by the autter JetBrains plugin) and
+/// Google Antigravity (captured through its hooks; see
+/// `crate::mdm::agents::AntigravityInstaller`). These signals are best-effort
+/// conventional locations, not verified against each vendor's docs; a miss
+/// only means no warning. Tracking doc: docs/unsupported-agents.md.
 const SIGNATURES: &[AgentSignature] = &[
-    AgentSignature {
-        id: "antigravity",
-        name: "Google Antigravity",
-        cli_names: &["antigravity"],
-        mac_apps: &["Antigravity.app"],
-        windows_programs: &["Antigravity"],
-        vscode_products: &["Antigravity"],
-        home_paths: &[".antigravity", ".gemini/antigravity"],
-        extension_prefixes: &[],
-    },
     AgentSignature {
         id: "kiro",
         name: "Kiro",
@@ -134,7 +127,6 @@ const EXTENSION_DIRS: &[&str] = &[
     ".vscode-oss/extensions",
     ".cursor/extensions",
     ".windsurf/extensions",
-    ".antigravity/extensions",
     ".kiro/extensions",
     ".trae/extensions",
 ];
@@ -317,42 +309,35 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_is_detected_from_each_signal() {
+    fn kiro_is_detected_from_each_signal() {
         let none = |_: &str| false;
 
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join("Applications/Antigravity.app")).unwrap();
+        fs::create_dir_all(home.path().join("Applications/Kiro.app")).unwrap();
         let found = detect_in(&env_for(home.path(), &none));
-        assert_eq!(ids(&found), vec!["antigravity"]);
+        assert_eq!(ids(&found), vec!["kiro"]);
         assert!(found[0].evidence.starts_with("app: "), "{:?}", found[0]);
 
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join("config/Antigravity/User")).unwrap();
-        assert_eq!(
-            ids(&detect_in(&env_for(home.path(), &none))),
-            vec!["antigravity"]
-        );
+        fs::create_dir_all(home.path().join("config/Kiro/User")).unwrap();
+        assert_eq!(ids(&detect_in(&env_for(home.path(), &none))), vec!["kiro"]);
 
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".gemini/antigravity")).unwrap();
+        let kiro_cli = |name: &str| name == "kiro";
         assert_eq!(
-            ids(&detect_in(&env_for(home.path(), &none))),
-            vec!["antigravity"]
-        );
-
-        let home = tempfile::tempdir().unwrap();
-        let antigravity_cli = |name: &str| name == "antigravity";
-        assert_eq!(
-            ids(&detect_in(&env_for(home.path(), &antigravity_cli))),
-            vec!["antigravity"]
+            ids(&detect_in(&env_for(home.path(), &kiro_cli))),
+            vec!["kiro"]
         );
     }
 
     #[test]
-    fn gemini_cli_alone_is_not_antigravity() {
-        // ~/.gemini belongs to the (supported) Gemini CLI.
+    fn antigravity_and_gemini_cli_dirs_are_not_reported_as_unsupported() {
+        // Antigravity is supported now, and ~/.gemini also belongs to the
+        // (supported) Gemini CLI: neither may trigger an "unsupported" warning.
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        fs::create_dir_all(home.path().join(".gemini/extensions")).unwrap();
+        fs::write(home.path().join(".gemini/settings.json"), "{}").unwrap();
+        fs::create_dir_all(home.path().join(".gemini/antigravity-ide")).unwrap();
         let none = |_: &str| false;
         assert!(detect_in(&env_for(home.path(), &none)).is_empty());
     }
@@ -378,13 +363,13 @@ mod tests {
     #[test]
     fn message_says_edits_are_attributed_to_the_user() {
         let agent = UnsupportedAgent {
-            id: "antigravity",
-            name: "Google Antigravity",
-            evidence: "app: /Applications/Antigravity.app".to_string(),
+            id: "kiro",
+            name: "Kiro",
+            evidence: "app: /Applications/Kiro.app".to_string(),
         };
         assert_eq!(
             not_captured_message(&agent),
-            "Google Antigravity detected — its edits are not captured; they will be attributed to you"
+            "Kiro detected — its edits are not captured; they will be attributed to you"
         );
     }
 }

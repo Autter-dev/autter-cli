@@ -3,6 +3,7 @@ pub mod parse;
 mod agent_v1;
 mod ai_tab;
 mod amp;
+mod antigravity;
 mod claude;
 mod codex;
 mod continue_cli;
@@ -162,6 +163,12 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, AutterError> {
         "droid" => Ok(Box::new(droid::DroidPreset)),
         "opencode" => Ok(Box::new(opencode::OpenCodePreset)),
         "pi" => Ok(Box::new(pi::PiPreset)),
+        "antigravity-pre" => Ok(Box::new(antigravity::AntigravityPreset {
+            phase: antigravity::AntigravityPhase::PreToolUse,
+        })),
+        "antigravity-post" => Ok(Box::new(antigravity::AntigravityPreset {
+            phase: antigravity::AntigravityPhase::PostToolUse,
+        })),
         "human" => Ok(Box::new(human::HumanPreset)),
         "mock_ai" => Ok(Box::new(mock_ai::MockAiPreset)),
         "known_human" => Ok(Box::new(known_human::KnownHumanPreset)),

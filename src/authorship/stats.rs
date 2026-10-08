@@ -733,14 +733,16 @@ mod tests {
     fn unsupported_agent_notice_names_the_agent() {
         use crate::mdm::unsupported_agents::UnsupportedAgent;
         assert_eq!(unsupported_agent_notice(&[]), None);
-        let antigravity = UnsupportedAgent {
-            id: "antigravity",
-            name: "Google Antigravity",
+        let trae = UnsupportedAgent {
+            id: "trae",
+            name: "Trae",
             evidence: "app".to_string(),
         };
-        let notice = unsupported_agent_notice(std::slice::from_ref(&antigravity)).unwrap();
+        let notice = unsupported_agent_notice(std::slice::from_ref(&trae)).unwrap();
         assert!(
-            notice.contains("Google Antigravity detected — its edits are not captured; they will be attributed to you"),
+            notice.contains(
+                "Trae detected — its edits are not captured; they will be attributed to you"
+            ),
             "{notice}"
         );
         let kiro = UnsupportedAgent {
@@ -748,11 +750,8 @@ mod tests {
             name: "Kiro",
             evidence: "app".to_string(),
         };
-        let notice = unsupported_agent_notice(&[antigravity, kiro]).unwrap();
-        assert!(
-            notice.contains("Google Antigravity, Kiro detected"),
-            "{notice}"
-        );
+        let notice = unsupported_agent_notice(&[trae, kiro]).unwrap();
+        assert!(notice.contains("Trae, Kiro detected"), "{notice}");
     }
 
     #[test]

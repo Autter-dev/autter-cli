@@ -566,6 +566,16 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
                 details: Vec::new(),
                 remediation: Some(format!("run `autter install-hooks`, then restart {}", name)),
             }),
+            Ok(result) if result.hooks_up_to_date && installer.id() == "antigravity" => {
+                checks.push(DoctorCheck {
+                    section: SECTION_AGENTS,
+                    name,
+                    status: DoctorStatus::Passed,
+                    summary: "hooks installed (up to date) -- captured in the Antigravity CLI and 2.0 app; the Antigravity IDE has been reported not to run hooks, see docs/unsupported-agents.md".to_string(),
+                    details: Vec::new(),
+                    remediation: None,
+                })
+            }
             Ok(result) if result.hooks_up_to_date => checks.push(DoctorCheck {
                 section: SECTION_AGENTS,
                 name,
@@ -611,6 +621,7 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
             details: vec![
                 agent.evidence.clone(),
                 "autter has no integration for this tool yet; edits made with it show as untracked in `autter stats` and as yours in `autter blame`".to_string(),
+                "what is missing and what would unblock it: docs/unsupported-agents.md (https://github.com/Autter-dev/autter-cli/blob/main/docs/unsupported-agents.md)".to_string(),
             ],
             remediation: None,
         });
