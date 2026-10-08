@@ -309,7 +309,20 @@ impl CiContext {
                         }
                     }
 
-                    if new_commits.len() == original_commits.len() {
+                    // The #1473 filter is not enough when `base_sha` is stale (the base
+                    // branch advanced after the PR was opened, e.g. another PR landed):
+                    // `base_sha..merge` then also holds those unrelated commits and a
+                    // squash merge can still match the PR's commit count. Rebase merges
+                    // keep each commit's subject, so require the pairs to line up.
+                    let looks_rebased = new_commits.len() == original_commits.len()
+                        && self.subjects_match(&original_commits, &new_commits);
+                    if new_commits.len() == original_commits.len() && !looks_rebased {
+                        println!(
+                            "Commit count matches but subjects differ from the PR commits; not a rebase merge"
+                        );
+                    }
+
+                    if looks_rebased {
                         println!(
                             "Detected rebase merge: {} original -> {} new commits",
                             original_commits.len(),
@@ -676,6 +689,25 @@ impl CiContext {
             AI_AUTHORSHIP_FORK_TRACKING_REF
         );
         Ok(copied)
+    }
+
+    /// True when every rewritten commit keeps the subject of the PR commit it is
+    /// paired with. Lookup failures keep the previous count-only behavior.
+    fn subjects_match(&self, original_commits: &[String], new_commits: &[String]) -> bool {
+        original_commits
+            .iter()
+            .zip(new_commits)
+            .all(|(original, rewritten)| {
+                let subject = |sha: &String| {
+                    self.repo
+                        .find_commit(sha.clone())
+                        .and_then(|commit| commit.summary())
+                };
+                match (subject(original), subject(rewritten)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => true,
+                }
+            })
     }
 
     fn has_notes_for_any_commit(&self, commit_shas: &[String]) -> Result<bool, AutterError> {
