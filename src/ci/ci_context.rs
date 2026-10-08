@@ -259,6 +259,8 @@ impl CiContext {
                     println!("Fetched base branch.");
                 }
 
+                self.ensure_pr_history_available(head_sha, base_ref)?;
+
                 // Detect squash vs rebase merge by counting commits
                 // For squash: N original commits → 1 merge commit
                 // For rebase: N original commits → N rebased commits
@@ -309,7 +311,20 @@ impl CiContext {
                         }
                     }
 
-                    if new_commits.len() == original_commits.len() {
+                    // The #1473 filter is not enough when `base_sha` is stale (the base
+                    // branch advanced after the PR was opened, e.g. another PR landed):
+                    // `base_sha..merge` then also holds those unrelated commits and a
+                    // squash merge can still match the PR's commit count. Rebase merges
+                    // keep each commit's subject, so require the pairs to line up.
+                    let looks_rebased = new_commits.len() == original_commits.len()
+                        && self.subjects_match(&original_commits, &new_commits);
+                    if new_commits.len() == original_commits.len() && !looks_rebased {
+                        println!(
+                            "Commit count matches but subjects differ from the PR commits; not a rebase merge"
+                        );
+                    }
+
+                    if looks_rebased {
                         println!(
                             "Detected rebase merge: {} original -> {} new commits",
                             original_commits.len(),
@@ -676,6 +691,75 @@ impl CiContext {
             AI_AUTHORSHIP_FORK_TRACKING_REF
         );
         Ok(copied)
+    }
+
+    /// A shallow clone (e.g. `actions/checkout` with its default `fetch-depth: 1`)
+    /// may not contain the PR head or its merge base, and the rewrite below would
+    /// then fail with an unrelated-looking error. Name the cause instead.
+    fn ensure_pr_history_available(
+        &self,
+        head_sha: &str,
+        base_ref: &str,
+    ) -> Result<(), AutterError> {
+        let mut args = self.repo.global_args_for_exec();
+        args.extend([
+            "rev-parse".to_string(),
+            "--is-shallow-repository".to_string(),
+        ]);
+        let is_shallow = exec_git(&args)
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "true")
+            .unwrap_or(false);
+        if !is_shallow {
+            return Ok(());
+        }
+
+        let head_available = self
+            .repo
+            .revparse_single(&format!("{}^{{commit}}", head_sha))
+            .is_ok();
+        let merge_base_available = head_available
+            && self
+                .repo
+                .merge_base(head_sha.to_string(), base_ref.to_string())
+                .ok()
+                .flatten()
+                .is_some();
+        if merge_base_available {
+            return Ok(());
+        }
+
+        Err(AutterError::Generic(format!(
+            "Repository {} is a shallow clone and does not contain the PR history \
+             (head {} {}). autter ci needs full history to rewrite authorship: use \
+             `fetch-depth: 0` with actions/checkout, `GIT_DEPTH: 0` on GitLab, or run \
+             `git fetch --unshallow` first.",
+            self.repo.path().display(),
+            head_sha,
+            if head_available {
+                format!("has no merge base with {} in the fetched history", base_ref)
+            } else {
+                "is not available locally".to_string()
+            }
+        )))
+    }
+
+    /// True when every rewritten commit keeps the subject of the PR commit it is
+    /// paired with. Lookup failures keep the previous count-only behavior.
+    fn subjects_match(&self, original_commits: &[String], new_commits: &[String]) -> bool {
+        original_commits
+            .iter()
+            .zip(new_commits)
+            .all(|(original, rewritten)| {
+                let subject = |sha: &String| {
+                    self.repo
+                        .find_commit(sha.clone())
+                        .and_then(|commit| commit.summary())
+                };
+                match (subject(original), subject(rewritten)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => true,
+                }
+            })
     }
 
     fn has_notes_for_any_commit(&self, commit_shas: &[String]) -> Result<bool, AutterError> {

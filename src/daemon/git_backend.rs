@@ -573,19 +573,14 @@ fn git_invocation_tokens(argv: &[String]) -> &[String] {
 }
 
 fn command_args(argv: &[String], command: &str) -> Vec<String> {
-    let slice = git_invocation_tokens(argv);
-    let mut seen = false;
-    let mut out = Vec::new();
-    for token in slice {
-        if !seen {
-            if token == command {
-                seen = true;
-            }
-            continue;
-        }
-        out.push(token.clone());
+    // Parse global options first so a global option's value (e.g. `-C clone`) is
+    // not mistaken for the subcommand.
+    let parsed = parse_git_cli_args(git_invocation_tokens(argv));
+    if parsed.command.as_deref() == Some(command) {
+        parsed.command_args
+    } else {
+        Vec::new()
     }
-    out
 }
 
 fn clone_init_positionals(args: &[String]) -> Vec<String> {
@@ -615,7 +610,9 @@ fn takes_value(arg: &str) -> bool {
     matches!(
         arg,
         "-b" | "--branch"
+            | "-o"
             | "--origin"
+            | "-u"
             | "--upload-pack"
             | "--template"
             | "--separate-git-dir"
@@ -624,6 +621,9 @@ fn takes_value(arg: &str) -> bool {
             | "-c"
             | "--config"
             | "--object-format"
+            | "--ref-format"
+            | "--revision"
+            | "--initial-branch"
             | "--depth"
             | "--shallow-since"
             | "--shallow-exclude"
@@ -732,7 +732,8 @@ fn parse_alias_tokens(value: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitBackend, SystemGitBackend, clone_init_positionals, default_clone_target_from_source,
+        GitBackend, SystemGitBackend, clone_init_positionals, command_args,
+        default_clone_target_from_source,
     };
     use std::path::PathBuf;
 
@@ -740,13 +741,10 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
-    // --- Bug: `takes_value` is incomplete — options like --depth, -j, -c are not listed.
-    // When `git clone --depth 1 <url>` is parsed, "1" is treated as a positional arg and
-    // the URL ends up as positional[1] (the "target directory"), triggering the error:
+    // --- Regression: value-taking options must consume their value. Before `--depth`,
+    // `-j` and `-c` were listed in `takes_value`, `git clone --depth 1 <url>` parsed "1"
+    // as the repository and the URL as the target directory, triggering:
     //   "failed to resolve clone/init target family from filesystem: <url>"
-    //
-    // These tests pin the CORRECT behaviour (URL-derived name as the only positional)
-    // and will FAIL until `takes_value` includes those options.
 
     #[test]
     fn clone_positionals_skips_value_for_depth_flag() {
@@ -880,6 +878,118 @@ mod tests {
             clone_init_positionals(&args),
             vec!["https://example.com/org/test-repo.git".to_string()],
             "--dissociate is boolean and must not consume the following URL"
+        );
+    }
+
+    // --- Remaining value-taking clone/init options missing from `takes_value`, and
+    // global options before the subcommand that `command_args` mistook for it.
+
+    #[test]
+    fn clone_positionals_skip_values_for_short_origin_and_upload_pack() {
+        for flag in ["-o", "-u"] {
+            let args = argv(&[flag, "value", "https://example.com/org/test-repo.git"]);
+            assert_eq!(
+                clone_init_positionals(&args),
+                vec!["https://example.com/org/test-repo.git".to_string()],
+                "{flag} should consume its value"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_positionals_skip_values_for_ref_format_revision_and_initial_branch() {
+        for flag in ["--ref-format", "--revision", "--initial-branch"] {
+            let args = argv(&[flag, "value", "target"]);
+            assert_eq!(
+                clone_init_positionals(&args),
+                vec!["target".to_string()],
+                "{flag} should consume its value"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_positionals_keep_equals_and_optional_value_forms_intact() {
+        let args = argv(&[
+            "--depth=1",
+            "--recurse-submodules",
+            "--shallow-submodules",
+            "--single-branch",
+            "https://example.com/org/test-repo.git",
+            "dest",
+        ]);
+        assert_eq!(
+            clone_init_positionals(&args),
+            vec![
+                "https://example.com/org/test-repo.git".to_string(),
+                "dest".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_target_with_depth_branch_and_explicit_dir() {
+        let backend = SystemGitBackend::new();
+        let cwd = PathBuf::from("/home/testuser/projects");
+        let args = argv(&[
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "main",
+            "https://example.com/org/test-repo.git",
+            "checkout",
+        ]);
+        assert_eq!(
+            backend.clone_target(&args, Some(&cwd)),
+            Some(PathBuf::from("/home/testuser/projects/checkout"))
+        );
+    }
+
+    #[test]
+    fn clone_target_with_short_origin_flag() {
+        let backend = SystemGitBackend::new();
+        let cwd = PathBuf::from("/home/testuser/projects");
+        let args = argv(&[
+            "git",
+            "clone",
+            "-o",
+            "upstream",
+            "https://example.com/org/test-repo.git",
+        ]);
+        assert_eq!(
+            backend.clone_target(&args, Some(&cwd)),
+            Some(PathBuf::from("/home/testuser/projects/test-repo"))
+        );
+    }
+
+    #[test]
+    fn command_args_skip_global_option_value_equal_to_subcommand() {
+        // `-C clone` is a directory named "clone"; the subcommand is the second "clone".
+        let args = argv(&[
+            "git",
+            "-C",
+            "clone",
+            "clone",
+            "--depth",
+            "1",
+            "https://example.com/org/test-repo.git",
+        ]);
+        assert_eq!(
+            command_args(&args, "clone"),
+            argv(&["--depth", "1", "https://example.com/org/test-repo.git"])
+        );
+    }
+
+    #[test]
+    fn init_target_with_initial_branch_value() {
+        let backend = SystemGitBackend::new();
+        let cwd = PathBuf::from("/home/testuser/projects");
+        let args = argv(&["git", "init", "--initial-branch", "main", "newrepo"]);
+        assert_eq!(
+            backend.init_target(&args, Some(&cwd)),
+            Some(PathBuf::from("/home/testuser/projects/newrepo"))
         );
     }
 
