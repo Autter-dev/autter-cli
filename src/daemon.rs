@@ -10258,12 +10258,7 @@ mod tests {
         }
         assert!(tx.is_closed(), "ingest worker must exit on shutdown");
 
-        let payload = serde_json::json!({
-            "event": "start",
-            "sid": "20260411T120000.000000-Ptest0002",
-            "__autter_ingest_seq": 1_u64,
-            "argv": ["git", "commit", "-m", "test"],
-        });
+        let payload = make_start_payload(&["git", "commit", "-m", "test"]);
         let error = coord.enqueue_trace_payload(payload).unwrap_err();
         assert!(
             error.to_string().contains("daemon is shutting down"),
@@ -10281,12 +10276,7 @@ mod tests {
         drop(rx);
         coord.trace_ingest_tx.set(tx).unwrap();
 
-        let payload = serde_json::json!({
-            "event": "start",
-            "sid": "20260411T120000.000000-Ptest0003",
-            "__autter_ingest_seq": 1_u64,
-            "argv": ["git", "commit", "-m", "test"],
-        });
+        let payload = make_start_payload(&["git", "commit", "-m", "test"]);
         let error = coord.enqueue_trace_payload(payload).unwrap_err();
         assert!(
             error.to_string().contains("worker may have crashed"),
