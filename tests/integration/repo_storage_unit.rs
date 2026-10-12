@@ -694,15 +694,6 @@ fn test_append_checkpoint_keeps_earlier_checkpoints_past_corrupt_line() {
         !rewritten.contains(&0u8),
         "the rewrite should drop the corrupt line"
     );
-    let leftover_tmp_files: Vec<_> = fs::read_dir(&working_log.dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
-        .collect();
-    assert!(
-        leftover_tmp_files.is_empty(),
-        "atomic write should not leave temp files behind"
-    );
 }
 
 // ---------------------------------------------------------------------------

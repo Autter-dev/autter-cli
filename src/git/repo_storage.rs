@@ -394,22 +394,20 @@ impl PersistedWorkingLog {
 
     /* append checkpoint */
     pub fn append_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), AutterError> {
-        // Read existing checkpoints
-        let mut checkpoints = self.read_all_checkpoints()?;
+        self.mutate_all_checkpoints(|checkpoints| {
+            // Create a copy, potentially without transcript to reduce storage size.
+            //
+            // Tools that DON'T support refetch (transcript must be kept):
+            // - "mock_ai" - test preset, transcript not stored externally
+            // - Any other agent-v1 custom tools (detected by lack of tool-specific metadata)
+            checkpoints.push(checkpoint.clone());
 
-        // Create a copy, potentially without transcript to reduce storage size.
-        //
-        // Tools that DON'T support refetch (transcript must be kept):
-        // - "mock_ai" - test preset, transcript not stored externally
-        // - Any other agent-v1 custom tools (detected by lack of tool-specific metadata)
-        checkpoints.push(checkpoint.clone());
-
-        // Prune char-level attributions from older checkpoints for the same files
-        // Only the most recent checkpoint per file needs char-level precision
-        self.prune_old_char_attributions(&mut checkpoints);
-
-        // Write all checkpoints back
-        self.write_all_checkpoints(&checkpoints)
+            // Prune char-level attributions from older checkpoints for the same files
+            // Only the most recent checkpoint per file needs char-level precision
+            self.prune_old_char_attributions(checkpoints);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn read_all_checkpoints(&self) -> Result<Vec<Checkpoint>, AutterError> {
@@ -423,20 +421,14 @@ impl PersistedWorkingLog {
         // into a single String. For large histories (hundreds of MB) the
         // whole-file read was a major source of peak-memory amplification.
         let file = fs::File::open(&checkpoints_file)?;
-        let mut reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::new(file);
         let mut checkpoints = Vec::new();
-        let mut line = Vec::new();
-        let mut line_number = 0usize;
 
         // Parse JSONL file - each line is a separate JSON object. Read raw bytes
         // so that a corrupt (e.g. NUL-padded or non-UTF-8) line is skipped
         // instead of failing the whole read and every checkpoint after it.
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            line_number += 1;
+        for (index, line) in reader.split(b'\n').enumerate() {
+            let line = line?;
             if line.trim_ascii().is_empty() {
                 continue;
             }
@@ -447,7 +439,7 @@ impl PersistedWorkingLog {
                     tracing::warn!(
                         %error,
                         path = %checkpoints_file.display(),
-                        line = line_number,
+                        line = index + 1,
                         "skipping corrupt checkpoint line"
                     );
                     continue;
@@ -564,23 +556,26 @@ impl PersistedWorkingLog {
             std::process::id(),
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let result = Self::write_checkpoints_to(&tmp_file, checkpoints)
-            .and_then(|()| fs::rename(&tmp_file, &checkpoints_file).map_err(AutterError::from));
+        let result = Self::write_checkpoints_atomically(&tmp_file, &checkpoints_file, checkpoints);
         if result.is_err() {
             let _ = fs::remove_file(&tmp_file);
         }
         result
     }
 
-    fn write_checkpoints_to(path: &Path, checkpoints: &[Checkpoint]) -> Result<(), AutterError> {
-        let file = fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
+    fn write_checkpoints_atomically(
+        tmp_file: &Path,
+        checkpoints_file: &Path,
+        checkpoints: &[Checkpoint],
+    ) -> Result<(), AutterError> {
+        let mut writer = std::io::BufWriter::new(fs::File::create(tmp_file)?);
         for checkpoint in checkpoints {
             serde_json::to_writer(&mut writer, checkpoint)?;
             writer.write_all(b"\n")?;
         }
-        let file = writer.into_inner().map_err(|e| e.into_error())?;
-        file.sync_all()?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        fs::rename(tmp_file, checkpoints_file)?;
         Ok(())
     }
 
