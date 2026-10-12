@@ -1,3 +1,4 @@
+use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use autter::authorship::attribution_tracker::LineAttribution;
 use autter::authorship::working_log::{
@@ -604,4 +605,133 @@ fn test_prune_does_not_touch_active_working_logs() {
         active_dir.exists(),
         "Active working logs should not be pruned"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 16. test_read_all_checkpoints_skips_corrupt_lines
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_read_all_checkpoints_skips_corrupt_lines() {
+    let repo = TestRepo::new();
+    let repo_storage = storage_for(&repo);
+    let working_log = repo_storage
+        .working_log_for_base_commit("test-commit-sha")
+        .unwrap();
+
+    let first = Checkpoint::new(
+        CheckpointKind::Human,
+        "diff-1".to_string(),
+        "first-author".to_string(),
+        vec![],
+    );
+    let mut second = first.clone();
+    second.author = "second-author".to_string();
+
+    let mut content = Vec::new();
+    content.extend_from_slice(serde_json::to_string(&first).unwrap().as_bytes());
+    content.push(b'\n');
+    // NUL padding, as left behind by an interrupted in-place rewrite
+    content.extend_from_slice(&[0u8; 64]);
+    content.push(b'\n');
+    // Invalid UTF-8
+    content.extend_from_slice(&[0xff, 0xfe, b'{', b'\n']);
+    // Truncated JSON
+    content.extend_from_slice(b"{\"kind\":\"Hum\n");
+    content.extend_from_slice(serde_json::to_string(&second).unwrap().as_bytes());
+    content.push(b'\n');
+    fs::write(working_log.dir.join("checkpoints.jsonl"), content).unwrap();
+
+    let checkpoints = working_log
+        .read_all_checkpoints()
+        .expect("corrupt lines should not fail the read");
+    let authors: Vec<&str> = checkpoints.iter().map(|c| c.author.as_str()).collect();
+    assert_eq!(authors, vec!["first-author", "second-author"]);
+}
+
+// ---------------------------------------------------------------------------
+// 17. test_append_checkpoint_keeps_earlier_checkpoints_past_corrupt_line
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_append_checkpoint_keeps_earlier_checkpoints_past_corrupt_line() {
+    let repo = TestRepo::new();
+    let repo_storage = storage_for(&repo);
+    let working_log = repo_storage
+        .working_log_for_base_commit("test-commit-sha")
+        .unwrap();
+
+    let earlier = Checkpoint::new(
+        CheckpointKind::Human,
+        "diff-1".to_string(),
+        "earlier-author".to_string(),
+        vec![],
+    );
+    working_log.append_checkpoint(&earlier).unwrap();
+
+    let checkpoints_file = working_log.dir.join("checkpoints.jsonl");
+    let mut content = fs::read(&checkpoints_file).unwrap();
+    content.extend_from_slice(&[0u8; 32]);
+    content.push(b'\n');
+    fs::write(&checkpoints_file, content).unwrap();
+
+    let later = Checkpoint::new(
+        CheckpointKind::AiAgent,
+        "diff-2".to_string(),
+        "later-author".to_string(),
+        vec![],
+    );
+    working_log
+        .append_checkpoint(&later)
+        .expect("append should succeed with a corrupt line present");
+
+    let checkpoints = working_log.read_all_checkpoints().unwrap();
+    let authors: Vec<&str> = checkpoints.iter().map(|c| c.author.as_str()).collect();
+    assert_eq!(authors, vec!["earlier-author", "later-author"]);
+
+    let rewritten = fs::read(&checkpoints_file).unwrap();
+    assert!(
+        !rewritten.contains(&0u8),
+        "the rewrite should drop the corrupt line"
+    );
+    let leftover_tmp_files: Vec<_> = fs::read_dir(&working_log.dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftover_tmp_files.is_empty(),
+        "atomic write should not leave temp files behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 18. test_ai_checkpoint_succeeds_with_corrupt_checkpoint_line
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ai_checkpoint_succeeds_with_corrupt_checkpoint_line() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("example.txt");
+
+    fs::write(&file_path, "Untracked line\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("example.txt");
+    file.assert_committed_lines(lines!["Untracked line".unattributed_human()]);
+
+    let checkpoints_file = repo.current_working_logs().dir.join("checkpoints.jsonl");
+    let mut content = fs::read(&checkpoints_file).unwrap_or_default();
+    content.extend_from_slice(&[0u8; 64]);
+    content.push(b'\n');
+    fs::write(&checkpoints_file, content).unwrap();
+
+    fs::write(&file_path, "Untracked line\nAI line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "example.txt"])
+        .expect("AI checkpoint should succeed despite a corrupt checkpoint line");
+
+    repo.stage_all_and_commit("AI commit").unwrap();
+    file.assert_committed_lines(lines![
+        "Untracked line".unattributed_human(),
+        "AI line".ai(),
+    ]);
 }

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Initial attributions data structure stored in the INITIAL file
@@ -394,7 +395,7 @@ impl PersistedWorkingLog {
     /* append checkpoint */
     pub fn append_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), AutterError> {
         // Read existing checkpoints
-        let mut checkpoints = self.read_all_checkpoints().unwrap_or_default();
+        let mut checkpoints = self.read_all_checkpoints()?;
 
         // Create a copy, potentially without transcript to reduce storage size.
         //
@@ -422,18 +423,36 @@ impl PersistedWorkingLog {
         // into a single String. For large histories (hundreds of MB) the
         // whole-file read was a major source of peak-memory amplification.
         let file = fs::File::open(&checkpoints_file)?;
-        let reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::new(file);
         let mut checkpoints = Vec::new();
+        let mut line = Vec::new();
+        let mut line_number = 0usize;
 
-        // Parse JSONL file - each line is a separate JSON object
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        // Parse JSONL file - each line is a separate JSON object. Read raw bytes
+        // so that a corrupt (e.g. NUL-padded or non-UTF-8) line is skipped
+        // instead of failing the whole read and every checkpoint after it.
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            line_number += 1;
+            if line.trim_ascii().is_empty() {
                 continue;
             }
 
-            let checkpoint: Checkpoint = serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let checkpoint: Checkpoint = match serde_json::from_slice(&line) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %checkpoints_file.display(),
+                        line = line_number,
+                        "skipping corrupt checkpoint line"
+                    );
+                    continue;
+                }
+            };
 
             if checkpoint.api_version != CHECKPOINT_API_VERSION {
                 tracing::debug!(
@@ -535,14 +554,33 @@ impl PersistedWorkingLog {
         // collecting every line into a Vec<String> and join()-ing them into one
         // giant String. On large histories that intermediate buffer (plus the
         // joined copy) was a major peak-memory amplifier.
-        let file = fs::File::create(&checkpoints_file)?;
+        //
+        // Write to a uniquely named temp file and rename it over the target so
+        // that a crash or a concurrent writer can never leave a partially
+        // written checkpoints.jsonl behind.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp_file = self.dir.join(format!(
+            "checkpoints.jsonl.{}.{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = Self::write_checkpoints_to(&tmp_file, checkpoints)
+            .and_then(|()| fs::rename(&tmp_file, &checkpoints_file).map_err(AutterError::from));
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_file);
+        }
+        result
+    }
+
+    fn write_checkpoints_to(path: &Path, checkpoints: &[Checkpoint]) -> Result<(), AutterError> {
+        let file = fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
         for checkpoint in checkpoints {
             serde_json::to_writer(&mut writer, checkpoint)?;
             writer.write_all(b"\n")?;
         }
-        writer.flush()?;
-
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
         Ok(())
     }
 
