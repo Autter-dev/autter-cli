@@ -369,11 +369,35 @@ fn is_storage_full_error(error: &AutterError) -> bool {
     matches!(error, AutterError::IoError(io_error) if io_error.kind() == std::io::ErrorKind::StorageFull)
 }
 
-fn log_side_effect_error(error: &AutterError, family: &str, seq: u64, message: &str) {
+/// Returns true when git exits 128 because the repository does not have the
+/// requested object. `git cat-file -t` reports "could not get object info" in
+/// current git and "Not a valid object name" in older git.
+fn is_missing_object_error(error: &AutterError) -> bool {
+    match error {
+        AutterError::GitCliError {
+            code: Some(128),
+            stderr,
+            ..
+        } => {
+            stderr.contains("could not get object info")
+                || stderr.contains("Not a valid object name")
+        }
+        _ => false,
+    }
+}
+
+fn log_side_effect_error(
+    error: &AutterError,
+    family: &str,
+    seq: u64,
+    command: Option<&str>,
+    message: &str,
+) {
+    let command = command.unwrap_or("unknown");
     if is_storage_full_error(error) {
-        tracing::warn!(%error, %family, seq, "{message}: host disk is full");
+        tracing::warn!(%error, %family, seq, %command, "{message}: host disk is full");
     } else {
-        tracing::error!(%error, %family, seq, "{message}");
+        tracing::error!(%error, %family, seq, %command, "{message}");
     }
 }
 
@@ -6120,6 +6144,7 @@ impl ActorDaemonCoordinator {
                                     error,
                                     family,
                                     applied.seq,
+                                    applied.command.primary_command.as_deref(),
                                     "command side effect failed",
                                 );
                             }
@@ -6609,9 +6634,20 @@ impl ActorDaemonCoordinator {
             && let Some(worktree) = cmd.worktree.as_ref()
         {
             let repo = find_repository_in_path(worktree.to_string_lossy().as_ref())?;
-            let stash_commit = repo.find_commit(stash_sha.to_string())?;
-            if let Ok(parent) = stash_commit.parent(0) {
-                return Ok(Some(parent.id().to_string()));
+            match repo.find_commit(stash_sha.to_string()) {
+                Ok(stash_commit) => {
+                    if let Ok(parent) = stash_commit.parent(0) {
+                        return Ok(Some(parent.id().to_string()));
+                    }
+                }
+                Err(error) if is_missing_object_error(&error) => {
+                    tracing::warn!(
+                        %error,
+                        %stash_sha,
+                        "stash commit is not in the repository; using the command head"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -7884,6 +7920,7 @@ impl ActorDaemonCoordinator {
                             &error,
                             &family,
                             applied.seq,
+                            applied.command.primary_command.as_deref(),
                             "async side-effect error",
                         );
                     } else if let Err(error) =
@@ -9474,6 +9511,75 @@ mod tests {
         assert!(!is_missing_working_dir_error(&AutterError::Generic(
             "No such file or directory".to_string()
         )));
+    }
+
+    #[test]
+    fn missing_object_error_detects_cat_file_failures() {
+        let current_git = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: git cat-file: could not get object info".to_string(),
+            args: vec!["cat-file".to_string(), "-t".to_string()],
+        };
+        assert!(is_missing_object_error(&current_git));
+
+        let older_git = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: Not a valid object name 0123456789abcdef0123456789abcdef01234567"
+                .to_string(),
+            args: vec!["cat-file".to_string(), "-t".to_string()],
+        };
+        assert!(is_missing_object_error(&older_git));
+
+        let other_failure = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: not a git repository (or any of the parent directories): .git"
+                .to_string(),
+            args: vec!["cat-file".to_string(), "-t".to_string()],
+        };
+        assert!(!is_missing_object_error(&other_failure));
+        assert!(!is_missing_object_error(&AutterError::Generic(
+            "could not get object info".to_string()
+        )));
+    }
+
+    #[test]
+    fn stash_create_head_uses_command_head_when_stash_commit_is_missing() {
+        let tmp = crate::git::test_utils::TmpRepo::new().unwrap();
+        let missing_stash_sha = "0123456789abcdef0123456789abcdef01234567";
+        let semantic_head = "89abcdef0123456789abcdef0123456789abcdef".to_string();
+        let cmd = crate::daemon::domain::NormalizedCommand {
+            scope: crate::daemon::domain::CommandScope::Family(crate::daemon::domain::FamilyKey(
+                "family".to_string(),
+            )),
+            family_key: Some(crate::daemon::domain::FamilyKey("family".to_string())),
+            worktree: Some(tmp.path().to_path_buf()),
+            root_sid: "s1".to_string(),
+            raw_argv: vec!["git".to_string(), "stash".to_string()],
+            primary_command: Some("stash".to_string()),
+            invoked_command: Some("stash".to_string()),
+            invoked_args: Vec::new(),
+            observed_child_commands: Vec::new(),
+            exit_code: 0,
+            started_at_ns: 1,
+            finished_at_ns: 2,
+            pre_repo: None,
+            post_repo: None,
+            inflight_rebase_original_head: None,
+            merge_squash_source_head: None,
+            carryover_snapshot_id: None,
+            stash_target_oid: None,
+            ref_changes: Vec::new(),
+            confidence: crate::daemon::domain::Confidence::Low,
+            wrapper_invocation_id: None,
+        };
+
+        let head = ActorDaemonCoordinator::resolve_stash_create_head_for_event(
+            &cmd,
+            Some(missing_stash_sha),
+            Some(&semantic_head),
+        )
+        .unwrap();
+        assert_eq!(head, Some(semantic_head));
     }
 
     #[test]
