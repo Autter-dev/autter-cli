@@ -54,6 +54,13 @@ pub fn handle_whoami(args: &[String]) {
                 auth_failed = true;
             }
         }
+        AuthState::LoginRefused(reason) => {
+            println!("Auth state: sign-in refused by the server ({})", reason);
+            println!("Fix: run `autter login`");
+            if api_ctx.api_key.is_none() {
+                auth_failed = true;
+            }
+        }
         AuthState::Error(err) => {
             println!("Auth state: error ({})", err);
             if api_ctx.api_key.is_none() {

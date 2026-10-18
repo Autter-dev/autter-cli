@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::auth::CredentialStore;
+use crate::auth::types::RefreshFailure;
 
 /// Minimum seconds between notices across processes (24 hours).
 const NOTICE_INTERVAL_SECS: i64 = 24 * 60 * 60;
@@ -74,6 +75,14 @@ fn notice_stamp_path() -> PathBuf {
         .join(".autter")
         .join("internal")
         .join("logged-out-notice-at")
+}
+
+/// Holds the `at` of the last refused login the user was told about.
+fn login_refused_notice_stamp_path() -> PathBuf {
+    crate::mdm::utils::home_dir()
+        .join(".autter")
+        .join("internal")
+        .join("login-refused-notice-at")
 }
 
 fn sync_blocked_stamp_path() -> PathBuf {
@@ -280,10 +289,9 @@ pub fn cloud_sync_attention() -> Option<CloudSyncAttention> {
     }
 
     let creds = CredentialStore::new().load().ok().flatten();
-    let auth_blocked = creds
-        .as_ref()
-        .is_none_or(|credentials| credentials.is_refresh_token_expired())
-        || sync_auth_blocked_recently();
+    let auth_blocked = creds.as_ref().is_none_or(|credentials| {
+        credentials.is_refresh_token_expired() || credentials.is_login_required()
+    }) || sync_auth_blocked_recently();
 
     if auth_blocked {
         return Some(CloudSyncAttention::AuthBlocked);
@@ -537,11 +545,29 @@ fn read_pending_sync_counts() -> Option<PendingSyncCounts> {
     })
 }
 
-fn print_sync_attention_message(attention: CloudSyncAttention, pending: PendingSyncCounts) {
+/// The server's refusal of the stored login, if it refused it.
+fn stored_login_refusal() -> Option<RefreshFailure> {
+    CredentialStore::new().load().ok().flatten()?.refresh_failed
+}
+
+fn print_sync_attention_message(
+    attention: CloudSyncAttention,
+    pending: PendingSyncCounts,
+    refusal: Option<&RefreshFailure>,
+) {
     eprintln!();
     match attention {
         CloudSyncAttention::AuthBlocked => {
-            eprintln!("\x1b[1;33m⚠ Cloud sync is paused — your autter login has expired.\x1b[0m");
+            if let Some(refusal) = refusal {
+                eprintln!(
+                    "\x1b[1;33m⚠ Cloud sync is paused — the autter server refused your saved login.\x1b[0m"
+                );
+                eprintln!("\x1b[1;33m  {}\x1b[0m", refusal.message());
+            } else {
+                eprintln!(
+                    "\x1b[1;33m⚠ Cloud sync is paused — your autter login has expired.\x1b[0m"
+                );
+            }
             if pending.total() > 0 {
                 eprintln!(
                     "\x1b[1;33m  {} are stored locally and will upload once you're back in.\x1b[0m",
@@ -599,6 +625,16 @@ fn eprint_sync_attention(rate_limited: bool) {
     let Some(attention) = cloud_sync_attention() else {
         return;
     };
+    let refusal = stored_login_refusal();
+    // A login the server just refused is news: say so on the next command even
+    // inside the 24-hour reminder window, but only once per refusal.
+    if attention == CloudSyncAttention::AuthBlocked
+        && let Some(refusal) = &refusal
+        && !refusal_already_announced(&login_refused_notice_stamp_path(), refusal)
+    {
+        announce_login_refused(refusal);
+        return;
+    }
     if rate_limited {
         if NOTICE_EMITTED.load(Ordering::Relaxed) || recently_notified() {
             return;
@@ -613,7 +649,45 @@ fn eprint_sync_attention(rate_limited: bool) {
     }
 
     let pending = pending_sync_counts();
-    print_sync_attention_message(attention, pending);
+    print_sync_attention_message(attention, pending, refusal.as_ref());
+}
+
+/// Tell an interactive user, once per refusal, that the server refused their
+/// saved login, with the server's own reason. The daemon has no terminal, so
+/// its refusals reach the user through the next interactive command instead
+/// (see [`maybe_warn_logged_out`]).
+pub fn announce_login_refused(refusal: &RefreshFailure) {
+    if cfg!(test) || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let stamp = login_refused_notice_stamp_path();
+    if refusal_already_announced(&stamp, refusal) {
+        return;
+    }
+    if NOTICE_EMITTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    record_refusal_announced(&stamp, refusal);
+    record_notified();
+    print_sync_attention_message(
+        CloudSyncAttention::AuthBlocked,
+        pending_sync_counts(),
+        Some(refusal),
+    );
+}
+
+fn refusal_already_announced(stamp: &std::path::Path, refusal: &RefreshFailure) -> bool {
+    stamp_time(stamp) == Some(refusal.at)
+}
+
+fn record_refusal_announced(stamp: &std::path::Path, refusal: &RefreshFailure) {
+    if let Some(parent) = stamp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(stamp, refusal.at.to_string());
 }
 
 /// Rate-limited reminder on interactive git/autter commands (once per 24 hours).
@@ -753,6 +827,30 @@ mod tests {
         assert!(summary.contains("upload pending"));
         assert!(summary.contains("2 records waiting"));
         assert!(summary.contains("Last metrics batch received"));
+    }
+
+    #[test]
+    fn login_refusal_is_announced_once_per_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("login-refused-notice-at");
+        let refusal = RefreshFailure {
+            at: 1_760_000_000,
+            error: "invalid_grant".to_string(),
+            error_code: Some("refresh_token_invalid".to_string()),
+            description: Some("Refresh token is not valid.".to_string()),
+        };
+
+        assert!(!refusal_already_announced(&stamp, &refusal));
+        record_refusal_announced(&stamp, &refusal);
+        assert!(refusal_already_announced(&stamp, &refusal));
+        assert!(refusal_already_announced(&stamp, &refusal.clone()));
+
+        // A new login that is refused later is news again.
+        let later = RefreshFailure {
+            at: refusal.at + 3600,
+            ..refusal
+        };
+        assert!(!refusal_already_announced(&stamp, &later));
     }
 
     #[test]

@@ -16,7 +16,17 @@ pub enum LoginOutcome {
 pub fn run_device_login() -> Result<LoginOutcome, String> {
     let store = CredentialStore::new();
 
-    if let Ok(Some(creds)) = store.load()
+    let stored = store.load().ok().flatten();
+    if let Some(refusal) = stored
+        .as_ref()
+        .and_then(|creds| creds.refresh_failed.as_ref())
+    {
+        // Refused credentials are never "already logged in", whatever their expiry says.
+        eprintln!(
+            "The server refused your saved login: {}\nStarting a new sign-in...\n",
+            refusal.message()
+        );
+    } else if let Some(creds) = &stored
         && !creds.is_refresh_token_expired()
     {
         if !crate::auth::notice::sync_auth_blocked_recently() {

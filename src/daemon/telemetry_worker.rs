@@ -395,7 +395,7 @@ fn flush_commit_summaries() {
     let home_client = ApiClient::new(ApiContext::new(None));
     if !home_client.is_logged_in() && !home_client.has_api_key() {
         note_durable_sync_unauthenticated("commit summaries", pending);
-        if let Some(issue) = home_client.auth_issue() {
+        if let Some(issue) = home_client.auth_issue_to_log() {
             tracing::warn!(reason = %issue, pending, "commit summaries: sync authentication unavailable");
         }
         return;
@@ -637,7 +637,7 @@ fn flush_stored_metrics() {
     let client = ApiClient::new(ApiContext::new(None));
     if !client.is_logged_in() && !client.has_api_key() {
         note_durable_sync_unauthenticated("metrics", pending as i64);
-        if let Some(issue) = client.auth_issue() {
+        if let Some(issue) = client.auth_issue_to_log() {
             tracing::warn!(reason = %issue, pending, "metrics: durable sync authentication unavailable");
         }
         return;
@@ -1075,7 +1075,7 @@ pub fn flush_notes() {
 
     if !client.is_logged_in() && !client.has_api_key() {
         note_durable_sync_unauthenticated("notes", pending_count);
-        if let Some(issue) = client.auth_issue() {
+        if let Some(issue) = client.auth_issue_to_log() {
             tracing::warn!(reason = %issue, pending = pending_count, "notes: sync authentication unavailable");
         }
         return;
@@ -1367,7 +1367,7 @@ fn flush_cas_queue() {
     let (auth_client, enabled) = cas_client();
     if !enabled {
         note_durable_sync_unauthenticated("cas_transcripts", pending);
-        if let Some(issue) = auth_client.auth_issue() {
+        if let Some(issue) = auth_client.auth_issue_to_log() {
             tracing::warn!(reason = %issue, pending, "cas: sync authentication unavailable");
         }
         return;

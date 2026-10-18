@@ -1,5 +1,7 @@
 use crate::api::client::ApiContext;
-use crate::auth::types::{DeviceAuthResponse, OAuthError, StoredCredentials, TokenResponse};
+use crate::auth::types::{
+    DeviceAuthResponse, OAuthError, StoredCredentials, TokenRequestError, TokenResponse,
+};
 use crate::config;
 use crate::http;
 use std::thread;
@@ -55,33 +57,30 @@ impl OAuthClient {
         })
     }
 
-    /// Common token exchange logic - POST to /worker/oauth/token with given body
-    fn exchange_token(&self, body: serde_json::Value) -> Result<StoredCredentials, String> {
+    /// Common token exchange logic - POST to /worker/oauth/token with given body.
+    /// A refusal comes back parsed so callers can tell a dead grant from an outage.
+    fn exchange_token(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<StoredCredentials, TokenRequestError> {
         let url = format!("{}/worker/oauth/token", self.base_url);
 
         let (_agent, request) = ApiContext::http_post(&url, Some(30));
         let request = request.set("Content-Type", "application/json");
-        let response = http::send_with_body(request, &body.to_string())
-            .map_err(|e| format!("Failed to connect to server: {}", e))?;
+        let response = http::send_with_body(request, &body.to_string()).map_err(|e| {
+            TokenRequestError::Transport(format!("Failed to connect to server: {}", e))
+        })?;
 
-        let response_body = response
-            .as_str()
-            .map_err(|e| format!("Invalid response encoding: {}", e))?;
+        let response_body = response.as_str().map_err(|e| {
+            TokenRequestError::Transport(format!("Invalid response encoding: {}", e))
+        })?;
 
         if response.status_code != 200 {
-            let error: OAuthError = serde_json::from_str(response_body).unwrap_or(OAuthError {
-                error: "unknown_error".to_string(),
-                error_description: None,
-            });
-
-            let msg = error
-                .error_description
-                .unwrap_or_else(|| error.error.clone());
-            return Err(msg);
+            return Err(parse_token_error(response.status_code, response_body));
         }
 
         let token_response: TokenResponse = serde_json::from_str(response_body)
-            .map_err(|e| format!("Invalid token response: {}", e))?;
+            .map_err(|e| TokenRequestError::Transport(format!("Invalid token response: {}", e)))?;
 
         let now = chrono::Utc::now().timestamp();
         Ok(StoredCredentials {
@@ -89,6 +88,7 @@ impl OAuthClient {
             refresh_token: token_response.refresh_token,
             access_token_expires_at: now + token_response.expires_in as i64,
             refresh_token_expires_at: now + token_response.refresh_expires_in as i64,
+            refresh_failed: None,
         })
     }
 
@@ -176,6 +176,7 @@ impl OAuthClient {
                     refresh_token: token_response.refresh_token,
                     access_token_expires_at: now + token_response.expires_in as i64,
                     refresh_token_expires_at: now + token_response.refresh_expires_in as i64,
+                    refresh_failed: None,
                 });
             }
 
@@ -225,7 +226,10 @@ impl OAuthClient {
     }
 
     /// Refresh the access token using a refresh token
-    pub fn refresh_access_token(&self, refresh_token: &str) -> Result<StoredCredentials, String> {
+    pub fn refresh_access_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<StoredCredentials, TokenRequestError> {
         let body = serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -233,7 +237,6 @@ impl OAuthClient {
         });
 
         self.exchange_token(body)
-            .map_err(|e| format!("Token refresh failed: {}", e))
     }
 
     /// Exchange a Personal Access Token (PAT) for credentials.
@@ -307,6 +310,23 @@ impl OAuthClient {
 
         self.exchange_token(body)
             .map_err(|e| format!("Nonce exchange failed: {}", e))
+    }
+}
+
+/// Turn a non-200 token-endpoint reply into a typed error. Anything that is
+/// not an OAuth error body (a proxy page, an empty 5xx) counts as transport.
+fn parse_token_error(status: u16, body: &str) -> TokenRequestError {
+    match serde_json::from_str::<OAuthError>(body) {
+        Ok(error) => TokenRequestError::Refused { status, error },
+        Err(_) => {
+            let detail = body.trim();
+            let detail = if detail.is_empty() {
+                "no details".to_string()
+            } else {
+                detail.chars().take(200).collect()
+            };
+            TokenRequestError::Transport(format!("HTTP {status}: {detail}"))
+        }
     }
 }
 
@@ -458,6 +478,37 @@ mod tests {
         assert!(error.error_description.is_none());
     }
 
+    #[test]
+    fn test_parse_token_error_keeps_the_oauth_fields() {
+        let error = parse_token_error(
+            400,
+            r#"{"error":"invalid_grant","error_description":"Refresh token is not valid. Run `autter login` to sign in again.","error_code":"refresh_token_invalid","login_required":true}"#,
+        );
+        let TokenRequestError::Refused { status, error } = &error else {
+            panic!("expected a refusal, got {error:?}");
+        };
+        assert_eq!(*status, 400);
+        assert_eq!(error.error, "invalid_grant");
+        assert_eq!(error.error_code.as_deref(), Some("refresh_token_invalid"));
+        assert_eq!(error.login_required, Some(true));
+    }
+
+    #[test]
+    fn test_parse_token_error_treats_non_oauth_pages_as_transport() {
+        let error = parse_token_error(502, "<html>Bad Gateway</html>");
+        assert_eq!(
+            error,
+            TokenRequestError::Transport("HTTP 502: <html>Bad Gateway</html>".to_string())
+        );
+        assert!(!error.requires_login());
+
+        let error = parse_token_error(503, "  ");
+        assert_eq!(
+            error,
+            TokenRequestError::Transport("HTTP 503: no details".to_string())
+        );
+    }
+
     // ============= Device Auth Response Parsing Tests =============
 
     #[test]
@@ -512,6 +563,7 @@ mod tests {
             refresh_token: "test".to_string(),
             access_token_expires_at: now + expires_in as i64,
             refresh_token_expires_at: now + refresh_expires_in as i64,
+            refresh_failed: None,
         };
 
         // Access token should expire in about 1 hour

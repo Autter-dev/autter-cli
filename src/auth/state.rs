@@ -7,6 +7,8 @@ pub enum AuthState {
     LoggedIn,
     SyncBlocked,
     RefreshExpired,
+    /// The server refused the stored login for good; carries its reason.
+    LoginRefused(String),
     Error(String),
 }
 
@@ -41,7 +43,9 @@ pub fn collect_auth_status() -> AuthStatus {
         },
         Ok(Some(creds)) => {
             let identity = extract_identity_from_access_token(&creds.access_token);
-            let state = if creds.is_refresh_token_expired() {
+            let state = if let Some(refusal) = &creds.refresh_failed {
+                AuthState::LoginRefused(refusal.message())
+            } else if creds.is_refresh_token_expired() {
                 AuthState::RefreshExpired
             } else if super::notice::sync_auth_blocked_recently() {
                 AuthState::SyncBlocked
