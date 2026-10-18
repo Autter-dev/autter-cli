@@ -104,7 +104,7 @@ pub fn flush_pending_to_cloud() {
             "file_changes",
             pending_count,
         );
-        if let Some(issue) = default_client.auth_issue() {
+        if let Some(issue) = default_client.auth_issue_to_log() {
             tracing::warn!(reason = %issue, pending = pending_count, "file-changes: sync authentication unavailable");
         }
         return;

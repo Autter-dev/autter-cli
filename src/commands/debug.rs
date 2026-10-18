@@ -334,6 +334,10 @@ fn build_debug_report(options: DebugOptions) -> String {
             let _ = writeln!(out, "Status: credentials expired (refresh token expired)");
             let _ = writeln!(out, "  fix: run `autter login` to sign in again");
         }
+        AuthState::LoginRefused(reason) => {
+            let _ = writeln!(out, "Status: sign-in refused by the server ({})", reason);
+            let _ = writeln!(out, "  fix: run `autter login` to sign in again");
+        }
         AuthState::Error(err) => {
             let _ = writeln!(out, "Status: <error: {}>", err);
             let _ = writeln!(
@@ -360,7 +364,10 @@ fn build_debug_report(options: DebugOptions) -> String {
         let _ = writeln!(out, "User ID: {}", user_id);
     } else if matches!(
         &auth_info.state,
-        AuthState::LoggedIn | AuthState::SyncBlocked | AuthState::RefreshExpired
+        AuthState::LoggedIn
+            | AuthState::SyncBlocked
+            | AuthState::RefreshExpired
+            | AuthState::LoginRefused(_)
     ) {
         let _ = writeln!(out, "User ID: <unavailable>");
     }
@@ -368,7 +375,10 @@ fn build_debug_report(options: DebugOptions) -> String {
         let _ = writeln!(out, "Email: {}", email);
     } else if matches!(
         &auth_info.state,
-        AuthState::LoggedIn | AuthState::SyncBlocked | AuthState::RefreshExpired
+        AuthState::LoggedIn
+            | AuthState::SyncBlocked
+            | AuthState::RefreshExpired
+            | AuthState::LoginRefused(_)
     ) {
         let _ = writeln!(out, "Email: <unavailable>");
     }
@@ -376,7 +386,10 @@ fn build_debug_report(options: DebugOptions) -> String {
         let _ = writeln!(out, "Name: {}", name);
     } else if matches!(
         &auth_info.state,
-        AuthState::LoggedIn | AuthState::SyncBlocked | AuthState::RefreshExpired
+        AuthState::LoggedIn
+            | AuthState::SyncBlocked
+            | AuthState::RefreshExpired
+            | AuthState::LoginRefused(_)
     ) {
         let _ = writeln!(out, "Name: <unavailable>");
     }

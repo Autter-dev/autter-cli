@@ -808,6 +808,24 @@ fn check_auth() -> (DoctorCheck, bool) {
             },
             has_api_key,
         ),
+        AuthState::LoginRefused(reason) => (
+            DoctorCheck {
+                section: SECTION_ACCOUNT,
+                name,
+                status: if Config::get().notes_backend_kind().uses_http() {
+                    DoctorStatus::Failed
+                } else {
+                    DoctorStatus::Warning
+                },
+                summary: format!("the server refused the saved login: {}", reason),
+                details,
+                remediation: Some(
+                    "run `autter login` to sign in again (ignore this in local-only mode)"
+                        .to_string(),
+                ),
+            },
+            has_api_key,
+        ),
         AuthState::Error(err) => (
             DoctorCheck {
                 section: SECTION_ACCOUNT,

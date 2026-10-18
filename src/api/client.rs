@@ -1,3 +1,4 @@
+use crate::auth::types::{RefreshFailure, StoredCredentials, TokenRequestError};
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
 use crate::error::AutterError;
@@ -5,6 +6,7 @@ use crate::git::repository::{current_git_committer_identity_resolution, parse_gi
 use crate::http;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use url::Url;
 
 /// Global mutex to prevent multiple threads from refreshing simultaneously.
@@ -13,12 +15,33 @@ use url::Url;
 /// because device-flow refresh tokens rotate on every use.
 static REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+/// How long to wait for a sibling process's refresh before refreshing without
+/// `credentials.lock`. A refresh round trip is normally well under 3 s.
+const REFRESH_FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The last refresh token this process saw refused, and why. Backs up the
+/// persisted refusal when writing it failed (keyring locked, disk full).
+static REFUSED_REFRESH_TOKEN: Lazy<Mutex<Option<(String, RefreshFailure)>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// `at` of the refusal this process last logged, so it is logged once.
+static LOGGED_REFUSAL_AT: AtomicI64 = AtomicI64::new(0);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthLoadIssue {
     NoCredentials,
     CredentialStore(String),
     RefreshExpired,
     RefreshFailed(String),
+    /// The server refused the stored refresh token for good. Nothing retries
+    /// until `autter login` stores new credentials.
+    LoginRequired(RefreshFailure),
+}
+
+impl AuthLoadIssue {
+    pub fn is_login_required(&self) -> bool {
+        matches!(self, Self::LoginRequired(_))
+    }
 }
 
 impl std::fmt::Display for AuthLoadIssue {
@@ -28,6 +51,9 @@ impl std::fmt::Display for AuthLoadIssue {
             Self::CredentialStore(error) => write!(f, "could not read credentials: {error}"),
             Self::RefreshExpired => write!(f, "refresh token expired"),
             Self::RefreshFailed(error) => write!(f, "access-token refresh failed: {error}"),
+            Self::LoginRequired(failure) => {
+                write!(f, "sign-in refused by the server: {}", failure.message())
+            }
         }
     }
 }
@@ -37,17 +63,15 @@ impl std::fmt::Display for AuthLoadIssue {
 /// Uses in-process Mutex for thread safety during token refresh.
 fn try_load_auth_token() -> Result<String, AuthLoadIssue> {
     let store = CredentialStore::new();
-
-    let creds = match store.load() {
-        Ok(Some(c)) => c,
-        Ok(None) => return Err(AuthLoadIssue::NoCredentials),
-        Err(error) => return Err(AuthLoadIssue::CredentialStore(error)),
-    };
-
-    // If refresh token expired, can't authenticate
-    if creds.is_refresh_token_expired() {
-        return Err(AuthLoadIssue::RefreshExpired);
+    let result = load_auth_token(&store);
+    if let Err(AuthLoadIssue::LoginRequired(failure)) = &result {
+        report_login_required(failure);
     }
+    result
+}
+
+fn load_auth_token(store: &CredentialStore) -> Result<String, AuthLoadIssue> {
+    let creds = load_refreshable_credentials(store)?;
 
     // Fast path: if access token is valid (with 5 min buffer), use it directly
     if !creds.is_access_token_expired(300) {
@@ -67,61 +91,174 @@ fn try_load_auth_token() -> Result<String, AuthLoadIssue> {
     // we still have on disk. Wait for a sibling refresh, then reload.
     let _file_lock = acquire_refresh_file_lock();
 
-    // Re-check credentials after acquiring lock - another thread/process may have refreshed
+    let client = OAuthClient::new();
+    refresh_stored_credentials(store, |refresh_token| {
+        client.refresh_access_token(refresh_token)
+    })
+    // Mutex / file-lock guards are released when dropped
+}
+
+/// Load credentials that may be used or refreshed. A login the server already
+/// refused, or one whose refresh token has expired, never reaches the network.
+fn load_refreshable_credentials(
+    store: &CredentialStore,
+) -> Result<StoredCredentials, AuthLoadIssue> {
     let creds = match store.load() {
         Ok(Some(c)) => c,
         Ok(None) => return Err(AuthLoadIssue::NoCredentials),
         Err(error) => return Err(AuthLoadIssue::CredentialStore(error)),
     };
-
+    if let Some(failure) = creds
+        .refresh_failed
+        .clone()
+        .or_else(|| refused_in_process(&creds.refresh_token))
+    {
+        return Err(AuthLoadIssue::LoginRequired(failure));
+    }
     if creds.is_refresh_token_expired() {
         return Err(AuthLoadIssue::RefreshExpired);
     }
+    Ok(creds)
+}
+
+/// The refresh itself, run under the refresh locks. `refresh` performs the
+/// network call (injected so tests can count calls without a server).
+fn refresh_stored_credentials(
+    store: &CredentialStore,
+    refresh: impl Fn(&str) -> Result<StoredCredentials, TokenRequestError>,
+) -> Result<String, AuthLoadIssue> {
+    // Re-check credentials after acquiring lock - another thread/process may have refreshed
+    let mut creds = load_refreshable_credentials(store)?;
 
     // Check again if access token is now valid (another thread/process may have refreshed)
     if !creds.is_access_token_expired(300) {
         return Ok(creds.access_token);
     }
 
-    // Still expired - we need to refresh
-    let client = OAuthClient::new();
-    match client.refresh_access_token(&creds.refresh_token) {
-        Ok(new_creds) => {
-            // The current process can use the fresh token even if persisting it
-            // fails, but surface that failure so the next process is diagnosable.
-            if let Err(error) = store.store(&new_creds) {
-                tracing::warn!(%error, "could not persist refreshed credentials");
+    // Still expired - we need to refresh. At most one retry, with a token a
+    // sibling process rotated in while this one was refreshing.
+    let mut retried = false;
+    loop {
+        let error = match refresh(&creds.refresh_token) {
+            Ok(new_creds) => {
+                persist_refreshed_credentials(store, &creds.refresh_token, &new_creds);
+                return Ok(new_creds.access_token);
             }
-            Ok(new_creds.access_token)
+            Err(error) => error,
+        };
+
+        // Lost the rotation race: another process already swapped the
+        // stored refresh token. Reload and use that session if it is live.
+        if let Ok(Some(reloaded)) = store.load()
+            && !reloaded.is_login_required()
+            && !reloaded.is_refresh_token_expired()
+        {
+            if !reloaded.is_access_token_expired(300) {
+                return Ok(reloaded.access_token);
+            }
+            if !retried && reloaded.refresh_token != creds.refresh_token {
+                retried = true;
+                creds = reloaded;
+                continue;
+            }
         }
+
+        // A device token the server refused for good: stop here. PATs share
+        // the refresh grant but are not rotated device sessions, so they keep
+        // today's retry behavior.
+        if error.requires_login()
+            && !creds.refresh_token.starts_with(PAT_PREFIX)
+            && let Some(oauth_error) = error.oauth_error()
+            && let Some(failure) = record_refused_login(
+                store,
+                &creds.refresh_token,
+                RefreshFailure::from_oauth_error(oauth_error),
+            )
+        {
+            return Err(AuthLoadIssue::LoginRequired(failure));
+        }
+
+        // Transient (network, 5xx, temporarily_unavailable, access_denied):
+        // keep the credentials and retry on a later call.
+        tracing::warn!(%error, "could not refresh autter access token");
+        return Err(AuthLoadIssue::RefreshFailed(format!(
+            "Token refresh failed: {error}"
+        )));
+    }
+}
+
+/// Write rotated credentials unless the store has moved on (compare-and-set
+/// on the refresh token that was sent). The current process can use the fresh
+/// token even if persisting it fails, but surface that failure so the next
+/// process is diagnosable.
+fn persist_refreshed_credentials(
+    store: &CredentialStore,
+    sent_refresh_token: &str,
+    new_creds: &StoredCredentials,
+) {
+    match store.store_if_current(sent_refresh_token, new_creds) {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            "stored credentials changed during refresh; keeping the newer stored session"
+        ),
+        Err(error) => tracing::warn!(%error, "could not persist refreshed credentials"),
+    }
+}
+
+/// Persist the refusal with the credentials so every process stops refreshing
+/// them. If that write fails, this process remembers it instead, so the loop
+/// cannot restart. Returns `None` when the store already holds other
+/// credentials (a sibling refresh or `autter login` landed meanwhile): those
+/// are not refused.
+fn record_refused_login(
+    store: &CredentialStore,
+    refresh_token: &str,
+    failure: RefreshFailure,
+) -> Option<RefreshFailure> {
+    match store.mark_refresh_failed(refresh_token, failure.clone()) {
+        Ok(recorded) => recorded,
         Err(error) => {
-            // Lost the rotation race: another process already swapped the
-            // stored refresh token. Reload and use that session if it is live.
-            if let Ok(Some(reloaded)) = store.load() {
-                if !reloaded.is_refresh_token_expired() && !reloaded.is_access_token_expired(300) {
-                    return Ok(reloaded.access_token);
-                }
-                if reloaded.refresh_token != creds.refresh_token
-                    && !reloaded.is_refresh_token_expired()
-                    && let Ok(new_creds) = client.refresh_access_token(&reloaded.refresh_token)
-                {
-                    if let Err(store_error) = store.store(&new_creds) {
-                        tracing::warn!(%store_error, "could not persist refreshed credentials");
-                    }
-                    return Ok(new_creds.access_token);
-                }
+            tracing::warn!(%error, "could not persist the refused login; remembering it in this process");
+            if let Ok(mut refused) = REFUSED_REFRESH_TOKEN.lock() {
+                *refused = Some((refresh_token.to_string(), failure.clone()));
             }
-            tracing::warn!(%error, "could not refresh autter access token");
-            Err(AuthLoadIssue::RefreshFailed(error))
+            Some(failure)
         }
     }
-    // Mutex / file-lock guards are released when dropped
+}
+
+fn refused_in_process(refresh_token: &str) -> Option<RefreshFailure> {
+    let refused = REFUSED_REFRESH_TOKEN.lock().ok()?;
+    match refused.as_ref() {
+        Some((token, failure)) if token == refresh_token => Some(failure.clone()),
+        _ => None,
+    }
+}
+
+/// Log a refused login once per process (the daemon would otherwise log it on
+/// every flush tick) and tell an interactive user once.
+fn report_login_required(failure: &RefreshFailure) {
+    if first_report_in_process(failure) {
+        tracing::warn!(
+            error = %failure.error,
+            error_code = failure.error_code.as_deref().unwrap_or("none"),
+            reason = %failure.message(),
+            "autter login refused by the server; not refreshing again until `autter login` stores new credentials"
+        );
+    }
+    crate::auth::notice::announce_login_refused(failure);
+}
+
+/// True the first time this process reports `failure`.
+fn first_report_in_process(failure: &RefreshFailure) -> bool {
+    LOGGED_REFUSAL_AT.swap(failure.at, Ordering::Relaxed) != failure.at
 }
 
 /// Cross-process lock around refresh-token rotation.
 ///
 /// Returns `None` in tests, when the lock file cannot be created, or if a
-/// sibling still holds the lock after a short wait (caller then reloads).
+/// sibling still holds the lock after [`REFRESH_FILE_LOCK_WAIT`]. The caller
+/// then refreshes without it; the compare-and-set write keeps that safe.
 fn acquire_refresh_file_lock() -> Option<crate::utils::LockFile> {
     if cfg!(test) || std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
         return None;
@@ -133,13 +270,17 @@ fn acquire_refresh_file_lock() -> Option<crate::utils::LockFile> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    for _ in 0..10 {
+    let deadline = std::time::Instant::now() + REFRESH_FILE_LOCK_WAIT;
+    loop {
         if let Some(lock) = crate::utils::LockFile::try_acquire(&path) {
             return Some(lock);
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if std::time::Instant::now() >= deadline {
+            tracing::debug!("credentials.lock still held; refreshing without it");
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    None
 }
 
 /// Prefix marking a Personal Access Token (mirrors the backend).
@@ -541,6 +682,12 @@ impl ApiClient {
         self.context.auth_issue.as_ref()
     }
 
+    /// The auth issue worth a log line on each flush. A refused login is left
+    /// out: the auth loader logs it once, and it cannot change before `autter login`.
+    pub fn auth_issue_to_log(&self) -> Option<&AuthLoadIssue> {
+        self.auth_issue().filter(|issue| !issue.is_login_required())
+    }
+
     /// Check if an API key is configured
     pub fn has_api_key(&self) -> bool {
         self.context.api_key.is_some()
@@ -691,6 +838,280 @@ mod tests {
         // All threads should have acquired the lock sequentially
         let final_count = counter.load(Ordering::SeqCst);
         assert_eq!(final_count, 5);
+    }
+
+    // ============= Dead refresh token (CE-20) =============
+
+    use crate::auth::credential_backend::{CredentialBackend, MockBackend};
+    use crate::auth::types::OAuthError;
+    use std::cell::Cell;
+
+    fn creds(refresh_token: &str, access_token: &str, access_expires_in: i64) -> StoredCredentials {
+        let now = chrono::Utc::now().timestamp();
+        StoredCredentials {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            access_token_expires_at: now + access_expires_in,
+            refresh_token_expires_at: now + 86400 * 90,
+            refresh_failed: None,
+        }
+    }
+
+    /// Stored credentials whose access token has expired, so the next load refreshes.
+    fn store_needing_refresh(refresh_token: &str) -> CredentialStore {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&creds(refresh_token, "expired-access", -60))
+            .unwrap();
+        store
+    }
+
+    fn refusal(status: u16, json: &str) -> TokenRequestError {
+        TokenRequestError::Refused {
+            status,
+            error: serde_json::from_str::<OAuthError>(json).unwrap(),
+        }
+    }
+
+    const DEAD_TOKEN_BODY: &str = r#"{"error":"invalid_grant","error_description":"Refresh token is not valid. Run `autter login` to sign in again.","error_code":"refresh_token_invalid","login_required":true}"#;
+
+    #[test]
+    fn dead_refresh_token_is_not_refreshed_again_until_login() {
+        let store = store_needing_refresh("rt-ce20-dead");
+        let calls = Cell::new(0);
+        let refresh = |token: &str| {
+            calls.set(calls.get() + 1);
+            if token == "rt-ce20-fresh" {
+                Ok(creds("rt-ce20-fresh-2", "fresh-access", 3600))
+            } else {
+                Err(refusal(400, DEAD_TOKEN_BODY))
+            }
+        };
+
+        let Err(AuthLoadIssue::LoginRequired(failure)) =
+            refresh_stored_credentials(&store, refresh)
+        else {
+            panic!("a dead token must end in LoginRequired");
+        };
+        assert_eq!(calls.get(), 1);
+        assert_eq!(failure.error_code.as_deref(), Some("refresh_token_invalid"));
+        assert!(failure.message().contains("autter login"));
+        // The refusal is persisted with the credentials for every process.
+        assert_eq!(
+            store.load().unwrap().unwrap().refresh_failed,
+            Some(failure.clone())
+        );
+
+        // Every later attempt (daemon ticks, other commands) stops before the network.
+        for _ in 0..5 {
+            assert_eq!(
+                refresh_stored_credentials(&store, refresh),
+                Err(AuthLoadIssue::LoginRequired(failure.clone()))
+            );
+            assert_eq!(
+                load_refreshable_credentials(&store).unwrap_err(),
+                AuthLoadIssue::LoginRequired(failure.clone())
+            );
+        }
+        assert_eq!(calls.get(), 1);
+
+        // `autter login` writes new credentials; refreshing resumes.
+        store
+            .store(&creds("rt-ce20-fresh", "login-access", -60))
+            .unwrap();
+        assert_eq!(
+            refresh_stored_credentials(&store, refresh),
+            Ok("fresh-access".to_string())
+        );
+        assert_eq!(calls.get(), 2);
+        let stored = store.load().unwrap().unwrap();
+        assert_eq!(stored.refresh_token, "rt-ce20-fresh-2");
+        assert!(!stored.is_login_required());
+    }
+
+    #[test]
+    fn refused_credentials_skip_even_a_valid_access_token() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        let mut stored = creds("rt-ce20-refused-live", "still-valid", 3600);
+        stored.refresh_failed = Some(RefreshFailure::from_oauth_error(
+            &serde_json::from_str(DEAD_TOKEN_BODY).unwrap(),
+        ));
+        store.store(&stored).unwrap();
+
+        assert!(matches!(
+            load_auth_token(&store),
+            Err(AuthLoadIssue::LoginRequired(_))
+        ));
+    }
+
+    #[test]
+    fn older_server_invalid_grant_is_terminal_too() {
+        let store = store_needing_refresh("rt-ce20-old-server");
+        let calls = Cell::new(0);
+        let refresh = |_: &str| {
+            calls.set(calls.get() + 1);
+            Err(refusal(400, r#"{"error":"invalid_grant"}"#))
+        };
+        assert!(matches!(
+            refresh_stored_credentials(&store, refresh),
+            Err(AuthLoadIssue::LoginRequired(_))
+        ));
+        assert!(matches!(
+            refresh_stored_credentials(&store, refresh),
+            Err(AuthLoadIssue::LoginRequired(_))
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn transient_refresh_errors_are_retried() {
+        let transient = [
+            TokenRequestError::Transport("Failed to connect to server: timed out".to_string()),
+            TokenRequestError::Transport("HTTP 502: <html>Bad Gateway</html>".to_string()),
+            refusal(503, r#"{"error":"temporarily_unavailable"}"#),
+            refusal(400, r#"{"error":"temporarily_unavailable"}"#),
+            refusal(400, r#"{"error":"access_denied"}"#),
+            refusal(500, r#"{"error":"server_error"}"#),
+        ];
+        for (index, error) in transient.into_iter().enumerate() {
+            let store = store_needing_refresh(&format!("rt-ce20-transient-{index}"));
+            let calls = Cell::new(0);
+            let refresh = |_: &str| {
+                calls.set(calls.get() + 1);
+                Err(error.clone())
+            };
+            for _ in 0..2 {
+                assert!(matches!(
+                    refresh_stored_credentials(&store, refresh),
+                    Err(AuthLoadIssue::RefreshFailed(_))
+                ));
+            }
+            assert_eq!(calls.get(), 2, "{error:?} must be retried");
+            assert!(!store.load().unwrap().unwrap().is_login_required());
+        }
+    }
+
+    #[test]
+    fn refused_pat_is_not_marked_dead() {
+        let store = store_needing_refresh("autter_pat_ce20");
+        let calls = Cell::new(0);
+        let refresh = |_: &str| {
+            calls.set(calls.get() + 1);
+            Err(refusal(400, DEAD_TOKEN_BODY))
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                refresh_stored_credentials(&store, refresh),
+                Err(AuthLoadIssue::RefreshFailed(_))
+            ));
+        }
+        assert_eq!(calls.get(), 2);
+        assert!(!store.load().unwrap().unwrap().is_login_required());
+    }
+
+    #[test]
+    fn superseded_by_a_sibling_uses_the_sibling_session() {
+        // Another process rotated rt-1 -> rt-2 while this one was refreshing
+        // rt-1; the server calls rt-1 superseded. That is not a dead login.
+        let store = store_needing_refresh("rt-ce20-sibling-1");
+        let refresh = |token: &str| {
+            assert_eq!(token, "rt-ce20-sibling-1");
+            store
+                .store(&creds("rt-ce20-sibling-2", "sibling-access", 3600))
+                .unwrap();
+            Err(refusal(
+                400,
+                r#"{"error":"invalid_grant","error_code":"refresh_token_superseded","login_required":true}"#,
+            ))
+        };
+        assert_eq!(
+            refresh_stored_credentials(&store, refresh),
+            Ok("sibling-access".to_string())
+        );
+        let stored = store.load().unwrap().unwrap();
+        assert_eq!(stored.refresh_token, "rt-ce20-sibling-2");
+        assert!(!stored.is_login_required());
+    }
+
+    #[test]
+    fn refreshed_credentials_do_not_overwrite_a_concurrent_login() {
+        let store = store_needing_refresh("rt-ce20-cas-1");
+        let refresh = |_: &str| {
+            // `autter login` lands while this refresh is in flight.
+            store
+                .store(&creds("rt-ce20-cas-login", "login-access", 3600))
+                .unwrap();
+            Ok(creds("rt-ce20-cas-2", "refreshed-access", 3600))
+        };
+        assert_eq!(
+            refresh_stored_credentials(&store, refresh),
+            Ok("refreshed-access".to_string())
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().refresh_token,
+            "rt-ce20-cas-login"
+        );
+    }
+
+    #[test]
+    fn refusal_is_remembered_when_it_cannot_be_persisted() {
+        let backend = MockBackend::new();
+        backend
+            .store(&serde_json::to_string(&creds("rt-ce20-disk-full", "expired", -60)).unwrap())
+            .unwrap();
+        let store = CredentialStore::with_backend(Box::new(backend.fail_store("disk full")));
+        let calls = Cell::new(0);
+        let refresh = |_: &str| {
+            calls.set(calls.get() + 1);
+            Err(refusal(400, DEAD_TOKEN_BODY))
+        };
+        for _ in 0..3 {
+            assert!(matches!(
+                refresh_stored_credentials(&store, refresh),
+                Err(AuthLoadIssue::LoginRequired(_))
+            ));
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_refusal_is_logged_once_per_process() {
+        let failure = RefreshFailure {
+            at: 1_760_000_123,
+            error: "invalid_grant".to_string(),
+            error_code: None,
+            description: None,
+        };
+        assert!(first_report_in_process(&failure));
+        assert!(!first_report_in_process(&failure));
+        assert!(!first_report_in_process(&failure));
+        // A new login that dies again is a new refusal.
+        let later = RefreshFailure {
+            at: failure.at + 1,
+            ..failure
+        };
+        assert!(first_report_in_process(&later));
+    }
+
+    #[test]
+    fn login_required_is_not_logged_per_flush() {
+        let refused = ApiClient::new(ApiContext {
+            auth_issue: Some(AuthLoadIssue::LoginRequired(RefreshFailure {
+                at: 1,
+                error: "invalid_grant".to_string(),
+                error_code: None,
+                description: None,
+            })),
+            ..ApiContext::without_auth(Some("https://example.com".to_string()))
+        });
+        assert!(refused.auth_issue().is_some());
+        assert!(refused.auth_issue_to_log().is_none());
+
+        let transient = ApiClient::new(ApiContext {
+            auth_issue: Some(AuthLoadIssue::RefreshFailed("timed out".to_string())),
+            ..ApiContext::without_auth(Some("https://example.com".to_string()))
+        });
+        assert!(transient.auth_issue_to_log().is_some());
     }
 
     // ============= encode_for_header Tests =============

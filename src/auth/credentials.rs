@@ -1,7 +1,7 @@
 #[cfg(all(not(test), feature = "keyring"))]
 use crate::auth::credential_backend::KeyringBackend;
 use crate::auth::credential_backend::{CredentialBackend, FileBackend};
-use crate::auth::types::StoredCredentials;
+use crate::auth::types::{RefreshFailure, StoredCredentials};
 #[cfg(not(test))]
 use crate::config::Config;
 use std::path::PathBuf;
@@ -141,6 +141,7 @@ impl CredentialStore {
                 refresh_token: creds.refresh_token,
                 access_token_expires_at: 0,
                 refresh_token_expires_at: creds.refresh_token_expires_at,
+                refresh_failed: creds.refresh_failed,
             };
             self.store(&migrated)?;
             eprintln!("Migrated stored credentials to API-only authentication.");
@@ -148,6 +149,50 @@ impl CredentialStore {
         }
 
         Ok(Some(creds))
+    }
+
+    /// Store refreshed credentials only if the store still holds
+    /// `sent_refresh_token`, the token the refresh used. Returns `Ok(false)`
+    /// without writing when a sibling refresh, `autter login` or `autter logout`
+    /// changed the store first: overwriting would put back an older session.
+    ///
+    /// Callers hold the refresh locks, so this mainly guards a process whose
+    /// wait for `credentials.lock` timed out.
+    pub fn store_if_current(
+        &self,
+        sent_refresh_token: &str,
+        creds: &StoredCredentials,
+    ) -> Result<bool, String> {
+        match self.load()? {
+            Some(current) if current.refresh_token == sent_refresh_token => {
+                self.store(creds)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Persist that the server refused `refresh_token` for good, if it is
+    /// still the stored one. An earlier refusal of the same token is kept, so
+    /// its timestamp (which keys the one-time notice) stays stable. Returns the
+    /// refusal now on record, or `None` when the store moved on to other
+    /// credentials (which must not be marked).
+    pub fn mark_refresh_failed(
+        &self,
+        refresh_token: &str,
+        failure: RefreshFailure,
+    ) -> Result<Option<RefreshFailure>, String> {
+        match self.load()? {
+            Some(mut current) if current.refresh_token == refresh_token => {
+                if let Some(existing) = current.refresh_failed {
+                    return Ok(Some(existing));
+                }
+                current.refresh_failed = Some(failure.clone());
+                self.store(&current)?;
+                Ok(Some(failure))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Clear stored credentials
@@ -212,6 +257,7 @@ mod tests {
             refresh_token: "test_refresh_token_67890".to_string(),
             access_token_expires_at: chrono::Utc::now().timestamp() + 3600,
             refresh_token_expires_at: chrono::Utc::now().timestamp() + 86400 * 90,
+            refresh_failed: None,
         }
     }
 
@@ -258,6 +304,7 @@ mod tests {
             refresh_token: "opaque-refresh-token".to_string(),
             access_token_expires_at: chrono::Utc::now().timestamp() + 3600,
             refresh_token_expires_at: chrono::Utc::now().timestamp() + 86400,
+            refresh_failed: None,
         };
         store.store(&legacy).unwrap();
 
@@ -281,6 +328,7 @@ mod tests {
                 refresh_token: String::new(),
                 access_token_expires_at: 1,
                 refresh_token_expires_at: 1,
+                refresh_failed: None,
             })
             .unwrap();
 
@@ -301,6 +349,116 @@ mod tests {
 
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.access_token, "new_access_token");
+    }
+
+    // ============= Compare-and-set writes (CE-20) =============
+
+    fn credentials_with_refresh_token(refresh_token: &str) -> StoredCredentials {
+        StoredCredentials {
+            refresh_token: refresh_token.to_string(),
+            ..make_test_credentials()
+        }
+    }
+
+    fn refusal(at: i64) -> RefreshFailure {
+        RefreshFailure {
+            at,
+            error: "invalid_grant".to_string(),
+            error_code: Some("refresh_token_invalid".to_string()),
+            description: Some("Refresh token is not valid.".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_store_if_current_writes_over_the_token_that_was_sent() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&credentials_with_refresh_token("rt-1"))
+            .unwrap();
+
+        let rotated = credentials_with_refresh_token("rt-2");
+        assert!(store.store_if_current("rt-1", &rotated).unwrap());
+        assert_eq!(store.load().unwrap().unwrap().refresh_token, "rt-2");
+    }
+
+    #[test]
+    fn test_store_if_current_keeps_a_newer_sibling_rotation() {
+        // Three processes refreshed rt-1 at once. The first wrote rt-2; the
+        // later ones must not put back their own (now older) rotation.
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&credentials_with_refresh_token("rt-2"))
+            .unwrap();
+
+        let late = credentials_with_refresh_token("rt-2b");
+        assert!(!store.store_if_current("rt-1", &late).unwrap());
+        assert_eq!(store.load().unwrap().unwrap().refresh_token, "rt-2");
+    }
+
+    #[test]
+    fn test_store_if_current_does_not_resurrect_a_logout() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        assert!(
+            !store
+                .store_if_current("rt-1", &credentials_with_refresh_token("rt-2"))
+                .unwrap()
+        );
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mark_refresh_failed_marks_only_the_refused_token() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&credentials_with_refresh_token("rt-new"))
+            .unwrap();
+
+        // The store moved on (login or sibling rotation): nothing is marked.
+        assert_eq!(
+            store.mark_refresh_failed("rt-old", refusal(1)).unwrap(),
+            None
+        );
+        assert!(!store.load().unwrap().unwrap().is_login_required());
+
+        assert_eq!(
+            store.mark_refresh_failed("rt-new", refusal(1)).unwrap(),
+            Some(refusal(1))
+        );
+        let stored = store.load().unwrap().unwrap();
+        assert_eq!(stored.refresh_failed, Some(refusal(1)));
+        assert_eq!(stored.refresh_token, "rt-new");
+    }
+
+    #[test]
+    fn test_mark_refresh_failed_keeps_the_first_refusal() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&credentials_with_refresh_token("rt-1"))
+            .unwrap();
+        store.mark_refresh_failed("rt-1", refusal(10)).unwrap();
+
+        assert_eq!(
+            store.mark_refresh_failed("rt-1", refusal(20)).unwrap(),
+            Some(refusal(10))
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().refresh_failed,
+            Some(refusal(10))
+        );
+    }
+
+    #[test]
+    fn test_login_store_clears_the_refusal() {
+        let store = CredentialStore::with_backend(Box::new(MockBackend::new()));
+        store
+            .store(&credentials_with_refresh_token("rt-1"))
+            .unwrap();
+        store.mark_refresh_failed("rt-1", refusal(1)).unwrap();
+
+        store
+            .store(&credentials_with_refresh_token("rt-login"))
+            .unwrap();
+        assert!(!store.load().unwrap().unwrap().is_login_required());
     }
 
     #[test]

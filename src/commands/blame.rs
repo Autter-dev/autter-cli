@@ -1425,7 +1425,7 @@ fn output_json_format(
         .load()
         .ok()
         .flatten()
-        .map(|creds| !creds.is_refresh_token_expired())
+        .map(|creds| !creds.is_refresh_token_expired() && !creds.is_login_required())
         .unwrap_or(false);
 
     let current_user = repo.effective_author_identity().formatted();
