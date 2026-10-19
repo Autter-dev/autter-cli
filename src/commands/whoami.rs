@@ -11,10 +11,27 @@ pub fn handle_whoami(args: &[String]) {
         std::process::exit(0);
     }
 
-    if !args.is_empty() {
-        eprintln!("Error: unknown whoami argument(s): {}", args.join(" "));
+    let short = args.iter().any(|arg| arg.as_str() == "--short" || arg.as_str() == "-s");
+    let unknown: Vec<&str> = args
+        .iter()
+        .map(|arg| arg.as_str())
+        .filter(|arg| *arg != "--short" && *arg != "-s")
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!("Error: unknown whoami argument(s): {}", unknown.join(" "));
         print_help();
         std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+    }
+
+    if short {
+        let auth = collect_auth_status();
+        let has_api_key = ApiContext::new(None).api_key.is_some();
+        let org_slug = auth.orgs.first().and_then(|org| org.org_slug.as_deref());
+        println!("{}", short_identity(&auth.state, auth.email.as_deref(), org_slug));
+        if identity_failed(&auth.state, has_api_key) {
+            std::process::exit(1);
+        }
+        return;
     }
 
     // Use Config::fresh() to support runtime config updates (daemon mode)
@@ -141,10 +158,77 @@ fn mask_api_key(key: &str) -> String {
     format!("{}...{}", prefix, suffix)
 }
 
+/// The auth state in a few words, for `autter whoami --short`.
+fn state_label(state: &AuthState) -> String {
+    match state {
+        AuthState::LoggedOut => "logged out".to_string(),
+        AuthState::LoggedIn => "logged in".to_string(),
+        AuthState::SyncBlocked => "cloud sync blocked".to_string(),
+        AuthState::RefreshExpired => "credentials expired".to_string(),
+        AuthState::Error(err) => format!("error: {}", err),
+    }
+}
+
+/// One line for scripts and shell prompts: `<email> (<org>) <state>`.
+fn short_identity(state: &AuthState, email: Option<&str>, org_slug: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(email) = email {
+        parts.push(email.to_string());
+    }
+    if let Some(org) = org_slug {
+        parts.push(format!("({})", org));
+    }
+    parts.push(state_label(state));
+    parts.join(" ")
+}
+
+/// Same rule as the full report: a session that is not logged in fails
+/// unless an API key is configured.
+fn identity_failed(state: &AuthState, has_api_key: bool) -> bool {
+    *state != AuthState::LoggedIn && !has_api_key
+}
+
 fn print_help() {
     eprintln!("autter whoami - Show current auth state and identity");
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  autter whoami");
+    eprintln!("  autter whoami --short   One line: <email> (<org>) <state>");
     eprintln!("  autter whoami --help");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_identity_names_the_user_org_and_state() {
+        assert_eq!(
+            short_identity(&AuthState::LoggedIn, Some("ada@example.com"), Some("acme")),
+            "ada@example.com (acme) logged in"
+        );
+        assert_eq!(
+            short_identity(&AuthState::RefreshExpired, Some("ada@example.com"), None),
+            "ada@example.com credentials expired"
+        );
+        assert_eq!(short_identity(&AuthState::LoggedOut, None, None), "logged out");
+        assert_eq!(
+            short_identity(&AuthState::Error("keychain locked".to_string()), None, None),
+            "error: keychain locked"
+        );
+    }
+
+    #[test]
+    fn identity_fails_only_without_a_login_or_an_api_key() {
+        assert!(!identity_failed(&AuthState::LoggedIn, false));
+        assert!(identity_failed(&AuthState::LoggedOut, false));
+        assert!(!identity_failed(&AuthState::LoggedOut, true));
+        assert!(identity_failed(&AuthState::SyncBlocked, false));
+    }
+
+    #[test]
+    fn api_keys_are_masked() {
+        assert_eq!(mask_api_key("short"), "*****");
+        assert_eq!(mask_api_key("abcd1234efgh5678"), "abcd...5678");
+    }
 }
