@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 fn local_mode_repo() -> TestRepo {
     TestRepo::new_dedicated_daemon_with_initial_config(|patch| {
         patch.prompt_storage = Some("local".to_string());
+        patch.telemetry_oss_disabled = Some(true);
+        patch.feature_flags = Some(serde_json::json!({"transcript_sweep": false}));
         patch.notes_backend = Some(NotesBackendConfig {
             kind: NotesBackendKind::GitNotes,
             backend_url: None,
@@ -30,6 +32,8 @@ fn local_mode_repo() -> TestRepo {
 fn connected_mode_repo() -> TestRepo {
     TestRepo::new_dedicated_daemon_with_initial_config(|patch| {
         patch.prompt_storage = Some("default".to_string());
+        patch.telemetry_oss_disabled = Some(true);
+        patch.feature_flags = Some(serde_json::json!({"transcript_sweep": false}));
         patch.notes_backend = Some(NotesBackendConfig {
             kind: NotesBackendKind::GitNotes,
             backend_url: None,
@@ -175,5 +179,116 @@ fn doctor_reports_local_mode_as_not_uploading() {
     assert!(
         output.contains("local mode — nothing is uploaded to the Autter platform"),
         "doctor should describe local mode as not uploading: {output}"
+    );
+}
+
+/// Exercise the real daemon reader and its outgoing metrics queue. The marker
+/// is ordinary prompt text, so secret redaction cannot hide a missing repo gate.
+fn streamed_prompt_is_queued(excluded: bool) -> bool {
+    let repo = TestRepo::new_dedicated_daemon_with_initial_config(|patch| {
+        patch.prompt_storage = Some("default".to_string());
+        patch.telemetry_oss_disabled = Some(true);
+        patch.disable_version_checks = Some(true);
+        patch.disable_auto_updates = Some(true);
+        patch.feature_flags = Some(serde_json::json!({
+            "transcript_streaming": true, "transcript_sweep": false
+        }));
+        patch.exclude_prompts_in_repositories = Some(if excluded {
+            vec!["https://github.com/privacy-test/*".to_string()]
+        } else {
+            vec![]
+        });
+    });
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/privacy-test/private.git",
+    ])
+    .unwrap();
+    let cwd = repo.canonical_path();
+    fs::write(cwd.join("source.rs"), "fn original() {}\n").unwrap();
+    repo.stage_all_and_commit("Initial stream fixture").unwrap();
+    repo.filename("source.rs")
+        .assert_committed_lines(lines!["fn original() {}".unattributed_human(),]);
+    let transcript = repo.test_home_path().join("privacy-transcript.jsonl");
+    let marker = "Private meeting agenda for the garden project";
+    let session = "privacy-session";
+    let metadata = serde_json::json!({
+        "type": "session_meta", "payload": { "id": session, "cwd": cwd }
+    });
+    let message = serde_json::json!({
+        "type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{ "type": "input_text", "text": marker }]
+        }
+    });
+    fs::write(&transcript, format!("{metadata}\n{message}\n")).unwrap();
+    fs::write(cwd.join("source.rs"), "fn example() {}\n").unwrap();
+    let hook = serde_json::json!({
+        "session_id": session, "cwd": cwd, "hook_event_name": "PostToolUse",
+        "tool_name": "apply_patch", "tool_use_id": "privacy-edit",
+        "tool_input": {"patch": format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-fn original() {{}}\n+fn example() {{}}\n*** End Patch",
+            cwd.join("source.rs").display()
+        )},
+        "tool_response": "A source.rs", "transcript_path": transcript
+    })
+    .to_string();
+    repo.autter(&["checkpoint", "codex", "--hook-input", &hook])
+        .unwrap();
+
+    let streams_path = repo
+        .daemon_home_path()
+        .join(".autter/internal/transcripts-db");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let processed = rusqlite::Connection::open(&streams_path)
+            .ok()
+            .and_then(|db| {
+                db.query_row(
+                    "SELECT MAX(CAST(watermark_value AS INTEGER)) FROM tracked_streams",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .ok()
+                .flatten()
+            })
+            .unwrap_or(0);
+        if processed > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transcript worker did not finish the fixture"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The worker has consumed the complete fixture; allow two flush ticks.
+    std::thread::sleep(Duration::from_secs(7));
+    let metrics_path = repo.daemon_home_path().join(".autter/internal/metrics-db");
+    if !metrics_path.exists() {
+        return false;
+    }
+    let metrics = rusqlite::Connection::open(metrics_path).unwrap();
+    let count: i64 = metrics
+        .query_row(
+            "SELECT COUNT(*) FROM metrics WHERE instr(event_json, ?1) > 0",
+            [marker],
+            |row| row.get(0),
+        )
+        .unwrap();
+    count > 0
+}
+
+#[test]
+fn transcript_stream_respects_repository_prompt_exclusion() {
+    assert!(
+        streamed_prompt_is_queued(false),
+        "control: allowed prompt should reach the retry queue"
+    );
+    assert!(
+        !streamed_prompt_is_queued(true),
+        "excluded repository prompt reached the outgoing retry queue"
     );
 }

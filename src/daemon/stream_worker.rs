@@ -944,6 +944,14 @@ impl StreamWorker {
             base_attrs = base_attrs.repo_url(url);
         }
 
+        // Use every remote, matching the repository policy used by commit-time
+        // transcript capture. A shared stream has no single repository context.
+        let remotes = resolved_work_dir
+            .as_deref()
+            .and_then(|cwd| {
+                crate::git::repository::discover_repository_in_path_no_git_exec(cwd).ok()
+            })
+            .and_then(|repo| repo.remotes_with_urls().ok());
         let file_meta = std::fs::metadata(&path).ok();
         let watermark_type_str = &stream.watermark_type;
         let is_initial_watermark = stream.watermark_value.is_empty()
@@ -972,10 +980,17 @@ impl StreamWorker {
 
             let batch_count = batch.events.len();
 
+            // Re-read privacy settings for each batch in this long-lived daemon.
+            // Still advance the cursor for withheld content so enabling sharing
+            // later does not silently replay previously private conversations.
+            let upload_allowed =
+                config::Config::fresh().should_upload_transcript_with_remotes(remotes.as_ref());
+
             let is_otel_stream = task.stream_kind == "otel_traces";
             let metric_events: Vec<MetricEvent> = batch
                 .events
                 .into_iter()
+                .filter(|_| upload_allowed)
                 .enumerate()
                 .filter_map(|(idx, raw_event)| {
                     let (eid, pid, tid) = agent.extract_event_ids(&raw_event);
@@ -1025,7 +1040,13 @@ impl StreamWorker {
                 })
                 .collect();
 
-            crate::observability::log_metrics(metric_events);
+            if !metric_events.is_empty() {
+                telemetry.submit_telemetry_blocking(vec![
+                    crate::daemon::TelemetryEnvelope::Metrics {
+                        events: metric_events,
+                    },
+                ]);
+            }
 
             // Backpressure: if the telemetry buffer has accumulated too many
             // events, poll briefly to let the 3-second flush cycle drain it.

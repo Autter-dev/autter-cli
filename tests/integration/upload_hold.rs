@@ -76,6 +76,58 @@ fn sign_in_offline(repo: &TestRepo) {
 }
 
 #[test]
+fn transcript_backlog_from_completed_legacy_migration_requires_consent() {
+    let repo = repo_without_service();
+    let internal = repo.test_home_path().join(".autter/internal");
+    fs::create_dir_all(&internal).unwrap();
+    // Version 2.2.1 already applied the old hold, but could subsequently queue
+    // session content from repositories excluded from prompt sharing.
+    fs::write(hold_marker(&repo), r#"{"legacy_migration":1}"#).unwrap();
+    let db = rusqlite::Connection::open(internal.join("metrics-db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+         INSERT INTO schema_metadata VALUES ('version', '2');
+         CREATE TABLE metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, event_json TEXT NOT NULL);
+         CREATE TABLE metrics_held (id INTEGER PRIMARY KEY AUTOINCREMENT, event_json TEXT NOT NULL);
+         CREATE TABLE agent_usage_throttle (prompt_id TEXT PRIMARY KEY, last_sent_ts INTEGER NOT NULL);",
+    ).unwrap();
+    for kind in [1, 5, 6] {
+        let event = serde_json::json!({"t": 1, "e": kind, "v": {}, "a": {}});
+        db.execute(
+            "INSERT INTO metrics (event_json) VALUES (?1)",
+            [event.to_string()],
+        )
+        .unwrap();
+    }
+    repo.autter(&["sync", "import"]).unwrap();
+    let status = sync_status(&repo);
+    assert_eq!(
+        status["held"]["metrics"], 2,
+        "old session content must be held: {status}"
+    );
+    assert_eq!(
+        status["pending"]["metrics"], 1,
+        "other metrics should remain pending: {status}"
+    );
+
+    db.execute(
+        "INSERT INTO metrics (event_json) VALUES (?1)",
+        [r#"{"t":2,"e":5,"v":{},"a":{}}"#],
+    )
+    .unwrap();
+    repo.autter(&["sync", "import"]).unwrap();
+    let status = sync_status(&repo);
+    assert_eq!(
+        status["held"]["metrics"], 2,
+        "migration must run only once: {status}"
+    );
+    assert_eq!(
+        status["pending"]["metrics"], 2,
+        "new events must not be held again: {status}"
+    );
+}
+
+#[test]
 fn legacy_backlog_is_held_until_explicit_import() {
     let repo = repo_without_service();
     let _ = fs::remove_file(hold_marker(&repo));
