@@ -5400,6 +5400,20 @@ impl ActorDaemonCoordinator {
                     "trace payload accounting rollback error"
                 );
             }
+            if self.is_shutting_down() {
+                // The worker exits on the shutdown signal, so a connection
+                // that is still open during stop or restart can deliver one
+                // more payload after the receiver is gone.
+                tracing::debug!(
+                    component = "daemon",
+                    phase = "enqueue_trace_payload",
+                    reason = "ingest_worker_stopped_for_shutdown",
+                    "trace payload dropped: daemon is shutting down"
+                );
+                return Err(AutterError::Generic(
+                    "trace payload dropped: daemon is shutting down".to_string(),
+                ));
+            }
             tracing::error!(
                 component = "daemon",
                 phase = "enqueue_trace_payload",
@@ -10226,6 +10240,49 @@ mod tests {
         assert!(coord.is_shutting_down());
         // Allow tokio to run the ingest worker's shutdown select arm.
         tokio::task::yield_now().await;
+    }
+
+    /// A payload that arrives after the worker exited for shutdown is a
+    /// benign race, not a worker crash.
+    #[tokio::test]
+    async fn enqueue_after_shutdown_is_not_reported_as_worker_crash() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        coord.request_shutdown();
+        let tx = coord.trace_ingest_tx.get().unwrap();
+        for _ in 0..100 {
+            if tx.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(tx.is_closed(), "ingest worker must exit on shutdown");
+
+        let payload = make_start_payload(&["git", "commit", "-m", "test"]);
+        let error = coord.enqueue_trace_payload(payload).unwrap_err();
+        assert!(
+            error.to_string().contains("daemon is shutting down"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(coord.queued_trace_payloads.load(Ordering::Relaxed), 0);
+    }
+
+    /// A closed ingest channel without a shutdown request is still a worker
+    /// crash, and it stops the daemon.
+    #[tokio::test]
+    async fn enqueue_after_unexpected_worker_exit_reports_crash() {
+        let coord = ActorDaemonCoordinator::new();
+        let (tx, rx) = mpsc::channel::<Value>(1);
+        drop(rx);
+        coord.trace_ingest_tx.set(tx).unwrap();
+
+        let payload = make_start_payload(&["git", "commit", "-m", "test"]);
+        let error = coord.enqueue_trace_payload(payload).unwrap_err();
+        assert!(
+            error.to_string().contains("worker may have crashed"),
+            "unexpected error: {error}"
+        );
+        assert!(coord.is_shutting_down());
     }
 
     /// Concurrent enqueues from multiple threads must never deadlock or
