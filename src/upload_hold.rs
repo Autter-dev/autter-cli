@@ -16,6 +16,10 @@
 //!   current backlog before signing in, so the background service cannot drain
 //!   it while onboarding asks what to do with it.
 //!
+//! A separate one-time hold covers session/trace metrics queued before the
+//! stream worker enforced repository sharing rules. The first migration's
+//! marker alone cannot establish consent for those subsequently queued rows.
+//!
 //! Provenance going forward needs no new columns: since local mode stopped
 //! queueing upload data and excluded repos stopped queueing transcripts, every
 //! item queued after the migration was queued in connected mode with sharing
@@ -40,12 +44,17 @@ pub const HELD_RETRY_AT: i64 = i64::MAX;
 
 /// Bump to re-run [`ensure_legacy_migration`] on every machine.
 pub const LEGACY_MIGRATION_VERSION: u32 = 1;
+const TRANSCRIPT_PRIVACY_MIGRATION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct HoldState {
     /// Last [`LEGACY_MIGRATION_VERSION`] applied on this machine.
     #[serde(default)]
     legacy_migration: u32,
+    /// Session content could still bypass repository sharing after the first
+    /// migration. This hold affects only transcript/trace metrics, not all queues.
+    #[serde(default)]
+    transcript_privacy_migration: u32,
 }
 
 /// Per-queue item counts.
@@ -184,17 +193,35 @@ pub fn held_counts() -> QueueCounts {
 /// `Err` when it could not be applied, in which case callers must not drain.
 pub fn ensure_legacy_migration() -> Result<bool, String> {
     let mut state = load_state();
-    if state.legacy_migration >= LEGACY_MIGRATION_VERSION {
+    let legacy_pending = state.legacy_migration < LEGACY_MIGRATION_VERSION;
+    let transcripts_pending =
+        state.transcript_privacy_migration < TRANSCRIPT_PRIVACY_MIGRATION_VERSION;
+    if !legacy_pending && !transcripts_pending {
         return Ok(true);
     }
-    let held = hold_all()?;
-    if held.total() > 0 {
-        tracing::info!(
-            held = %held.summary(),
-            "upload hold: holding backlog queued by an earlier autter version until the user consents"
-        );
+    if legacy_pending {
+        let held = hold_all()?;
+        if held.total() > 0 {
+            tracing::info!(
+                held = %held.summary(),
+                "upload hold: holding backlog queued by an earlier autter version until the user consents"
+            );
+        }
+        state.legacy_migration = LEGACY_MIGRATION_VERSION;
     }
-    state.legacy_migration = LEGACY_MIGRATION_VERSION;
+    if transcripts_pending {
+        let db = crate::metrics::db::MetricsDatabase::global().map_err(|e| e.to_string())?;
+        let held = lock(db)?
+            .hold_transcript_events()
+            .map_err(|e| e.to_string())?;
+        if held > 0 {
+            tracing::info!(
+                held,
+                "upload hold: holding older session content until the user consents"
+            );
+        }
+        state.transcript_privacy_migration = TRANSCRIPT_PRIVACY_MIGRATION_VERSION;
+    }
     save_state(&state)?;
     Ok(true)
 }
@@ -215,8 +242,10 @@ mod tests {
     fn hold_state_round_trips_and_defaults_to_unmigrated() {
         let state: HoldState = serde_json::from_str("{}").unwrap();
         assert_eq!(state.legacy_migration, 0);
+        assert_eq!(state.transcript_privacy_migration, 0);
         let state = HoldState {
             legacy_migration: LEGACY_MIGRATION_VERSION,
+            transcript_privacy_migration: TRANSCRIPT_PRIVACY_MIGRATION_VERSION,
         };
         let back: HoldState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(back, state);

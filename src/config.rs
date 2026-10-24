@@ -607,8 +607,18 @@ impl Config {
     /// - User B: autter only in work repos (via allow_repositories), CAS there
     ///   (prompt_storage="default", no include list needed)
     pub fn effective_prompt_storage(&self, repository: &Option<Repository>) -> PromptStorageMode {
+        let remotes = repository
+            .as_ref()
+            .and_then(|repo| repo.remotes_with_urls().ok());
+        self.effective_prompt_storage_with_remotes(remotes.as_ref())
+    }
+
+    fn effective_prompt_storage_with_remotes(
+        &self,
+        remotes: Option<&Vec<(String, String)>>,
+    ) -> PromptStorageMode {
         // Step 1: Check exclusion list first (deny always wins)
-        if self.should_exclude_prompts(repository) {
+        if self.should_exclude_prompts_with_remotes(remotes) {
             return PromptStorageMode::Local;
         }
 
@@ -621,11 +631,7 @@ impl Config {
         }
 
         // Step 3: Check if repo matches include list
-        let remotes = repository
-            .as_ref()
-            .and_then(|repo| repo.remotes_with_urls().ok());
-
-        let matches_include = match &remotes {
+        let matches_include = match remotes {
             Some(remotes) if !remotes.is_empty() => {
                 // Has remotes - check if any match inclusion patterns
                 remotes.iter().any(|remote| {
@@ -652,6 +658,26 @@ impl Config {
                 .and_then(|s| s.parse::<PromptStorageMode>().ok())
                 .unwrap_or(PromptStorageMode::Local) // Safe default
         }
+    }
+
+    /// Session streams contain conversation content, so both capture and prompt
+    /// sharing rules apply. Unknown repository context cannot satisfy restrictions.
+    pub(crate) fn should_upload_transcript_with_remotes(
+        &self,
+        remotes: Option<&Vec<(String, String)>>,
+    ) -> bool {
+        if !self.platform_sync_enabled() {
+            return false;
+        }
+        if remotes.is_none()
+            && (self.has_repository_filters()
+                || !self.exclude_prompts_in_repositories.is_empty()
+                || !self.include_prompts_in_repositories.is_empty())
+        {
+            return false;
+        }
+        self.is_allowed_repository_with_remotes(remotes)
+            && self.effective_prompt_storage_with_remotes(remotes) != PromptStorageMode::Local
     }
 
     /// Returns the API key if configured
@@ -2388,6 +2414,62 @@ mod tests {
                 "prompt_storage={connected} is connected mode"
             );
         }
+    }
+
+    #[test]
+    fn test_transcript_upload_checks_all_repository_remotes() {
+        let config = create_test_config_with_include_prompts(
+            vec![],
+            vec!["https://github.com/private/*".into()],
+            "default",
+            None,
+        );
+        let public = vec![("origin".into(), "https://github.com/public/repo".into())];
+        assert!(config.should_upload_transcript_with_remotes(Some(&public)));
+        let mut multiple = public;
+        multiple.push(("mirror".into(), "git@github.com:private/repo.git".into()));
+        assert!(!config.should_upload_transcript_with_remotes(Some(&multiple)));
+        assert!(!config.should_upload_transcript_with_remotes(None));
+    }
+
+    #[test]
+    fn test_transcript_upload_honors_include_fallback_and_local_mode() {
+        let work = vec![("origin".into(), "https://github.com/work/repo".into())];
+        let other = vec![("origin".into(), "https://github.com/personal/repo".into())];
+        let mut config = create_test_config_with_include_prompts(
+            vec!["https://github.com/work/*".into()],
+            vec![],
+            "default",
+            Some("local"),
+        );
+        assert!(config.should_upload_transcript_with_remotes(Some(&work)));
+        assert!(!config.should_upload_transcript_with_remotes(Some(&other)));
+        assert!(!config.should_upload_transcript_with_remotes(None));
+        config.prompt_storage = "local".into();
+        config.default_prompt_storage = Some("default".into());
+        assert!(!config.should_upload_transcript_with_remotes(Some(&other)));
+    }
+
+    #[test]
+    fn test_transcript_upload_honors_capture_filters() {
+        let allowed = vec![("origin".into(), "https://github.com/allowed/repo".into())];
+        let private = vec![("origin".into(), "https://github.com/private/repo".into())];
+        let config = create_test_config(vec!["https://github.com/allowed/*".into()], vec![]);
+        assert!(config.should_upload_transcript_with_remotes(Some(&allowed)));
+        assert!(!config.should_upload_transcript_with_remotes(Some(&private)));
+        assert!(!config.should_upload_transcript_with_remotes(None));
+        let config = create_test_config(vec![], vec!["https://github.com/private/*".into()]);
+        assert!(!config.should_upload_transcript_with_remotes(Some(&private)));
+    }
+
+    #[test]
+    fn test_transcript_upload_unknown_context_without_restrictions() {
+        let config = create_test_config(vec![], vec![]);
+        assert!(config.should_upload_transcript_with_remotes(None));
+        let excluded =
+            create_test_config_with_include_prompts(vec![], vec!["*".into()], "default", None);
+        assert!(!excluded.should_upload_transcript_with_remotes(Some(&vec![])));
+        assert!(!excluded.should_upload_transcript_with_remotes(None));
     }
 
     #[test]

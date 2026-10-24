@@ -141,6 +141,12 @@ impl DaemonTelemetryWorkerHandle {
         self.buffer.lock().await.ingest_envelopes(envelopes);
     }
 
+    /// Submit from a blocking worker without routing through global diagnostic
+    /// logging, which is best-effort and disabled in test-support builds.
+    pub fn submit_telemetry_blocking(&self, envelopes: Vec<TelemetryEnvelope>) {
+        self.buffer.blocking_lock().ingest_envelopes(envelopes);
+    }
+
     /// Submit CAS records for batched upload.
     pub async fn submit_cas(&self, records: Vec<CasSyncPayload>) {
         self.buffer.lock().await.ingest_cas(records);

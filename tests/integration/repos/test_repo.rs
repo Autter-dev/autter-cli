@@ -479,6 +479,16 @@ impl DaemonProcess {
 
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
     command.env("HOME", test_home);
+    // dirs::home_dir uses Windows Known Folders, which ignores HOME and
+    // USERPROFILE. Pin these databases explicitly in test-support binaries.
+    for (key, filename) in [
+        ("AUTTER_TEST_METRICS_DB_PATH", "metrics-db"),
+        ("AUTTER_TEST_NOTES_DB_PATH", "notes-db"),
+    ] {
+        if !command.get_envs().any(|(name, _)| name == key) {
+            command.env(key, test_home.join(".autter/internal").join(filename));
+        }
+    }
     command.env("GIT_CONFIG_GLOBAL", test_home.join(".gitconfig"));
     // Redirect XDG_CONFIG_HOME so git does not read the real user's
     // $XDG_CONFIG_HOME/git/config (which may contain filter drivers,

@@ -315,6 +315,30 @@ impl MetricsDatabase {
         Ok(n)
     }
 
+    /// Older transcript rows lack the capture-time sharing decision. Preserve
+    /// them locally until explicit import, leaving ordinary metrics eligible.
+    pub fn hold_transcript_events(&mut self) -> Result<usize, AutterError> {
+        use crate::metrics::types::MetricEventId;
+        let tx = self.conn.transaction()?;
+        let session_kind = MetricEventId::SessionEvent as u16;
+        let trace_kind = MetricEventId::OtelTrace as u16;
+        let kinds = params![session_kind, trace_kind];
+        let n = tx.execute(
+            "INSERT INTO metrics_held (event_json)
+             SELECT event_json FROM metrics
+             WHERE CASE WHEN json_valid(event_json) THEN json_extract(event_json, '$.e') END IN (?1, ?2)
+             ORDER BY id",
+            kinds,
+        )?;
+        tx.execute(
+            "DELETE FROM metrics
+             WHERE CASE WHEN json_valid(event_json) THEN json_extract(event_json, '$.e') END IN (?1, ?2)",
+            kinds,
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Move held events back into the upload queue.
     pub fn release_held(&mut self) -> Result<usize, AutterError> {
         let tx = self.conn.transaction()?;
@@ -419,6 +443,29 @@ mod tests {
 
         db.hold_all().unwrap();
         assert_eq!(db.delete_all().unwrap(), 3, "purge removes held events too");
+    }
+
+    #[test]
+    fn test_transcript_hold_preserves_content_and_other_metrics() {
+        let (mut db, _temp_dir) = create_test_db();
+        let events = vec![
+            r#"{"e":1,"v":{"0":"ordinary metric"}}"#.to_string(),
+            r#"{"e":5,"v":{"0":"private conversation"}}"#.to_string(),
+            r#"{"e":6,"v":{"0":"private trace"}}"#.to_string(),
+            "malformed old record".to_string(),
+        ];
+        db.insert_events(&events).unwrap();
+        assert_eq!(db.hold_transcript_events().unwrap(), 2);
+        assert_eq!(db.count_held().unwrap(), 2);
+        let pending = db.get_batch(10).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].event_json, events[0]);
+        assert_eq!(pending[1].event_json, events[3]);
+        assert_eq!(db.hold_transcript_events().unwrap(), 0);
+        assert_eq!(db.release_held().unwrap(), 2);
+        let restored = db.get_batch(10).unwrap();
+        assert_eq!(restored[2].event_json, events[1]);
+        assert_eq!(restored[3].event_json, events[2]);
     }
 
     #[test]

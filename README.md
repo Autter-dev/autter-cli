@@ -66,6 +66,10 @@ The installer is the only setup step. There are **no per-repo hooks to wire up a
 
 Installation lets you choose **local-only** mode or **connect to the Autter platform**, and the choice is reversible at any time with `autter onboard`. Local-only attribution, blame, and stats run entirely on your machine — no code, prompts, or usage data ever leave it.
 
+On connected machines, repository prompt-sharing rules also apply to streamed session content. For example, `autter config --add exclude_prompts_in_repositories "https://github.com/acme/private-*"` keeps matching repositories' session content out of the upload queue. When repository restrictions are configured, streams without enough repository context to apply those rules are not uploaded.
+
+After upgrading, session and trace events queued by older versions are held once for consent, since those rows do not record whether repository sharing was permitted when captured. Inspect them with `autter sync status`; use `autter sync import --yes` only if you intend to upload that history, or `autter sync purge --force` to discard the upload backlog.
+
 For verification steps, privacy controls, everyday commands, and troubleshooting, read the **[full installation and setup guide](INSTALL.md)**.
 
 ## Connect to the Autter platform (optional)
