@@ -11,6 +11,14 @@ use std::path::PathBuf;
 
 const GITHUB_COPILOT_PRE_TOOL_CMD: &str = "checkpoint github-copilot --hook-input stdin";
 const GITHUB_COPILOT_POST_TOOL_CMD: &str = "checkpoint github-copilot --hook-input stdin";
+/// Every hook event autter installs in `~/.copilot/hooks/autter.json`, which
+/// both VS Code and the Copilot CLI read. `UserPromptSubmit` and `Stop` (the
+/// CLI's aliases for `userPromptSubmitted` / `agentStop`) wake the transcript
+/// reader when a prompt is sent or a turn ends.
+const GITHUB_COPILOT_HOOK_EVENTS: [&str; 4] =
+    ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"];
+/// The events that carry the post-tool command (all but `PreToolUse`).
+const GITHUB_COPILOT_SESSION_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 
 pub struct GitHubCopilotInstaller;
 
@@ -174,10 +182,26 @@ impl HookInstaller for GitHubCopilotInstaller {
             })
             .unwrap_or(false);
 
+        let has_session_up_to_date = GITHUB_COPILOT_SESSION_EVENTS.iter().all(|event| {
+            existing
+                .get("hooks")
+                .and_then(|h| h.get(*event))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|cmd| cmd == post_desired)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+
         Ok(HookCheckResult {
             tool_installed: true,
             hooks_installed: has_pre_installed || has_post_installed,
-            hooks_up_to_date: has_pre_up_to_date && has_post_up_to_date,
+            hooks_up_to_date: has_pre_up_to_date && has_post_up_to_date && has_session_up_to_date,
         })
     }
 
@@ -228,6 +252,18 @@ impl HookInstaller for GitHubCopilotInstaller {
                         "type": "command",
                         "command": post_tool_cmd
                     }
+                ],
+                "UserPromptSubmit": [
+                    {
+                        "type": "command",
+                        "command": post_tool_cmd
+                    }
+                ],
+                "Stop": [
+                    {
+                        "type": "command",
+                        "command": post_tool_cmd
+                    }
                 ]
             }
         });
@@ -243,7 +279,7 @@ impl HookInstaller for GitHubCopilotInstaller {
             None => json!({}),
         };
 
-        for hook_name in &["PreToolUse", "PostToolUse"] {
+        for hook_name in &GITHUB_COPILOT_HOOK_EVENTS {
             let desired_hook = desired
                 .get("hooks")
                 .and_then(|h| h.get(*hook_name))
@@ -364,7 +400,7 @@ impl HookInstaller for GitHubCopilotInstaller {
 
         let mut changed = false;
 
-        for hook_name in &["PreToolUse", "PostToolUse"] {
+        for hook_name in &GITHUB_COPILOT_HOOK_EVENTS {
             if let Some(hooks_array) = hooks_obj.get_mut(*hook_name).and_then(|v| v.as_array_mut())
             {
                 let original_len = hooks_array.len();
@@ -789,6 +825,69 @@ mod tests {
             assert!(result.tool_installed);
             assert!(result.hooks_installed);
             assert!(!result.hooks_up_to_date);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_install_hooks_adds_prompt_and_stop_hooks_and_uninstall_removes_them() {
+        with_temp_home(|home| {
+            let installer = GitHubCopilotInstaller;
+            let params = HookInstallerParams {
+                binary_path: test_binary_path(),
+            };
+            let hooks_path = home.join(".copilot").join("hooks").join("autter.json");
+            // An install from before the session hooks, plus a user Stop hook.
+            fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+            let cmd = "/tmp/autter/bin/autter checkpoint github-copilot --hook-input stdin";
+            fs::write(
+                &hooks_path,
+                serde_json::to_string_pretty(&json!({
+                    "hooks": {
+                        "PreToolUse": [{"type": "command", "command": cmd}],
+                        "PostToolUse": [{"type": "command", "command": cmd}],
+                        "Stop": [{"type": "command", "command": "say done"}]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(installer.install_hooks(&params, false).unwrap().is_some());
+            let content: Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            for event in GITHUB_COPILOT_SESSION_EVENTS {
+                let commands: Vec<&str> = content["hooks"][event]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|h| h["command"].as_str())
+                    .collect();
+                assert!(commands.contains(&cmd), "{event}: {commands:?}");
+            }
+            let stop: Vec<&str> = content["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|h| h["command"].as_str())
+                .collect();
+            assert!(stop.contains(&"say done"), "the user's Stop hook is kept");
+            assert!(installer.install_hooks(&params, false).unwrap().is_none());
+
+            installer.uninstall_hooks(&params, false).unwrap();
+            let content: Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            for event in GITHUB_COPILOT_HOOK_EVENTS {
+                let ours = content["hooks"][event]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|h| h["command"].as_str())
+                            .any(GitHubCopilotInstaller::is_github_copilot_checkpoint_command)
+                    })
+                    .unwrap_or(false);
+                assert!(!ours, "{event}");
+            }
         });
     }
 }

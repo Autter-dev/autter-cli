@@ -112,13 +112,14 @@ type MutatingCall = {
 };
 
 type CheckpointPayload = {
-  hook_event_name: HookEventName;
+  hook_event_name: HookEventName | 'agent_end';
   session_id: string;
   session_path: string;
   cwd: string;
   model: string;
-  tool_name: CanonicalToolName;
-  tool_name_raw: string;
+  /** Absent on `agent_end`, which concerns no tool. */
+  tool_name?: CanonicalToolName;
+  tool_name_raw?: string;
   tool_use_id?: string;
   dirty_files?: Record<string, string>;
   will_edit_filepaths?: string[];
@@ -259,6 +260,23 @@ export default function (pi: ExtensionAPI) {
   const pendingCalls = new Map<string, MutatingCall[]>();
   const pendingBashCalls = new Set<string>();
   const toolConfigPromise = buildToolConfig();
+
+  // The agent finished the prompt: have autter read the session file now,
+  // including sessions that never edit a file (questions, reviews, planning).
+  pi.on('agent_end', async (_event, ctx) => {
+    const sessionPath = ctx.sessionManager.getSessionFile();
+    if (!sessionPath) return;
+    const sessionId = await readSessionId(sessionPath).catch(() => undefined);
+    if (!sessionId) return;
+    const model = await readLatestAssistantModel(sessionPath).catch(() => '');
+    await runCheckpoint({
+      hook_event_name: 'agent_end',
+      session_id: sessionId,
+      session_path: sessionPath,
+      cwd: ctx.cwd,
+      model,
+    });
+  });
 
   pi.on('tool_call', async (event, ctx) => {
     const sessionPath = ctx.sessionManager.getSessionFile();

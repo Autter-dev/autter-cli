@@ -12,7 +12,9 @@ use toml::Value as TomlValue;
 use toml::map::Map;
 
 const CODEX_CHECKPOINT_CMD: &str = "checkpoint codex --hook-input stdin";
-const CODEX_HOOK_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "Stop"];
+/// `UserPromptSubmit` and `Stop` change the transcript without a file edit;
+/// the preset turns them into a session-activity wake-up for the daemon.
+const CODEX_HOOK_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"];
 
 pub struct CodexInstaller;
 
@@ -101,6 +103,7 @@ impl CodexInstaller {
         match event {
             "PreToolUse" => "pre_tool_use",
             "PostToolUse" => "post_tool_use",
+            "UserPromptSubmit" => "user_prompt_submit",
             "Stop" => "stop",
             _ => unreachable!("unknown Codex hook event: {event}"),
         }
@@ -2403,5 +2406,23 @@ trusted_hash = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef123
             let content_after_second = fs::read_to_string(&config_path).unwrap();
             assert_eq!(content_after_first, content_after_second);
         });
+    }
+
+    #[test]
+    fn test_config_with_installed_hooks_trusts_the_prompt_hook() {
+        let existing = CodexInstaller::parse_config_toml("model = \"gpt-5\"\n").unwrap();
+        let merged =
+            CodexInstaller::config_with_installed_hooks(&existing, &test_binary_path()).unwrap();
+        assert!(CODEX_HOOK_EVENTS.contains(&"UserPromptSubmit"));
+        let state = merged
+            .get("hooks")
+            .and_then(|h| h.get("state"))
+            .and_then(|v| v.as_table())
+            .expect("hooks.state");
+        assert!(
+            state.keys().any(|k| k.contains(":user_prompt_submit:")),
+            "a trusted state entry for the prompt hook: {:?}",
+            state.keys().collect::<Vec<_>>()
+        );
     }
 }

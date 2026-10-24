@@ -2,7 +2,7 @@ use crate::authorship::authorship_log_serialization::generate_trace_id;
 use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::commands::checkpoint_agent::presets::{
     KnownHumanEdit, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    StreamSource, UntrackedEdit,
+    SessionActivity, StreamSource, UntrackedEdit,
 };
 use crate::config;
 use crate::daemon::checkpoint::PreparedPathRole;
@@ -319,7 +319,58 @@ fn execute_event(
         ParsedHookEvent::PostBashCall(e) => execute_post_bash_call(e),
         ParsedHookEvent::KnownHumanEdit(e) => execute_known_human_edit(e),
         ParsedHookEvent::UntrackedEdit(e) => execute_untracked_edit(e),
+        ParsedHookEvent::SessionActivity(e) => Ok(execute_session_activity(e)),
     }
+}
+
+/// Metadata key carrying the repository a session-activity request is about.
+/// It has no files, so the daemon cannot take the repository from them.
+pub const SESSION_ACTIVITY_REPO_KEY: &str = "repo_work_dir";
+
+/// Metadata key marking a request that only wakes the stream worker.
+pub const SESSION_ACTIVITY_KEY: &str = "session_activity";
+
+/// A request with no files and a stream source: the daemon tells its stream
+/// worker to read the transcript now and records no checkpoint (daemons that
+/// predate this ingest a file-less request as a no-op, after the same wake-up).
+/// The repository comes from the hook's cwd; outside a repository the request
+/// still goes out, and the worker infers the directory as it does on a sweep.
+fn execute_session_activity(e: SessionActivity) -> Vec<CheckpointRequest> {
+    let mut metadata = e.context.metadata;
+    metadata.insert(SESSION_ACTIVITY_KEY.to_string(), "true".to_string());
+    if let Some(repo_work_dir) = worktree_root_for_path(&e.context.cwd) {
+        metadata.insert(
+            SESSION_ACTIVITY_REPO_KEY.to_string(),
+            repo_work_dir.to_string_lossy().to_string(),
+        );
+    }
+    vec![CheckpointRequest {
+        trace_id: e.context.trace_id,
+        checkpoint_kind: CheckpointKind::AiAgent,
+        agent_id: Some(AgentId::normalized(e.context.agent_id)),
+        files: vec![],
+        path_role: PreparedPathRole::Edited,
+        stream_source: Some(e.stream_source),
+        metadata,
+    }]
+}
+
+/// Whether a request only wakes the stream worker (see [`execute_session_activity`]).
+pub fn is_session_activity(request: &CheckpointRequest) -> bool {
+    request.files.is_empty()
+        && request.stream_source.is_some()
+        && request
+            .metadata
+            .get(SESSION_ACTIVITY_KEY)
+            .is_some_and(|v| v == "true")
+}
+
+/// The repository a session-activity request names, if any.
+pub fn session_activity_repo(request: &CheckpointRequest) -> Option<PathBuf> {
+    request
+        .metadata
+        .get(SESSION_ACTIVITY_REPO_KEY)
+        .map(PathBuf::from)
 }
 
 fn split_files_into_requests(
@@ -537,4 +588,79 @@ fn execute_post_bash_call(e: PostBashCall) -> Result<Vec<CheckpointRequest>, Aut
         e.stream_source,
         metadata,
     ))
+}
+
+#[cfg(test)]
+mod session_activity_tests {
+    use super::*;
+    use crate::commands::checkpoint_agent::presets::{PresetContext, StreamFormat};
+
+    fn activity(cwd: &Path) -> SessionActivity {
+        SessionActivity {
+            context: PresetContext {
+                agent_id: AgentId {
+                    tool: "claude".to_string(),
+                    id: "sess-1".to_string(),
+                    model: "unknown".to_string(),
+                },
+                external_session_id: "sess-1".to_string(),
+                trace_id: "t_test123456789a".to_string(),
+                cwd: cwd.to_path_buf(),
+                metadata: HashMap::new(),
+            },
+            stream_source: StreamSource {
+                path: cwd.join("transcript.jsonl"),
+                format: StreamFormat::ClaudeJsonl,
+                session_id: "s_1".to_string(),
+                external_session_id: "sess-1".to_string(),
+                external_parent_session_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn session_activity_wakes_the_stream_worker_without_a_checkpoint() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let nested = repo.path().join("src").join("lib");
+        fs::create_dir_all(&nested).unwrap();
+
+        let requests = execute_session_activity(activity(&nested));
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.files.is_empty(), "no checkpoint is taken");
+        assert!(request.stream_source.is_some());
+        assert!(is_session_activity(request));
+        assert_eq!(
+            session_activity_repo(request),
+            worktree_root_for_path(&nested),
+            "the repository comes from the hook's cwd"
+        );
+        assert_eq!(
+            request.agent_id.as_ref().map(|a| a.tool.as_str()),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn session_activity_outside_a_repository_names_no_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = execute_session_activity(activity(dir.path()));
+        assert!(is_session_activity(&requests[0]));
+        assert_eq!(session_activity_repo(&requests[0]), None);
+    }
+
+    #[test]
+    fn a_file_less_edit_request_is_not_session_activity() {
+        let request = CheckpointRequest {
+            trace_id: "t".to_string(),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            agent_id: None,
+            files: vec![],
+            path_role: PreparedPathRole::Edited,
+            stream_source: None,
+            metadata: HashMap::new(),
+        };
+        assert!(!is_session_activity(&request));
+    }
 }

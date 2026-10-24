@@ -1,7 +1,7 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext, StreamFormat, StreamSource, session_activity_event,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct GeminiPreset;
+
+/// Gemini CLI agent-loop events: `BeforeAgent` (a prompt was submitted) and
+/// `AfterAgent` (the agent loop ended). They wake the transcript reader.
+pub const GEMINI_SESSION_ACTIVITY_EVENTS: [&str; 2] = ["BeforeAgent", "AfterAgent"];
 
 impl AgentPreset for GeminiPreset {
     fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, AutterError> {
@@ -27,19 +31,29 @@ impl AgentPreset for GeminiPreset {
         let is_bash = tool_name
             .map(|n| bash_tool::classify_tool(Agent::Gemini, n) == ToolClass::Bash)
             .unwrap_or(false);
+        let is_session_activity =
+            hook_event.is_some_and(|e| GEMINI_SESSION_ACTIVITY_EVENTS.contains(&e));
+
+        // BeforeAgent runs before Gemini acts on the prompt: no transcript read
+        // for the model there (the stream worker reads it).
+        let model = if is_session_activity {
+            "unknown".to_string()
+        } else {
+            crate::streams::model_extraction::extract_model(
+                Path::new(transcript_path),
+                crate::streams::sweep::StreamFormat::GeminiJsonl,
+                None,
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string())
+        };
 
         let context = PresetContext {
             agent_id: AgentId {
                 tool: "gemini".to_string(),
                 id: session_id.clone(),
-                model: crate::streams::model_extraction::extract_model(
-                    Path::new(transcript_path),
-                    crate::streams::sweep::StreamFormat::GeminiJsonl,
-                    None,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "unknown".to_string()),
+                model,
             },
             external_session_id: session_id,
             trace_id: trace_id.to_string(),
@@ -54,6 +68,10 @@ impl AgentPreset for GeminiPreset {
             external_session_id: context.external_session_id.clone(),
             external_parent_session_id: None,
         });
+
+        if is_session_activity {
+            return session_activity_event(context, stream_source);
+        }
 
         // Gemini uses "BeforeTool" instead of "PreToolUse"
         let is_pre = matches!(hook_event, Some("BeforeTool") | Some("PreToolUse"));

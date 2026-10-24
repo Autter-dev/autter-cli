@@ -1,9 +1,10 @@
+use crate::commands::checkpoint_agent::presets::claude::CLAUDE_SESSION_ACTIVITY_EVENTS;
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    MIN_CLAUDE_VERSION, binary_exists, claude_config_dir, generate_diff, get_binary_version,
-    is_autter_checkpoint_command, normalize_windows_path_for_shell, parse_version,
-    version_meets_requirement, write_atomic,
+    MIN_CLAUDE_VERSION, binary_exists, claude_config_dir, ensure_session_hook, generate_diff,
+    get_binary_version, is_autter_checkpoint_command, normalize_windows_path_for_shell,
+    parse_version, session_hooks_installed, version_meets_requirement, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -40,8 +41,16 @@ impl ClaudeCodeInstaller {
 
     /// Returns `(hooks_installed, hooks_up_to_date)` from a parsed settings value.
     /// `hooks_installed` = autter checkpoint command exists in ANY matcher block.
-    /// `hooks_up_to_date` = autter checkpoint command exists in the `"*"` catch-all block.
+    /// `hooks_up_to_date` = autter checkpoint command exists in the `"*"` catch-all block,
+    /// and in every session-activity event (prompt submitted, turn ended).
     fn hook_status(settings: &Value) -> (bool, bool) {
+        let (installed, tool_hooks_current) = Self::tool_hook_status(settings);
+        let session_hooks_current =
+            session_hooks_installed(settings, &CLAUDE_SESSION_ACTIVITY_EVENTS);
+        (installed, tool_hooks_current && session_hooks_current)
+    }
+
+    fn tool_hook_status(settings: &Value) -> (bool, bool) {
         let pre_tool_blocks = settings
             .get("hooks")
             .and_then(|h| h.get("PreToolUse"))
@@ -236,6 +245,12 @@ impl ClaudeCodeInstaller {
             }
         }
 
+        // Prompt submitted / turn ended: the transcript changed without a file
+        // edit, so the daemon reads it now instead of on its next sweep.
+        for hook_type in CLAUDE_SESSION_ACTIVITY_EVENTS {
+            ensure_session_hook(&mut hooks_obj, hook_type, &post_tool_cmd);
+        }
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -273,9 +288,12 @@ impl ClaudeCodeInstaller {
 
         let mut changed = false;
 
-        for hook_type in &["PreToolUse", "PostToolUse"] {
+        let hook_types = ["PreToolUse", "PostToolUse"]
+            .into_iter()
+            .chain(CLAUDE_SESSION_ACTIVITY_EVENTS);
+        for hook_type in hook_types {
             if let Some(hook_type_array) =
-                hooks_obj.get_mut(*hook_type).and_then(|v| v.as_array_mut())
+                hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
             {
                 for matcher_block in hook_type_array.iter_mut() {
                     if let Some(hooks_array) = matcher_block
@@ -468,6 +486,32 @@ mod tests {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
+    /// Add the session-activity hooks (prompt submitted, turn ended) a current install has.
+    fn with_session_hooks(mut settings: Value, cmd: &str) -> Value {
+        let hooks = settings["hooks"].as_object_mut().unwrap();
+        for event in CLAUDE_SESSION_ACTIVITY_EVENTS {
+            hooks.insert(
+                event.to_string(),
+                json!([{"hooks": [{"type": "command", "command": cmd}]}]),
+            );
+        }
+        settings
+    }
+
+    fn autter_commands(settings: &Value, hook_type: &str) -> Vec<String> {
+        settings["hooks"][hook_type]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .flat_map(|b| b["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|h| h["command"].as_str().map(String::from))
+                    .filter(|c| is_autter_checkpoint_command(c))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn autter_blocks_in(hook_type_array: &[Value]) -> Vec<&Value> {
         hook_type_array
             .iter()
@@ -539,10 +583,36 @@ mod tests {
         let cmd = expected_cmd();
         fs::write(
             &path,
+            serde_json::to_string_pretty(&with_session_hooks(
+                json!({
+                    "hooks": {
+                        "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
+                        "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]
+                    }
+                }),
+                &cmd,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let diff = ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        assert!(diff.is_none(), "should return None when already up-to-date");
+    }
+
+    #[test]
+    fn s2b_upgrade_adds_session_activity_hooks_once() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        // An install from before the session-activity hooks: tool hooks only,
+        // plus a Stop hook of the user's own that must survive.
+        fs::write(
+            &path,
             serde_json::to_string_pretty(&json!({
                 "hooks": {
                     "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
-                    "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]
+                    "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
+                    "Stop": [{"hooks": [{"type":"command","command": "say done"}]}]
                 }
             }))
             .unwrap(),
@@ -550,7 +620,88 @@ mod tests {
         .unwrap();
 
         let diff = ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
-        assert!(diff.is_none(), "should return None when already up-to-date");
+        assert!(diff.is_some(), "the session hooks are new");
+        let settings = read_settings(&path);
+        for event in CLAUDE_SESSION_ACTIVITY_EVENTS {
+            assert_eq!(
+                autter_commands(&settings, event),
+                vec![cmd.clone()],
+                "{event}"
+            );
+        }
+        let stop_commands: Vec<&str> = settings["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|b| b["hooks"].as_array().unwrap().iter())
+            .filter_map(|h| h["command"].as_str())
+            .collect();
+        assert!(
+            stop_commands.contains(&"say done"),
+            "the user's Stop hook is kept"
+        );
+        // Session events have no matcher.
+        assert!(
+            settings["hooks"]["UserPromptSubmit"][0]
+                .get("matcher")
+                .is_none()
+        );
+
+        // Running it again changes nothing.
+        let again = ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        assert!(again.is_none(), "idempotent after the upgrade");
+        let (installed, up_to_date) = ClaudeCodeInstaller::hook_status(&settings);
+        assert!(installed && up_to_date);
+    }
+
+    #[test]
+    fn s2c_session_hooks_follow_a_moved_binary_and_drop_duplicates() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        let old = "/old/place/autter checkpoint claude --hook-input stdin";
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
+                    "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type":"command","command": old}]},
+                        {"hooks": [{"type":"command","command": old}]}
+                    ],
+                    "Stop": [{"hooks": [{"type":"command","command": cmd}]}],
+                    "SubagentStop": [{"hooks": [{"type":"command","command": cmd}]}]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        let settings = read_settings(&path);
+        assert_eq!(autter_commands(&settings, "UserPromptSubmit"), vec![cmd]);
+        assert_eq!(
+            settings["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the block only the duplicate filled is removed"
+        );
+    }
+
+    #[test]
+    fn s2d_uninstall_removes_session_hooks_too() {
+        let (_td, path) = setup_test_env();
+        ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        ClaudeCodeInstaller::uninstall_hooks_at(&path, false).unwrap();
+        let settings = read_settings(&path);
+        for event in ["PreToolUse", "PostToolUse"]
+            .into_iter()
+            .chain(CLAUDE_SESSION_ACTIVITY_EVENTS)
+        {
+            assert!(autter_commands(&settings, event).is_empty(), "{event}");
+        }
     }
 
     #[test]
@@ -751,18 +902,21 @@ mod tests {
     fn s7_idempotent_user_catch_all_plus_autter() {
         let (_td, path) = setup_test_env();
         let cmd = expected_cmd();
-        let before = json!({
-            "hooks": {
-                "PreToolUse": [{"matcher": "*", "hooks": [
-                    {"type":"command","command": "my-audit-tool"},
-                    {"type":"command","command": cmd}
-                ]}],
-                "PostToolUse": [{"matcher": "*", "hooks": [
-                    {"type":"command","command": "my-audit-tool"},
-                    {"type":"command","command": cmd}
-                ]}]
-            }
-        });
+        let before = with_session_hooks(
+            json!({
+                "hooks": {
+                    "PreToolUse": [{"matcher": "*", "hooks": [
+                        {"type":"command","command": "my-audit-tool"},
+                        {"type":"command","command": cmd}
+                    ]}],
+                    "PostToolUse": [{"matcher": "*", "hooks": [
+                        {"type":"command","command": "my-audit-tool"},
+                        {"type":"command","command": cmd}
+                    ]}]
+                }
+            }),
+            &cmd,
+        );
         fs::write(&path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
 
         let diff = ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
@@ -1215,6 +1369,22 @@ mod tests {
     #[test]
     fn c2_autter_in_catch_all_returns_up_to_date() {
         let cmd = expected_cmd();
+        let settings = with_session_hooks(
+            json!({
+                "hooks": {
+                    "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]
+                }
+            }),
+            &cmd,
+        );
+        let (installed, up_to_date) = ClaudeCodeInstaller::hook_status(&settings);
+        assert!(installed);
+        assert!(up_to_date);
+    }
+
+    #[test]
+    fn c2b_tool_hooks_without_session_hooks_need_an_update() {
+        let cmd = expected_cmd();
         let settings = json!({
             "hooks": {
                 "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]
@@ -1222,7 +1392,10 @@ mod tests {
         });
         let (installed, up_to_date) = ClaudeCodeInstaller::hook_status(&settings);
         assert!(installed);
-        assert!(up_to_date);
+        assert!(
+            !up_to_date,
+            "an install from before the session hooks is out of date"
+        );
     }
 
     #[test]

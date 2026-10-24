@@ -1102,6 +1102,91 @@ pub fn update_vscode_chat_hook_settings(
     Ok(Some(diff_output))
 }
 
+// ── Session-activity hooks shared by the JSON settings installers ──────────
+
+pub fn block_has_autter_hook(block: &serde_json::Value) -> bool {
+    block
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(is_autter_checkpoint_command)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Keep exactly one autter command for a hook event that has no matcher
+/// (Claude Code / Droid `UserPromptSubmit`, `Stop`, `SubagentStop`; Gemini CLI
+/// `BeforeAgent`, `AfterAgent`): update it in place when the
+/// binary path changed, drop duplicates (and blocks only they filled), or add
+/// a `{"hooks": [...]}` block. Other hooks the user configured are untouched.
+pub fn ensure_session_hook(hooks_obj: &mut serde_json::Value, hook_type: &str, desired_cmd: &str) {
+    let mut blocks = hooks_obj
+        .get(hook_type)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut kept = false;
+    let mut emptied = vec![false; blocks.len()];
+    for (i, block) in blocks.iter_mut().enumerate() {
+        let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            continue;
+        };
+        let before = hooks.len();
+        hooks.retain_mut(|hook| {
+            let is_autter = hook
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(is_autter_checkpoint_command)
+                .unwrap_or(false);
+            if !is_autter {
+                return true;
+            }
+            if kept {
+                return false;
+            }
+            kept = true;
+            if hook.get("command").and_then(|c| c.as_str()) != Some(desired_cmd) {
+                *hook = serde_json::json!({ "type": "command", "command": desired_cmd });
+            }
+            true
+        });
+        if hooks.is_empty() && before > 0 {
+            emptied[i] = true;
+        }
+    }
+    let mut i = 0;
+    blocks.retain(|_| {
+        let remove = emptied[i];
+        i += 1;
+        !remove
+    });
+    if !kept {
+        blocks.push(serde_json::json!({
+            "hooks": [{ "type": "command", "command": desired_cmd }]
+        }));
+    }
+    if let Some(obj) = hooks_obj.as_object_mut() {
+        obj.insert(hook_type.to_string(), serde_json::Value::Array(blocks));
+    }
+}
+
+/// Whether every one of `events` carries an autter command in `settings.hooks`.
+pub fn session_hooks_installed(settings: &serde_json::Value, events: &[&str]) -> bool {
+    events.iter().all(|event| {
+        settings
+            .get("hooks")
+            .and_then(|h| h.get(*event))
+            .and_then(|v| v.as_array())
+            .is_some_and(|blocks| blocks.iter().any(block_has_autter_hook))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

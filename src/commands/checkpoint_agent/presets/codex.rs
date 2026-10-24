@@ -2,7 +2,7 @@ use super::opencode::OpenCodePreset;
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext, StreamFormat, StreamSource, session_activity_event,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -12,6 +12,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub struct CodexPreset;
+
+/// Codex hook events with no tool: a prompt was submitted, or the agent (or a
+/// subagent) finished its turn. They wake the transcript reader.
+pub const CODEX_SESSION_ACTIVITY_EVENTS: [&str; 3] = ["UserPromptSubmit", "Stop", "SubagentStop"];
 
 impl CodexPreset {
     fn session_id_from_hook_data(data: &serde_json::Value) -> Result<String, AutterError> {
@@ -137,6 +141,10 @@ impl AgentPreset for CodexPreset {
             external_session_id: context.external_session_id.clone(),
             external_parent_session_id: None,
         });
+
+        if hook_event.is_some_and(|e| CODEX_SESSION_ACTIVITY_EVENTS.contains(&e)) {
+            return session_activity_event(context, stream_source);
+        }
 
         let event = match hook_event {
             Some("PreToolUse") => {

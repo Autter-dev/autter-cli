@@ -1,7 +1,7 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext, StreamFormat, StreamSource, session_activity_event,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct DroidPreset;
+
+/// Droid hook events with no tool (Claude Code-compatible, no matcher).
+pub const DROID_SESSION_ACTIVITY_EVENTS: [&str; 3] = ["UserPromptSubmit", "Stop", "SubagentStop"];
 
 impl AgentPreset for DroidPreset {
     fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, AutterError> {
@@ -161,6 +164,10 @@ impl AgentPreset for DroidPreset {
             external_session_id: context.external_session_id.clone(),
             external_parent_session_id: None,
         });
+
+        if DROID_SESSION_ACTIVITY_EVENTS.contains(&hook_event_name) {
+            return session_activity_event(context, stream_source);
+        }
 
         // PreToolUse
         if hook_event_name == "PreToolUse" {

@@ -1,5 +1,9 @@
 use super::parse;
-use super::{AgentPreset, ParsedHookEvent};
+use super::{
+    AgentPreset, ParsedHookEvent, PresetContext, StreamFormat, StreamSource, session_activity_event,
+};
+use crate::authorship::authorship_log_serialization::generate_session_id;
+use crate::authorship::working_log::AgentId;
 use crate::error::AutterError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,6 +12,87 @@ mod cli;
 mod ide;
 
 pub struct GithubCopilotPreset;
+
+/// Hook events with no tool, as installed in `~/.copilot/hooks/autter.json`
+/// (PascalCase: VS Code's names, which the Copilot CLI accepts as aliases of
+/// `userPromptSubmitted` / `agentStop` / `subagentStop`). The camelCase names
+/// are accepted too, in case a payload carries the CLI's own spelling.
+pub const COPILOT_SESSION_ACTIVITY_EVENTS: [&str; 6] = [
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStop",
+    "userPromptSubmitted",
+    "agentStop",
+    "subagentStop",
+];
+
+/// A prompt was submitted or a turn ended, in VS Code or the Copilot CLI (both
+/// read the same hooks file). VS Code names its chat transcript; the CLI's is
+/// `~/.copilot/session-state/<session>/events.jsonl`. A VS Code event for a
+/// Claude session (VS Code also runs Claude Code hooks) is left to Claude's.
+fn parse_session_activity(
+    data: &serde_json::Value,
+    trace_id: &str,
+) -> Result<Vec<ParsedHookEvent>, AutterError> {
+    let cwd = parse::optional_str_multi(data, &["cwd", "workspace_folder", "workspaceFolder"])
+        .ok_or_else(|| AutterError::PresetError("cwd not found in hook_input".to_string()))?;
+    let session_id = extract_session_id(data);
+    let transcript_path = ide::transcript_path_from_hook_data(data);
+
+    if transcript_path.is_some_and(ide::looks_like_claude_transcript_path) {
+        return Err(AutterError::PresetError(
+            "Skipping Copilot session activity for a Claude transcript.".to_string(),
+        ));
+    }
+
+    let (tool, path, format) = if ide::is_likely_copilot_native_hook(transcript_path) {
+        let path = transcript_path.unwrap_or_default().to_string();
+        let format = if path.contains("/workspaceStorage/") || path.contains("\\workspaceStorage\\")
+        {
+            StreamFormat::CopilotEventStreamJsonl
+        } else {
+            StreamFormat::CopilotSessionJson
+        };
+        ("github-copilot", Some(PathBuf::from(path)), format)
+    } else {
+        let path = transcript_path
+            .filter(|p| p.ends_with("events.jsonl"))
+            .map(PathBuf::from)
+            .or_else(|| cli::resolve_copilot_cli_session_path(&session_id));
+        (
+            "github-copilot-cli",
+            path,
+            StreamFormat::CopilotEventStreamJsonl,
+        )
+    };
+
+    let mut metadata = HashMap::new();
+    if let Some(ref p) = path {
+        metadata.insert(
+            "transcript_path".to_string(),
+            p.to_string_lossy().into_owned(),
+        );
+    }
+    let context = PresetContext {
+        agent_id: AgentId {
+            tool: tool.to_string(),
+            id: session_id.clone(),
+            model: "unknown".to_string(),
+        },
+        external_session_id: session_id.clone(),
+        trace_id: trace_id.to_string(),
+        cwd: PathBuf::from(cwd),
+        metadata,
+    };
+    let stream_source = path.map(|path| StreamSource {
+        path,
+        format,
+        session_id: generate_session_id(&session_id, tool),
+        external_session_id: session_id.clone(),
+        external_parent_session_id: None,
+    });
+    session_activity_event(context, stream_source)
+}
 
 impl AgentPreset for GithubCopilotPreset {
     fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, AutterError> {
@@ -20,6 +105,10 @@ impl AgentPreset for GithubCopilotPreset {
 
         if hook_event_name == "before_edit" || hook_event_name == "after_edit" {
             return ide::parse_legacy_extension_hooks(&data, hook_event_name, trace_id);
+        }
+
+        if COPILOT_SESSION_ACTIVITY_EVENTS.contains(&hook_event_name) {
+            return parse_session_activity(&data, trace_id);
         }
 
         if hook_event_name == "PreToolUse" || hook_event_name == "PostToolUse" {

@@ -1,7 +1,7 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext, StreamFormat, StreamSource, session_activity_event,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct CursorPreset;
+
+/// Cursor's turn-end event: the agent loop ended (completed, aborted or
+/// errored). It wakes the transcript reader; `transcript_path` is null when
+/// Cursor's transcripts are off, and then there is nothing to read.
+pub const CURSOR_SESSION_ACTIVITY_EVENTS: [&str; 1] = ["stop"];
 
 pub struct CursorBackgroundPreset;
 
@@ -47,6 +52,39 @@ impl AgentPreset for CursorPreset {
         let hook_event_name = parse::required_str(&data, "hook_event_name")?;
 
         let transcript_path = parse::optional_str(&data, "transcript_path").map(|s| s.to_string());
+
+        if CURSOR_SESSION_ACTIVITY_EVENTS.contains(&hook_event_name) {
+            let cwd = workspace_roots.first().cloned().ok_or_else(|| {
+                AutterError::PresetError("No workspace root found in hook_input".to_string())
+            })?;
+            let mut metadata = HashMap::new();
+            if let Some(ref tp) = transcript_path {
+                metadata.insert("transcript_path".to_string(), tp.clone());
+            }
+            let model = parse::optional_str(&data, "model")
+                .filter(|m| !is_cursor_placeholder_model(m))
+                .unwrap_or("unknown")
+                .to_string();
+            let context = PresetContext {
+                agent_id: AgentId {
+                    tool: "cursor".to_string(),
+                    id: conversation_id.clone(),
+                    model,
+                },
+                external_session_id: conversation_id.clone(),
+                trace_id: trace_id.to_string(),
+                cwd: PathBuf::from(&cwd),
+                metadata,
+            };
+            let stream_source = transcript_path.map(|tp| StreamSource {
+                path: PathBuf::from(tp),
+                format: StreamFormat::CursorJsonl,
+                session_id: generate_session_id(&conversation_id, "cursor"),
+                external_session_id: conversation_id.clone(),
+                external_parent_session_id: None,
+            });
+            return session_activity_event(context, stream_source);
+        }
 
         // Cursor documents both `model` and `model_id` on pre/postToolUse hooks.
         // Fall back to the transcript when the hook only carries placeholders (Auto, etc.).

@@ -332,7 +332,7 @@ pub(super) fn parse_vscode_native_hooks(
 // IDE-specific helpers
 // ---------------------------------------------------------------------------
 
-fn transcript_path_from_hook_data(data: &serde_json::Value) -> Option<&str> {
+pub(super) fn transcript_path_from_hook_data(data: &serde_json::Value) -> Option<&str> {
     parse::optional_str_multi(
         data,
         &[
@@ -344,7 +344,7 @@ fn transcript_path_from_hook_data(data: &serde_json::Value) -> Option<&str> {
     )
 }
 
-fn looks_like_claude_transcript_path(path: &str) -> bool {
+pub(super) fn looks_like_claude_transcript_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     normalized.contains("/.claude/") || normalized.contains("/claude/projects/")
 }
@@ -357,7 +357,7 @@ fn looks_like_copilot_transcript_path(path: &str) -> bool {
         || (normalized.contains("/workspacestorage/") && normalized.contains("/chatsessions/"))
 }
 
-fn is_likely_copilot_native_hook(transcript_path: Option<&str>) -> bool {
+pub(super) fn is_likely_copilot_native_hook(transcript_path: Option<&str>) -> bool {
     let Some(path) = transcript_path else {
         return false;
     };

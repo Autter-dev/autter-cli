@@ -7965,7 +7965,17 @@ impl ActorDaemonCoordinator {
                     let trace_id = request.trace_id.clone();
                     let tool_use_id = request.metadata.get("tool_use_id").cloned();
 
-                    let repo_work_dir = request.files.first().map(|f| f.repo_work_dir.clone());
+                    // A session-activity request (prompt submitted, turn ended) has no
+                    // files; its repository travels in its metadata.
+                    let repo_work_dir = request
+                        .files
+                        .first()
+                        .map(|f| f.repo_work_dir.clone())
+                        .or_else(|| {
+                            crate::commands::checkpoint_agent::orchestrator::session_activity_repo(
+                                &request,
+                            )
+                        });
 
                     worker.notify_checkpoint(
                         session_id,

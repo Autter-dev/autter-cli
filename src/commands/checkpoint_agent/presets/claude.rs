@@ -1,7 +1,7 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext, SessionActivity, StreamFormat, StreamSource,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct ClaudePreset;
+
+/// Hook events that change the transcript without editing a file: a prompt
+/// was submitted, or the agent (or a subagent) finished its turn. They wake
+/// the transcript reader instead of taking a checkpoint.
+pub const CLAUDE_SESSION_ACTIVITY_EVENTS: [&str; 3] = ["UserPromptSubmit", "Stop", "SubagentStop"];
 
 impl ClaudePreset {
     fn is_vscode_copilot_hook_payload(data: &serde_json::Value) -> bool {
@@ -71,19 +76,29 @@ impl AgentPreset for ClaudePreset {
         let is_bash = tool_name
             .map(|n| bash_tool::classify_tool(Agent::Claude, n) == ToolClass::Bash)
             .unwrap_or(false);
+        let is_session_activity =
+            hook_event.is_some_and(|e| CLAUDE_SESSION_ACTIVITY_EVENTS.contains(&e));
+
+        // UserPromptSubmit runs before Claude acts on the prompt, so it stays
+        // cheap: no transcript read for the model (the stream worker reads it).
+        let model = if is_session_activity {
+            "unknown".to_string()
+        } else {
+            crate::streams::model_extraction::extract_model(
+                Path::new(transcript_path),
+                crate::streams::sweep::StreamFormat::ClaudeJsonl,
+                None,
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string())
+        };
 
         let context = PresetContext {
             agent_id: AgentId {
                 tool: "claude".to_string(),
                 id: session_id.clone(),
-                model: crate::streams::model_extraction::extract_model(
-                    Path::new(transcript_path),
-                    crate::streams::sweep::StreamFormat::ClaudeJsonl,
-                    None,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "unknown".to_string()),
+                model,
             },
             external_session_id: session_id.clone(),
             trace_id: trace_id.to_string(),
@@ -96,13 +111,21 @@ impl AgentPreset for ClaudePreset {
             crate::streams::agents::claude::ClaudeAgent::detect_subagent_parent(
                 &transcript_path_buf,
             );
-        let stream_source = Some(StreamSource {
+        let source = StreamSource {
             path: transcript_path_buf,
             format: StreamFormat::ClaudeJsonl,
             session_id: generate_session_id(&session_id, "claude"),
             external_session_id: session_id.clone(),
             external_parent_session_id,
-        });
+        };
+
+        if is_session_activity {
+            return Ok(vec![ParsedHookEvent::SessionActivity(SessionActivity {
+                context,
+                stream_source: source,
+            })]);
+        }
+        let stream_source = Some(source);
 
         let event = match (hook_event, is_bash) {
             (Some("PreToolUse"), true) => ParsedHookEvent::PreBashCall(PreBashCall {
@@ -192,6 +215,37 @@ mod tests {
                 }
             }
             _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_claude_prompt_and_stop_are_session_activity() {
+        for event in CLAUDE_SESSION_ACTIVITY_EVENTS {
+            // Real payloads for these events carry no tool.
+            let input = json!({
+                "transcript_path": "/home/user/.claude/projects/abc123.jsonl",
+                "cwd": "/home/user/project",
+                "hook_event_name": event,
+                "session_id": "sess-1",
+                "prompt": "Explain the retry helper"
+            })
+            .to_string();
+            let events = ClaudePreset.parse(&input, "t_test123456789a").unwrap();
+            assert_eq!(events.len(), 1, "{event}");
+            match &events[0] {
+                ParsedHookEvent::SessionActivity(e) => {
+                    assert_eq!(e.context.agent_id.tool, "claude");
+                    assert_eq!(e.context.external_session_id, "sess-1");
+                    // No transcript read on the prompt path.
+                    assert_eq!(e.context.agent_id.model, "unknown");
+                    assert_eq!(e.stream_source.format, StreamFormat::ClaudeJsonl);
+                    assert_eq!(
+                        e.stream_source.session_id,
+                        generate_session_id("sess-1", "claude")
+                    );
+                }
+                _ => panic!("Expected SessionActivity for {event}"),
+            }
         }
     }
 

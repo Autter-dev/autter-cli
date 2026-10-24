@@ -145,12 +145,16 @@ fn test_windsurf_preset_ai_checkpoint_post_cascade() {
 
     let events = parse_windsurf(&hook_input).expect("Failed to run WindsurfPreset");
     assert_eq!(events.len(), 1);
-    // post_cascade_response_with_transcript is an AI checkpoint variant
+    // post_cascade_response_with_transcript edits no file: Cascade finished
+    // responding, so it wakes the transcript reader instead of taking a
+    // checkpoint. (It used to parse as a file edit with no files, which built
+    // no request, so the transcript waited for the next sweep.)
     match &events[0] {
-        ParsedHookEvent::PostFileEdit(e) => {
-            assert!(e.stream_source.is_some());
+        ParsedHookEvent::SessionActivity(e) => {
+            assert_eq!(e.stream_source.path.to_string_lossy(), temp_path);
+            assert_eq!(e.context.external_session_id, "traj-abc-123");
         }
-        _ => panic!("Expected PostFileEdit for post_cascade_response_with_transcript"),
+        _ => panic!("Expected SessionActivity for post_cascade_response_with_transcript"),
     }
 }
 

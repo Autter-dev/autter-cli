@@ -1,3 +1,4 @@
+use crate::commands::checkpoint_agent::presets::cursor::CURSOR_SESSION_ACTIVITY_EVENTS;
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{
     HookCheckResult, HookInstaller, HookInstallerParams, InstallResult,
@@ -15,6 +16,9 @@ use std::path::PathBuf;
 // Command patterns for hooks
 const CURSOR_PRE_TOOL_USE_CMD: &str = "checkpoint cursor --hook-input stdin";
 const CURSOR_POST_TOOL_USE_CMD: &str = "checkpoint cursor --hook-input stdin";
+/// Every hook event autter installs in `~/.cursor/hooks.json`: the tool events,
+/// plus `stop` (the agent loop ended), which wakes the transcript reader.
+const CURSOR_HOOK_EVENTS: [&str; 3] = ["preToolUse", "postToolUse", "stop"];
 
 pub struct CursorInstaller;
 
@@ -83,24 +87,29 @@ impl HookInstaller for CursorInstaller {
         let content = fs::read_to_string(&hooks_path)?;
         let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
 
-        let has_hooks = existing
-            .get("hooks")
-            .and_then(|h| h.get("preToolUse"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(Self::is_cursor_checkpoint_command)
-                        .unwrap_or(false)
+        let has_event = |event: &str| {
+            existing
+                .get("hooks")
+                .and_then(|h| h.get(event))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(Self::is_cursor_checkpoint_command)
+                            .unwrap_or(false)
+                    })
                 })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false)
+        };
+        let has_hooks = has_event("preToolUse");
 
         Ok(HookCheckResult {
             tool_installed: true,
             hooks_installed: has_hooks,
-            hooks_up_to_date: has_hooks,
+            // An install from before the turn-end hook is out of date.
+            hooks_up_to_date: has_hooks
+                && CURSOR_SESSION_ACTIVITY_EVENTS.iter().all(|e| has_event(e)),
         })
     }
 
@@ -159,6 +168,11 @@ impl HookInstaller for CursorInstaller {
                     {
                         "command": post_tool_use_cmd
                     }
+                ],
+                "stop": [
+                    {
+                        "command": post_tool_use_cmd
+                    }
                 ]
             }
         });
@@ -176,8 +190,8 @@ impl HookInstaller for CursorInstaller {
         // Merge hooks object
         let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
 
-        // Process both hook types
-        for hook_name in &["preToolUse", "postToolUse"] {
+        // Process every hook type
+        for hook_name in &CURSOR_HOOK_EVENTS {
             let desired_hooks = desired
                 .get("hooks")
                 .and_then(|h| h.get(*hook_name))
@@ -282,8 +296,8 @@ impl HookInstaller for CursorInstaller {
 
         let mut changed = false;
 
-        // Remove autter checkpoint cursor commands from both hook types
-        for hook_name in &["preToolUse", "postToolUse"] {
+        // Remove autter checkpoint cursor commands from every hook type
+        for hook_name in &CURSOR_HOOK_EVENTS {
             if let Some(hooks_array) = hooks_obj.get_mut(*hook_name).and_then(|v| v.as_array_mut())
             {
                 let original_len = hooks_array.len();
@@ -661,5 +675,82 @@ mod tests {
     fn test_cursor_settings_targets_returns_candidates() {
         let targets = CursorInstaller::settings_targets();
         assert!(!targets.is_empty());
+    }
+
+    fn with_temp_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().to_path_buf();
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        // SAFETY: tests are serialized via #[serial], so mutating process env is safe.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+        f(&home);
+        // SAFETY: tests are serialized via #[serial], so restoring process env is safe.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_install_hooks_adds_stop_hook_and_uninstall_removes_it() {
+        with_temp_home(|home| {
+            let params = HookInstallerParams {
+                binary_path: create_test_binary_path(),
+            };
+            let hooks_path = home.join(".cursor").join("hooks.json");
+            let cmd = format!(
+                "{} {}",
+                create_test_binary_path().display(),
+                CURSOR_POST_TOOL_USE_CMD
+            );
+
+            assert!(
+                CursorInstaller
+                    .install_hooks(&params, false)
+                    .unwrap()
+                    .is_some()
+            );
+            let content: Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            for event in CURSOR_HOOK_EVENTS {
+                let commands: Vec<&str> = content["hooks"][event]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|h| h["command"].as_str())
+                    .collect();
+                assert_eq!(commands, vec![cmd.as_str()], "{event}");
+            }
+            assert!(
+                CursorInstaller
+                    .install_hooks(&params, false)
+                    .unwrap()
+                    .is_none(),
+                "idempotent"
+            );
+
+            CursorInstaller.uninstall_hooks(&params, false).unwrap();
+            let content: Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            for event in CURSOR_HOOK_EVENTS {
+                assert!(
+                    content["hooks"][event]
+                        .as_array()
+                        .is_none_or(|a| a.is_empty()),
+                    "{event}"
+                );
+            }
+        });
     }
 }

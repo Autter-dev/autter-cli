@@ -4,21 +4,21 @@ mod agent_v1;
 mod ai_tab;
 mod amp;
 mod antigravity;
-mod claude;
-mod codex;
+pub(crate) mod claude;
+pub(crate) mod codex;
 mod continue_cli;
-mod cursor;
-mod droid;
+pub(crate) mod cursor;
+pub(crate) mod droid;
 mod firebender;
-mod gemini;
-mod github_copilot;
+pub(crate) mod gemini;
+pub(crate) mod github_copilot;
 mod human;
 mod known_human;
 mod mock_ai;
 mod mock_known_human;
 mod opencode;
 mod pi;
-mod windsurf;
+pub(crate) mod windsurf;
 
 use crate::authorship::working_log::AgentId;
 use crate::error::AutterError;
@@ -43,6 +43,12 @@ pub enum ParsedHookEvent {
     PostBashCall(PostBashCall),
     KnownHumanEdit(KnownHumanEdit),
     UntrackedEdit(UntrackedEdit),
+    /// The agent's transcript changed without a file edit: the person
+    /// submitted a prompt, or the agent finished its turn. No checkpoint is
+    /// taken; the daemon's stream worker is told to read the transcript now
+    /// instead of waiting for its next sweep, so sessions that never edit a
+    /// file (questions, reviews, planning) reach the platform within seconds.
+    SessionActivity(SessionActivity),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +97,30 @@ pub struct PostBashCall {
     pub context: PresetContext,
     pub tool_use_id: String,
     pub stream_source: Option<StreamSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionActivity {
+    pub context: PresetContext,
+    pub stream_source: StreamSource,
+}
+
+/// A prompt was submitted or the agent ended its turn: tell the daemon to read
+/// the session's transcript now. Every agent with such a hook event maps it
+/// here. Without a transcript there is nothing to read, so the hook is skipped.
+pub(crate) fn session_activity_event(
+    context: PresetContext,
+    stream_source: Option<StreamSource>,
+) -> Result<Vec<ParsedHookEvent>, AutterError> {
+    match stream_source {
+        Some(stream_source) => Ok(vec![ParsedHookEvent::SessionActivity(SessionActivity {
+            context,
+            stream_source,
+        })]),
+        None => Err(AutterError::PresetError(
+            "Skipping session activity: no transcript for this session.".to_string(),
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,5 +207,181 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, AutterError> {
             "Unknown preset: {}",
             name
         ))),
+    }
+}
+
+#[cfg(test)]
+mod session_activity_preset_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn activity(preset: &str, input: serde_json::Value) -> SessionActivity {
+        let events = resolve_preset(preset)
+            .unwrap()
+            .parse(&input.to_string(), "t_test123456789a")
+            .unwrap_or_else(|e| panic!("{preset}: {e}"));
+        assert_eq!(events.len(), 1, "{preset}");
+        match events.into_iter().next().unwrap() {
+            ParsedHookEvent::SessionActivity(e) => e,
+            other => panic!("{preset}: expected SessionActivity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_prompt_and_stop() {
+        for event in ["UserPromptSubmit", "Stop", "SubagentStop"] {
+            let e = activity(
+                "codex",
+                json!({"cwd": "/p", "session_id": "c1", "hook_event_name": event,
+                       "transcript_path": "/h/.codex/sessions/rollout-c1.jsonl", "prompt": "hi"}),
+            );
+            assert_eq!(e.stream_source.format, StreamFormat::CodexJsonl, "{event}");
+            assert_eq!(e.context.agent_id.tool, "codex");
+        }
+    }
+
+    #[test]
+    fn droid_prompt_and_stop() {
+        for event in ["UserPromptSubmit", "Stop", "SubagentStop"] {
+            let e = activity(
+                "droid",
+                json!({"cwd": "/p", "session_id": "d1", "hookEventName": event,
+                       "transcript_path": "/h/.factory/sessions/d1.jsonl"}),
+            );
+            assert_eq!(e.stream_source.format, StreamFormat::DroidJsonl, "{event}");
+        }
+    }
+
+    #[test]
+    fn gemini_before_and_after_agent() {
+        for event in ["BeforeAgent", "AfterAgent"] {
+            let e = activity(
+                "gemini",
+                json!({"cwd": "/p", "session_id": "g1", "hook_event_name": event,
+                       "transcript_path": "/h/.gemini/tmp/g1.json", "prompt": "hi"}),
+            );
+            assert_eq!(e.stream_source.format, StreamFormat::GeminiJsonl, "{event}");
+            assert_eq!(
+                e.context.agent_id.model, "unknown",
+                "no transcript read on the prompt path"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_stop_with_and_without_transcript() {
+        let e = activity(
+            "cursor",
+            json!({"conversation_id": "k1", "generation_id": "g", "hook_event_name": "stop",
+                   "status": "completed", "workspace_roots": ["/p"],
+                   "transcript_path": "/h/.cursor/projects/p/agent-transcripts/k1.jsonl"}),
+        );
+        assert_eq!(e.stream_source.format, StreamFormat::CursorJsonl);
+        assert_eq!(e.context.cwd, std::path::PathBuf::from("/p"));
+
+        let no_transcript = json!({"conversation_id": "k1", "hook_event_name": "stop",
+                                   "workspace_roots": ["/p"], "transcript_path": null});
+        assert!(
+            resolve_preset("cursor")
+                .unwrap()
+                .parse(&no_transcript.to_string(), "t")
+                .is_err(),
+            "nothing to read without a transcript"
+        );
+    }
+
+    #[test]
+    fn windsurf_cascade_response() {
+        for event in [
+            "post_cascade_response_with_transcript",
+            "post_cascade_response",
+            "pre_user_prompt",
+        ] {
+            let e = activity(
+                "windsurf",
+                json!({"trajectory_id": "w1", "agent_action_name": event, "cwd": "/p",
+                       "tool_info": {"transcript_path": "/h/.windsurf/transcripts/w1.jsonl"}}),
+            );
+            assert_eq!(
+                e.stream_source.format,
+                StreamFormat::WindsurfJsonl,
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_vscode_and_cli_and_claude_transcripts() {
+        let vscode = activity(
+            "github-copilot",
+            json!({"hook_event_name": "Stop", "session_id": "v1", "cwd": "/p",
+                   "transcript_path": "/h/Code/User/workspaceStorage/ab/GitHub.copilot-chat/transcripts/v1.jsonl"}),
+        );
+        assert_eq!(vscode.context.agent_id.tool, "github-copilot");
+        assert_eq!(
+            vscode.stream_source.format,
+            StreamFormat::CopilotEventStreamJsonl
+        );
+
+        let cli = activity(
+            "github-copilot",
+            json!({"hookEventName": "Stop", "sessionId": "s1", "cwd": "/p",
+                   "transcriptPath": "/h/.copilot/session-state/s1/events.jsonl"}),
+        );
+        assert_eq!(cli.context.agent_id.tool, "github-copilot-cli");
+        assert_eq!(
+            cli.stream_source.format,
+            StreamFormat::CopilotEventStreamJsonl
+        );
+
+        let claude = json!({"hook_event_name": "UserPromptSubmit", "session_id": "c", "cwd": "/p",
+                            "transcript_path": "/h/.claude/projects/p/c.jsonl"});
+        assert!(
+            resolve_preset("github-copilot")
+                .unwrap()
+                .parse(&claude.to_string(), "t")
+                .is_err(),
+            "a Claude session is Claude's preset's to report"
+        );
+    }
+
+    #[test]
+    fn amp_turn_end() {
+        // Amp reads only a thread file that exists.
+        let dir = tempfile::tempdir().unwrap();
+        let thread = dir.path().join("T-1.json");
+        std::fs::write(&thread, "{\"id\":\"T-1\",\"messages\":[]}").unwrap();
+        let e = activity(
+            "amp",
+            json!({"hook_event_name": "Stop", "thread_id": "T-1", "cwd": "/p",
+                   "transcript_path": thread.to_string_lossy()}),
+        );
+        assert_eq!(e.stream_source.format, StreamFormat::AmpThreadJson);
+        assert_eq!(e.context.external_session_id, "T-1");
+    }
+
+    #[test]
+    fn pi_agent_end() {
+        let e = activity(
+            "pi",
+            json!({"hook_event_name": "agent_end", "session_id": "p1",
+                   "session_path": "/h/.pi/agent/sessions/p1.jsonl", "cwd": "/p", "model": "anthropic/claude-sonnet-5"}),
+        );
+        assert_eq!(e.stream_source.format, StreamFormat::PiJsonl);
+        assert_eq!(e.context.agent_id.model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn opencode_idle_never_takes_a_checkpoint() {
+        // The session's SQLite store decides whether there is a transcript; either
+        // way a turn end must not become a file checkpoint.
+        let input = json!({"hook_event_name": "Stop", "session_id": "o1", "cwd": "/p"});
+        match resolve_preset("opencode")
+            .unwrap()
+            .parse(&input.to_string(), "t")
+        {
+            Ok(events) => assert!(matches!(events[0], ParsedHookEvent::SessionActivity(_))),
+            Err(e) => assert!(e.to_string().contains("no transcript"), "{e}"),
+        }
     }
 }

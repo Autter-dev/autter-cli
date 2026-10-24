@@ -236,6 +236,27 @@ export default function ampAutterPlugin(amp: PluginAPI) {
 		return { action: 'allow' as const }
 	})
 
+	// The agent finished its turn: have autter read the thread now, including
+	// threads that never edit a file (questions, reviews, planning).
+	amp.on('agent.end', async (event, ctx) => {
+		const autterInstalled = await ensureAutterInstalled()
+		if (!autterInstalled) {
+			return
+		}
+		const threadId = event.thread?.id
+		if (!threadId) {
+			return
+		}
+		await runCheckpoint(
+			{ logger: ctx.logger },
+			{
+				hook_event_name: 'Stop',
+				thread_id: threadId,
+				cwd: await resolveRepoRoot([]),
+			},
+		)
+	})
+
 	amp.on('tool.result', async (event, ctx) => {
 		const pending = pendingCalls.get(event.toolUseID)
 		if (!pending) {

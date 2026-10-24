@@ -1,7 +1,9 @@
+use crate::commands::checkpoint_agent::presets::gemini::GEMINI_SESSION_ACTIVITY_EVENTS;
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    binary_exists, generate_diff, home_dir, is_autter_checkpoint_command, write_atomic,
+    binary_exists, ensure_session_hook, generate_diff, home_dir, is_autter_checkpoint_command,
+    session_hooks_installed, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -41,7 +43,8 @@ impl GeminiInstaller {
 
         let hooks_up_to_date = enable_hooks
             && Self::catch_all_has_autter(settings, "BeforeTool")
-            && Self::catch_all_has_autter(settings, "AfterTool");
+            && Self::catch_all_has_autter(settings, "AfterTool")
+            && session_hooks_installed(settings, &GEMINI_SESSION_ACTIVITY_EVENTS);
 
         (hooks_installed, hooks_up_to_date)
     }
@@ -269,6 +272,12 @@ impl GeminiInstaller {
             }
         }
 
+        // Prompt submitted (BeforeAgent) / agent loop ended (AfterAgent): the
+        // transcript changed without a file edit, so the daemon reads it now.
+        for hook_type in GEMINI_SESSION_ACTIVITY_EVENTS {
+            ensure_session_hook(&mut hooks_obj, hook_type, &after_tool_cmd);
+        }
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -306,9 +315,12 @@ impl GeminiInstaller {
 
         let mut changed = false;
 
-        for hook_type in &["BeforeTool", "AfterTool"] {
+        let hook_types = ["BeforeTool", "AfterTool"]
+            .into_iter()
+            .chain(GEMINI_SESSION_ACTIVITY_EVENTS);
+        for hook_type in hook_types {
             if let Some(hook_type_array) =
-                hooks_obj.get_mut(*hook_type).and_then(|v| v.as_array_mut())
+                hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
             {
                 for matcher_block in hook_type_array.iter_mut() {
                     if let Some(hooks_array) = matcher_block
@@ -415,6 +427,7 @@ impl HookInstaller for GeminiInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::checkpoint_agent::presets::gemini::GEMINI_SESSION_ACTIVITY_EVENTS;
     use std::fs;
     use tempfile::TempDir;
 
@@ -445,6 +458,32 @@ mod tests {
 
     fn read_settings(path: &Path) -> Value {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Add the session-activity hooks (prompt submitted, turn ended) a current install has.
+    fn with_session_hooks(mut settings: Value, cmd: &str) -> Value {
+        let hooks = settings["hooks"].as_object_mut().unwrap();
+        for event in GEMINI_SESSION_ACTIVITY_EVENTS {
+            hooks.insert(
+                event.to_string(),
+                json!([{"hooks": [{"type": "command", "command": cmd}]}]),
+            );
+        }
+        settings
+    }
+
+    fn autter_commands(settings: &Value, hook_type: &str) -> Vec<String> {
+        settings["hooks"][hook_type]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .flat_map(|b| b["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|h| h["command"].as_str().map(String::from))
+                    .filter(|c| is_autter_checkpoint_command(c))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn hooks_in_catch_all<'a>(settings: &'a Value, hook_type: &str) -> Vec<&'a Value> {
@@ -506,13 +545,13 @@ mod tests {
         let ac = expected_after_cmd();
         fs::write(
             &path,
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&with_session_hooks(json!({
                 "tools": {"enableHooks": true},
                 "hooks": {
                     "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": bc}]}],
                     "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": ac}]}]
                 }
-            }))
+            }), &ac))
             .unwrap(),
         )
         .unwrap();
@@ -704,13 +743,16 @@ mod tests {
         let (_td, path) = setup_test_env();
         let bc = expected_before_cmd();
         let ac = expected_after_cmd();
-        let before = json!({
-            "tools": {"enableHooks": true},
-            "hooks": {
-                "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": bc}]}],
-                "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": ac}]}]
-            }
-        });
+        let before = with_session_hooks(
+            json!({
+                "tools": {"enableHooks": true},
+                "hooks": {
+                    "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": bc}]}],
+                    "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": ac}]}]
+                }
+            }),
+            &ac,
+        );
         fs::write(&path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
         let diff = GeminiInstaller::install_hooks_at(&path, &params(), false).unwrap();
         assert!(diff.is_none());
@@ -1009,13 +1051,16 @@ mod tests {
     fn c2_autter_in_catch_all_returns_up_to_date() {
         let before_cmd = expected_before_cmd();
         let after_cmd = expected_after_cmd();
-        let settings = json!({
-            "tools": {"enableHooks": true},
-            "hooks": {
-                "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": before_cmd}]}],
-                "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": after_cmd}]}]
-            }
-        });
+        let settings = with_session_hooks(
+            json!({
+                "tools": {"enableHooks": true},
+                "hooks": {
+                    "BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": before_cmd}]}],
+                    "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": after_cmd}]}]
+                }
+            }),
+            &after_cmd,
+        );
         let (installed, up_to_date) = GeminiInstaller::hook_status(&settings);
         assert!(installed);
         assert!(up_to_date);
@@ -1056,5 +1101,64 @@ mod tests {
         let (installed, up_to_date) = GeminiInstaller::hook_status(&settings);
         assert!(installed);
         assert!(!up_to_date);
+    }
+
+    #[test]
+    fn session_activity_hooks_upgrade_idempotent_and_uninstall() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_after_cmd();
+        fs::write(&path, serde_json::to_string_pretty(&json!({"tools": {"enableHooks": true}, "hooks": {"BeforeTool": [{"matcher": "*", "hooks": [{"type":"command","command": expected_before_cmd()}]}], "AfterTool": [{"matcher": "*", "hooks": [{"type":"command","command": expected_after_cmd()}]}]}})).unwrap()).unwrap();
+        // A user hook on a session event must survive.
+        let mut settings = read_settings(&path);
+        settings["hooks"]
+            [GEMINI_SESSION_ACTIVITY_EVENTS[GEMINI_SESSION_ACTIVITY_EVENTS.len() - 1]] =
+            json!([{"hooks": [{"type": "command", "command": "say done"}]}]);
+        fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        let (_, up_to_date) = GeminiInstaller::hook_status(&settings);
+        assert!(
+            !up_to_date,
+            "an install without the session hooks is out of date"
+        );
+
+        assert!(
+            GeminiInstaller::install_hooks_at(&path, &params(), false)
+                .unwrap()
+                .is_some()
+        );
+        let settings = read_settings(&path);
+        for event in GEMINI_SESSION_ACTIVITY_EVENTS {
+            assert_eq!(
+                autter_commands(&settings, event),
+                vec![cmd.clone()],
+                "{event}"
+            );
+            assert!(
+                settings["hooks"][event][0].get("matcher").is_none(),
+                "{event}: no matcher"
+            );
+        }
+        let last = GEMINI_SESSION_ACTIVITY_EVENTS[GEMINI_SESSION_ACTIVITY_EVENTS.len() - 1];
+        let all: Vec<&str> = settings["hooks"][last]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|b| b["hooks"].as_array().unwrap().iter())
+            .filter_map(|h| h["command"].as_str())
+            .collect();
+        assert!(all.contains(&"say done"), "the user's hook is kept");
+        let (installed, up_to_date) = GeminiInstaller::hook_status(&settings);
+        assert!(installed && up_to_date);
+        assert!(
+            GeminiInstaller::install_hooks_at(&path, &params(), false)
+                .unwrap()
+                .is_none(),
+            "idempotent"
+        );
+
+        GeminiInstaller::uninstall_hooks_at(&path, false).unwrap();
+        let settings = read_settings(&path);
+        for event in GEMINI_SESSION_ACTIVITY_EVENTS {
+            assert!(autter_commands(&settings, event).is_empty(), "{event}");
+        }
     }
 }

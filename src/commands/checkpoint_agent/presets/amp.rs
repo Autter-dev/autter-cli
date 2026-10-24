@@ -250,6 +250,7 @@ impl AgentPreset for AmpPreset {
             .map_err(|e| AutterError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
         let is_pre = hook_input.hook_event_name == "PreToolUse";
+        let hook_event_name = hook_input.hook_event_name.clone();
 
         let is_bash = hook_input
             .tool_name
@@ -328,6 +329,11 @@ impl AgentPreset for AmpPreset {
             external_session_id: context.external_session_id.clone(),
             external_parent_session_id: None,
         });
+
+        // The plugin sends `Stop` from Amp's `agent.end` (the turn ended).
+        if hook_event_name == "Stop" {
+            return super::session_activity_event(context, stream_source);
+        }
 
         let event = match (is_pre, is_bash) {
             (true, true) => ParsedHookEvent::PreBashCall(PreBashCall {

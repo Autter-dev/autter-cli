@@ -390,3 +390,77 @@ crate::reuse_tests_in_worktree!(
     test_claude_preset_does_not_ignore_when_transcript_path_is_claude,
     test_claude_e2e_prefers_latest_checkpoint_for_prompts,
 );
+
+/// A prompt submitted or a turn ended changes the transcript without a file
+/// edit: the hook wakes the daemon's transcript reader and records no
+/// checkpoint, so read-only sessions reach the platform without waiting for
+/// the periodic sweep.
+#[test]
+fn test_claude_prompt_and_stop_hooks_record_no_checkpoint() {
+    use crate::repos::test_repo::TestRepo;
+
+    let repo = TestRepo::new();
+    let repo_root = repo.canonical_path();
+    fs::write(repo_root.join("README.md"), "# demo\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    let transcript_path = repo_root.join("session.jsonl");
+    fs::write(
+        &transcript_path,
+        "{\"type\":\"user\",\"message\":{\"content\":\"How do retries work?\"}}\n",
+    )
+    .unwrap();
+
+    for event in ["UserPromptSubmit", "Stop", "SubagentStop"] {
+        let hook = json!({
+            "cwd": repo_root.to_string_lossy(),
+            "hook_event_name": event,
+            "session_id": "sess-activity-test",
+            "transcript_path": transcript_path.to_string_lossy(),
+            "prompt": "How do retries work?"
+        })
+        .to_string();
+        let stdout = repo
+            .autter(&["checkpoint", "claude", "--hook-input", &hook])
+            .unwrap_or_else(|e| panic!("{event} hook should succeed: {e}"));
+        assert!(
+            stdout.contains("checkpoint_requests=0"),
+            "{event}: no checkpoint, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("session_activity_requests=1"),
+            "{event}: one wake-up, got: {stdout}"
+        );
+    }
+
+    let checkpoints = repo.current_working_logs().read_all_checkpoints().unwrap();
+    assert!(checkpoints.is_empty(), "no checkpoint is written");
+}
+
+#[test]
+fn test_claude_preset_parses_real_prompt_submit_payload() {
+    let hook_input = r##"{
+        "session_id": "23aad27c-175d-427f-ac5f-a6830b8e6e65",
+        "transcript_path": "tests/fixtures/example-claude-code.jsonl",
+        "cwd": "/Users/svarlamov/projects/testing-git",
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "Write a function to calculate the factorial of a number"
+    }"##;
+
+    let events = resolve_preset("claude")
+        .unwrap()
+        .parse(hook_input, "t_test")
+        .expect("Failed to run ClaudePreset");
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ParsedHookEvent::SessionActivity(e) => {
+            assert_eq!(
+                e.stream_source.external_session_id,
+                "23aad27c-175d-427f-ac5f-a6830b8e6e65"
+            );
+        }
+        _ => panic!("Expected SessionActivity"),
+    }
+}

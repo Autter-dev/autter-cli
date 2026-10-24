@@ -538,11 +538,36 @@ fn handle_checkpoint(args: &[String]) {
         if config.has_repository_filters() {
             let mut checked_repos = std::collections::HashSet::new();
             for request in &requests {
-                for file in &request.files {
-                    if checked_repos.insert(file.repo_work_dir.clone())
+                // A session-activity request has no files; its repository is in
+                // its metadata. Outside any repository there is nothing to check
+                // against the filters, so it is skipped rather than let through.
+                let session_repo =
+                    if crate::commands::checkpoint_agent::orchestrator::is_session_activity(request)
+                    {
+                        match crate::commands::checkpoint_agent::orchestrator::session_activity_repo(
+                            request,
+                        ) {
+                            Some(repo) => Some(repo),
+                            None => {
+                                eprintln!(
+                                    "Skipping session activity outside a repository because repository filters are configured"
+                                );
+                                std::process::exit(0);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                let repo_dirs = request
+                    .files
+                    .iter()
+                    .map(|file| file.repo_work_dir.clone())
+                    .chain(session_repo);
+                for repo_work_dir in repo_dirs {
+                    if checked_repos.insert(repo_work_dir.clone())
                         && let Ok(repo) =
                             crate::git::repository::discover_repository_in_path_no_git_exec(
-                                &file.repo_work_dir,
+                                &repo_work_dir,
                             )
                         && !config.is_allowed_repository(&Some(repo))
                     {
@@ -589,10 +614,15 @@ fn handle_checkpoint(args: &[String]) {
     const CHECKPOINT_DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let mut sent_count = 0u64;
+    // Session-activity requests wake the transcript reader and record no
+    // checkpoint, so they are counted apart from checkpoints.
+    let mut activity_count = 0u64;
     let mut active_socket = config.control_socket_path.clone();
     let mut tried_spawn = false;
     for request in requests {
         let t_send = std::time::Instant::now();
+        let is_activity =
+            crate::commands::checkpoint_agent::orchestrator::is_session_activity(&request);
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
         };
@@ -630,11 +660,16 @@ fn handle_checkpoint(args: &[String]) {
             eprintln!("Failed to send checkpoint to background worker: {}", e);
             std::process::exit(0);
         }
-        sent_count += 1;
+        if is_activity {
+            activity_count += 1;
+        } else {
+            sent_count += 1;
+        }
     }
 
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
         println!("checkpoint_requests={}", sent_count);
+        println!("session_activity_requests={}", activity_count);
     }
 
     if perf {

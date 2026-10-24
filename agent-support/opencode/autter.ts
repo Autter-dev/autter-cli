@@ -3,7 +3,9 @@
  *
  * This plugin integrates autter with OpenCode to track AI-generated code.
  * It uses the tool.execute.before and tool.execute.after events to create
- * checkpoints that mark code changes as human or AI-authored.
+ * checkpoints that mark code changes as human or AI-authored, and the
+ * session.idle event (the session finished responding) to have autter read
+ * the session right away, including sessions that never edit a file.
  *
  * Installation:
  *   - Automatically installed by `autter install-hooks`
@@ -443,6 +445,32 @@ const createAutterPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plug
   }
 
   return {
+    // The session finished responding: wake autter's transcript reader so the
+    // turn is uploaded now rather than on its next periodic sweep.
+    event: swallowHookErrors(
+      "session-idle notification failed",
+      async ({ event }: { event: { type?: string; properties?: unknown } }) => {
+        if (event?.type !== "session.idle") {
+          return
+        }
+        const sessionID = hookString(asRecord(event.properties)?.sessionID)
+        if (!sessionID) {
+          return
+        }
+        const repoDir = await resolveRepoDir([], defaultCwd)
+        if (!repoDir) {
+          return
+        }
+        await runCheckpoint(
+          JSON.stringify({
+            hook_event_name: "Stop",
+            session_id: sessionID,
+            cwd: repoDir,
+          }),
+        )
+      },
+    ),
+
     "tool.execute.before": swallowHookErrors(
       "pre-tool checkpoint failed",
       async (input: ToolHookInput, output?: { args?: unknown }) => {

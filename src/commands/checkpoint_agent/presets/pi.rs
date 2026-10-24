@@ -18,7 +18,10 @@ struct PiHookInput {
     session_id: String,
     session_path: String,
     cwd: String,
+    #[serde(default)]
     model: String,
+    /// Absent on `agent_end`, which concerns no tool.
+    #[serde(default)]
     tool_name: String,
     #[serde(default)]
     tool_name_raw: Option<String>,
@@ -94,6 +97,35 @@ impl AgentPreset for PiPreset {
             dirty_files,
             tool_use_id,
         } = hook_input;
+
+        // The extension sends `agent_end` when the agent finished the prompt:
+        // wake the transcript reader for the session file.
+        if hook_event_name == "agent_end" {
+            let model_stripped = Self::strip_provider_prefix(model.trim());
+            let context = PresetContext {
+                agent_id: AgentId {
+                    tool: "pi".to_string(),
+                    id: session_id.clone(),
+                    model: if model_stripped.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        model_stripped
+                    },
+                },
+                external_session_id: session_id.clone(),
+                trace_id: trace_id.to_string(),
+                cwd: PathBuf::from(&cwd),
+                metadata: HashMap::from([("session_path".to_string(), session_path.clone())]),
+            };
+            let stream_source = StreamSource {
+                path: PathBuf::from(&session_path),
+                format: StreamFormat::PiJsonl,
+                session_id: generate_session_id(&session_id, "pi"),
+                external_session_id: session_id,
+                external_parent_session_id: None,
+            };
+            return super::session_activity_event(context, Some(stream_source));
+        }
 
         let hook_event = PiHookEvent::parse(&hook_event_name)?;
         Self::validate_tool_name(&tool_name)?;

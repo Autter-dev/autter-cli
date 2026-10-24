@@ -1,6 +1,10 @@
+use crate::commands::checkpoint_agent::presets::droid::DROID_SESSION_ACTIVITY_EVENTS;
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
-use crate::mdm::utils::{generate_diff, home_dir, is_autter_checkpoint_command, write_atomic};
+use crate::mdm::utils::{
+    ensure_session_hook, generate_diff, home_dir, is_autter_checkpoint_command,
+    session_hooks_installed, write_atomic,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,8 +22,17 @@ impl DroidInstaller {
 
     /// Returns `(hooks_installed, hooks_up_to_date)` from a parsed settings value.
     /// `hooks_installed` = autter checkpoint command exists in ANY matcher block.
-    /// `hooks_up_to_date` = autter checkpoint command exists in the `"*"` catch-all block.
+    /// `hooks_up_to_date` = autter checkpoint command exists in the `"*"` catch-all block,
+    /// and in every session-activity event (prompt submitted, turn ended).
     fn hook_status(settings: &Value) -> (bool, bool) {
+        let (installed, tool_hooks_current) = Self::tool_hook_status(settings);
+        (
+            installed,
+            tool_hooks_current && session_hooks_installed(settings, &DROID_SESSION_ACTIVITY_EVENTS),
+        )
+    }
+
+    fn tool_hook_status(settings: &Value) -> (bool, bool) {
         let pre_tool_blocks = settings
             .get("hooks")
             .and_then(|h| h.get("PreToolUse"))
@@ -213,6 +226,12 @@ impl DroidInstaller {
             }
         }
 
+        // Prompt submitted / turn ended: the transcript changed without a file
+        // edit, so the daemon reads it now instead of on its next sweep.
+        for hook_type in DROID_SESSION_ACTIVITY_EVENTS {
+            ensure_session_hook(&mut hooks_obj, hook_type, &post_tool_cmd);
+        }
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -257,9 +276,12 @@ impl DroidInstaller {
 
         let mut changed = false;
 
-        for hook_type in &["PreToolUse", "PostToolUse"] {
+        let hook_types = ["PreToolUse", "PostToolUse"]
+            .into_iter()
+            .chain(DROID_SESSION_ACTIVITY_EVENTS);
+        for hook_type in hook_types {
             if let Some(hook_type_array) =
-                hooks_obj.get_mut(*hook_type).and_then(|v| v.as_array_mut())
+                hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
             {
                 for matcher_block in hook_type_array.iter_mut() {
                     if let Some(hooks_array) = matcher_block
@@ -365,6 +387,7 @@ impl HookInstaller for DroidInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::checkpoint_agent::presets::droid::DROID_SESSION_ACTIVITY_EVENTS;
     use std::fs;
     use tempfile::TempDir;
 
@@ -391,6 +414,32 @@ mod tests {
 
     fn read_settings(path: &Path) -> Value {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Add the session-activity hooks (prompt submitted, turn ended) a current install has.
+    fn with_session_hooks(mut settings: Value, cmd: &str) -> Value {
+        let hooks = settings["hooks"].as_object_mut().unwrap();
+        for event in DROID_SESSION_ACTIVITY_EVENTS {
+            hooks.insert(
+                event.to_string(),
+                json!([{"hooks": [{"type": "command", "command": cmd}]}]),
+            );
+        }
+        settings
+    }
+
+    fn autter_commands(settings: &Value, hook_type: &str) -> Vec<String> {
+        settings["hooks"][hook_type]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .flat_map(|b| b["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|h| h["command"].as_str().map(String::from))
+                    .filter(|c| is_autter_checkpoint_command(c))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn hooks_in_catch_all<'a>(settings: &'a Value, hook_type: &str) -> Vec<&'a Value> {
@@ -448,13 +497,13 @@ mod tests {
         let cmd = expected_cmd();
         fs::write(
             &path,
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&with_session_hooks(json!({
                 "hooks": {
                     "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
                     "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}],
                     "claudeHooksImported": true
                 }
-            }))
+            }), &cmd))
             .unwrap(),
         )
         .unwrap();
@@ -646,13 +695,16 @@ mod tests {
     fn s7_idempotent_user_catch_all_plus_autter() {
         let (_td, path) = setup_test_env();
         let cmd = expected_cmd();
-        let before = json!({
-            "hooks": {
-                "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": cmd}]}],
-                "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": cmd}]}],
-                "claudeHooksImported": true
-            }
-        });
+        let before = with_session_hooks(
+            json!({
+                "hooks": {
+                    "PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": cmd}]}],
+                    "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": "audit-tool"}, {"type":"command","command": cmd}]}],
+                    "claudeHooksImported": true
+                }
+            }),
+            &cmd,
+        );
         fs::write(&path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
         let diff = DroidInstaller::install_hooks_at(&path, &params(), false).unwrap();
         assert!(diff.is_none());
@@ -934,7 +986,10 @@ mod tests {
     #[test]
     fn c2_autter_in_catch_all_returns_up_to_date() {
         let cmd = expected_cmd();
-        let settings = json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]}});
+        let settings = with_session_hooks(
+            json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": cmd}]}]}}),
+            &cmd,
+        );
         let (installed, up_to_date) = DroidInstaller::hook_status(&settings);
         assert!(installed);
         assert!(up_to_date);
@@ -947,5 +1002,63 @@ mod tests {
         let (installed, up_to_date) = DroidInstaller::hook_status(&settings);
         assert!(installed);
         assert!(!up_to_date);
+    }
+
+    #[test]
+    fn session_activity_hooks_upgrade_idempotent_and_uninstall() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        fs::write(&path, serde_json::to_string_pretty(&json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": expected_cmd()}]}], "PostToolUse": [{"matcher": "*", "hooks": [{"type":"command","command": expected_cmd()}]}], "claudeHooksImported": true}})).unwrap()).unwrap();
+        // A user hook on a session event must survive.
+        let mut settings = read_settings(&path);
+        settings["hooks"][DROID_SESSION_ACTIVITY_EVENTS[DROID_SESSION_ACTIVITY_EVENTS.len() - 1]] =
+            json!([{"hooks": [{"type": "command", "command": "say done"}]}]);
+        fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        let (_, up_to_date) = DroidInstaller::hook_status(&settings);
+        assert!(
+            !up_to_date,
+            "an install without the session hooks is out of date"
+        );
+
+        assert!(
+            DroidInstaller::install_hooks_at(&path, &params(), false)
+                .unwrap()
+                .is_some()
+        );
+        let settings = read_settings(&path);
+        for event in DROID_SESSION_ACTIVITY_EVENTS {
+            assert_eq!(
+                autter_commands(&settings, event),
+                vec![cmd.clone()],
+                "{event}"
+            );
+            assert!(
+                settings["hooks"][event][0].get("matcher").is_none(),
+                "{event}: no matcher"
+            );
+        }
+        let last = DROID_SESSION_ACTIVITY_EVENTS[DROID_SESSION_ACTIVITY_EVENTS.len() - 1];
+        let all: Vec<&str> = settings["hooks"][last]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|b| b["hooks"].as_array().unwrap().iter())
+            .filter_map(|h| h["command"].as_str())
+            .collect();
+        assert!(all.contains(&"say done"), "the user's hook is kept");
+        let (installed, up_to_date) = DroidInstaller::hook_status(&settings);
+        assert!(installed && up_to_date);
+        assert!(
+            DroidInstaller::install_hooks_at(&path, &params(), false)
+                .unwrap()
+                .is_none(),
+            "idempotent"
+        );
+
+        DroidInstaller::uninstall_hooks_at(&path, false).unwrap();
+        let settings = read_settings(&path);
+        for event in DROID_SESSION_ACTIVITY_EVENTS {
+            assert!(autter_commands(&settings, event).is_empty(), "{event}");
+        }
     }
 }

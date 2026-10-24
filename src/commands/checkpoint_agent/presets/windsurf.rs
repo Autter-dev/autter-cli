@@ -1,7 +1,7 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext, StreamFormat, StreamSource, session_activity_event,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -10,6 +10,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub struct WindsurfPreset;
+
+/// Cascade events with no file edit: a prompt was submitted, or Cascade
+/// finished responding. They wake the transcript reader.
+pub const WINDSURF_SESSION_ACTIVITY_EVENTS: [&str; 3] = [
+    "pre_user_prompt",
+    "post_cascade_response",
+    "post_cascade_response_with_transcript",
+];
 
 /// Escape raw ASCII control characters (0x00..=0x1F) that appear inside JSON
 /// string literals so the input parses under strict serde_json. Bytes outside
@@ -117,6 +125,10 @@ impl AgentPreset for WindsurfPreset {
             external_session_id: context.external_session_id.clone(),
             external_parent_session_id: None,
         });
+
+        if agent_action.is_some_and(|a| WINDSURF_SESSION_ACTIVITY_EVENTS.contains(&a)) {
+            return session_activity_event(context, stream_source);
+        }
 
         let is_bash = matches!(
             agent_action,

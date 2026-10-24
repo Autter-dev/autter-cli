@@ -268,6 +268,9 @@ impl AgentPreset for OpenCodePreset {
             .unwrap_or(false);
 
         let is_pre = hook_input.hook_event_name == "PreToolUse";
+        // The plugin sends `Stop` from OpenCode's `session.idle` (the session
+        // finished responding).
+        let is_session_activity = hook_input.hook_event_name == "Stop";
 
         let OpenCodeHookInput {
             hook_event_name: _,
@@ -314,6 +317,10 @@ impl AgentPreset for OpenCodePreset {
         };
 
         let stream_source = transcript_result.map(|(source, _)| source);
+
+        if is_session_activity {
+            return super::session_activity_event(context, stream_source);
+        }
 
         let event = match (is_pre, is_bash) {
             (true, true) => ParsedHookEvent::PreBashCall(PreBashCall {
