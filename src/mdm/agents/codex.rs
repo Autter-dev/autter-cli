@@ -15,6 +15,18 @@ const CODEX_CHECKPOINT_CMD: &str = "checkpoint codex --hook-input stdin";
 /// `UserPromptSubmit` and `Stop` change the transcript without a file edit;
 /// the preset turns them into a session-activity wake-up for the daemon.
 const CODEX_HOOK_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"];
+/// `autter memory-hook codex` events: the repository memory briefing at session
+/// start, matching sections per prompt, and the area page after a file is
+/// read or patched (Codex adds `additionalContext` to the model's context).
+const CODEX_MEMORY_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "PostToolUse"];
+/// Every event autter hooks in Codex (checkpoint or memory).
+const CODEX_ALL_EVENTS: [&str; 5] = [
+    "PreToolUse",
+    "PostToolUse",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionStart",
+];
 
 pub struct CodexInstaller;
 
@@ -29,6 +41,22 @@ impl CodexInstaller {
 
     fn desired_command(binary_path: &Path) -> String {
         format!("{} {}", binary_path.display(), CODEX_CHECKPOINT_CMD)
+    }
+
+    fn memory_command(binary_path: &Path) -> String {
+        crate::mdm::utils::memory_hook_command(&binary_path.display().to_string(), "codex", None)
+    }
+
+    /// The autter commands an event carries: the checkpoint and/or the memory hook.
+    fn desired_commands(binary_path: &Path, event_name: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        if CODEX_HOOK_EVENTS.contains(&event_name) {
+            commands.push(Self::desired_command(binary_path));
+        }
+        if CODEX_MEMORY_EVENTS.contains(&event_name) {
+            commands.push(Self::memory_command(binary_path));
+        }
+        commands
     }
 
     fn parse_config_toml(content: &str) -> Result<TomlValue, AutterError> {
@@ -72,7 +100,9 @@ impl CodexInstaller {
     }
 
     fn is_autter_codex_command(cmd: &str) -> bool {
-        is_autter_checkpoint_command(cmd) && cmd.contains("checkpoint codex")
+        (is_autter_checkpoint_command(cmd) && cmd.contains("checkpoint codex"))
+            || (crate::mdm::utils::is_autter_memory_hook_command(cmd)
+                && cmd.contains("memory-hook codex"))
     }
 
     fn is_autter_codex_notify_args(args: &[String]) -> bool {
@@ -105,6 +135,7 @@ impl CodexInstaller {
             "PostToolUse" => "post_tool_use",
             "UserPromptSubmit" => "user_prompt_submit",
             "Stop" => "stop",
+            "SessionStart" => "session_start",
             _ => unreachable!("unknown Codex hook event: {event}"),
         }
     }
@@ -244,7 +275,6 @@ impl CodexInstaller {
             .ok_or_else(|| AutterError::Generic("Codex config root must be a table".to_string()))?;
 
         // Add inline hooks to config.toml under [hooks] table
-        let desired_command = Self::desired_command(binary_path);
         let hooks_table = root
             .entry("hooks")
             .or_insert_with(|| TomlValue::Table(Map::new()));
@@ -255,9 +285,9 @@ impl CodexInstaller {
             AutterError::Generic("Codex config hooks field must be a table".to_string())
         })?;
 
-        let mut installed_positions: Vec<(&str, usize, usize)> = Vec::new();
+        let mut installed_positions: Vec<(&str, usize, usize, String)> = Vec::new();
 
-        for event_name in CODEX_HOOK_EVENTS {
+        for event_name in CODEX_ALL_EVENTS {
             let blocks = hooks_obj
                 .get(event_name)
                 .and_then(|value| value.as_array())
@@ -316,15 +346,14 @@ impl CodexInstaller {
                 .get_mut("hooks")
                 .and_then(|value| value.as_array_mut())
             {
-                let handler_idx = hooks_array.len();
-                let mut hook_entry = Map::new();
-                hook_entry.insert("type".to_string(), TomlValue::String("command".to_string()));
-                hook_entry.insert(
-                    "command".to_string(),
-                    TomlValue::String(desired_command.clone()),
-                );
-                hooks_array.push(TomlValue::Table(hook_entry));
-                installed_positions.push((event_name, target_idx, handler_idx));
+                for command in Self::desired_commands(binary_path, event_name) {
+                    let handler_idx = hooks_array.len();
+                    let mut hook_entry = Map::new();
+                    hook_entry.insert("type".to_string(), TomlValue::String("command".to_string()));
+                    hook_entry.insert("command".to_string(), TomlValue::String(command.clone()));
+                    hooks_array.push(TomlValue::Table(hook_entry));
+                    installed_positions.push((event_name, target_idx, handler_idx, command));
+                }
             }
 
             hooks_obj.insert(event_name.to_string(), TomlValue::Array(cleaned_blocks));
@@ -342,13 +371,13 @@ impl CodexInstaller {
             AutterError::Generic("Codex config hooks.state must be a table".to_string())
         })?;
 
-        for (event_name, group_idx, handler_idx) in &installed_positions {
+        for (event_name, group_idx, handler_idx, command) in &installed_positions {
             let snake_name = Self::event_name_to_snake_case(event_name);
             let state_key = format!(
                 "{}:{}:{}:{}",
                 config_path_str, snake_name, group_idx, handler_idx
             );
-            let trust_hash = Self::compute_trust_hash(snake_name, &desired_command)?;
+            let trust_hash = Self::compute_trust_hash(snake_name, command)?;
 
             let mut entry = Map::new();
             entry.insert("enabled".to_string(), TomlValue::Boolean(true));
@@ -395,7 +424,7 @@ impl CodexInstaller {
         })?;
 
         let mut changed = false;
-        for event_name in CODEX_HOOK_EVENTS {
+        for event_name in CODEX_ALL_EVENTS {
             let Some(blocks) = hooks_obj.get(event_name).and_then(|value| value.as_array()) else {
                 continue;
             };
@@ -453,7 +482,7 @@ impl CodexInstaller {
                 .keys()
                 .filter(|key| {
                     key.starts_with(&config_path_str)
-                        && CODEX_HOOK_EVENTS.iter().any(|event| {
+                        && CODEX_ALL_EVENTS.iter().any(|event| {
                             let snake = Self::event_name_to_snake_case(event);
                             key.contains(&format!(":{snake}:"))
                         })
@@ -515,7 +544,7 @@ impl CodexInstaller {
         })?;
 
         let mut changed = false;
-        for event_name in CODEX_HOOK_EVENTS {
+        for event_name in CODEX_ALL_EVENTS {
             let Some(blocks) = hooks_obj.get(event_name).and_then(|value| value.as_array()) else {
                 continue;
             };
@@ -585,8 +614,7 @@ impl CodexInstaller {
             AutterError::Generic("Codex hooks field must be a JSON object".to_string())
         })?;
 
-        let desired_command = Self::desired_command(binary_path);
-        for event_name in CODEX_HOOK_EVENTS {
+        for event_name in CODEX_ALL_EVENTS {
             let mut blocks = hooks_obj
                 .get(event_name)
                 .and_then(|value| value.as_array())
@@ -614,10 +642,12 @@ impl CodexInstaller {
             let hooks_array = hooks.as_array_mut().ok_or_else(|| {
                 AutterError::Generic("Codex hooks.json hooks entry must be an array".to_string())
             })?;
-            hooks_array.push(json!({
-                "type": "command",
-                "command": desired_command.clone(),
-            }));
+            for command in Self::desired_commands(binary_path, event_name) {
+                hooks_array.push(json!({
+                    "type": "command",
+                    "command": command,
+                }));
+            }
 
             hooks_obj.insert(event_name.to_string(), JsonValue::Array(blocks));
         }
@@ -641,7 +671,7 @@ impl CodexInstaller {
     }
 
     fn hooks_json_has_autter_entries(hooks_json: &JsonValue) -> bool {
-        CODEX_HOOK_EVENTS.iter().any(|event_name| {
+        CODEX_ALL_EVENTS.iter().any(|event_name| {
             hooks_json
                 .get("hooks")
                 .and_then(|hooks| hooks.get(*event_name))
@@ -1005,6 +1035,57 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_memory_hooks_installed_with_trust_and_removed() {
+        let binary = Path::new("/usr/local/bin/autter");
+        let config =
+            CodexInstaller::config_with_installed_hooks(&TomlValue::Table(Map::new()), binary)
+                .unwrap();
+        let hooks = config.get("hooks").unwrap();
+        let commands = |event: &str| -> Vec<String> {
+            hooks
+                .get(event)
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .flat_map(|b| {
+                    b.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        let memory = "/usr/local/bin/autter memory-hook codex --hook-input stdin".to_string();
+        let checkpoint = "/usr/local/bin/autter checkpoint codex --hook-input stdin".to_string();
+        assert_eq!(commands("SessionStart"), vec![memory.clone()]);
+        assert_eq!(
+            commands("UserPromptSubmit"),
+            vec![checkpoint.clone(), memory.clone()]
+        );
+        assert_eq!(
+            commands("PostToolUse"),
+            vec![checkpoint.clone(), memory.clone()]
+        );
+        assert_eq!(commands("PreToolUse"), vec![checkpoint.clone()]);
+        // Every command is trusted, so Codex runs it without asking.
+        let state = hooks.get("state").and_then(|v| v.as_table()).unwrap();
+        assert!(state.keys().any(|k| k.contains(":session_start:0:0")));
+        assert!(state.keys().any(|k| k.contains(":user_prompt_submit:0:1")));
+        assert_eq!(state.len(), 7);
+
+        let (removed, changed) = CodexInstaller::remove_inline_hooks_from_config(&config).unwrap();
+        assert!(changed);
+        let text = toml::to_string(&removed).unwrap();
+        assert!(!text.contains("memory-hook"));
+        assert!(!text.contains("checkpoint codex"));
     }
 
     #[test]

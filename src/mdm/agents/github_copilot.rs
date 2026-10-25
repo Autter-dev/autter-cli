@@ -19,6 +19,27 @@ const GITHUB_COPILOT_HOOK_EVENTS: [&str; 4] =
     ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"];
 /// The events that carry the post-tool command (all but `PreToolUse`).
 const GITHUB_COPILOT_SESSION_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
+/// `autter memory-hook github-copilot` events. Copilot drops prompt-hook
+/// output, so memory comes at session start and after a file is read or
+/// edited. The event is passed on the command line because the payload may
+/// not name it.
+const GITHUB_COPILOT_MEMORY_EVENTS: [&str; 2] = ["SessionStart", "PostToolUse"];
+
+fn copilot_memory_hooks(binary_path: &std::path::Path) -> Vec<(&'static str, String)> {
+    GITHUB_COPILOT_MEMORY_EVENTS
+        .iter()
+        .map(|event| {
+            (
+                *event,
+                crate::mdm::utils::memory_hook_command(
+                    &binary_path.display().to_string(),
+                    "github-copilot",
+                    Some(event),
+                ),
+            )
+        })
+        .collect()
+}
 
 pub struct GitHubCopilotInstaller;
 
@@ -201,7 +222,13 @@ impl HookInstaller for GitHubCopilotInstaller {
         Ok(HookCheckResult {
             tool_installed: true,
             hooks_installed: has_pre_installed || has_post_installed,
-            hooks_up_to_date: has_pre_up_to_date && has_post_up_to_date && has_session_up_to_date,
+            hooks_up_to_date: has_pre_up_to_date
+                && has_post_up_to_date
+                && has_session_up_to_date
+                && crate::mdm::utils::flat_memory_hooks_current(
+                    &existing,
+                    &copilot_memory_hooks(&params.binary_path),
+                ),
         })
     }
 
@@ -346,6 +373,13 @@ impl HookInstaller for GitHubCopilotInstaller {
             }
         }
 
+        // Repository memory before code: `autter memory-hook` injects it.
+        crate::mdm::utils::ensure_flat_memory_hooks(
+            &mut hooks_obj,
+            &copilot_memory_hooks(&params.binary_path),
+            true,
+        );
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -398,7 +432,10 @@ impl HookInstaller for GitHubCopilotInstaller {
             None => return Ok(None),
         };
 
-        let mut changed = false;
+        let mut changed = crate::mdm::utils::remove_flat_memory_hooks(
+            &mut hooks_obj,
+            &GITHUB_COPILOT_MEMORY_EVENTS,
+        );
 
         for hook_name in &GITHUB_COPILOT_HOOK_EVENTS {
             if let Some(hooks_array) = hooks_obj.get_mut(*hook_name).and_then(|v| v.as_array_mut())
@@ -518,10 +555,23 @@ mod tests {
                 .unwrap();
 
             assert_eq!(pre.len(), 1);
-            assert_eq!(post.len(), 1);
+            // The checkpoint and the repository memory hook.
+            assert_eq!(post.len(), 2);
             assert_eq!(
                 pre[0].get("command").and_then(|v| v.as_str()),
                 Some("/tmp/autter/bin/autter checkpoint github-copilot --hook-input stdin")
+            );
+            assert_eq!(
+                post[1].get("command").and_then(|v| v.as_str()),
+                Some(
+                    "/tmp/autter/bin/autter memory-hook github-copilot --event PostToolUse --hook-input stdin"
+                )
+            );
+            assert_eq!(
+                content["hooks"]["SessionStart"][0]["command"].as_str(),
+                Some(
+                    "/tmp/autter/bin/autter memory-hook github-copilot --event SessionStart --hook-input stdin"
+                )
             );
         });
     }
@@ -618,7 +668,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(pre.len(), 1);
-            assert_eq!(post.len(), 1);
+            assert_eq!(post.len(), 2);
         });
     }
 

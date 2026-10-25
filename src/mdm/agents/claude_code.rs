@@ -2,9 +2,10 @@ use crate::commands::checkpoint_agent::presets::claude::CLAUDE_SESSION_ACTIVITY_
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    MIN_CLAUDE_VERSION, binary_exists, claude_config_dir, ensure_session_hook, generate_diff,
-    get_binary_version, is_autter_checkpoint_command, normalize_windows_path_for_shell,
-    parse_version, session_hooks_installed, version_meets_requirement, write_atomic,
+    MIN_CLAUDE_VERSION, binary_exists, claude_config_dir, ensure_memory_hook, ensure_session_hook,
+    generate_diff, get_binary_version, is_autter_checkpoint_command, memory_hook_command,
+    memory_hooks_installed, normalize_windows_path_for_shell, parse_version, remove_memory_hooks,
+    session_hooks_installed, version_meets_requirement, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -14,6 +15,19 @@ use std::path::{Path, PathBuf};
 const CLAUDE_PRE_TOOL_CMD: &str = "checkpoint claude --hook-input stdin";
 const CLAUDE_POST_TOOL_CMD: &str = "checkpoint claude --hook-input stdin";
 const CLAUDE_CATCH_ALL_MATCHER: &str = "*";
+
+/// `autter memory-hook claude` events: the repository memory briefing at
+/// session start, matching sections on each prompt, and the area page when a
+/// file is read or edited (context arrives with the tool result).
+pub const CLAUDE_MEMORY_HOOKS: [(&str, Option<&str>); 3] = [
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    (
+        "PostToolUse",
+        Some("Read|Edit|Write|MultiEdit|NotebookEdit"),
+    ),
+];
+const CLAUDE_MEMORY_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "PostToolUse"];
 
 pub struct ClaudeCodeInstaller;
 
@@ -47,7 +61,11 @@ impl ClaudeCodeInstaller {
         let (installed, tool_hooks_current) = Self::tool_hook_status(settings);
         let session_hooks_current =
             session_hooks_installed(settings, &CLAUDE_SESSION_ACTIVITY_EVENTS);
-        (installed, tool_hooks_current && session_hooks_current)
+        let memory_hooks_current = memory_hooks_installed(settings, &CLAUDE_MEMORY_EVENTS);
+        (
+            installed,
+            tool_hooks_current && session_hooks_current && memory_hooks_current,
+        )
     }
 
     fn tool_hook_status(settings: &Value) -> (bool, bool) {
@@ -251,6 +269,12 @@ impl ClaudeCodeInstaller {
             ensure_session_hook(&mut hooks_obj, hook_type, &post_tool_cmd);
         }
 
+        // Repository memory before code: `autter memory-hook` injects it.
+        let memory_cmd = memory_hook_command(&binary_path_str, "claude", None);
+        for (hook_type, matcher) in CLAUDE_MEMORY_HOOKS {
+            ensure_memory_hook(&mut hooks_obj, hook_type, matcher, &memory_cmd);
+        }
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -286,7 +310,7 @@ impl ClaudeCodeInstaller {
             None => return Ok(None),
         };
 
-        let mut changed = false;
+        let mut changed = remove_memory_hooks(&mut hooks_obj, &CLAUDE_MEMORY_EVENTS);
 
         let hook_types = ["PreToolUse", "PostToolUse"]
             .into_iter()
@@ -487,6 +511,8 @@ mod tests {
     }
 
     /// Add the session-activity hooks (prompt submitted, turn ended) a current install has.
+    /// Settings as a current install leaves them: session-activity hooks and
+    /// the memory hooks next to whatever the test put in.
     fn with_session_hooks(mut settings: Value, cmd: &str) -> Value {
         let hooks = settings["hooks"].as_object_mut().unwrap();
         for event in CLAUDE_SESSION_ACTIVITY_EVENTS {
@@ -494,6 +520,11 @@ mod tests {
                 event.to_string(),
                 json!([{"hooks": [{"type": "command", "command": cmd}]}]),
             );
+        }
+        let memory_cmd = cmd.replace("checkpoint claude", "memory-hook claude");
+        let hooks = settings.get_mut("hooks").unwrap();
+        for (event, matcher) in CLAUDE_MEMORY_HOOKS {
+            ensure_memory_hook(hooks, event, matcher, &memory_cmd);
         }
         settings
     }
@@ -728,12 +759,16 @@ mod tests {
             let hooks = hooks_in_catch_all(&settings, hook_type);
             assert_eq!(hooks.len(), 1, "{hook_type}: expected autter in catch-all");
 
-            // The old matcher block had only our hook, so it must be removed entirely.
-            let blocks = settings
+            // The old matcher block had only our hook, so it must be removed entirely
+            // (the memory hook's own PostToolUse block aside).
+            let blocks: Vec<&Value> = settings
                 .get("hooks")
                 .and_then(|h| h.get(*hook_type))
                 .and_then(|v| v.as_array())
-                .unwrap();
+                .unwrap()
+                .iter()
+                .filter(|b| b.get("matcher").and_then(|m| m.as_str()) != CLAUDE_MEMORY_HOOKS[2].1)
+                .collect();
             assert_eq!(
                 blocks.len(),
                 1,
@@ -1380,6 +1415,46 @@ mod tests {
         let (installed, up_to_date) = ClaudeCodeInstaller::hook_status(&settings);
         assert!(installed);
         assert!(up_to_date);
+    }
+
+    #[test]
+    fn m1_installs_memory_hooks_and_uninstall_removes_them() {
+        let (_tmp, path) = setup_test_env();
+        ClaudeCodeInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        let settings = read_settings(&path);
+        let memory_cmd = expected_cmd().replace("checkpoint claude", "memory-hook claude");
+        let commands = |event: &str| -> Vec<String> {
+            settings["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|b| b["hooks"].as_array().unwrap().iter())
+                .filter_map(|h| h["command"].as_str().map(str::to_string))
+                .filter(|c| c.contains("memory-hook"))
+                .collect()
+        };
+        for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+            assert_eq!(commands(event), vec![memory_cmd.clone()], "{event}");
+        }
+        let read_block = settings["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["matcher"] == "Read|Edit|Write|MultiEdit|NotebookEdit")
+            .expect("a PostToolUse block for reads and edits");
+        assert_eq!(read_block["hooks"][0]["command"], memory_cmd);
+        assert!(ClaudeCodeInstaller::hook_status(&settings).1);
+        // Re-running is a no-op.
+        assert!(
+            ClaudeCodeInstaller::install_hooks_at(&path, &params(), false)
+                .unwrap()
+                .is_none()
+        );
+
+        ClaudeCodeInstaller::uninstall_hooks_at(&path, false).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("memory-hook"));
+        assert!(!after.contains("checkpoint claude"));
     }
 
     #[test]

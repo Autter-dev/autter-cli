@@ -19,6 +19,28 @@ const CURSOR_POST_TOOL_USE_CMD: &str = "checkpoint cursor --hook-input stdin";
 /// Every hook event autter installs in `~/.cursor/hooks.json`: the tool events,
 /// plus `stop` (the agent loop ended), which wakes the transcript reader.
 const CURSOR_HOOK_EVENTS: [&str; 3] = ["preToolUse", "postToolUse", "stop"];
+/// `autter memory-hook cursor` events: the repository memory briefing at
+/// session start (`additional_context`). Cursor documents context from
+/// `sessionStart` and `postToolUse` but currently drops it (forum reports,
+/// 2026); only the once-per-session hook is installed until that is fixed, so
+/// no network call is added to every tool call for nothing.
+const CURSOR_MEMORY_EVENTS: [&str; 1] = ["sessionStart"];
+
+fn cursor_memory_hooks(binary_path: &std::path::Path) -> Vec<(&'static str, String)> {
+    CURSOR_MEMORY_EVENTS
+        .iter()
+        .map(|event| {
+            (
+                *event,
+                crate::mdm::utils::memory_hook_command(
+                    &binary_path.display().to_string(),
+                    "cursor",
+                    Some(event),
+                ),
+            )
+        })
+        .collect()
+}
 
 pub struct CursorInstaller;
 
@@ -46,7 +68,7 @@ impl HookInstaller for CursorInstaller {
         "cursor"
     }
 
-    fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
+    fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let resolved_cli = resolve_editor_cli("cursor");
         let has_cli = resolved_cli.is_some();
         let has_dotfiles = home_dir().join(".cursor").exists();
@@ -109,7 +131,11 @@ impl HookInstaller for CursorInstaller {
             hooks_installed: has_hooks,
             // An install from before the turn-end hook is out of date.
             hooks_up_to_date: has_hooks
-                && CURSOR_SESSION_ACTIVITY_EVENTS.iter().all(|e| has_event(e)),
+                && CURSOR_SESSION_ACTIVITY_EVENTS.iter().all(|e| has_event(e))
+                && crate::mdm::utils::flat_memory_hooks_current(
+                    &existing,
+                    &cursor_memory_hooks(&params.binary_path),
+                ),
         })
     }
 
@@ -251,6 +277,13 @@ impl HookInstaller for CursorInstaller {
             }
         }
 
+        // Repository memory before code: `autter memory-hook` injects it.
+        crate::mdm::utils::ensure_flat_memory_hooks(
+            &mut hooks_obj,
+            &cursor_memory_hooks(&params.binary_path),
+            false,
+        );
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -294,7 +327,8 @@ impl HookInstaller for CursorInstaller {
             None => return Ok(None),
         };
 
-        let mut changed = false;
+        let mut changed =
+            crate::mdm::utils::remove_flat_memory_hooks(&mut hooks_obj, &CURSOR_MEMORY_EVENTS);
 
         // Remove autter checkpoint cursor commands from every hook type
         for hook_name in &CURSOR_HOOK_EVENTS {

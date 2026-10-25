@@ -2,9 +2,23 @@ use crate::commands::checkpoint_agent::presets::gemini::GEMINI_SESSION_ACTIVITY_
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    binary_exists, ensure_session_hook, generate_diff, home_dir, is_autter_checkpoint_command,
+    binary_exists, ensure_memory_hook, ensure_session_hook, generate_diff, home_dir,
+    is_autter_checkpoint_command, memory_hook_command, memory_hooks_installed, remove_memory_hooks,
     session_hooks_installed, write_atomic,
 };
+
+/// `autter memory-hook gemini` events: the repository memory briefing at
+/// session start, matching sections before each turn (BeforeAgent), and the
+/// area page after a file is read or edited (AfterTool).
+pub const GEMINI_MEMORY_HOOKS: [(&str, Option<&str>); 3] = [
+    ("SessionStart", None),
+    ("BeforeAgent", None),
+    (
+        "AfterTool",
+        Some("read_file|read_many_files|write_file|replace"),
+    ),
+];
+const GEMINI_MEMORY_EVENTS: [&str; 3] = ["SessionStart", "BeforeAgent", "AfterTool"];
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,7 +58,8 @@ impl GeminiInstaller {
         let hooks_up_to_date = enable_hooks
             && Self::catch_all_has_autter(settings, "BeforeTool")
             && Self::catch_all_has_autter(settings, "AfterTool")
-            && session_hooks_installed(settings, &GEMINI_SESSION_ACTIVITY_EVENTS);
+            && session_hooks_installed(settings, &GEMINI_SESSION_ACTIVITY_EVENTS)
+            && memory_hooks_installed(settings, &GEMINI_MEMORY_EVENTS);
 
         (hooks_installed, hooks_up_to_date)
     }
@@ -278,6 +293,13 @@ impl GeminiInstaller {
             ensure_session_hook(&mut hooks_obj, hook_type, &after_tool_cmd);
         }
 
+        // Repository memory before code: `autter memory-hook` injects it.
+        let memory_cmd =
+            memory_hook_command(&params.binary_path.display().to_string(), "gemini", None);
+        for (hook_type, matcher) in GEMINI_MEMORY_HOOKS {
+            ensure_memory_hook(&mut hooks_obj, hook_type, matcher, &memory_cmd);
+        }
+
         if let Some(root) = merged.as_object_mut() {
             root.insert("hooks".to_string(), hooks_obj);
         }
@@ -313,7 +335,7 @@ impl GeminiInstaller {
             None => return Ok(None),
         };
 
-        let mut changed = false;
+        let mut changed = remove_memory_hooks(&mut hooks_obj, &GEMINI_MEMORY_EVENTS);
 
         let hook_types = ["BeforeTool", "AfterTool"]
             .into_iter()
@@ -469,6 +491,11 @@ mod tests {
                 json!([{"hooks": [{"type": "command", "command": cmd}]}]),
             );
         }
+        let memory_cmd = cmd.replace("checkpoint gemini", "memory-hook gemini");
+        let hooks = settings.get_mut("hooks").unwrap();
+        for (event, matcher) in GEMINI_MEMORY_HOOKS {
+            crate::mdm::utils::ensure_memory_hook(hooks, event, matcher, &memory_cmd);
+        }
         settings
     }
 
@@ -589,12 +616,16 @@ mod tests {
                 "{hook_type}: autter should be in catch-all"
             );
 
-            // The old matcher block had only our hook, so it must be removed entirely.
-            let blocks = settings
+            // The old matcher block had only our hook, so it must be removed entirely
+            // (the memory hook's own block aside).
+            let blocks: Vec<&Value> = settings
                 .get("hooks")
                 .and_then(|h| h.get(*hook_type))
                 .and_then(|v| v.as_array())
-                .unwrap();
+                .unwrap()
+                .iter()
+                .filter(|b| b.get("matcher").and_then(|m| m.as_str()) != GEMINI_MEMORY_HOOKS[2].1)
+                .collect();
             assert_eq!(
                 blocks.len(),
                 1,

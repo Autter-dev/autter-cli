@@ -1187,12 +1187,269 @@ pub fn session_hooks_installed(settings: &serde_json::Value, events: &[&str]) ->
     })
 }
 
+// ── Memory hooks (`autter memory-hook`) shared by the JSON settings installers ──
+
+/// An `autter memory-hook` command (repository memory injection), as opposed
+/// to the checkpoint commands the other helpers manage.
+pub fn is_autter_memory_hook_command(cmd: &str) -> bool {
+    cmd.contains("autter") && cmd.contains("memory-hook")
+}
+
+/// The memory-hook command line for an agent, with an optional `--event`.
+pub fn memory_hook_command(binary: &str, agent: &str, event: Option<&str>) -> String {
+    match event {
+        Some(event) => format!("{binary} memory-hook {agent} --event {event} --hook-input stdin"),
+        None => format!("{binary} memory-hook {agent} --hook-input stdin"),
+    }
+}
+
+/// Keep exactly one memory-hook command for `hook_type` in a
+/// `{"hooks": {<event>: [{"matcher"?, "hooks": [...]}]}}` settings object
+/// (Claude Code, Droid, Gemini CLI): in the block with `matcher` (or the block
+/// without one), updated in place when the binary moved. Memory hooks in other
+/// blocks of the event are removed; other hooks are untouched.
+pub fn ensure_memory_hook(
+    hooks_obj: &mut serde_json::Value,
+    hook_type: &str,
+    matcher: Option<&str>,
+    desired_cmd: &str,
+) {
+    let mut blocks = hooks_obj
+        .get(hook_type)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let matches =
+        |block: &serde_json::Value| block.get("matcher").and_then(|m| m.as_str()) == matcher;
+    let target = blocks.iter().position(|b| matches(b));
+    for (i, block) in blocks.iter_mut().enumerate() {
+        let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            continue;
+        };
+        if Some(i) == target {
+            let mut kept = false;
+            hooks.retain_mut(|hook| {
+                let is_memory = hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_autter_memory_hook_command);
+                if !is_memory {
+                    return true;
+                }
+                if kept {
+                    return false;
+                }
+                kept = true;
+                if hook.get("command").and_then(|c| c.as_str()) != Some(desired_cmd) {
+                    *hook = serde_json::json!({ "type": "command", "command": desired_cmd });
+                }
+                true
+            });
+            if !kept {
+                hooks.push(serde_json::json!({ "type": "command", "command": desired_cmd }));
+            }
+        } else {
+            hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_autter_memory_hook_command)
+            });
+        }
+    }
+    // Drop blocks that held only memory hooks we removed.
+    blocks.retain(|b| {
+        b.get("hooks")
+            .and_then(|h| h.as_array())
+            .is_none_or(|h| !h.is_empty())
+    });
+    if target.is_none() {
+        let mut block = serde_json::json!({
+            "hooks": [{ "type": "command", "command": desired_cmd }]
+        });
+        if let Some(m) = matcher {
+            block["matcher"] = serde_json::Value::String(m.to_string());
+        }
+        blocks.push(block);
+    }
+    if let Some(obj) = hooks_obj.as_object_mut() {
+        obj.insert(hook_type.to_string(), serde_json::Value::Array(blocks));
+    }
+}
+
+/// Remove every memory-hook command from `events`; true when anything changed.
+pub fn remove_memory_hooks(hooks_obj: &mut serde_json::Value, events: &[&str]) -> bool {
+    let mut changed = false;
+    for event in events {
+        let Some(blocks) = hooks_obj.get_mut(*event).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                let before = hooks.len();
+                hooks.retain(|hook| {
+                    !hook
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(is_autter_memory_hook_command)
+                });
+                changed |= hooks.len() != before;
+            }
+        }
+        blocks.retain(|b| {
+            b.get("hooks")
+                .and_then(|h| h.as_array())
+                .is_none_or(|h| !h.is_empty())
+        });
+        if blocks.is_empty()
+            && let Some(obj) = hooks_obj.as_object_mut()
+        {
+            obj.remove(*event);
+        }
+    }
+    changed
+}
+
+/// Keep exactly one memory-hook command, `{"type": "command", "command": ...}`
+/// (Copilot) or `{"command": ...}` (Cursor), in each flat `hooks.<event>` array.
+pub fn ensure_flat_memory_hooks(
+    hooks_obj: &mut serde_json::Value,
+    events: &[(&str, String)],
+    with_type: bool,
+) {
+    for (event, desired_cmd) in events {
+        let mut entries = hooks_obj
+            .get(*event)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        entries.retain(|h| {
+            !h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_autter_memory_hook_command)
+        });
+        entries.push(if with_type {
+            serde_json::json!({ "type": "command", "command": desired_cmd })
+        } else {
+            serde_json::json!({ "command": desired_cmd })
+        });
+        if let Some(obj) = hooks_obj.as_object_mut() {
+            obj.insert(event.to_string(), serde_json::Value::Array(entries));
+        }
+    }
+}
+
+/// Whether each flat `hooks.<event>` array has exactly the desired memory-hook command.
+pub fn flat_memory_hooks_current(settings: &serde_json::Value, events: &[(&str, String)]) -> bool {
+    events.iter().all(|(event, desired_cmd)| {
+        settings
+            .get("hooks")
+            .and_then(|h| h.get(*event))
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|h| {
+                    h.get("command").and_then(|c| c.as_str()) == Some(desired_cmd.as_str())
+                })
+            })
+    })
+}
+
+/// Remove memory-hook commands from flat `hooks.<event>` arrays; true when anything changed.
+pub fn remove_flat_memory_hooks(hooks_obj: &mut serde_json::Value, events: &[&str]) -> bool {
+    let mut changed = false;
+    for event in events {
+        if let Some(entries) = hooks_obj.get_mut(*event).and_then(|v| v.as_array_mut()) {
+            let before = entries.len();
+            entries.retain(|h| {
+                !h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_autter_memory_hook_command)
+            });
+            changed |= entries.len() != before;
+        }
+    }
+    changed
+}
+
+/// Whether every one of `events` carries a memory-hook command in `settings.hooks`.
+pub fn memory_hooks_installed(settings: &serde_json::Value, events: &[&str]) -> bool {
+    events.iter().all(|event| {
+        settings
+            .get("hooks")
+            .and_then(|h| h.get(*event))
+            .and_then(|v| v.as_array())
+            .is_some_and(|blocks| {
+                blocks.iter().any(|b| {
+                    b.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|hooks| {
+                            hooks.iter().any(|hook| {
+                                hook.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(is_autter_memory_hook_command)
+                            })
+                        })
+                })
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn memory_hooks_are_added_once_updated_in_place_and_removed() {
+        let mut hooks = serde_json::json!({
+            "PostToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": "/bin/autter checkpoint claude --hook-input stdin"}]},
+                {"matcher": "Read", "hooks": [{"type": "command", "command": "/old/autter memory-hook claude --hook-input stdin"}]}
+            ],
+            "SessionStart": [{"hooks": [{"type": "command", "command": "echo mine"}]}]
+        });
+        let cmd = memory_hook_command("/bin/autter", "claude", None);
+        ensure_memory_hook(&mut hooks, "SessionStart", None, &cmd);
+        ensure_memory_hook(&mut hooks, "PostToolUse", Some("Read|Edit|Write"), &cmd);
+        ensure_memory_hook(&mut hooks, "PostToolUse", Some("Read|Edit|Write"), &cmd);
+        // SessionStart: the user's hook stays, ours joins its block.
+        assert_eq!(
+            hooks["SessionStart"][0]["hooks"],
+            serde_json::json!([
+                {"type": "command", "command": "echo mine"},
+                {"type": "command", "command": cmd}
+            ])
+        );
+        // PostToolUse: the stale memory hook in another block is gone, the checkpoint hook stays.
+        let blocks = hooks["PostToolUse"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["matcher"], "*");
+        assert_eq!(blocks[1]["matcher"], "Read|Edit|Write");
+        assert_eq!(blocks[1]["hooks"][0]["command"], cmd);
+        let settings = serde_json::json!({ "hooks": hooks.clone() });
+        assert!(memory_hooks_installed(
+            &settings,
+            &["SessionStart", "PostToolUse"]
+        ));
+        assert!(!memory_hooks_installed(&settings, &["UserPromptSubmit"]));
+
+        assert!(remove_memory_hooks(
+            &mut hooks,
+            &["SessionStart", "PostToolUse"]
+        ));
+        assert_eq!(
+            hooks["SessionStart"][0]["hooks"],
+            serde_json::json!([{"type": "command", "command": "echo mine"}])
+        );
+        assert_eq!(hooks["PostToolUse"].as_array().unwrap().len(), 1);
+        assert!(!remove_memory_hooks(&mut hooks, &["SessionStart"]));
+        assert_eq!(
+            memory_hook_command("autter", "github-copilot", Some("sessionStart")),
+            "autter memory-hook github-copilot --event sessionStart --hook-input stdin"
+        );
+    }
 
     #[test]
     fn test_parse_version() {

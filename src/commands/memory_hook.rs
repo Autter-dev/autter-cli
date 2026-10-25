@@ -116,6 +116,7 @@ fn is_file_tool(name: &str) -> bool {
         "replace",
         "edit_file",
         "apply_patch",
+        "applypatch",
         "str_replace",
         "str_replace_editor",
         "create",
@@ -184,6 +185,9 @@ fn tool_files(tool_input: Option<&Value>) -> Vec<String> {
         for part in command.iter().filter_map(|v| v.as_str()) {
             files.extend(patch_files(part));
         }
+    }
+    if let Some(paths) = input.get("paths").and_then(|v| v.as_array()) {
+        files.extend(paths.iter().filter_map(|p| p.as_str()).map(str::to_string));
     }
     if let Some(edits) = input.get("edits").and_then(|v| v.as_array()) {
         for e in edits {
@@ -287,7 +291,13 @@ pub fn render_output(
                 // Copilot drops prompt-hook output.
                 return None;
             }
-            json!({ "additionalContext": context }).to_string()
+            // One hooks file serves the Copilot CLI (top-level field) and VS Code
+            // (Claude-style field); each reads its own.
+            json!({
+                "additionalContext": context,
+                "hookSpecificOutput": { "hookEventName": event, "additionalContext": context },
+            })
+            .to_string()
         }
         HookDialect::Cursor => {
             if moment == HookMoment::Prompt {
@@ -308,6 +318,55 @@ pub struct SessionState {
     /// Area pages (`areas/<slug>`) already injected.
     #[serde(default)]
     pub areas: Vec<String>,
+    /// Every area page and the path it covers, from the session briefing.
+    /// Known: a file read outside a new area needs no call at all.
+    #[serde(default)]
+    pub area_paths: Option<Vec<AreaPath>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AreaPath {
+    pub slug: String,
+    pub path: String,
+}
+
+/// The area pages covering these repo-relative files that are not injected yet.
+pub fn new_areas_for(
+    paths: &[String],
+    area_paths: &[AreaPath],
+    injected: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for file in paths {
+        let best = area_paths
+            .iter()
+            .filter(|a| {
+                let dir = a.path.trim_start_matches("./").trim_end_matches('/');
+                !dir.is_empty() && file.starts_with(&format!("{dir}/"))
+            })
+            .max_by_key(|a| a.path.len());
+        if let Some(area) = best
+            && !injected.contains(&area.slug)
+            && !out.contains(&area.slug)
+        {
+            out.push(area.slug.clone());
+        }
+    }
+    out
+}
+
+fn area_paths_of(brief: &Option<Value>) -> Option<Vec<AreaPath>> {
+    let list = brief.as_ref()?.get("areaPaths")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|a| {
+                Some(AreaPath {
+                    slug: a.get("slug")?.as_str()?.to_string(),
+                    path: a.get("path")?.as_str()?.to_string(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -474,7 +533,11 @@ pub fn run_hook_with(
     let dialect = dialect_for(agent)?;
     let mut parts: Vec<String> = Vec::new();
     let mut session = |state: &mut SessionState, parts: &mut Vec<String>| {
-        let md = markdown_of(&fetch("session", None, &[], &[]));
+        let brief = fetch("session", None, &[], &[]);
+        if let Some(area_paths) = area_paths_of(&brief) {
+            state.area_paths = Some(area_paths);
+        }
+        let md = markdown_of(&brief);
         state.session_done = true;
         if !md.is_empty() {
             parts.push(md);
@@ -501,6 +564,13 @@ pub fn run_hook_with(
         HookMoment::File => {
             let paths = repo_relative(&call.files, call.cwd.as_deref(), repo_root);
             if paths.is_empty() {
+                return None;
+            }
+            // With the area map from the session briefing, only a file in an
+            // area not injected yet is worth a call.
+            if let Some(area_paths) = state.area_paths.as_deref()
+                && new_areas_for(&paths, area_paths, &state.areas).is_empty()
+            {
                 return None;
             }
             let brief = fetch("file", None, &paths, &state.areas);
@@ -696,6 +766,100 @@ mod tests {
     }
 
     #[test]
+    fn skips_the_call_for_files_outside_new_areas() {
+        let areas = vec![
+            AreaPath {
+                slug: "areas/src".into(),
+                path: "src/".into(),
+            },
+            AreaPath {
+                slug: "areas/src-payments".into(),
+                path: "src/payments/".into(),
+            },
+        ];
+        assert_eq!(
+            new_areas_for(
+                &[
+                    "src/payments/a.ts".into(),
+                    "src/x.ts".into(),
+                    "README.md".into()
+                ],
+                &areas,
+                &[]
+            ),
+            vec!["areas/src-payments".to_string(), "areas/src".to_string()]
+        );
+        assert!(
+            new_areas_for(
+                &["src/payments/a.ts".into()],
+                &areas,
+                &["areas/src-payments".into()]
+            )
+            .is_empty()
+        );
+        assert!(new_areas_for(&["docs/a.md".into()], &areas, &[]).is_empty());
+
+        // The session briefing carries the area map; a later read outside a new
+        // area makes no call.
+        let root = Path::new("/repo");
+        let mut state = SessionState::default();
+        let calls = RefCell::new(0);
+        let mut fetch = |mode: &str, _q: Option<&str>, _p: &[String], _s: &[String]| {
+            *calls.borrow_mut() += 1;
+            match mode {
+                "session" => Some(
+                    json!({"markdown": "map", "areaPaths": [{"slug": "areas/src-payments", "path": "src/payments/"}]}),
+                ),
+                _ => Some(json!({"markdown": "area page", "areas": ["areas/src-payments"]})),
+            }
+        };
+        let start =
+            call(json!({"hook_event_name": "SessionStart", "session_id": "s", "cwd": "/repo"}))
+                .unwrap();
+        run_hook_with("claude", &start, root, true, &mut state, &mut fetch).unwrap();
+        let read = |file: &str| {
+            call(json!({"hook_event_name": "PostToolUse", "tool_name": "Read", "session_id": "s", "cwd": "/repo",
+                        "tool_input": {"file_path": file}})).unwrap()
+        };
+        assert!(
+            run_hook_with(
+                "claude",
+                &read("/repo/README.md"),
+                root,
+                true,
+                &mut state,
+                &mut fetch
+            )
+            .is_none()
+        );
+        assert_eq!(*calls.borrow(), 1, "no call for a file outside every area");
+        assert!(
+            run_hook_with(
+                "claude",
+                &read("/repo/src/payments/a.ts"),
+                root,
+                true,
+                &mut state,
+                &mut fetch
+            )
+            .is_some()
+        );
+        assert_eq!(*calls.borrow(), 2);
+        assert!(
+            run_hook_with(
+                "claude",
+                &read("/repo/src/payments/b.ts"),
+                root,
+                true,
+                &mut state,
+                &mut fetch
+            )
+            .is_none()
+        );
+        assert_eq!(*calls.borrow(), 2, "no call once the area was injected");
+    }
+
+    #[test]
     fn makes_files_repo_relative() {
         let root = Path::new("/repo");
         assert_eq!(
@@ -765,12 +929,12 @@ mod tests {
                 render_output(
                     HookDialect::Copilot,
                     HookMoment::SessionStart,
-                    "sessionStart",
+                    "SessionStart",
                     "m"
                 )
                 .unwrap()
             ),
-            json!({"additionalContext": "m"})
+            json!({"additionalContext": "m", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "m"}})
         );
         assert!(
             render_output(
