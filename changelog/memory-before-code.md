@@ -25,12 +25,12 @@ Researched 2026-10-25 from each agent's hook documentation.
 | OpenCode | plugin: `experimental.chat.system.transform`, `chat.message` | system prompt | The briefing and the sections for the latest prompt, cached per session. |
 | Amp | plugin: `agent.start` | hidden message | |
 | Pi | extension: `before_agent_start` | hidden `autter-memory` message | |
-| Windsurf, Continue CLI | none | | Windsurf hooks cannot add context; Continue's hooks are not wired yet (it reads `~/.claude/settings.json`, so Claude's hooks will apply once it is). Use the `autter-memory` skill or `autter memory`. |
+| Windsurf, Continue CLI | none | | Windsurf hooks cannot add context; Continue's hooks are not wired yet (it reads `~/.claude/settings.json`, so Claude's hooks will apply once it is). Use the `autter-repo-context` skill or `autter memory`. |
 
 ## Also
 
 - `autter memory [question] [--path <file>]...` prints the briefing in a terminal: the map, the sections matching a question, or the area pages for files. For people, and for agents whose hooks cannot add context.
-- The `autter-memory` skill (`autter install --skills`) tells agents to load the memory for the files they are about to change, through the MCP tools or `autter memory`, and to record durable lessons back.
+- The `autter-repo-context` skill in [Autter-dev/autter-skills](https://github.com/Autter-dev/autter-skills) (`npx skills add Autter-dev/autter-skills --skill autter-repo-context`) tells agents to load the memory for the files they are about to change, through the MCP tools or `autter memory`, and to record durable lessons back. It lives there rather than in the CLI so agents without the CLI's hooks (Cursor, Windsurf, Continue) get it too, and so there is one skill for reading Autter before coding.
 
 ## Privacy and switches
 

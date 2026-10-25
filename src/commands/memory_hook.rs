@@ -694,8 +694,8 @@ pub fn handle_memory_hook(args: &[String]) {
 
 /// `autter memory [question] [--path <file>]...`: print the repository memory
 /// briefing in a terminal. For people, and for agents whose hooks cannot add
-/// context (the bundled `autter-memory` skill tells them to run it before
-/// editing): no arguments prints the session briefing (the map), a question
+/// context (the `autter-repo-context` skill in Autter-dev/autter-skills tells
+/// them to run it before editing): no arguments prints the session briefing (the map), a question
 /// prints the matching sections, `--path` prints the area pages for files.
 pub fn handle_memory_command(args: &[String]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
