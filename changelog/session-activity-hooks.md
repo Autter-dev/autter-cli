@@ -21,7 +21,7 @@ Autter's repository memory reads these session events to learn what people ask a
 | Amp | `agent.end` | plugin; now also sends the thread id |
 | Pi | `agent_end` | extension |
 
-Not covered, because there is no transcript the daemon reads for them or no hook point: Firebender, Antigravity, Continue CLI, and the JetBrains, VS Code-extension and Visual Studio integrations. Their sessions are still read by the periodic sweep where the agent has a stream reader.
+Not covered, because there is no transcript the daemon reads for them or no hook point: Firebender, Antigravity, Continue CLI, and the JetBrains, VS Code-extension and Visual Studio integrations. Their sessions are still read by the periodic sweep where the agent has a stream reader. (Firebender, Antigravity, Continue CLI and Cursor without transcripts are covered by `agent-capture-gaps.md`.)
 
 ## Changes
 

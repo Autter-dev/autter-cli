@@ -1,8 +1,9 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext,
+    PresetContext, StreamFormat, StreamSource, session_activity_event,
 };
+use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::AutterError;
@@ -14,15 +15,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct FirebenderPreset;
 
+/// Firebender's turn-end events (its hooks follow Cursor's schema). They wake
+/// the transcript reader; `transcript_path` is null when Firebender's
+/// transcripts are off, and then there is nothing to read.
+pub const FIREBENDER_SESSION_ACTIVITY_EVENTS: [&str; 2] = ["stop", "sessionEnd"];
+
 #[derive(Debug, Deserialize)]
 struct FirebenderHookInput {
     hook_event_name: String,
+    #[serde(default)]
     model: String,
     repo_working_dir: Option<String>,
     workspace_roots: Option<Vec<String>>,
     tool_name: Option<String>,
     tool_input: Option<serde_json::Value>,
     completion_id: Option<String>,
+    /// Stable across a conversation's turns (Cursor-compatible hooks).
+    conversation_id: Option<String>,
+    /// Per user message in current Firebender builds.
+    generation_id: Option<String>,
+    /// The conversation transcript; null when Firebender's transcripts are off.
+    transcript_path: Option<String>,
     dirty_files: Option<HashMap<String, String>>,
     tool_use_id: Option<String>,
 }
@@ -128,9 +141,74 @@ impl AgentPreset for FirebenderPreset {
             tool_name,
             tool_input,
             completion_id,
+            conversation_id,
+            generation_id,
+            transcript_path,
             dirty_files,
             tool_use_id,
         } = hook_input;
+
+        let non_empty =
+            |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let conversation_id = non_empty(conversation_id);
+        let transcript_path = non_empty(transcript_path);
+        let model = {
+            let m = model.trim().to_string();
+            if m.is_empty() {
+                "unknown".to_string()
+            } else {
+                m
+            }
+        };
+        let cwd = repo_working_dir
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| workspace_roots.and_then(|roots| roots.into_iter().next()));
+        let cwd_str = cwd.as_deref().unwrap_or(".").to_string();
+
+        // The conversation, when the hook names it; otherwise the completion
+        // (older builds), otherwise now.
+        let session_id = conversation_id
+            .clone()
+            .or_else(|| non_empty(completion_id))
+            .or_else(|| non_empty(generation_id))
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis().to_string())
+                    .unwrap_or_else(|_| "0".to_string())
+            });
+        let stream_source = transcript_path.as_ref().map(|tp| {
+            let path = PathBuf::from(tp);
+            let external = conversation_id
+                .clone()
+                .or_else(|| {
+                    crate::streams::agents::JsonlFlavor::Firebender.external_session_id(&path)
+                })
+                .unwrap_or_else(|| session_id.clone());
+            StreamSource {
+                session_id: generate_session_id(&external, "firebender"),
+                external_session_id: external,
+                path,
+                format: StreamFormat::FirebenderJsonl,
+                external_parent_session_id: None,
+            }
+        });
+        let make_context = |trace_id: &str| PresetContext {
+            agent_id: AgentId {
+                tool: "firebender".to_string(),
+                id: format!("firebender-{}", session_id),
+                model: model.clone(),
+            },
+            external_session_id: session_id.clone(),
+            trace_id: trace_id.to_string(),
+            cwd: PathBuf::from(&cwd_str),
+            metadata: HashMap::new(),
+        };
+
+        if FIREBENDER_SESSION_ACTIVITY_EVENTS.contains(&hook_event_name.as_str()) {
+            return session_activity_event(make_context(trace_id), stream_source);
+        }
 
         // Legacy events that should be silently skipped
         if hook_event_name == "beforeSubmitPrompt" || hook_event_name == "afterFileEdit" {
@@ -142,7 +220,7 @@ impl AgentPreset for FirebenderPreset {
 
         if hook_event_name != "preToolUse" && hook_event_name != "postToolUse" {
             return Err(AutterError::PresetError(format!(
-                "Invalid hook_event_name: {}. Expected 'preToolUse' or 'postToolUse'",
+                "Invalid hook_event_name: {}. Expected 'preToolUse', 'postToolUse' or 'stop'",
                 hook_event_name
             )));
         }
@@ -157,12 +235,7 @@ impl AgentPreset for FirebenderPreset {
         }
         let is_bash = tool_class == ToolClass::Bash;
 
-        let cwd = repo_working_dir
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| workspace_roots.and_then(|roots| roots.into_iter().next()));
-
-        let cwd_str = cwd.as_deref().unwrap_or(".");
+        let cwd_str = cwd_str.as_str();
 
         let tool_input = tool_input.unwrap_or(serde_json::Value::Null);
         let file_paths_raw = Self::extract_file_paths(&tool_input).map(|paths| {
@@ -178,33 +251,7 @@ impl AgentPreset for FirebenderPreset {
             .map(|p| parse::resolve_absolute(&p, cwd_str))
             .collect();
 
-        let model = {
-            let m = model.trim().to_string();
-            if m.is_empty() {
-                "unknown".to_string()
-            } else {
-                m
-            }
-        };
-
-        let session_id = completion_id.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis().to_string())
-                .unwrap_or_else(|_| "0".to_string())
-        });
-
-        let context = PresetContext {
-            agent_id: AgentId {
-                tool: "firebender".to_string(),
-                id: format!("firebender-{}", session_id),
-                model,
-            },
-            external_session_id: session_id.clone(),
-            trace_id: trace_id.to_string(),
-            cwd: PathBuf::from(cwd_str),
-            metadata: HashMap::new(),
-        };
+        let context = make_context(trace_id);
 
         let dirty =
             dirty_files.map(|df| df.into_iter().map(|(k, v)| (PathBuf::from(k), v)).collect());
@@ -225,13 +272,13 @@ impl AgentPreset for FirebenderPreset {
             (_, true) => ParsedHookEvent::PostBashCall(PostBashCall {
                 context,
                 tool_use_id: tool_use_id_str,
-                stream_source: None,
+                stream_source,
             }),
             (_, false) => ParsedHookEvent::PostFileEdit(PostFileEdit {
                 context,
                 file_paths,
                 dirty_files: dirty,
-                stream_source: None,
+                stream_source,
                 tool_use_id: Some(tool_use_id_str),
             }),
         };

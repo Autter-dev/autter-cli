@@ -18,13 +18,16 @@
 //! in `toolCall.args.TargetFile`; `run_command` gives `CommandLine` and `Cwd`.
 //!
 //! The conversation transcript (`transcriptPath`, a `transcript.jsonl` under
-//! the app data dir) has no documented record format, so it is not bridged
-//! into prompt storage.
+//! the app data dir) has no documented record format. It is not bridged into
+//! commit prompt storage, but PostToolUse hands it to the transcript reader,
+//! which uploads its lines as written (a one-minute sweep also finds it, for
+//! builds whose hooks do not run); the backend reads the shapes it recognises.
 
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext,
+    PresetContext, StreamFormat, StreamSource,
 };
+use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::AutterError;
@@ -117,12 +120,25 @@ impl AgentPreset for AntigravityPreset {
         })?;
 
         let mut metadata = HashMap::new();
-        if let Some(path) = data.get("transcriptPath").and_then(Value::as_str) {
-            // Kept for reference only: the transcript format is undocumented,
-            // so it is deliberately not stored under `transcript_path` (which
-            // would make the prompt bridge try to parse it).
-            metadata.insert("antigravity_transcript_path".to_string(), path.to_string());
+        let transcript_path = data
+            .get("transcriptPath")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+        if let Some(path) = &transcript_path {
+            // The transcript format is undocumented, so it is deliberately not
+            // stored under `transcript_path` (which would make the commit prompt
+            // bridge try to parse it). The session reader below uploads its
+            // lines as written instead.
+            metadata.insert("antigravity_transcript_path".to_string(), path.clone());
         }
+        let stream_source = transcript_path.map(|path| StreamSource {
+            path: PathBuf::from(path),
+            format: StreamFormat::AntigravityJsonl,
+            session_id: generate_session_id(&conversation_id, TOOL),
+            external_session_id: conversation_id.clone(),
+            external_parent_session_id: None,
+        });
 
         let context = PresetContext {
             agent_id: AgentId {
@@ -147,7 +163,7 @@ impl AgentPreset for AntigravityPreset {
                 ParsedHookEvent::PostBashCall(PostBashCall {
                     context,
                     tool_use_id,
-                    stream_source: None,
+                    stream_source,
                 })
             }
             (AntigravityPhase::PreToolUse, _) => ParsedHookEvent::PreFileEdit(PreFileEdit {
@@ -160,7 +176,7 @@ impl AgentPreset for AntigravityPreset {
                 context,
                 file_paths,
                 dirty_files: None,
-                stream_source: None,
+                stream_source,
                 tool_use_id: Some(tool_use_id),
             }),
         };
@@ -249,7 +265,18 @@ mod tests {
                         e.file_paths,
                         vec![PathBuf::from("/workspace/project/src/lib.rs")]
                     );
-                    assert!(e.stream_source.is_none());
+                    // The transcript goes to the session reader, never to the
+                    // commit prompt bridge (`transcript_path`).
+                    let source = e
+                        .stream_source
+                        .as_ref()
+                        .expect("transcript handed to the reader");
+                    assert_eq!(source.format, StreamFormat::AntigravityJsonl);
+                    assert_eq!(
+                        source.external_session_id,
+                        "ec33ebf9-0cba-4100-8142-c61503f6c587"
+                    );
+                    assert!(source.path.ends_with("logs/transcript.jsonl"));
                     assert!(!e.context.metadata.contains_key("transcript_path"));
                 }
                 other => panic!("{tool}: expected PostFileEdit, got {other:?}"),

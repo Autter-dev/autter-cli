@@ -42,6 +42,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod cursor_state;
 pub mod db;
 pub mod model_extraction;
 pub mod sweep;

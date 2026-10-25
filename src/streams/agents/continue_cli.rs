@@ -8,6 +8,14 @@ use crate::streams::watermark::{RecordIndexWatermark, WatermarkStrategy};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Where Continue CLI keeps its session files, relative to home.
+const CONTINUE_SESSION_DIRS: [&str; 2] = [".continue/sessions", ".continue-cli/sessions"];
+
+/// Continue CLI has no hook, so only a sweep finds its sessions. It asks for a
+/// one-minute sweep (a glob and a stat per file) instead of the 30-minute
+/// full sweep, so prompts arrive about as fast as a hooked agent's.
+pub const CONTINUE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Continue CLI agent that reads Continue JSON transcript files.
 ///
 /// Uses `RecordIndexWatermark` because the format has no timestamps at all.
@@ -27,20 +35,24 @@ impl ContinueAgent {
         Self { batch_size }
     }
 
-    /// Scan for Continue session files in `~/.continue/sessions/**/*.json`.
+    /// Scan for Continue session files in `~/.continue/sessions/**/*.json`
+    /// and `~/.continue-cli/sessions/**/*.json` (newer `cn` builds).
     fn scan_session_files() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
         if let Some(home) = dirs::home_dir() {
-            let pattern = home
-                .join(".continue/sessions/**/*.json")
-                .to_string_lossy()
-                .to_string();
+            for dir in CONTINUE_SESSION_DIRS {
+                let pattern = home
+                    .join(dir)
+                    .join("**/*.json")
+                    .to_string_lossy()
+                    .to_string();
 
-            if let Ok(entries) = glob::glob(&pattern) {
-                for entry in entries.flatten() {
-                    if entry.is_file() {
-                        paths.push(entry);
+                if let Ok(entries) = glob::glob(&pattern) {
+                    for entry in entries.flatten() {
+                        if entry.is_file() && !paths.contains(&entry) {
+                            paths.push(entry);
+                        }
                     }
                 }
             }
@@ -62,7 +74,7 @@ impl Agent for ContinueAgent {
     }
 
     fn sweep_strategy(&self) -> SweepStrategy {
-        SweepStrategy::Periodic(Duration::from_secs(30 * 60))
+        SweepStrategy::Periodic(CONTINUE_SWEEP_INTERVAL)
     }
 
     fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError> {
@@ -199,7 +211,12 @@ mod tests {
         let agent = ContinueAgent::new();
         assert_eq!(
             agent.sweep_strategy(),
-            SweepStrategy::Periodic(Duration::from_secs(30 * 60))
+            SweepStrategy::Periodic(Duration::from_secs(60))
+        );
+        // No hook: Continue is swept on the fast ticker, not only every 30 minutes.
+        assert_eq!(
+            agent.sweep_strategy().fast_interval(),
+            Some(CONTINUE_SWEEP_INTERVAL)
         );
     }
 

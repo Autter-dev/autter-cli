@@ -42,10 +42,14 @@ What is still missing:
   Antigravity IDE build that executes `PreToolUse`/`PostToolUse` hooks. To check
   your build, edit a file with the IDE agent, commit, and run `autter stats`: AI
   lines mean the hooks ran.
-- **Transcripts.** Hooks pass `transcriptPath`, a `transcript.jsonl` under
-  `<app data dir>/brain/<conversationId>/.system_generated/logs/`, but its record
-  format is not documented, so autter does not import Antigravity prompts yet.
-  A documented (or stable, versioned) transcript schema would unblock this.
+- **Transcripts (best effort).** Hooks pass `transcriptPath`, a `transcript.jsonl`
+  under `<app data dir>/brain/<conversationId>/.system_generated/logs/`. Its record
+  format is not documented. autter uploads its lines as written (PostToolUse hands
+  the file to the transcript reader, and a one-minute sweep finds it for builds
+  whose hooks do not run), and the backend reads the user-turn shapes it
+  recognises. It is still not bridged into commit prompt storage. A documented
+  (or stable, versioned) transcript schema, or sample files, would confirm the
+  prompt extraction.
 - **Approval replies.** A `PreToolUse` hook must print a JSON reply. autter prints
   `{}` (no `decision`), which the CLI changelog says is handled safely ("safely
   handling empty decision strings returned by pre-tool hooks"). If a future build

@@ -189,6 +189,8 @@ const ALL_AGENT_TYPES: &[&str] = &[
     "amp",
     "opencode",
     "pi",
+    "firebender",
+    "antigravity",
 ];
 
 /// Get an agent implementation by type name.
@@ -210,6 +212,8 @@ pub fn get_agent(agent_type: &str) -> Option<Box<dyn Agent>> {
         "amp" => Some(Box::new(super::agents::AmpAgent::new())),
         "opencode" => Some(Box::new(super::agents::OpenCodeAgent::new())),
         "pi" => Some(Box::new(super::agents::PiAgent::new())),
+        "firebender" => Some(Box::new(super::agents::CursorAgent::firebender())),
+        "antigravity" => Some(Box::new(super::agents::CursorAgent::antigravity())),
         _ => None,
     }
 }

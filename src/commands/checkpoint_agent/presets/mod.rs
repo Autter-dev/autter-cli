@@ -150,6 +150,8 @@ pub enum StreamFormat {
     AmpThreadJson,
     OpenCodeSqlite,
     PiJsonl,
+    FirebenderJsonl,
+    AntigravityJsonl,
 }
 
 impl StreamFormat {
@@ -162,6 +164,8 @@ impl StreamFormat {
             | Self::WindsurfJsonl
             | Self::CodexJsonl
             | Self::PiJsonl
+            | Self::FirebenderJsonl
+            | Self::AntigravityJsonl
             | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
             Self::DroidJsonl => WatermarkType::Hybrid,
             Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
@@ -269,6 +273,7 @@ mod session_activity_preset_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn cursor_stop_with_and_without_transcript() {
         let e = activity(
             "cursor",
@@ -279,6 +284,10 @@ mod session_activity_preset_tests {
         assert_eq!(e.stream_source.format, StreamFormat::CursorJsonl);
         assert_eq!(e.context.cwd, std::path::PathBuf::from("/p"));
 
+        // Without a transcript and with no conversation in Cursor's database,
+        // there is nothing to read.
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = CursorStateEnv::set(&tmp.path().join("missing.vscdb"), &tmp.path().join("out"));
         let no_transcript = json!({"conversation_id": "k1", "hook_event_name": "stop",
                                    "workspace_roots": ["/p"], "transcript_path": null});
         assert!(
@@ -288,6 +297,130 @@ mod session_activity_preset_tests {
                 .is_err(),
             "nothing to read without a transcript"
         );
+    }
+
+    /// Points the Cursor database fallback at test paths; restores on drop.
+    /// Tests using it are `#[serial]` because the environment is process-wide.
+    struct CursorStateEnv;
+
+    impl CursorStateEnv {
+        fn set(db: &std::path::Path, out: &std::path::Path) -> Self {
+            unsafe {
+                std::env::set_var("CURSOR_STATE_DB", db);
+                std::env::set_var("AUTTER_CURSOR_EXPORT_DIR", out);
+            }
+            Self
+        }
+    }
+
+    impl Drop for CursorStateEnv {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("CURSOR_STATE_DB");
+                std::env::remove_var("AUTTER_CURSOR_EXPORT_DIR");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cursor_stop_without_transcript_reads_cursors_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+        )
+        .unwrap();
+        for (key, value) in [
+            (
+                "composerData:k2",
+                json!({"fullConversationHeadersOnly": [{"bubbleId": "b1", "type": 1}]}),
+            ),
+            (
+                "bubbleId:k2:b1",
+                json!({"type": 1, "text": "Rename the retry flag"}),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value.to_string()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let out = tmp.path().join("out");
+        let _env = CursorStateEnv::set(&db, &out);
+
+        let e = activity(
+            "cursor",
+            json!({"conversation_id": "k2", "hook_event_name": "stop",
+                   "workspace_roots": ["/p"], "transcript_path": null}),
+        );
+        assert_eq!(e.stream_source.format, StreamFormat::CursorJsonl);
+        assert_eq!(e.stream_source.path, out.join("k2.jsonl"));
+        assert_eq!(e.stream_source.external_session_id, "k2");
+        let written = std::fs::read_to_string(out.join("k2.jsonl")).unwrap();
+        assert!(written.contains("Rename the retry flag"));
+        assert!(written.contains(r#""role":"user""#));
+    }
+
+    #[test]
+    fn firebender_stop_and_transcripts() {
+        let e = activity(
+            "firebender",
+            json!({"hook_event_name": "stop", "conversation_id": "fb-1", "generation_id": "gen-9",
+                   "model": "claude-sonnet-4-5", "workspace_roots": ["/p"],
+                   "transcript_path": "/h/.firebender/projects/p/transcripts/agent-fb-1.jsonl"}),
+        );
+        assert_eq!(e.stream_source.format, StreamFormat::FirebenderJsonl);
+        assert_eq!(e.stream_source.external_session_id, "fb-1");
+        assert_eq!(e.context.agent_id.id, "firebender-fb-1");
+        assert_eq!(e.context.cwd, std::path::PathBuf::from("/p"));
+
+        // A transcript path without a conversation id still names the session.
+        let e = activity(
+            "firebender",
+            json!({"hook_event_name": "sessionEnd", "workspace_roots": ["/p"],
+                   "transcript_path": "/h/.firebender/projects/p/transcripts/agent-fb-2.jsonl"}),
+        );
+        assert_eq!(e.stream_source.external_session_id, "fb-2");
+
+        // Transcripts off: nothing to read.
+        assert!(
+            resolve_preset("firebender")
+                .unwrap()
+                .parse(
+                    &json!({"hook_event_name": "stop", "conversation_id": "fb-1",
+                            "workspace_roots": ["/p"], "transcript_path": null})
+                    .to_string(),
+                    "t"
+                )
+                .is_err()
+        );
+
+        // Edits in the same conversation carry the transcript too.
+        let events = resolve_preset("firebender")
+            .unwrap()
+            .parse(
+                &json!({"hook_event_name": "postToolUse", "conversation_id": "fb-1",
+                        "model": "m", "repo_working_dir": "/p", "tool_name": "Write",
+                        "tool_input": {"file_path": "src/lib.rs"},
+                        "transcript_path": "/h/.firebender/projects/p/transcripts/agent-fb-1.jsonl"})
+                .to_string(),
+                "t",
+            )
+            .unwrap();
+        match &events[..] {
+            [ParsedHookEvent::PostFileEdit(e)] => {
+                assert_eq!(e.context.agent_id.id, "firebender-fb-1");
+                assert_eq!(
+                    e.stream_source.as_ref().map(|s| s.format),
+                    Some(StreamFormat::FirebenderJsonl)
+                );
+            }
+            other => panic!("expected PostFileEdit, got {other:?}"),
+        }
     }
 
     #[test]

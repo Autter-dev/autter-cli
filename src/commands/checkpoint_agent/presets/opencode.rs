@@ -181,46 +181,50 @@ impl OpenCodePreset {
         .flatten()
     }
 
+    /// OpenCode keeps its data in the XDG data dir on every platform (it uses
+    /// `xdg-basedir`: `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`),
+    /// Windows included. `%APPDATA%`/`%LOCALAPPDATA%` are still checked for
+    /// older Windows setups. The first candidate that exists wins; when none
+    /// does, the XDG location is returned.
     fn opencode_data_path() -> Result<PathBuf, AutterError> {
-        #[cfg(target_os = "macos")]
-        {
-            let home = dirs::home_dir().ok_or_else(|| {
-                AutterError::Generic("Could not determine home directory".to_string())
-            })?;
-            Ok(home.join(".local").join("share").join("opencode"))
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
-                Ok(PathBuf::from(xdg_data).join("opencode"))
+        let candidates = Self::opencode_data_candidates(
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            dirs::home_dir(),
+            if cfg!(windows) {
+                vec![
+                    std::env::var_os("APPDATA").map(PathBuf::from),
+                    std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+                ]
             } else {
-                let home = dirs::home_dir().ok_or_else(|| {
-                    AutterError::Generic("Could not determine home directory".to_string())
-                })?;
-                Ok(home.join(".local").join("share").join("opencode"))
-            }
-        }
+                Vec::new()
+            },
+        );
+        candidates
+            .iter()
+            .find(|p| p.exists())
+            .or_else(|| candidates.first())
+            .cloned()
+            .ok_or_else(|| {
+                AutterError::Generic("Could not determine the OpenCode data directory".to_string())
+            })
+    }
 
-        #[cfg(target_os = "windows")]
-        {
-            if let Ok(app_data) = std::env::var("APPDATA") {
-                Ok(PathBuf::from(app_data).join("opencode"))
-            } else if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                Ok(PathBuf::from(local_app_data).join("opencode"))
-            } else {
-                Err(AutterError::Generic(
-                    "Neither APPDATA nor LOCALAPPDATA is set".to_string(),
-                ))
-            }
+    fn opencode_data_candidates(
+        xdg_data_home: Option<PathBuf>,
+        home: Option<PathBuf>,
+        windows_app_dirs: Vec<Option<PathBuf>>,
+    ) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(xdg) = xdg_data_home.filter(|p| !p.as_os_str().is_empty()) {
+            candidates.push(xdg.join("opencode"));
         }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            Err(AutterError::PresetError(
-                "OpenCode storage path not supported on this platform".to_string(),
-            ))
+        if let Some(home) = home {
+            candidates.push(home.join(".local").join("share").join("opencode"));
         }
+        for dir in windows_app_dirs.into_iter().flatten() {
+            candidates.push(dir.join("opencode"));
+        }
+        candidates
     }
 
     fn resolve_sqlite_db_path(path: &Path) -> Option<PathBuf> {
@@ -356,6 +360,32 @@ mod tests {
     use super::*;
     use crate::commands::checkpoint_agent::presets::*;
     use serde_json::json;
+
+    #[test]
+    fn opencode_data_dir_is_xdg_first_on_every_platform() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            OpenCodePreset::opencode_data_candidates(None, Some(home.clone()), Vec::new()),
+            vec![home.join(".local").join("share").join("opencode")]
+        );
+        assert_eq!(
+            OpenCodePreset::opencode_data_candidates(
+                Some(PathBuf::from("/xdg")),
+                Some(home.clone()),
+                vec![Some(PathBuf::from("C:/AppData/Roaming")), None],
+            ),
+            vec![
+                PathBuf::from("/xdg").join("opencode"),
+                home.join(".local").join("share").join("opencode"),
+                PathBuf::from("C:/AppData/Roaming").join("opencode"),
+            ]
+        );
+        // An empty XDG_DATA_HOME is ignored.
+        assert_eq!(
+            OpenCodePreset::opencode_data_candidates(Some(PathBuf::new()), None, Vec::new()),
+            Vec::<PathBuf>::new()
+        );
+    }
 
     fn make_opencode_input(event: &str, tool: &str) -> String {
         json!({

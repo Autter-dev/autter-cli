@@ -13,7 +13,8 @@ pub fn extract_model(
         StreamFormat::ClaudeJsonl
         | StreamFormat::CopilotEventStreamJsonl
         | StreamFormat::GeminiJsonl
-        | StreamFormat::CursorJsonl => extract_model_from_jsonl_tail(path),
+        | StreamFormat::CursorJsonl
+        | StreamFormat::FirebenderJsonl => extract_model_from_jsonl_tail(path),
         StreamFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
         StreamFormat::AmpThreadJson => extract_model_from_amp_thread_json(path),
         StreamFormat::OpenCodeSqlite => extract_model_from_opencode_sqlite(path, session_id),

@@ -8,6 +8,11 @@ use std::path::PathBuf;
 const FIREBENDER_CHECKPOINT_CMD: &str = "checkpoint firebender --hook-input stdin";
 const FIREBENDER_PRE_TOOL_USE_CMD: &str = "checkpoint firebender --hook-input stdin";
 const FIREBENDER_POST_TOOL_USE_CMD: &str = "checkpoint firebender --hook-input stdin";
+const FIREBENDER_STOP_CMD: &str = "checkpoint firebender --hook-input stdin";
+
+/// Every event autter hooks. `stop` (turn end) wakes the transcript reader so
+/// prompts arrive even from turns that edit nothing.
+const FIREBENDER_HOOK_EVENTS: [&str; 3] = ["preToolUse", "postToolUse", "stop"];
 
 pub struct FirebenderInstaller;
 
@@ -53,40 +58,30 @@ impl HookInstaller for FirebenderInstaller {
         let content = fs::read_to_string(&hooks_path)?;
         let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
 
-        let has_pre = existing
-            .get("hooks")
-            .and_then(|h| h.get("preToolUse"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter().any(|item| {
-                    item.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(Self::is_firebender_checkpoint_command)
-                        .unwrap_or(false)
-                        && item.get("matcher").is_none()
+        let has = |event: &str| {
+            existing
+                .get("hooks")
+                .and_then(|h| h.get(event))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|item| {
+                        item.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(Self::is_firebender_checkpoint_command)
+                            .unwrap_or(false)
+                            && item.get("matcher").is_none()
+                    })
                 })
-            })
-            .unwrap_or(false);
-
-        let has_post = existing
-            .get("hooks")
-            .and_then(|h| h.get("postToolUse"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter().any(|item| {
-                    item.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(Self::is_firebender_checkpoint_command)
-                        .unwrap_or(false)
-                        && item.get("matcher").is_none()
-                })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false)
+        };
+        let has_pre = has("preToolUse");
+        let has_post = has("postToolUse");
+        let has_stop = has("stop");
 
         Ok(HookCheckResult {
             tool_installed: true,
             hooks_installed: has_pre && has_post,
-            hooks_up_to_date: has_pre && has_post,
+            hooks_up_to_date: has_pre && has_post && has_stop,
         })
     }
 
@@ -135,6 +130,11 @@ impl HookInstaller for FirebenderInstaller {
                     {
                         "command": post_tool_use_cmd
                     }
+                ],
+                "stop": [
+                    {
+                        "command": format!("{} {}", params.binary_path.display(), FIREBENDER_STOP_CMD)
+                    }
                 ]
             }
         });
@@ -148,7 +148,7 @@ impl HookInstaller for FirebenderInstaller {
 
         let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
 
-        for hook_name in &["preToolUse", "postToolUse"] {
+        for hook_name in &FIREBENDER_HOOK_EVENTS {
             let desired_hooks = desired
                 .get("hooks")
                 .and_then(|h| h.get(*hook_name))
@@ -233,7 +233,7 @@ impl HookInstaller for FirebenderInstaller {
         };
         let mut changed = false;
 
-        for hook_name in &["preToolUse", "postToolUse"] {
+        for hook_name in &FIREBENDER_HOOK_EVENTS {
             if let Some(arr) = hooks_obj.get_mut(*hook_name).and_then(|v| v.as_array_mut()) {
                 let original_len = arr.len();
                 arr.retain(|item| {

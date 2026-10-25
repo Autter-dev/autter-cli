@@ -1,4 +1,14 @@
-//! Cursor agent implementation with sweep discovery.
+//! Cursor-style JSONL transcripts (one JSON object per line, append-only),
+//! with sweep discovery. One reader serves three agents:
+//!
+//! - Cursor: `~/.cursor/projects/**/*.jsonl` (written when Cursor's
+//!   transcripts setting is on), plus the transcripts autter copies out of
+//!   Cursor's own database when it is off (`cursor_state`).
+//! - Firebender: Cursor-compatible hooks and transcripts,
+//!   `~/.firebender/projects/**/agent-<conversationId>.jsonl`.
+//! - Antigravity: `~/.gemini/antigravity*/brain/<conversationId>/.system_generated/logs/transcript.jsonl`.
+//!   Its record format is undocumented, so lines are uploaded as written and the
+//!   backend reads the shapes it recognises.
 
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::streams::agent::{Agent, PathResolverKind, StreamDescriptor};
@@ -9,41 +19,139 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Cursor agent that discovers conversations from Cursor storage.
+/// Which agent's JSONL transcripts a [`CursorAgent`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonlFlavor {
+    Cursor,
+    Firebender,
+    Antigravity,
+}
+
+/// Antigravity hooks may not run in every build (the IDE), so its transcripts
+/// are also found by a one-minute sweep.
+pub const ANTIGRAVITY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+impl JsonlFlavor {
+    pub fn tool(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::Firebender => "firebender",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    fn format(self) -> StreamFormat {
+        match self {
+            Self::Cursor => StreamFormat::CursorJsonl,
+            Self::Firebender => StreamFormat::FirebenderJsonl,
+            Self::Antigravity => StreamFormat::AntigravityJsonl,
+        }
+    }
+
+    /// The agent's conversation id for a transcript file: the file stem for
+    /// Cursor, the stem without `agent-` for Firebender, and the `brain/<id>`
+    /// directory for Antigravity.
+    pub fn external_session_id(self, path: &Path) -> Option<String> {
+        match self {
+            Self::Cursor => path.file_stem()?.to_str().map(str::to_string),
+            Self::Firebender => {
+                let stem = path.file_stem()?.to_str()?;
+                Some(stem.strip_prefix("agent-").unwrap_or(stem).to_string())
+            }
+            Self::Antigravity => path
+                .parent()? // logs
+                .parent()? // .system_generated
+                .parent()? // <conversationId>
+                .file_name()?
+                .to_str()
+                .map(str::to_string),
+        }
+    }
+}
+
+/// Reads Cursor-style JSONL transcripts for one agent ([`JsonlFlavor`]).
 pub struct CursorAgent {
     batch_size: usize,
+    flavor: JsonlFlavor,
 }
 
 impl CursorAgent {
     pub fn new() -> Self {
-        Self { batch_size: 1000 }
+        Self::for_flavor(JsonlFlavor::Cursor)
+    }
+
+    pub fn firebender() -> Self {
+        Self::for_flavor(JsonlFlavor::Firebender)
+    }
+
+    pub fn antigravity() -> Self {
+        Self::for_flavor(JsonlFlavor::Antigravity)
+    }
+
+    fn for_flavor(flavor: JsonlFlavor) -> Self {
+        Self {
+            batch_size: 1000,
+            flavor,
+        }
     }
 
     #[cfg(test)]
     pub fn with_batch_size(batch_size: usize) -> Self {
-        Self { batch_size }
+        Self {
+            batch_size,
+            flavor: JsonlFlavor::Cursor,
+        }
     }
 
-    /// Scan for Cursor conversation files in standard locations.
-    fn scan_conversation_files() -> Vec<PathBuf> {
+    /// Scan for this agent's transcript files in their standard locations.
+    fn scan_conversation_files(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-
-        let base_dir = if let Ok(config_dir) = std::env::var("CURSOR_CONFIG_DIR") {
-            Some(PathBuf::from(config_dir))
-        } else {
-            dirs::home_dir().map(|p| p.join(".cursor"))
-        };
-
-        let search_dirs = vec![base_dir.as_ref().map(|p| p.join("projects"))];
-
-        for dir_opt in search_dirs {
-            if let Some(dir) = dir_opt
-                && dir.exists()
-            {
-                Self::scan_jsonl_recursive(&dir, &mut paths);
+        match self.flavor {
+            JsonlFlavor::Cursor => {
+                let base_dir = if let Ok(config_dir) = std::env::var("CURSOR_CONFIG_DIR") {
+                    Some(PathBuf::from(config_dir))
+                } else {
+                    dirs::home_dir().map(|p| p.join(".cursor"))
+                };
+                let search_dirs = vec![
+                    base_dir.as_ref().map(|p| p.join("projects")),
+                    crate::streams::cursor_state::exported_transcripts_dir(),
+                ];
+                for dir in search_dirs.into_iter().flatten() {
+                    if dir.exists() {
+                        Self::scan_jsonl_recursive(&dir, &mut paths);
+                    }
+                }
+            }
+            JsonlFlavor::Firebender => {
+                let base_dir = if let Ok(config_dir) = std::env::var("FIREBENDER_CONFIG_DIR") {
+                    Some(PathBuf::from(config_dir))
+                } else {
+                    dirs::home_dir().map(|p| p.join(".firebender"))
+                };
+                if let Some(dir) = base_dir.map(|p| p.join("projects"))
+                    && dir.exists()
+                {
+                    Self::scan_jsonl_recursive(&dir, &mut paths);
+                }
+            }
+            JsonlFlavor::Antigravity => {
+                let base = if let Ok(dir) = std::env::var("ANTIGRAVITY_GEMINI_DIR") {
+                    Some(PathBuf::from(dir))
+                } else {
+                    dirs::home_dir().map(|p| p.join(".gemini"))
+                };
+                if let Some(base) = base {
+                    let pattern = base
+                        .join("antigravity*/brain/*/.system_generated/logs/transcript.jsonl")
+                        .to_string_lossy()
+                        .to_string();
+                    if let Ok(entries) = glob::glob(&pattern) {
+                        paths.extend(entries.flatten().filter(|p| p.is_file()));
+                    }
+                }
             }
         }
-
         paths
     }
 
@@ -76,28 +184,27 @@ impl Agent for CursorAgent {
     }
 
     fn sweep_strategy(&self) -> SweepStrategy {
-        // Poll every 30 minutes for new Cursor conversations
-        SweepStrategy::Periodic(Duration::from_secs(30 * 60))
+        match self.flavor {
+            JsonlFlavor::Antigravity => SweepStrategy::Periodic(ANTIGRAVITY_SWEEP_INTERVAL),
+            // Hooks wake the reader; the full sweep catches anything they missed.
+            _ => SweepStrategy::Periodic(Duration::from_secs(30 * 60)),
+        }
     }
 
     fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError> {
-        let paths = Self::scan_conversation_files();
+        let paths = self.scan_conversation_files();
         let mut sessions = Vec::new();
+        let tool = self.flavor.tool();
 
         for path in paths {
-            // Cursor conversation_id is the file stem
-            let Some(external_session_id) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-            else {
+            let Some(external_session_id) = self.flavor.external_session_id(&path) else {
                 continue;
             };
-            let session_id = generate_session_id(&external_session_id, "cursor");
+            let session_id = generate_session_id(&external_session_id, tool);
 
             let session = DiscoveredSession {
                 session_id,
-                tool: "cursor".to_string(),
+                tool: tool.to_string(),
                 stream_path: path,
                 external_session_id,
                 external_parent_session_id: None,
@@ -218,7 +325,7 @@ impl Agent for CursorAgent {
     }
 
     fn streams(&self) -> Vec<StreamDescriptor> {
-        let format = StreamFormat::CursorJsonl;
+        let format = self.flavor.format();
         vec![StreamDescriptor {
             stream_kind: "transcript",
             format,
@@ -378,5 +485,101 @@ mod tests {
         assert_eq!(result.events.len(), 2);
         assert_eq!(result.events[0]["role"].as_str(), Some("user"));
         assert_eq!(result.events[1]["role"].as_str(), Some("assistant"));
+    }
+}
+
+#[cfg(test)]
+mod flavor_tests {
+    use super::*;
+
+    #[test]
+    fn names_each_agents_conversation() {
+        assert_eq!(
+            JsonlFlavor::Cursor
+                .external_session_id(Path::new(
+                    "/h/.cursor/projects/p/agent-transcripts/k1.jsonl"
+                ))
+                .as_deref(),
+            Some("k1")
+        );
+        assert_eq!(
+            JsonlFlavor::Firebender
+                .external_session_id(Path::new(
+                    "/h/.firebender/projects/p/transcripts/agent-fb-1.jsonl"
+                ))
+                .as_deref(),
+            Some("fb-1")
+        );
+        assert_eq!(
+            JsonlFlavor::Antigravity
+                .external_session_id(Path::new(
+                    "/h/.gemini/antigravity-ide/brain/ec33/.system_generated/logs/transcript.jsonl"
+                ))
+                .as_deref(),
+            Some("ec33")
+        );
+    }
+
+    #[test]
+    fn firebender_and_antigravity_have_readers() {
+        for (tool, format) in [
+            ("firebender", StreamFormat::FirebenderJsonl),
+            ("antigravity", StreamFormat::AntigravityJsonl),
+        ] {
+            let agent = crate::streams::agent::get_agent(tool).expect(tool);
+            assert_eq!(agent.streams()[0].format, format, "{tool}");
+            assert!(
+                crate::streams::agent::get_all_agents()
+                    .iter()
+                    .any(|(name, _)| name == tool),
+                "{tool} is swept"
+            );
+        }
+        // Antigravity hooks may not run (the IDE), so it is swept every minute.
+        assert_eq!(
+            CursorAgent::antigravity().sweep_strategy().fast_interval(),
+            Some(ANTIGRAVITY_SWEEP_INTERVAL)
+        );
+        assert_eq!(
+            CursorAgent::firebender().sweep_strategy().fast_interval(),
+            None
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discovers_antigravity_transcripts_in_every_app_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        for app in ["antigravity", "antigravity-cli", "antigravity-ide"] {
+            let logs = tmp
+                .path()
+                .join(app)
+                .join("brain")
+                .join(format!("{app}-conv"))
+                .join(".system_generated/logs");
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(logs.join("transcript.jsonl"), "{\"role\":\"user\"}\n").unwrap();
+        }
+        // The Gemini CLI's own files are not Antigravity's.
+        std::fs::create_dir_all(tmp.path().join("tmp")).unwrap();
+        std::fs::write(tmp.path().join("tmp/session.jsonl"), "{}\n").unwrap();
+
+        unsafe { std::env::set_var("ANTIGRAVITY_GEMINI_DIR", tmp.path()) };
+        let sessions = CursorAgent::antigravity().discover_sessions().unwrap();
+        unsafe { std::env::remove_var("ANTIGRAVITY_GEMINI_DIR") };
+
+        let mut ids: Vec<_> = sessions
+            .iter()
+            .map(|s| (s.tool.as_str(), s.external_session_id.as_str()))
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                ("antigravity", "antigravity-cli-conv"),
+                ("antigravity", "antigravity-conv"),
+                ("antigravity", "antigravity-ide-conv"),
+            ]
+        );
     }
 }

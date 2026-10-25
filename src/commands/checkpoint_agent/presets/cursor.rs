@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 pub struct CursorPreset;
 
 /// Cursor's turn-end event: the agent loop ended (completed, aborted or
-/// errored). It wakes the transcript reader; `transcript_path` is null when
-/// Cursor's transcripts are off, and then there is nothing to read.
+/// errored). It wakes the transcript reader. `transcript_path` is null when
+/// Cursor's transcripts are off; the conversation is then copied out of
+/// Cursor's own database into a Cursor-shaped transcript
+/// (`crate::streams::cursor_state`) and that file is read instead.
 pub const CURSOR_SESSION_ACTIVITY_EVENTS: [&str; 1] = ["stop"];
 
 pub struct CursorBackgroundPreset;
@@ -76,8 +78,11 @@ impl AgentPreset for CursorPreset {
                 cwd: PathBuf::from(&cwd),
                 metadata,
             };
-            let stream_source = transcript_path.map(|tp| StreamSource {
-                path: PathBuf::from(tp),
+            let transcript = transcript_path
+                .map(PathBuf::from)
+                .or_else(|| crate::streams::cursor_state::export_for_hook(&conversation_id));
+            let stream_source = transcript.map(|path| StreamSource {
+                path,
                 format: StreamFormat::CursorJsonl,
                 session_id: generate_session_id(&conversation_id, "cursor"),
                 external_session_id: conversation_id.clone(),

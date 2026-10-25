@@ -58,10 +58,32 @@ impl SweepCoordinator {
 
     /// Run a full sweep across all agents.
     pub fn run_sweep(&self) -> Result<Vec<SweepItem>, StreamError> {
+        self.run_sweep_where(|strategy| matches!(strategy, SweepStrategy::Periodic(_)))
+    }
+
+    /// Sweep only the agents that asked for a shorter interval than the full
+    /// sweep (see [`SweepStrategy::fast_interval`]).
+    pub fn run_fast_sweep(&self) -> Result<Vec<SweepItem>, StreamError> {
+        self.run_sweep_where(|strategy| strategy.fast_interval().is_some())
+    }
+
+    /// The shortest fast interval any agent asked for; None when every agent is
+    /// happy with the full sweep.
+    pub fn fast_sweep_interval(&self) -> Option<std::time::Duration> {
+        self.agent_registry
+            .iter()
+            .filter_map(|(_, agent)| agent.sweep_strategy().fast_interval())
+            .min()
+    }
+
+    fn run_sweep_where(
+        &self,
+        include: impl Fn(&SweepStrategy) -> bool,
+    ) -> Result<Vec<SweepItem>, StreamError> {
         let mut items = Vec::new();
 
         for (agent_type, agent) in &self.agent_registry {
-            if !matches!(agent.sweep_strategy(), SweepStrategy::Periodic(_)) {
+            if !include(&agent.sweep_strategy()) {
                 continue;
             }
 

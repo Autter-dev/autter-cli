@@ -271,11 +271,17 @@ impl StreamWorker {
         let sweep_enabled = config::Config::get().get_feature_flags().transcript_sweep;
 
         let mut processing_ticker = interval(PROCESSING_TICK_INTERVAL);
-        let mut sweep_ticker = interval(Duration::from_secs(30 * 60)); // NEW: 30 minutes
+        let mut sweep_ticker = interval(crate::streams::sweep::FULL_SWEEP_INTERVAL);
+        // Agents with no hook (Continue CLI) ask to be swept more often than the
+        // full sweep, so their sessions arrive within about a minute.
+        let fast_sweep = self.sweep_coordinator.fast_sweep_interval();
+        let mut fast_sweep_ticker =
+            interval(fast_sweep.unwrap_or(crate::streams::sweep::FULL_SWEEP_INTERVAL));
 
         // Skip the first immediate tick
         processing_ticker.tick().await;
         sweep_ticker.tick().await;
+        fast_sweep_ticker.tick().await;
 
         // Run initial sweep on startup
         if sweep_enabled
@@ -298,7 +304,12 @@ impl StreamWorker {
                 _ = processing_ticker.tick() => {
                     self.process_next_task().await;
                 }
-                _ = sweep_ticker.tick() => {  // NEW: sweep ticker
+                _ = fast_sweep_ticker.tick(), if sweep_enabled && fast_sweep.is_some() => {
+                    if let Err(e) = self.run_sweep_with(true).await {
+                        tracing::warn!(error = %e, "fast sweep failed");
+                    }
+                }
+                _ = sweep_ticker.tick() => {
                     if sweep_enabled
                         && self
                             .sweep_trigger_gate
@@ -332,14 +343,29 @@ impl StreamWorker {
 
     /// Run a sweep across all agents to discover new/behind sessions.
     async fn run_sweep(&mut self) -> Result<(), String> {
+        self.run_sweep_with(false).await
+    }
+
+    /// `fast`: only the agents with a fast sweep interval, logged quietly
+    /// because it runs every minute or so.
+    async fn run_sweep_with(&mut self, fast: bool) -> Result<(), String> {
         use crate::daemon::sweep_coordinator::SweepItem;
 
-        let items = self
-            .sweep_coordinator
-            .run_sweep()
-            .map_err(|e| e.to_string())?;
+        let items = if fast {
+            self.sweep_coordinator.run_fast_sweep()
+        } else {
+            self.sweep_coordinator.run_sweep()
+        }
+        .map_err(|e| e.to_string())?;
 
-        tracing::info!(discovered = items.len(), "sweep completed");
+        if fast {
+            if items.is_empty() {
+                return Ok(());
+            }
+            tracing::debug!(discovered = items.len(), "fast sweep completed");
+        } else {
+            tracing::info!(discovered = items.len(), "sweep completed");
+        }
 
         for (i, item) in items.iter().enumerate().take(10) {
             match item {

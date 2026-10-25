@@ -18,7 +18,7 @@ pub use codex::CodexAgent;
 pub use continue_cli::ContinueAgent;
 pub use copilot::CopilotAgent;
 pub use copilot_cli::CopilotCliAgent;
-pub use cursor::CursorAgent;
+pub use cursor::{CursorAgent, JsonlFlavor};
 pub use droid::DroidAgent;
 pub use gemini::GeminiAgent;
 pub use opencode::OpenCodeAgent;
