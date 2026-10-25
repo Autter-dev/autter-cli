@@ -196,6 +196,9 @@ pub fn handle_autter(args: &[String]) {
         "memory-hook" => {
             commands::memory_hook::handle_memory_hook(&args[1..]);
         }
+        "memory" => {
+            commands::memory_hook::handle_memory_command(&args[1..]);
+        }
         "checkpoint" => {
             if let Some(t) = perf_entry {
                 eprintln!(
