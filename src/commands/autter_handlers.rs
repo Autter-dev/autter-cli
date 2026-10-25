@@ -106,6 +106,7 @@ pub fn handle_autter(args: &[String]) {
             | "ask"
             | "logs"
             | "threads"
+            | "memory"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -134,6 +135,7 @@ pub fn handle_autter(args: &[String]) {
 
     match args[0].as_str() {
         "ask" | "logs" | "threads" => commands::ask::handle(&args[0], &args[1..]),
+        "memory" => commands::memory::handle(&args[1..]),
         "help" | "--help" | "-h" => {
             match args.get(1) {
                 Some(cmd) => commands::arg_parser::print_command_help(cmd),

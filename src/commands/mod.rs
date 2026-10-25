@@ -20,6 +20,7 @@ pub mod install_hooks;
 pub mod log;
 pub mod login;
 pub mod logout;
+pub mod memory;
 pub mod notes_migrate;
 pub mod onboard;
 pub mod personal_dashboard;

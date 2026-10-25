@@ -613,7 +613,7 @@ impl Config {
         self.effective_prompt_storage_with_remotes(remotes.as_ref())
     }
 
-    fn effective_prompt_storage_with_remotes(
+    pub(crate) fn effective_prompt_storage_with_remotes(
         &self,
         remotes: Option<&Vec<(String, String)>>,
     ) -> PromptStorageMode {
