@@ -20,6 +20,15 @@ pub struct CredentialStore {
 impl CredentialStore {
     /// Create a new credential store, testing keyring availability
     pub fn new() -> Self {
+        // Integration tests pin the credentials file, since dirs::home_dir
+        // ignores HOME and USERPROFILE on Windows. Skips the keyring too.
+        #[cfg(all(not(test), feature = "test-support"))]
+        if let Some(path) = std::env::var_os("AUTTER_TEST_CREDENTIALS_PATH") {
+            return Self {
+                backend: Box::new(FileBackend::new(PathBuf::from(path))),
+            };
+        }
+
         // In test builds, always use file-based storage to avoid keyring blocking issues
         #[cfg(test)]
         {
