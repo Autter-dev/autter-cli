@@ -23,7 +23,6 @@ pub const FIREBENDER_SESSION_ACTIVITY_EVENTS: [&str; 2] = ["stop", "sessionEnd"]
 #[derive(Debug, Deserialize)]
 struct FirebenderHookInput {
     hook_event_name: String,
-    #[serde(default)]
     model: String,
     repo_working_dir: Option<String>,
     workspace_roots: Option<Vec<String>>,

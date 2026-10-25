@@ -381,7 +381,7 @@ mod session_activity_preset_tests {
         // A transcript path without a conversation id still names the session.
         let e = activity(
             "firebender",
-            json!({"hook_event_name": "sessionEnd", "workspace_roots": ["/p"],
+            json!({"hook_event_name": "sessionEnd", "model": "m", "workspace_roots": ["/p"],
                    "transcript_path": "/h/.firebender/projects/p/transcripts/agent-fb-2.jsonl"}),
         );
         assert_eq!(e.stream_source.external_session_id, "fb-2");
@@ -391,7 +391,7 @@ mod session_activity_preset_tests {
             resolve_preset("firebender")
                 .unwrap()
                 .parse(
-                    &json!({"hook_event_name": "stop", "conversation_id": "fb-1",
+                    &json!({"hook_event_name": "stop", "conversation_id": "fb-1", "model": "m",
                             "workspace_roots": ["/p"], "transcript_path": null})
                     .to_string(),
                     "t"
