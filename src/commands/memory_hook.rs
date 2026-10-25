@@ -548,9 +548,7 @@ pub fn run_hook_with(
         HookMoment::Prompt => {
             // Agents whose prompt output is dropped get nothing here; their
             // session hook carries the briefing.
-            if render_output(dialect, HookMoment::Prompt, &call.event, "x").is_none() {
-                return None;
-            }
+            render_output(dialect, HookMoment::Prompt, &call.event, "x")?;
             if !state.session_done {
                 session(state, &mut parts);
             }

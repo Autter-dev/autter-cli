@@ -1221,7 +1221,7 @@ pub fn ensure_memory_hook(
         .unwrap_or_default();
     let matches =
         |block: &serde_json::Value| block.get("matcher").and_then(|m| m.as_str()) == matcher;
-    let target = blocks.iter().position(|b| matches(b));
+    let target = blocks.iter().position(matches);
     for (i, block) in blocks.iter_mut().enumerate() {
         let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
             continue;
