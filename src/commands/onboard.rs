@@ -1,8 +1,10 @@
 //! First-run onboarding flow (`autter onboard`).
 //!
-//! After installation, autter walks the user through a one-time guided setup:
-//! an arrow-key choice between the two modes, a telemetry consent choice, and
-//! a "you're all set" summary with the first commands to try.
+//! After installation, autter walks the user through a one-time guided setup
+//! on a single step rail: a choice between the two modes, browser sign-in
+//! when connecting, a telemetry consent choice, which integrations to
+//! install, and a closing summary with the first commands to try. Each
+//! question shows its place in the flow ("2/4").
 //!
 //! - **Local mode** — everything stays on the machine (git notes + local
 //!   storage). Nothing is uploaded. The user is told they will not get the
@@ -11,7 +13,9 @@
 //! - **Connected mode** — the user links their Autter account (OAuth device
 //!   flow). Attribution is still written to local git notes exactly as before,
 //!   and prompt/usage data additionally syncs to the org's Autter platform
-//!   (persisted in the org's PostgreSQL via the platform API).
+//!   (persisted in the org's PostgreSQL via the platform API). If sign-in is
+//!   skipped or fails, the user can retry, paste an access token, or continue
+//!   in local mode.
 //!
 //! After the mode choice (and regardless of whether the user signed in), the
 //! flow asks for consent to anonymous usage analytics and error tracking. The
@@ -27,7 +31,8 @@
 //!
 //! Choosing a mode is not consent to change system configuration. IDE/agent
 //! hooks, global git trace2 settings and the background service are applied
-//! only after an interactive "yes", or with an explicit `--yes`.
+//! only for the integrations the user checks interactively, or all of them
+//! with an explicit `--yes`.
 //!
 //! Note: the full authorship-note → Postgres dual-write (keeping local git
 //! notes while also uploading the note itself) is delivered alongside the
@@ -35,14 +40,13 @@
 //! prompt/usage data via the existing CAS upload path.
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 
 use serde_json::json;
 
 use crate::auth::{AuthState, collect_auth_status};
-use crate::commands::login::run_device_login;
+use crate::commands::login::{Decline, LoginOutcome, LoginUi, run_device_login_with};
 use crate::config::{self, NotesBackendConfig, NotesBackendKind};
-use crate::ui::{self, BOLD, CYAN, DIM, GREEN, RESET, SelectItem, YELLOW};
+use crate::ui::{self, SelectItem, TermCaps, rail};
 
 /// Entry point for the `autter onboard` command.
 pub fn handle_onboard(args: &[String]) {
@@ -83,9 +87,31 @@ pub fn handle_onboard(args: &[String]) {
         return;
     }
 
+    let logged_in = matches!(collect_auth_status().state, AuthState::LoggedIn);
+    let interactive = ui::is_interactive();
+    let ask_mode = !(choose_connect || choose_local || logged_in);
+
+    if ask_mode && !interactive {
+        // Non-interactive shell with no explicit choice: don't block automated
+        // installs and don't guess — leave onboarding incomplete so the user can
+        // run `autter onboard` later from a real terminal.
+        eprintln!("Non-interactive shell detected — skipping onboarding for now.");
+        eprintln!("Run `autter onboard` from your terminal to choose local or connected mode.");
+        return;
+    }
+
     print_welcome();
 
-    let logged_in = matches!(collect_auth_status().state, AuthState::LoggedIn);
+    let plan = StepPlan {
+        ask_mode,
+        sign_in: !logged_in,
+        ask_telemetry: telemetry_flag.is_none(),
+        ask_integrations: !assume_yes,
+        maybe_backlog: !assume_yes && interactive && backlog_exists(),
+    };
+    // Number the questions for the recommended (connected) path until the
+    // user picks one.
+    let mut steps = Steps::new(interactive, plan.total(true));
 
     let connect = if choose_connect {
         true
@@ -95,16 +121,10 @@ pub fn handle_onboard(args: &[String]) {
         // Already authenticated (e.g. via an install nonce): treat as connected
         // without prompting.
         true
-    } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        prompt_mode_choice()
     } else {
-        // Non-interactive shell with no explicit choice: don't block automated
-        // installs and don't guess — leave onboarding incomplete so the user can
-        // run `autter onboard` later from a real terminal.
-        eprintln!("Non-interactive shell detected — skipping onboarding for now.");
-        eprintln!("Run `autter onboard` from your terminal to choose local or connected mode.");
-        return;
+        prompt_mode_choice(steps.next().as_deref())
     };
+    steps.set_total(plan.total(connect));
 
     // Every step that does not complete is recorded here, so onboarding never
     // ends with "You're all set!" after something went wrong.
@@ -122,7 +142,7 @@ pub fn handle_onboard(args: &[String]) {
                 crate::upload_hold::PURGE_COMMAND,
             );
         }
-        if let Err(e) = setup_connected(&mut file_config, logged_in) {
+        if let Err(e) = setup_connected(&mut file_config, logged_in, !ask_mode, &mut steps) {
             report.problem(
                 format!(
                     "Could not connect to the Autter platform ({e}); set up in local mode instead"
@@ -131,16 +151,16 @@ pub fn handle_onboard(args: &[String]) {
             );
         }
     } else {
-        setup_local(&mut file_config);
+        setup_local(&mut file_config, !ask_mode);
     }
 
     // Telemetry consent is asked regardless of the connected/local choice above.
-    let telemetry_enabled = configure_telemetry(&mut file_config, telemetry_flag);
+    let telemetry_enabled = configure_telemetry(&mut file_config, telemetry_flag, &mut steps);
 
     // System integrations (IDE hooks, global git trace2, daemon) require
     // explicit consent. Picking a mode (`--local`/`--connect`) or re-running
-    // (`--force`) is not consent; only an interactive "yes" or `--yes` is.
-    if let Err(e) = apply_system_integrations_with_consent(assume_yes) {
+    // (`--force`) is not consent; only interactive choices or `--yes` are.
+    if let Err(e) = apply_system_integrations_with_consent(assume_yes, &mut steps) {
         report.problem(
             format!("Could not install IDE/agent hooks and git capture settings ({e})"),
             "autter install --system",
@@ -149,7 +169,7 @@ pub fn handle_onboard(args: &[String]) {
 
     // After connect: offer to keep or discard any pre-login upload backlog.
     if file_config.prompt_storage.as_deref() != Some("local")
-        && let Err(e) = offer_historical_sync_consent(assume_yes)
+        && let Err(e) = offer_historical_sync_consent(assume_yes, &mut steps)
     {
         report.problem(
             format!("Could not apply your choice for the held upload backlog ({e})"),
@@ -187,10 +207,7 @@ pub fn handle_onboard(args: &[String]) {
     // Reflect the mode actually configured: a connect attempt can fall back
     // to local if the device login fails.
     let connected = file_config.prompt_storage.as_deref() != Some("local");
-    eprint!(
-        "{}",
-        render_finished(connected, &report, std::io::stderr().is_terminal())
-    );
+    eprint!("{}", render_finished(connected, &report, &ui::caps()));
 
     // Fire a one-off install/onboard event so we can count installs by version
     // and platform. Only when the user just opted in.
@@ -203,6 +220,75 @@ pub fn handle_onboard(args: &[String]) {
     if !report.is_clean() {
         std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
     }
+}
+
+/// Which questions this run will ask, to number them.
+#[derive(Debug, Clone, Copy)]
+struct StepPlan {
+    ask_mode: bool,
+    sign_in: bool,
+    ask_telemetry: bool,
+    ask_integrations: bool,
+    maybe_backlog: bool,
+}
+
+impl StepPlan {
+    fn total(&self, connect: bool) -> usize {
+        [
+            self.ask_mode,
+            connect && self.sign_in,
+            self.ask_telemetry,
+            self.ask_integrations,
+            connect && self.maybe_backlog,
+        ]
+        .into_iter()
+        .filter(|&step| step)
+        .count()
+    }
+}
+
+/// Numbers the questions actually shown ("2/4"). Without a terminal there
+/// are no questions, so no numbers either.
+struct Steps {
+    enabled: bool,
+    shown: usize,
+    total: usize,
+}
+
+impl Steps {
+    fn new(enabled: bool, total: usize) -> Self {
+        Self {
+            enabled,
+            shown: 0,
+            total,
+        }
+    }
+
+    fn set_total(&mut self, total: usize) {
+        self.total = total;
+    }
+
+    fn next(&mut self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        self.shown += 1;
+        Some(format!("{}/{}", self.shown, self.total.max(self.shown)))
+    }
+}
+
+/// Whether there is queued upload data a connect would ask about.
+fn backlog_exists() -> bool {
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return false;
+    }
+    crate::auth::notice::pending_sync_counts().total() + crate::upload_hold::held_counts().total()
+        > 0
+}
+
+/// A prompt title with its step counter.
+fn titled(title: &str, counter: Option<&str>) -> String {
+    rail::titled(&ui::caps(), title, counter)
 }
 
 /// One onboarding step that did not complete, with the exact command that
@@ -252,7 +338,7 @@ fn restart_daemon_for_mode_change() -> Result<(), String> {
 }
 
 /// The interactive connected-vs-local choice, as an arrow-key selector.
-fn prompt_mode_choice() -> bool {
+fn prompt_mode_choice(counter: Option<&str>) -> bool {
     let items = [
         SelectItem::new(
             "Connected — link this machine to your Autter org (recommended)",
@@ -263,65 +349,79 @@ fn prompt_mode_choice() -> bool {
             "No account needed. Switch anytime with `autter onboard --connect`.",
         ),
     ];
-    ui::select("How should Autter run on this machine?", &items, 0) == 0
+    ui::select(
+        &titled("How should Autter run on this machine?", counter),
+        &items,
+        0,
+    ) == 0
+}
+
+fn telemetry_log_path() -> String {
+    config::id_file_path()
+        .and_then(|p| p.parent().map(|d| d.join("telemetry.log")))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.autter/internal/telemetry.log".to_string())
 }
 
 /// Ask whether to enable anonymous telemetry + error tracking and persist the
 /// choice into `telemetry_oss` ("on"/"off"). Returns whether telemetry ended up
 /// enabled.
-fn configure_telemetry(cfg: &mut config::FileConfig, flag: Option<bool>) -> bool {
-    let local_log = config::id_file_path()
-        .and_then(|p| p.parent().map(|d| d.join("telemetry.log")))
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.autter/internal/telemetry.log".to_string());
-
-    eprintln!();
-    eprintln!("  {DIM}One last thing — anonymous usage analytics and error reporting.");
-    eprintln!("  No personal data is ever collected: no code, prompts, file paths,");
-    eprintln!("  repo names, usernames, or IP addresses. Only a random install ID,");
-    eprintln!("  coarse device info (OS, CPU architecture, core count) and the");
-    eprintln!("  Autter version. Everything sent is mirrored to a local log:");
-    eprintln!("      {local_log}{RESET}");
-    eprintln!();
+fn configure_telemetry(
+    cfg: &mut config::FileConfig,
+    flag: Option<bool>,
+    steps: &mut Steps,
+) -> bool {
+    let local_log = telemetry_log_path();
 
     let enabled = match flag {
-        Some(value) => value,
+        Some(value) => {
+            rail::print_step(telemetry_summary(value), None);
+            value
+        }
+        None if ui::is_interactive() => {
+            let yes_hint = format!(
+                "Sends OS, CPU architecture, core count, the Autter version and a random install ID. \
+                 Never code, prompts, file paths, repo names, usernames or IP addresses. \
+                 Everything sent is mirrored to {local_log}."
+            );
+            let items = [
+                SelectItem::new("Yes — help improve Autter", &yes_hint),
+                SelectItem::new(
+                    "No — send nothing",
+                    "Change anytime with `autter telemetry on` or `autter telemetry off`.",
+                ),
+            ];
+            let counter = steps.next();
+            ui::select(
+                &titled(
+                    "Share anonymous usage data and error reports?",
+                    counter.as_deref(),
+                ),
+                &items,
+                0,
+            ) == 0
+        }
         None => {
-            if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-                let items = [
-                    SelectItem::new(
-                        "Enable — help improve Autter",
-                        "Audit every event in the local log, or turn it off anytime with `autter telemetry off`.",
-                    ),
-                    SelectItem::new(
-                        "Disable — send nothing",
-                        "You can opt in later with `autter telemetry on`.",
-                    ),
-                ];
-                ui::select("Enable anonymous telemetry and error tracking?", &items, 0) == 0
-            } else {
-                // Non-interactive and no explicit flag: default to disabled so we
-                // never collect data the user didn't actively agree to.
-                false
-            }
+            // Non-interactive and no explicit flag: default to disabled so we
+            // never collect data the user didn't actively agree to.
+            rail::print_step(telemetry_summary(false), None);
+            false
         }
     };
 
     cfg.telemetry_oss = Some(if enabled { "on" } else { "off" }.to_string());
-
-    eprintln!();
     if enabled {
-        eprintln!(
-            "  {GREEN}\u{2713}{RESET} Telemetry enabled. Thank you — you can review what's sent at:"
-        );
-        eprintln!("      {DIM}{local_log}{RESET}");
-    } else {
-        eprintln!(
-            "  {GREEN}\u{2713}{RESET} Telemetry disabled. Nothing will be collected or sent."
-        );
+        rail::print_note(&format!("Everything sent is mirrored to {local_log}"));
     }
-
     enabled
+}
+
+fn telemetry_summary(enabled: bool) -> &'static str {
+    if enabled {
+        "Anonymous telemetry on"
+    } else {
+        "Anonymous telemetry off \u{00B7} nothing is collected or sent"
+    }
 }
 
 /// Send a single anonymous install/onboard event to PostHog (best-effort).
@@ -337,8 +437,9 @@ fn record_install_event(connected: bool) {
     }
 }
 
-/// Configure local-only mode and explain the trade-off.
-fn setup_local(cfg: &mut config::FileConfig) {
+/// Configure local-only mode and explain the trade-off. `announce` adds the
+/// step line when no mode question was shown (flags, or a fallback).
+fn setup_local(cfg: &mut config::FileConfig, announce: bool) {
     // Keep everything on the machine: prompts only in local SQLite, attribution
     // in local git notes, nothing uploaded.
     cfg.prompt_storage = Some("local".to_string());
@@ -347,17 +448,14 @@ fn setup_local(cfg: &mut config::FileConfig) {
         backend_url: None,
     });
 
-    eprintln!();
-    eprintln!("{GREEN}{BOLD}\u{2713} Autter is set up in local mode.{RESET}");
-    eprintln!();
-    eprintln!("  \u{2022} Attribution, blame, and stats run entirely on your machine.");
-    eprintln!("  \u{2022} Data stays in this repo's git notes (refs/notes/ai) and local storage.");
-    eprintln!("  \u{2022} Nothing is uploaded to the Autter platform.");
-    eprintln!();
-    eprintln!("  {DIM}Heads up: in local mode you will NOT have access to the Autter platform's");
-    eprintln!("  detailed prompt usage and team/user usage dashboards.");
-    eprintln!();
-    eprintln!("  Run `autter onboard --connect` anytime to link your Autter account.{RESET}");
+    if announce {
+        rail::print_step("Local mode \u{00B7} everything stays on this machine", None);
+    }
+    rail::print_note(
+        "Attribution, blame and stats run on this machine, in git notes (refs/notes/ai).\n\
+         Nothing is uploaded, so the platform's prompt-usage and team dashboards aren't included.\n\
+         Connect anytime with `autter onboard --connect`.",
+    );
 
     // Data queued while this machine was connected (or by older versions)
     // stays on disk. Local mode never uploads it; reconnecting asks before
@@ -366,37 +464,60 @@ fn setup_local(cfg: &mut config::FileConfig) {
         let pending = crate::auth::notice::pending_sync_counts();
         let held = crate::upload_hold::held_counts();
         if pending.total() + held.total() > 0 {
-            eprintln!();
-            eprintln!(
-                "  {DIM}Found {} records queued for upload earlier. They will not be",
+            rail::print_note(&format!(
+                "Found {} records queued for upload earlier. They won't be uploaded in local mode.\n\
+                 Delete them with `autter sync purge --force`.",
                 pending.total() + held.total()
-            );
-            eprintln!(
-                "  uploaded in local mode. Delete them with `autter sync purge --force`.{RESET}"
-            );
+            ));
         }
     }
 }
 
-/// Log the user in (if needed) and configure connected mode. On a failed
-/// login, falls back to local mode and returns the error so the closing
-/// summary can report it.
-fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) -> Result<(), String> {
+/// Log the user in (if needed) and configure connected mode. Skipping
+/// sign-in sets up local mode; a failed sign-in does too, and returns the
+/// error so the closing summary can report it.
+fn setup_connected(
+    cfg: &mut config::FileConfig,
+    already_logged_in: bool,
+    announce: bool,
+    steps: &mut Steps,
+) -> Result<(), String> {
     if !already_logged_in {
-        eprintln!();
-        eprintln!("Connecting to the Autter platform...");
-        if let Err(e) = run_device_login() {
+        let interactive = ui::is_interactive();
+        if !interactive {
             eprintln!();
-            eprintln!("\u{2717} Could not connect: {e}");
-            eprintln!();
-            crate::commands::login::print_pat_fallback_instructions();
-            // `autter login` alone does not switch modes: local mode never
-            // uploads, so the retry has to go through onboarding.
-            eprintln!(
-                "  Setting up local mode for now \u{2014} run `autter onboard --connect` to retry."
-            );
-            setup_local(cfg);
-            return Err(e.to_string());
+            eprintln!("Connecting to the Autter platform...");
+        }
+        let counter = steps.next();
+        let outcome = run_device_login_with(LoginUi {
+            counter: counter.as_deref(),
+            decline: Decline::ContinueLocally,
+        });
+        match outcome {
+            Ok(LoginOutcome::LoggedIn | LoginOutcome::AlreadyLoggedIn) => {}
+            Ok(LoginOutcome::Declined { after_error: None }) => {
+                setup_local(cfg, true);
+                return Ok(());
+            }
+            Ok(LoginOutcome::Declined {
+                after_error: Some(e),
+            }) => {
+                setup_local(cfg, true);
+                return Err(e);
+            }
+            Err(e) => {
+                eprintln!();
+                eprintln!("\u{2717} Could not connect: {e}");
+                eprintln!();
+                crate::commands::login::print_pat_fallback_instructions();
+                // `autter login` alone does not switch modes: local mode never
+                // uploads, so the retry has to go through onboarding.
+                eprintln!(
+                    "  Setting up local mode for now \u{2014} run `autter onboard --connect` to retry."
+                );
+                setup_local(cfg, true);
+                return Err(e);
+            }
         }
     }
 
@@ -409,102 +530,115 @@ fn setup_connected(cfg: &mut config::FileConfig, already_logged_in: bool) -> Res
         backend_url: None,
     });
 
-    let status = collect_auth_status();
-    let who = status
-        .email
-        .or(status.name)
-        .unwrap_or_else(|| "your Autter account".to_string());
-
-    eprintln!();
-    eprintln!("{GREEN}{BOLD}\u{2713} Connected to the Autter platform as {who}.{RESET}");
-    eprintln!();
-    eprintln!("  \u{2022} Attribution is still written locally to git notes (refs/notes/ai).");
-    eprintln!("  \u{2022} Prompt and usage data also sync to your org's Autter dashboard,");
-    eprintln!("    so you get detailed prompt usage and team/user analytics.");
-    eprintln!();
-    eprintln!("  {DIM}Manage your account with `autter whoami` / `autter logout`.{RESET}");
+    // A fresh sign-in already showed who is signed in.
+    if already_logged_in && announce {
+        let status = collect_auth_status();
+        let who = status
+            .email
+            .or(status.name)
+            .unwrap_or_else(|| "your Autter account".to_string());
+        rail::print_step(&format!("Connected as {who}"), None);
+    }
+    rail::print_note(
+        "Attribution is still written locally to git notes (refs/notes/ai).\n\
+         Prompt and usage data also sync to your org's Autter dashboard.",
+    );
     Ok(())
 }
 
 fn print_welcome() {
     let version = env!("CARGO_PKG_VERSION");
     eprintln!();
-    eprintln!("  {BOLD}Welcome to Autter{RESET} \u{1F9A6}  {DIM}v{version}{RESET}");
+    ui::Header::new(
+        "Welcome to Autter",
+        format!("v{version}"),
+        "Setup \u{00B7} about a minute",
+        ui::header::display_cwd(),
+    )
+    .print();
     eprintln!();
     eprintln!("  Autter records which lines of your code were written by AI \u{2014} tied to");
     eprintln!("  the agent, model, and prompts behind them \u{2014} right in Git itself.");
     eprintln!();
-    eprintln!("  {DIM}Setup takes about a minute: two quick choices and you're done.{RESET}");
-    eprintln!();
 }
 
-/// Closing summary. With no problems: the green "all set" message plus the
-/// first commands worth trying. With problems: a yellow "Set up with
-/// warnings" summary listing each problem and the exact command that fixes
-/// it, and no claim that everything is ready.
-fn render_finished(connected: bool, report: &SetupReport, color: bool) -> String {
-    use std::fmt::Write as _;
-    let paint = |code: &'static str| if color { code } else { "" };
-    let (green, yellow, bold, cyan, dim, reset) = (
-        paint(GREEN),
-        paint(YELLOW),
-        paint(BOLD),
-        paint(CYAN),
-        paint(DIM),
-        paint(RESET),
-    );
-    let mut out = String::new();
-    let _ = writeln!(out);
+/// Closing summary. With no problems: "You're all set!" plus the first
+/// commands worth trying. With problems: "Set up with warnings", each problem
+/// with the exact command that fixes it, and no claim that everything is
+/// ready.
+fn render_finished(connected: bool, report: &SetupReport, caps: &TermCaps) -> String {
+    let bar = caps.paint("90", caps.glyphs().bar);
+    let cyan = |text: &str| caps.paint("36", text);
+    let mut out = rail::gap(caps);
     if report.is_clean() {
-        let _ = writeln!(out, "{green}{bold}\u{2713} You're all set!{reset}");
-        let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "  Just keep coding \u{2014} authorship is recorded automatically on every commit."
-        );
+        out.push_str(&rail::end(
+            caps,
+            &format!(
+                "{} Authorship is recorded automatically on every commit.",
+                caps.paint("1;32", "You're all set!")
+            ),
+        ));
     } else {
-        let _ = writeln!(
-            out,
-            "{yellow}{bold}\u{26a0} Set up with warnings{reset} \u{2014} {} step{} did not complete:",
-            report.problems.len(),
-            if report.problems.len() == 1 { "" } else { "s" }
-        );
-        let _ = writeln!(out);
+        let count = report.problems.len();
+        out.push_str(&rail::warn(
+            caps,
+            &format!(
+                "Set up with warnings \u{2014} {count} step{} did not complete:",
+                if count == 1 { "" } else { "s" }
+            ),
+        ));
         for problem in &report.problems {
-            let _ = writeln!(out, "  {yellow}\u{2022}{reset} {}", problem.what);
-            let _ = writeln!(out, "    Fix: {cyan}{}{reset}", problem.fix);
+            let mut lines = problem.what.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(&format!(
+                    "{bar}  {} {first}\n",
+                    caps.paint("33", "\u{2022}")
+                ));
+            }
+            for line in lines {
+                out.push_str(&format!("{bar}    {line}\n"));
+            }
+            out.push_str(&format!("{bar}    Fix: {}\n", cyan(&problem.fix)));
         }
-        let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "  Then run {cyan}autter doctor{reset} to confirm everything works."
-        );
+        out.push_str(&rail::end(
+            caps,
+            &format!(
+                "Then run {} to confirm everything works.",
+                cyan("autter doctor")
+            ),
+        ));
     }
-    let _ = writeln!(out);
-    let _ = writeln!(out, "  Try it on any repo:");
-    let _ = writeln!(
-        out,
-        "    {cyan}autter stats{reset}          {dim}AI vs human share of your latest commit{reset}"
-    );
-    let _ = writeln!(
-        out,
-        "    {cyan}autter blame <file>{reset}   {dim}who \u{2014} you or an agent \u{2014} wrote each line{reset}"
-    );
-    let _ = writeln!(
-        out,
-        "    {cyan}autter log{reset}            {dim}git log with AI authorship stats{reset}"
-    );
+
+    let command = |name: &str, what: &str| {
+        format!(
+            "     {}{}  {}\n",
+            cyan(name),
+            " ".repeat(20usize.saturating_sub(name.len())),
+            caps.paint("2", what)
+        )
+    };
+    out.push('\n');
+    out.push_str("   Try it on any repo:\n");
+    out.push_str(&command(
+        "autter stats",
+        "AI vs human share of your latest commit",
+    ));
+    out.push_str(&command(
+        "autter blame <file>",
+        "who \u{2014} you or an agent \u{2014} wrote each line",
+    ));
+    out.push_str(&command("autter log", "git log with AI authorship stats"));
     if connected {
-        let _ = writeln!(
-            out,
-            "    {cyan}autter dash{reset}           {dim}open your personal dashboard{reset}"
-        );
+        out.push_str(&command("autter dash", "open your personal dashboard"));
     }
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {dim}All commands: `autter help` \u{2022} Docs: https://autter.dev/docs{reset}"
-    );
+    out.push('\n');
+    out.push_str(&format!(
+        "   {}\n",
+        caps.paint(
+            "2",
+            "All commands: `autter help` \u{2022} Docs: https://autter.dev/docs"
+        )
+    ));
     out
 }
 
@@ -552,68 +686,87 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
     let enabled = cfg.telemetry_oss.as_deref() != Some("off");
     eprintln!();
     if enabled {
-        let local_log = config::id_file_path()
-            .and_then(|p| p.parent().map(|d| d.join("telemetry.log")))
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "~/.autter/internal/telemetry.log".to_string());
         eprintln!("Anonymous telemetry is ON. Everything sent is logged at:");
-        eprintln!("  {local_log}");
+        eprintln!("  {}", telemetry_log_path());
     } else {
         eprintln!("Anonymous telemetry is OFF.");
     }
 }
 
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
-/// Returns whether the integrations were installed, or the install error.
+/// Returns whether any integrations were installed, or the install error.
 ///
-/// Only `assume_yes` (`--yes`) applies them without asking. Interactive runs
-/// ask; non-interactive runs without `--yes` leave them off.
-fn apply_system_integrations_with_consent(assume_yes: bool) -> Result<bool, String> {
+/// Only `assume_yes` (`--yes`) applies them all without asking. Interactive
+/// runs list the detected tools with everything checked, so Enter installs
+/// everything and unchecking all is "not now"; non-interactive runs without
+/// `--yes` leave them off.
+fn apply_system_integrations_with_consent(
+    assume_yes: bool,
+    steps: &mut Steps,
+) -> Result<bool, String> {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
         return Ok(false);
     }
 
-    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let apply = match integration_decision(assume_yes, interactive) {
-        IntegrationDecision::Apply => true,
-        IntegrationDecision::Ask => {
-            eprintln!();
-            eprintln!("{BOLD}System integrations{RESET}");
-            eprintln!(
-                "  Autter can install IDE/agent hooks, write git trace2 settings, and start a"
-            );
-            eprintln!("  background service so terminal commits get authorship notes.");
-            eprintln!();
-            let items = [
-                SelectItem::new(
-                    "Yes — install hooks, configure git, and start the background service",
-                    "Required for attribution on terminal commits and AI editor sessions.",
-                ),
-                SelectItem::new(
-                    "Not now — I'll run `autter install --system` later",
-                    "Binary stays installed; attribution will not capture until you opt in.",
-                ),
-            ];
-            matches!(ui::select("Install system integrations?", &items, 0), 0)
+    match integration_decision(assume_yes, ui::is_interactive()) {
+        IntegrationDecision::Apply => {
+            rail::print_step("Installing integrations", None);
+            let _rail = ui::progress::on_rail();
+            crate::commands::install_hooks::run(&["--system".to_string()])
+                .map(|_| true)
+                .map_err(|e| e.to_string())
         }
         IntegrationDecision::Skip => {
             // Non-interactive without `--yes`: leave integrations off.
             eprintln!(
                 "Skipping system integrations (non-interactive, no --yes). Run `autter install --system` to install them."
             );
-            false
+            Ok(false)
         }
-    };
+        IntegrationDecision::Ask => {
+            let spinner =
+                ui::progress::Spinner::new("Looking for coding tools on this machine\u{2026}");
+            let tools = crate::commands::install_hooks::detect_tools();
+            spinner.stop();
 
-    if !apply {
-        return Ok(false);
+            let mut items: Vec<SelectItem> = tools
+                .iter()
+                .map(|tool| {
+                    SelectItem::new(
+                        &tool.name,
+                        "Hooks record the edits this tool's agent makes.",
+                    )
+                })
+                .collect();
+            items.push(SelectItem::new(
+                "Git capture and background service",
+                "Global git trace2 settings and a background service, so commits from any terminal get authorship notes.",
+            ));
+            let system_item = items.len() - 1;
+            let all: Vec<usize> = (0..items.len()).collect();
+
+            let counter = steps.next();
+            let question = format!(
+                "{}\n{}",
+                titled("Install integrations?", counter.as_deref()),
+                ui::caps().paint("2", "space toggles \u{00B7} enter confirms")
+            );
+            let chosen = ui::multiselect(&question, &items, &all);
+            if chosen.is_empty() {
+                rail::print_note("Skipped. Run `autter install --system` when you're ready.");
+                return Ok(false);
+            }
+
+            let tool_ids: Vec<String> = chosen
+                .iter()
+                .filter(|&&i| i < tools.len())
+                .map(|&i| tools[i].id.clone())
+                .collect();
+            crate::commands::install_hooks::run_for_tools(&tool_ids, chosen.contains(&system_item))
+                .map(|_| true)
+                .map_err(|e| e.to_string())
+        }
     }
-
-    eprintln!();
-    eprintln!("Installing IDE/agent hooks…");
-    crate::commands::install_hooks::run(&["--system".to_string()])
-        .map(|_| true)
-        .map_err(|e| e.to_string())
 }
 
 /// Parsed `autter onboard` flags.
@@ -671,20 +824,20 @@ fn hold_backlog_before_connecting() -> Result<(), String> {
 /// without explicit consent: an interactive "Import", or `--yes` in a
 /// non-interactive run. Otherwise it stays held, and the commands to import
 /// or delete it are printed.
-fn offer_historical_sync_consent(assume_yes: bool) -> Result<(), String> {
+fn offer_historical_sync_consent(assume_yes: bool, steps: &mut Steps) -> Result<(), String> {
     let held = crate::upload_hold::held_counts();
     if held.total() == 0 {
         return Ok(());
     }
 
-    eprintln!();
-    eprintln!("{BOLD}Previously collected sessions{RESET}");
-    eprintln!("  Found local data queued for upload: {}.", held.summary());
-    eprintln!("  It was queued before you connected this machine (or by an older autter) and");
-    eprintln!("  may include sessions recorded in local mode. It is held and has not been sent.");
-    eprintln!();
+    rail::print_note(&format!(
+        "Found local data queued for upload: {}.\n\
+         It was queued before you connected this machine (or by an older autter) and may include\n\
+         sessions recorded in local mode. It is held and has not been sent.",
+        held.summary()
+    ));
 
-    let decision = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+    let decision = if ui::is_interactive() {
         let items = [
             SelectItem::new(
                 "Import — upload this backlog to your Autter org",
@@ -695,7 +848,13 @@ fn offer_historical_sync_consent(assume_yes: bool) -> Result<(), String> {
                 "Runs `autter sync purge`. Nothing pre-dating this connect is uploaded.",
             ),
         ];
-        if ui::select("What should we do with the backlog?", &items, 0) == 0 {
+        let counter = steps.next();
+        if ui::select(
+            &titled("What should we do with the backlog?", counter.as_deref()),
+            &items,
+            0,
+        ) == 0
+        {
             BacklogDecision::Import
         } else {
             BacklogDecision::Discard
@@ -709,21 +868,23 @@ fn offer_historical_sync_consent(assume_yes: bool) -> Result<(), String> {
     match decision {
         BacklogDecision::Import => {
             let released = crate::upload_hold::release_all()?;
-            eprintln!(
-                "  Backlog released ({} records); it uploads in the background after setup.",
+            rail::print_note(&format!(
+                "Backlog released ({} records); it uploads in the background after setup.",
                 released.total()
-            );
+            ));
         }
         BacklogDecision::Discard => {
             let summary = crate::commands::sync::purge_sync_queues().map_err(|e| e.to_string())?;
-            eprintln!("{GREEN}\u{2713} Cleared local upload queue ({summary}).{RESET}");
+            rail::print_step(&format!("Cleared local upload queue ({summary})"), None);
         }
         BacklogDecision::KeepHeld => {
-            eprintln!(
-                "  Kept on this machine and NOT uploaded (non-interactive run without --yes)."
-            );
-            eprintln!("    Upload it:  {}", crate::upload_hold::IMPORT_COMMAND);
-            eprintln!("    Delete it:  {}", crate::upload_hold::PURGE_COMMAND);
+            rail::print_note(&format!(
+                "Kept on this machine and NOT uploaded (non-interactive run without --yes).\n\
+                 Upload it:  {}\n\
+                 Delete it:  {}",
+                crate::upload_hold::IMPORT_COMMAND,
+                crate::upload_hold::PURGE_COMMAND
+            ));
         }
     }
     Ok(())
@@ -747,9 +908,19 @@ fn is_help_request(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::{Charset, ColorLevel};
 
     fn args(flags: &[&str]) -> Vec<String> {
         flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn plain() -> TermCaps {
+        TermCaps {
+            tty: false,
+            color: ColorLevel::None,
+            charset: Charset::Unicode,
+            width: 80,
+        }
     }
 
     #[test]
@@ -790,9 +961,11 @@ mod tests {
 
     #[test]
     fn clean_setup_ends_with_all_set() {
-        let text = render_finished(false, &SetupReport::default(), false);
+        let text = render_finished(false, &SetupReport::default(), &plain());
         assert!(text.contains("You're all set!"), "{text}");
         assert!(!text.contains("Set up with warnings"), "{text}");
+        assert!(!text.contains("autter dash"), "{text}");
+        assert!(render_finished(true, &SetupReport::default(), &plain()).contains("autter dash"));
     }
 
     #[test]
@@ -806,7 +979,7 @@ mod tests {
             "Could not install hooks (denied)",
             "autter install --system",
         );
-        let text = render_finished(true, &report, false);
+        let text = render_finished(true, &report, &plain());
         assert!(!text.contains("You're all set"), "{text}");
         assert!(text.contains("Set up with warnings"), "{text}");
         assert!(text.contains("2 steps did not complete"), "{text}");
@@ -817,6 +990,59 @@ mod tests {
         // The daemon fix is the canonical restart command.
         assert!(text.contains("Fix: autter bg restart"), "{text}");
         assert!(text.contains("Fix: autter install --system"), "{text}");
+    }
+
+    #[test]
+    fn multi_line_problems_stay_on_the_rail() {
+        let mut report = SetupReport::default();
+        report.problem(
+            "Could not connect (CLI authorization failed: denied\nNo credentials were issued or changed.)",
+            "autter onboard --connect",
+        );
+        let text = render_finished(false, &report, &plain());
+        assert!(
+            text.contains(
+                "│  • Could not connect (CLI authorization failed: denied\n\
+                 │    No credentials were issued or changed.)\n\
+                 │    Fix: autter onboard --connect\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn steps_count_only_the_questions_asked() {
+        let plan = StepPlan {
+            ask_mode: true,
+            sign_in: true,
+            ask_telemetry: true,
+            ask_integrations: true,
+            maybe_backlog: false,
+        };
+        assert_eq!(plan.total(true), 4);
+        assert_eq!(plan.total(false), 3);
+
+        let flags_given = StepPlan {
+            ask_mode: false,
+            sign_in: false,
+            ask_telemetry: false,
+            ask_integrations: true,
+            maybe_backlog: true,
+        };
+        assert_eq!(flags_given.total(true), 2);
+        assert_eq!(flags_given.total(false), 1);
+    }
+
+    #[test]
+    fn step_numbers_follow_the_chosen_path() {
+        let mut steps = Steps::new(true, 4);
+        assert_eq!(steps.next().as_deref(), Some("1/4"));
+        steps.set_total(3);
+        assert_eq!(steps.next().as_deref(), Some("2/3"));
+        assert_eq!(steps.next().as_deref(), Some("3/3"));
+
+        let mut quiet = Steps::new(false, 4);
+        assert_eq!(quiet.next(), None);
     }
 
     #[test]
