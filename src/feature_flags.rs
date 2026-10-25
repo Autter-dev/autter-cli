@@ -84,6 +84,8 @@ define_feature_flags!(
     transcript_sweep: transcript_sweep, debug = true, release = true,
     checkpoint_debug_log: checkpoint_debug_log, debug = false, release = false,
     squash_recovery: squash_recovery, debug = true, release = true,
+    // Agent hooks inject repository memory before agents write code (memory-hook).
+    memory_context: memory_context, debug = true, release = true,
 );
 
 impl FeatureFlags {
@@ -208,6 +210,7 @@ mod tests {
             transcript_sweep: true,
             checkpoint_debug_log: false,
             squash_recovery: true,
+            memory_context: true,
         };
 
         let serialized = serde_json::to_string(&flags).unwrap();
@@ -228,6 +231,7 @@ mod tests {
             transcript_sweep: true,
             checkpoint_debug_log: true,
             squash_recovery: true,
+            memory_context: true,
         };
         let cloned = flags.clone();
         assert_eq!(cloned.rewrite_stash, flags.rewrite_stash);

@@ -21,6 +21,7 @@ fn setup() {
         transcript_sweep: true,
         checkpoint_debug_log: false,
         squash_recovery: true,
+        memory_context: true,
     };
 
     autter::config::Config::set_test_feature_flags(test_flags.clone());
