@@ -1,7 +1,11 @@
 //! Repository memory from the Autter cloud: `autter memory search` ranks what
 //! Autter knows about this repository by meaning (its shared memory pages,
 //! learnings, production lessons, rules, past findings, the wiki and code), and
-//! `autter memory show` prints the memory pages. Coding agents reach these
+//! `autter memory show` prints the memory pages. The memory keeps its detail in
+//! one page per area of the codebase and a what-works ledger, so
+//! `autter memory for [<file>...]` prints the area pages covering the files at
+//! hand (by default the changed ones) with the ledger lines about those areas,
+//! the way reviews read them; `areas` and `ledger` list them. Coding agents reach these
 //! through the installed `repo-memory` skill when the Autter MCP server is not
 //! connected. Nothing is sent in local mode or for repositories excluded from
 //! prompt sharing.
@@ -9,9 +13,10 @@ use crate::commands::arg_parser::{self, ScanMode};
 use crate::commands::ask::{component, org_api_context};
 use crate::config::{Config, PromptStorageMode};
 use crate::error::AutterError;
-use crate::git::repository::discover_repository_in_path_no_git_exec;
+use crate::git::repository::{Repository, discover_repository_in_path_no_git_exec};
 use crate::repo_url::{normalize_repo_url, resolve_repo_url_from_repo};
 use serde_json::{Map, Value, json};
+use std::path::{Component, Path, PathBuf};
 
 /// Search sources the server accepts (`search_context` kinds in the platform).
 const KINDS: &[&str] = &[
@@ -34,6 +39,11 @@ const KINDS: &[&str] = &[
 const LOCAL_MODE: &str = "Repository memory lives in the Autter cloud, and this machine is in local mode, so nothing is sent to Autter. Run `autter onboard` to connect.";
 const EXCLUDED: &str = "This repository is excluded from sharing with Autter (exclude_prompts_in_repositories), so it has no cloud memory and its questions are not sent.";
 const EXCERPT_CHARS: usize = 280;
+/// Files one `autter memory for` asks about (the server's limit).
+const MAX_FILES: usize = 20;
+/// The what-works ledger page the nightly pass keeps (RM-10 in the platform).
+const LEDGER_SLUG: &str = "ledger/what-works";
+const NO_LEDGER: &str = "This repository's memory has no what-works ledger yet. Autter starts it the first night it sees changes kept, reworked or waved off.";
 
 #[derive(Debug, Default, PartialEq)]
 struct Options {
@@ -106,8 +116,15 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         }
         "search" => Ok(options),
         "show" if options.words.len() > 1 => Err("memory show takes at most one page".into()),
-        "show" => Ok(options),
-        "" => Err("memory needs a subcommand: search or show".into()),
+        "for" if options.words.len() > MAX_FILES => {
+            Err(format!("memory for takes at most {MAX_FILES} files"))
+        }
+        "show" | "for" => Ok(options),
+        "areas" | "ledger" if !options.words.is_empty() => {
+            Err(format!("memory {} takes no arguments", options.subcommand))
+        }
+        "areas" | "ledger" => Ok(options),
+        "" => Err("memory needs a subcommand: search, for, show, areas or ledger".into()),
         other => Err(format!("unknown memory subcommand: {other}")),
     }
 }
@@ -128,7 +145,10 @@ type Remotes = Vec<(String, String)>;
 
 /// The repository to ask about (`--repo`, else this checkout's default remote,
 /// normalized to https) and the remotes the sharing policy is checked against.
-fn target_repository(explicit: Option<&str>) -> Result<(String, Option<Remotes>), AutterError> {
+fn target_repository(
+    explicit: Option<&str>,
+    local: Option<&Repository>,
+) -> Result<(String, Option<Remotes>), AutterError> {
     if let Some(value) = explicit {
         return Ok(match normalize_repo_url(value) {
             Ok(url) => (url.clone(), Some(vec![("--repo".to_owned(), url)])),
@@ -140,10 +160,88 @@ fn target_repository(explicit: Option<&str>) -> Result<(String, Option<Remotes>)
             "Run this inside a git checkout with a remote, or pass --repo <owner/repo>.".into(),
         )
     };
-    let cwd = std::env::current_dir()?;
-    let repo = discover_repository_in_path_no_git_exec(&cwd).map_err(|_| not_found())?;
-    let url = resolve_repo_url_from_repo(&repo).ok_or_else(not_found)?;
+    let repo = local.ok_or_else(not_found)?;
+    let url = resolve_repo_url_from_repo(repo).ok_or_else(not_found)?;
     Ok((url, repo.remotes_with_urls().ok()))
+}
+
+/// `path` relative to the checkout root, with `/` separators; `cwd` resolves a
+/// relative path. Lexical, so a file that does not exist yet still resolves.
+fn repo_relative(workdir: &Path, cwd: &Path, path: &str) -> Option<String> {
+    let joined = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        cwd.join(path)
+    };
+    let mut normal = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    let rest = normal.strip_prefix(workdir).ok()?;
+    let text = rest
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(text)
+}
+
+/// The files `autter memory for` asks about: the arguments, made relative to
+/// the checkout root, or the files changed in the working tree when none are
+/// given. Outside a checkout (with `--repo`) arguments are taken as
+/// repository paths.
+fn files_for(words: &[String], local: Option<&Repository>) -> Result<Vec<String>, AutterError> {
+    let mut files: Vec<String> = match local {
+        Some(repo) if !words.is_empty() => {
+            let cwd = std::env::current_dir()?;
+            let workdir = repo.workdir()?;
+            // Compare like with like: canonical root, canonical cwd.
+            let workdir = workdir.canonicalize().unwrap_or(workdir);
+            let cwd = cwd.canonicalize().unwrap_or(cwd);
+            let mut out = Vec::new();
+            for word in words {
+                // An absolute path must be canonical too to share the root's prefix.
+                let canonical = Path::new(word)
+                    .is_absolute()
+                    .then(|| Path::new(word).canonicalize().ok())
+                    .flatten()
+                    .map(|path| path.to_string_lossy().into_owned());
+                let file = repo_relative(&workdir, &cwd, canonical.as_deref().unwrap_or(word))
+                    .ok_or_else(|| {
+                        AutterError::Generic(format!("{word} is outside this repository."))
+                    })?;
+                out.push(file);
+            }
+            out
+        }
+        Some(repo) => {
+            let mut changed: Vec<String> = repo
+                .get_staged_and_unstaged_filenames()?
+                .into_iter()
+                .collect();
+            changed.sort();
+            changed
+        }
+        None => words
+            .iter()
+            .map(|w| w.replace('\\', "/").trim_start_matches("./").to_owned())
+            .collect(),
+    };
+    files.retain(|file| !file.is_empty());
+    files.dedup();
+    if files.is_empty() {
+        return Err(AutterError::Generic(
+            "Nothing changed in this checkout. Name the files: autter memory for <file>...".into(),
+        ));
+    }
+    files.truncate(MAX_FILES);
+    Ok(files)
 }
 
 fn response_json(response: crate::http::Response) -> Result<Value, AutterError> {
@@ -303,6 +401,57 @@ fn render_page(repo: &str, page: &Value) -> String {
     out
 }
 
+/// `(slug, label)` rows as an aligned two-column list.
+fn render_rows(out: &mut String, rows: &[(String, String)]) {
+    let width = rows
+        .iter()
+        .map(|(slug, _)| slug.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (slug, label) in rows {
+        out.push_str(&format!("  {slug:<width$}  {label}\n"));
+    }
+}
+
+/// An area's path for people: the prefix, or "whole repository" for the root.
+fn area_path_label(path: &Value) -> String {
+    match path.as_str() {
+        Some("") => "whole repository".to_owned(),
+        Some(path) => clean(path),
+        None => "no path".to_owned(),
+    }
+}
+
+fn area_rows(areas: &[Value]) -> Vec<(String, String)> {
+    areas
+        .iter()
+        .map(|area| {
+            (
+                clean(area["slug"].as_str().unwrap_or("")),
+                format!(
+                    "{}  ({})",
+                    clean(area["title"].as_str().unwrap_or("")),
+                    area_path_label(&area["path"])
+                ),
+            )
+        })
+        .collect()
+}
+
+fn render_areas(result: &Value) -> String {
+    let repo = clean(result["repo"].as_str().unwrap_or(""));
+    let empty = Vec::new();
+    let areas = result["areas"].as_array().unwrap_or(&empty);
+    if areas.is_empty() {
+        return format!(
+            "{repo}'s memory has no area pages yet. Autter writes them each night for the parts of the codebase with activity.\n"
+        );
+    }
+    let mut out = format!("{repo}: {} areas\n\n", areas.len());
+    render_rows(&mut out, &area_rows(areas));
+    out
+}
+
 fn render_show(result: &Value) -> String {
     let repo = result["repo"].as_str().unwrap_or("");
     if result["page"].is_object() {
@@ -317,34 +466,135 @@ fn render_show(result: &Value) -> String {
         );
     }
     let mut out = render_page(repo, &result["home"]);
-    if !pages.is_empty() {
-        out.push_str("\nPages:\n");
-        let width = pages
-            .iter()
-            .filter_map(|page| page["slug"].as_str())
-            .map(|slug| slug.chars().count())
-            .max()
-            .unwrap_or(0);
-        for page in pages {
-            out.push_str(&format!(
-                "  {:<width$}  {}\n",
+    let areas = result["areas"].as_array().unwrap_or(&empty);
+    if !areas.is_empty() {
+        out.push_str("\nAreas (autter memory for <file> opens the ones covering it):\n");
+        render_rows(&mut out, &area_rows(areas));
+    }
+    let others: Vec<(String, String)> = pages
+        .iter()
+        .filter(|page| !areas.iter().any(|area| area["slug"] == page["slug"]))
+        .map(|page| {
+            (
                 clean(page["slug"].as_str().unwrap_or("")),
                 clean(page["title"].as_str().unwrap_or("")),
+            )
+        })
+        .collect();
+    if !others.is_empty() {
+        out.push_str("\nPages:\n");
+        render_rows(&mut out, &others);
+    }
+    out
+}
+
+fn plural(count: usize, one: &str) -> String {
+    format!("{count} {one}{}", if count == 1 { "" } else { "s" })
+}
+
+/// The memory for the files at hand: the area pages covering them, most
+/// specific first, then what the ledger says about those areas.
+fn render_for(result: &Value) -> String {
+    let repo = clean(result["repo"].as_str().unwrap_or(""));
+    let empty = Vec::new();
+    let paths = result["paths"].as_array().unwrap_or(&empty);
+    let areas = result["areas"].as_array().unwrap_or(&empty);
+    let uncovered = result["uncovered"].as_array().unwrap_or(&empty);
+    if result["has_memory"] == false {
+        return format!(
+            "{repo} has no repository memory yet. Autter writes it each night from agent sessions, reviews and learnings.\n"
+        );
+    }
+    let mut out = if areas.is_empty() {
+        format!(
+            "No area page in {repo}'s memory covers {}. List them with `autter memory areas`, or search with `autter memory search \"<question>\"`.\n",
+            if paths.len() == 1 {
+                "this file"
+            } else {
+                "these files"
+            }
+        )
+    } else {
+        format!(
+            "{repo}: {} for {}\n",
+            plural(areas.len(), "area page"),
+            plural(paths.len(), "file")
+        )
+    };
+    for area in areas {
+        let covers: Vec<String> = area["covers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(clean)
+            .collect();
+        out.push_str(&format!(
+            "\n== {} ({}, {})\n   covers {}\n",
+            clean(area["title"].as_str().unwrap_or("")),
+            clean(area["slug"].as_str().unwrap_or("")),
+            area_path_label(&area["path"]),
+            covers.join(", ")
+        ));
+        let body = clean(area["body"].as_str().unwrap_or("")).trim().to_owned();
+        if !body.is_empty() {
+            out.push('\n');
+            out.push_str(&body);
+            out.push('\n');
+        }
+    }
+    let lines = result["ledger"]["lines"].as_array().unwrap_or(&empty);
+    if !lines.is_empty() {
+        out.push_str("\nWhat the ledger says about these areas:\n");
+        let mut section: Option<&str> = None;
+        for line in lines {
+            let this = line["section"].as_str();
+            if this != section {
+                if let Some(name) = this {
+                    out.push_str(&format!("  {}:\n", clean(name)));
+                }
+                section = this;
+            }
+            out.push_str(&format!(
+                "    - {}\n",
+                excerpt(line["line"].as_str().unwrap_or(""), 400)
             ));
         }
+    }
+    if !uncovered.is_empty() && !areas.is_empty() {
+        let names: Vec<String> = uncovered
+            .iter()
+            .filter_map(Value::as_str)
+            .map(clean)
+            .collect();
+        out.push_str(&format!("\nNo area page covers: {}\n", names.join(", ")));
     }
     out
 }
 
 fn run(options: Options) -> Result<(), AutterError> {
     let config = Config::get();
-    let (repository, remotes) = target_repository(options.repository.as_deref())?;
+    let local = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| discover_repository_in_path_no_git_exec(&cwd).ok());
+    let (repository, remotes) = target_repository(options.repository.as_deref(), local.as_ref())?;
     if let Some(reason) = sharing_refusal(
         config.platform_sync_enabled(),
         config.effective_prompt_storage_with_remotes(remotes.as_ref()),
     ) {
         return Err(AutterError::Generic(reason.into()));
     }
+    // With --repo, this checkout (if any) says nothing about that repository's files.
+    let files_repo = if options.repository.is_some() {
+        None
+    } else {
+        local.as_ref()
+    };
+    let files = if options.subcommand == "for" {
+        files_for(&options.words, files_repo)?
+    } else {
+        Vec::new()
+    };
     let (context, slug) = org_api_context(options.organization.as_deref(), 60)?;
     let base = format!("/api/cli/orgs/{}/memory", component(&slug));
     let result = if options.subcommand == "search" {
@@ -364,25 +614,49 @@ fn run(options: Options) -> Result<(), AutterError> {
     } else {
         let mut params = url::form_urlencoded::Serializer::new(String::new());
         params.append_pair("repository", &repository);
-        if let Some(page) = options.words.first() {
-            params.append_pair("slug", page);
+        match options.subcommand.as_str() {
+            "show" => {
+                if let Some(page) = options.words.first() {
+                    params.append_pair("slug", page);
+                }
+            }
+            "ledger" => {
+                params.append_pair("slug", LEDGER_SLUG);
+            }
+            "for" => {
+                for file in &files {
+                    params.append_pair("path", file);
+                }
+            }
+            _ => {}
         }
-        response_json(context.get(&format!("{base}?{}", params.finish()))?)?
+        match response_json(context.get(&format!("{base}?{}", params.finish()))?) {
+            Err(AutterError::Generic(message))
+                if options.subcommand == "ledger"
+                    && message.contains("No repository memory page") =>
+            {
+                return Err(AutterError::Generic(NO_LEDGER.into()));
+            }
+            other => other?,
+        }
     };
     if arg_parser::json() {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
-    if options.subcommand == "search" {
-        print!("{}", render_search(&result));
-        let has_pages = result["results"]
-            .as_array()
-            .is_some_and(|hits| hits.iter().any(|hit| hit["kind"] == "repo_memory_page"));
-        if has_pages && !arg_parser::quiet() {
-            println!("\nOpen a memory page with: autter memory show <page>");
+    match options.subcommand.as_str() {
+        "search" => {
+            print!("{}", render_search(&result));
+            let has_pages = result["results"]
+                .as_array()
+                .is_some_and(|hits| hits.iter().any(|hit| hit["kind"] == "repo_memory_page"));
+            if has_pages && !arg_parser::quiet() {
+                println!("\nOpen a memory page with: autter memory show <page>");
+            }
         }
-    } else {
-        print!("{}", render_show(&result));
+        "for" => print!("{}", render_for(&result)),
+        "areas" => print!("{}", render_areas(&result)),
+        _ => print!("{}", render_show(&result)),
     }
     Ok(())
 }
@@ -409,7 +683,10 @@ pub fn handle(args: &[String]) {
         std::process::exit(2);
     });
     if let Err(error) = run(options) {
-        eprintln!("error: {error}");
+        match error {
+            AutterError::Generic(message) => eprintln!("error: {message}"),
+            other => eprintln!("error: {other}"),
+        }
         std::process::exit(1);
     }
 }
@@ -485,7 +762,7 @@ mod tests {
 
     #[test]
     fn an_explicit_repository_is_normalized_like_uploads() {
-        let (repo, remotes) = target_repository(Some("git@github.com:acme/api.git")).unwrap();
+        let (repo, remotes) = target_repository(Some("git@github.com:acme/api.git"), None).unwrap();
         assert_eq!(repo, "https://github.com/acme/api");
         assert_eq!(
             remotes,
@@ -494,7 +771,7 @@ mod tests {
                 "https://github.com/acme/api".into()
             )])
         );
-        let (repo, remotes) = target_repository(Some("acme/api")).unwrap();
+        let (repo, remotes) = target_repository(Some("acme/api"), None).unwrap();
         assert_eq!(repo, "acme/api");
         assert_eq!(remotes, None);
     }
@@ -578,5 +855,124 @@ mod tests {
         );
         let none = json!({ "repo": "acme/api", "home": { "exists": false }, "pages": [] });
         assert!(render_show(&none).starts_with("acme/api has no repository memory yet."));
+    }
+
+    #[test]
+    fn structured_subcommands_take_files_or_nothing() {
+        let options = parse_options(&args(&["for", "src/a.rs", "src/b/"])).unwrap();
+        assert_eq!(options.words, vec!["src/a.rs", "src/b/"]);
+        assert!(parse_options(&args(&["for"])).unwrap().words.is_empty());
+        let too_many: Vec<String> = std::iter::once("for".to_owned())
+            .chain((0..21).map(|i| format!("f{i}")))
+            .collect();
+        assert!(parse_options(&too_many).is_err());
+        assert!(parse_options(&args(&["for", "a", "--kind", "code"])).is_err());
+        assert!(parse_options(&args(&["areas"])).is_ok());
+        assert!(parse_options(&args(&["areas", "x"])).is_err());
+        assert!(parse_options(&args(&["ledger", "--repo", "acme/api"])).is_ok());
+        assert!(parse_options(&args(&["ledger", "x"])).is_err());
+    }
+
+    #[test]
+    fn files_resolve_relative_to_the_checkout_root() {
+        let root = Path::new("/work/app");
+        let cwd = Path::new("/work/app/src/payments");
+        assert_eq!(
+            repo_relative(root, cwd, "charge.rs").as_deref(),
+            Some("src/payments/charge.rs")
+        );
+        assert_eq!(
+            repo_relative(root, cwd, "../http/./retry.rs").as_deref(),
+            Some("src/http/retry.rs")
+        );
+        assert_eq!(
+            repo_relative(root, cwd, ".").as_deref(),
+            Some("src/payments")
+        );
+        assert_eq!(repo_relative(root, cwd, "../../../other/x.rs"), None);
+    }
+
+    #[test]
+    fn memory_for_files_prints_area_pages_then_the_ledger() {
+        let result = json!({
+            "repo": "acme/api",
+            "paths": ["src/payments/webhooks/stripe.ts", "README.md"],
+            "has_memory": true,
+            "areas": [
+                {
+                    "slug": "areas/src-payments-webhooks",
+                    "title": "Payment webhooks",
+                    "path": "src/payments/webhooks/",
+                    "covers": ["src/payments/webhooks/stripe.ts"],
+                    "body": "# Payment webhooks\nPath: `src/payments/webhooks/`\n\n## Conventions\n- Dedupe on event id."
+                },
+                {
+                    "slug": "areas/root",
+                    "title": "Repository root",
+                    "path": "",
+                    "covers": ["src/payments/webhooks/stripe.ts"],
+                    "body": ""
+                }
+            ],
+            "uncovered": ["README.md"],
+            "ledger": { "lines": [
+                { "section": "Works", "line": "Idempotency keys [src-payments-webhooks]", "area": "src-payments-webhooks" },
+                { "section": "Doesn't work", "line": "Polling Stripe [src-payments-webhooks]", "area": "src-payments-webhooks" },
+                { "section": "Doesn't work", "line": "Secrets in env [root]", "area": "root" }
+            ] }
+        });
+        assert_eq!(
+            render_for(&result),
+            "acme/api: 2 area pages for 2 files\n\
+             \n== Payment webhooks (areas/src-payments-webhooks, src/payments/webhooks/)\
+             \n   covers src/payments/webhooks/stripe.ts\n\
+             \n# Payment webhooks\nPath: `src/payments/webhooks/`\n\n## Conventions\n- Dedupe on event id.\n\
+             \n== Repository root (areas/root, whole repository)\
+             \n   covers src/payments/webhooks/stripe.ts\n\
+             \nWhat the ledger says about these areas:\
+             \n  Works:\
+             \n    - Idempotency keys [src-payments-webhooks]\
+             \n  Doesn't work:\
+             \n    - Polling Stripe [src-payments-webhooks]\
+             \n    - Secrets in env [root]\n\
+             \nNo area page covers: README.md\n"
+        );
+        let none = json!({ "repo": "acme/api", "paths": ["README.md"], "has_memory": true, "areas": [], "uncovered": ["README.md"], "ledger": null });
+        assert!(
+            render_for(&none).starts_with("No area page in acme/api's memory covers this file.")
+        );
+        let empty = json!({ "repo": "acme/api", "paths": ["a"], "has_memory": false, "areas": [] });
+        assert!(render_for(&empty).starts_with("acme/api has no repository memory yet."));
+    }
+
+    #[test]
+    fn areas_list_with_their_paths_and_show_groups_them() {
+        let home = json!({
+            "repo": "acme/api",
+            "home": { "slug": "MEMORY", "title": "Repository memory", "body": "- Map.", "exists": true },
+            "pages": [
+                { "slug": "areas/root", "title": "Root" },
+                { "slug": "areas/src-http", "title": "HTTP client" },
+                { "slug": "ledger/what-works", "title": "What works" }
+            ],
+            "areas": [
+                { "slug": "areas/root", "title": "Root", "path": "" },
+                { "slug": "areas/src-http", "title": "HTTP client", "path": "src/http/" }
+            ]
+        });
+        assert_eq!(
+            render_areas(&home),
+            "acme/api: 2 areas\n\n  areas/root      Root  (whole repository)\n  areas/src-http  HTTP client  (src/http/)\n"
+        );
+        assert_eq!(
+            render_show(&home),
+            "Repository memory (MEMORY, acme/api)\n\n- Map.\n\
+             \nAreas (autter memory for <file> opens the ones covering it):\
+             \n  areas/root      Root  (whole repository)\
+             \n  areas/src-http  HTTP client  (src/http/)\n\
+             \nPages:\n  ledger/what-works  What works\n"
+        );
+        let bare = json!({ "repo": "acme/api", "areas": [] });
+        assert!(render_areas(&bare).starts_with("acme/api's memory has no area pages yet."));
     }
 }

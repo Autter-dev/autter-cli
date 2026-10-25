@@ -370,4 +370,4 @@ Use `autter ask` for evidence-backed system questions, `autter logs` for structu
 
 ### Repository memory
 
-Use `autter memory search "<question>"` to rank what Autter knows about the repository you're in (its shared memory pages, learnings, production lessons, team rules, past findings, wiki and code) by meaning, and `autter memory show [<page>]` to read its memory pages. Add `--json` for coding agents; the `repo-memory` skill tells them to use these when the Autter MCP server isn't connected. Nothing is sent in local mode or for repositories excluded from sharing.
+Use `autter memory search "<question>"` to rank what Autter knows about the repository you're in (its shared memory pages, learnings, production lessons, team rules, past findings, wiki and code) by meaning, `autter memory for [<file>...]` to read the memory's area pages for the files you're editing (with what worked and what didn't there), and `autter memory show`, `areas` and `ledger` to browse it. Add `--json` for coding agents; the `repo-memory` skill tells them to use these when the Autter MCP server isn't connected. Nothing is sent in local mode or for repositories excluded from sharing.

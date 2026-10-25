@@ -69,3 +69,31 @@ fn memory_rejects_bad_usage_before_anything_else() {
     let output = memory_error(&repo, &["memory"]);
     assert!(output.contains("memory needs a subcommand"), "{output}");
 }
+
+#[test]
+fn memory_for_files_sends_nothing_in_local_mode() {
+    let mut repo = repo_with_remote();
+    repo.patch_autter_config(|patch| patch.prompt_storage = Some("local".to_string()));
+    for args in [
+        &["memory", "for", "src/lib.rs"][..],
+        &["memory", "for"][..],
+        &["memory", "areas"][..],
+        &["memory", "ledger"][..],
+    ] {
+        let output = memory_error(&repo, args);
+        assert!(output.contains("local mode"), "{output}");
+    }
+}
+
+#[test]
+fn memory_for_without_changes_asks_for_files() {
+    let mut repo = repo_with_remote();
+    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    let output = memory_error(&repo, &["memory", "for"]);
+    assert!(
+        output.contains("Nothing changed in this checkout"),
+        "{output}"
+    );
+    let output = memory_error(&repo, &["memory", "for", "../outside.rs"]);
+    assert!(output.contains("outside this repository"), "{output}");
+}

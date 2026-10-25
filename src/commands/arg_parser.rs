@@ -635,8 +635,14 @@ autter login [--token <token>]
         summary: "Search this repository's memory in the Autter cloud",
         body: "autter memory search <question> [--path <file|dir>]... [--kind <kind>]... [--limit 1..30]
                      [--repo <remote|owner/repo>] [--org <slug>] [--json]
+autter memory for [<file>...] [--repo <remote|owner/repo>] [--org <slug>] [--json]
 autter memory show [<page>] [--repo <remote|owner/repo>] [--org <slug>] [--json]
+autter memory areas | ledger [--repo <remote|owner/repo>] [--org <slug>] [--json]
 
+  for     Print the area pages of the memory covering these files (default: the
+          files changed in this checkout), most specific first: how that part of
+          the codebase works, its conventions, what breaks and what works there,
+          then the what-works ledger lines about those areas.
   search  Rank what Autter knows about this repository by meaning: its shared
           memory pages, learnings, production lessons, team rules, past review
           and scan findings, the wiki and code. --path keeps results about those
@@ -644,7 +650,9 @@ autter memory show [<page>] [--repo <remote|owner/repo>] [--org <slug>] [--json]
           comma-separate): repo_memory, learnings, lessons, rules, memory,
           repo_context, review_findings, scan_findings, docs, incidents,
           pr_summaries, tickets, code, symbols.
-  show    Print the repository memory home page and its page index, or one page.
+  show    Print the repository memory home page, its areas and pages, or one page.
+  areas   List the area pages and the part of the codebase each covers.
+  ledger  Print what worked, what didn't, and what the team waves off.
 
   The repository is this checkout's default remote unless --repo is given.
   Uses your autter login. Nothing is sent in local mode or for repositories
