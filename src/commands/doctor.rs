@@ -15,6 +15,7 @@ use crate::config::{self, Config};
 use crate::diagnostics::{DiagnosticCheckResult, DiagnosticStatus, GitDiagnosticTarget};
 use crate::process_timeout::run_command_with_timeout;
 use serde::Serialize;
+use std::io::IsTerminal;
 use std::time::Duration;
 
 const SKIP_TRACE2_CHECKS_FLAG: &str = "--skip-trace2-checks";
@@ -125,7 +126,16 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     let json = arg_parser::json();
     let mut reporter = Reporter::new(json);
 
-    if !json {
+    if reporter.live {
+        eprintln!();
+        crate::ui::Header::new(
+            "Autter doctor",
+            format!("v{}", version_string()),
+            "Checking your setup \u{00B7} the end-to-end checks take a few seconds",
+            crate::ui::header::display_cwd(),
+        )
+        .print();
+    } else if !json {
         println!("autter doctor (autter {})", version_string());
         println!("Validating your autter setup -- the end-to-end checks take a few seconds.");
     }
@@ -133,14 +143,18 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     let git_cmd = Config::get().git_cmd().to_string();
 
     // Setup: git binary/version, config file parse, repository eligibility.
+    reporter.begin(SECTION_SETUP, "checking git");
     let (git_check, terminal_git_ok) = check_git_versions(&git_cmd);
     reporter.add(git_check);
+    reporter.begin(SECTION_SETUP, "reading the config file");
     reporter.add(check_config_file());
+    reporter.begin(SECTION_SETUP, "checking this repository");
     reporter.add(check_repository());
 
     // Background service health uses the same probe as `autter bg status`, so
     // the two commands always agree. This starts (or restarts) the service
     // when needed, so it must run before the end-to-end checkpoint check.
+    reporter.begin(SECTION_SERVICE, "checking the background service");
     let daemon_check = check_from_diagnostic(
         SECTION_SERVICE,
         "background service",
@@ -152,6 +166,7 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     // Separately: do real git trace2 events reach the service? A failure here
     // is usually missing trace2 config, not an unhealthy service.
     if daemon_ok {
+        reporter.begin(SECTION_SERVICE, "sending a git event to the service");
         reporter.add(check_from_diagnostic(
             SECTION_SERVICE,
             "trace2 ingestion",
@@ -174,6 +189,7 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         ("trace2 config (configured git)", &configured_target),
         ("trace2 config (terminal git)", &terminal_target),
     ] {
+        reporter.begin(SECTION_TRACE2, &format!("checking {name}"));
         let check = check_from_diagnostic(
             SECTION_TRACE2,
             name,
@@ -191,6 +207,7 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
             format!("skipped ({})", SKIP_TRACE2_CHECKS_FLAG),
         ));
     } else {
+        reporter.begin(SECTION_TRACE2, "capturing a real git event");
         let capture = check_from_diagnostic(
             SECTION_TRACE2,
             "trace2 event capture",
@@ -212,6 +229,7 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         } else {
             &configured_target
         };
+        reporter.begin(SECTION_E2E, "running a checkpoint through a test commit");
         let mut e2e_check = check_from_diagnostic(
             SECTION_E2E,
             "checkpoint round-trip",
@@ -242,19 +260,25 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     }
 
     // AI agent hooks: would an edit made right now actually checkpoint?
+    reporter.begin(SECTION_AGENTS, "checking agent hooks");
     for check in agent_hook_checks() {
         reporter.add(check);
     }
+    reporter.begin(SECTION_AGENTS, "checking VS Code");
     if let Some(check) = vscode_native_hooks_check() {
         reporter.add(check);
     }
 
     // Account & sync: auth state and API reachability. Uploads silently
     // no-op when unauthenticated, so doctor is where a broken login surfaces.
+    reporter.begin(SECTION_ACCOUNT, "checking your sign-in");
     let (auth_check, authenticated) = check_auth();
     reporter.add(auth_check);
+    reporter.begin(SECTION_ACCOUNT, "reaching the Autter API");
     reporter.add(check_connectivity(authenticated));
+    reporter.begin(SECTION_ACCOUNT, "checking your org's data plane");
     reporter.add(check_org_data_plane());
+    reporter.begin(SECTION_ACCOUNT, "checking the upload queue");
     reporter.add(check_sync_queue());
 
     reporter.finish()
@@ -1173,32 +1197,70 @@ fn summarize(checks: &[DoctorCheck]) -> DoctorSummary {
 /// document at the end.
 struct Reporter {
     json: bool,
+    /// A person is watching both streams: each check shows a spinner while
+    /// it runs and resolves in place, in the terminal's glyphs.
+    live: bool,
     current_section: Option<&'static str>,
+    running: Option<crate::ui::progress::Spinner>,
     checks: Vec<DoctorCheck>,
 }
 
 impl Reporter {
     fn new(json: bool) -> Self {
+        let live = !json && std::io::stdout().is_terminal() && crate::ui::caps().tty;
         Self {
             json,
+            live,
             current_section: None,
+            running: None,
             checks: Vec::new(),
         }
     }
 
+    /// Announce a check that is about to run. Only shows anything live; the
+    /// result still arrives through [`Self::add`].
+    fn begin(&mut self, section: &'static str, activity: &str) {
+        if !self.live {
+            return;
+        }
+        self.enter_section(section);
+        if let Some(spinner) = self.running.take() {
+            spinner.stop();
+        }
+        self.running = Some(crate::ui::progress::Spinner::indented(
+            &format!("{activity}\u{2026}"),
+            2,
+        ));
+    }
+
     fn add(&mut self, check: DoctorCheck) {
+        if let Some(spinner) = self.running.take() {
+            spinner.stop();
+        }
         if !self.json {
-            if self.current_section != Some(check.section) {
-                println!();
-                println!("{}", check.section);
-                self.current_section = Some(check.section);
-            }
-            print_human_check(&check);
+            self.enter_section(check.section);
+            let glyphs = if self.live {
+                crate::ui::caps().glyphs()
+            } else {
+                &crate::ui::theme::UNICODE_GLYPHS
+            };
+            print_human_check(&check, glyphs);
         }
         self.checks.push(check);
     }
 
-    fn finish(self) -> DoctorOutput {
+    fn enter_section(&mut self, section: &'static str) {
+        if self.current_section != Some(section) {
+            println!();
+            println!("{}", arg_parser::paint("1", section));
+            self.current_section = Some(section);
+        }
+    }
+
+    fn finish(mut self) -> DoctorOutput {
+        if let Some(spinner) = self.running.take() {
+            spinner.stop();
+        }
         let summary = summarize(&self.checks);
         let next_step = next_step_from_checks(&self.checks);
         let output = DoctorOutput {
@@ -1266,11 +1328,11 @@ impl Reporter {
     }
 }
 
-fn print_human_check(check: &DoctorCheck) {
+fn print_human_check(check: &DoctorCheck, glyphs: &crate::ui::theme::Glyphs) {
     let (symbol, color) = match check.status {
-        DoctorStatus::Passed => ("✓", "1;32"),
-        DoctorStatus::Warning => ("⚠", "1;33"),
-        DoctorStatus::Failed => ("✗", "1;31"),
+        DoctorStatus::Passed => (glyphs.ok, "1;32"),
+        DoctorStatus::Warning => (glyphs.warn, "1;33"),
+        DoctorStatus::Failed => (glyphs.fail, "1;31"),
         DoctorStatus::Skipped => ("-", "90"),
     };
     println!(

@@ -711,8 +711,7 @@ fn apply_system_integrations_with_consent(
     match integration_decision(assume_yes, ui::is_interactive()) {
         IntegrationDecision::Apply => {
             rail::print_step("Installing integrations", None);
-            let _rail = ui::progress::on_rail();
-            crate::commands::install_hooks::run(&["--system".to_string()])
+            crate::commands::install_hooks::run_for_tools(None, true)
                 .map(|_| true)
                 .map_err(|e| e.to_string())
         }
@@ -762,9 +761,12 @@ fn apply_system_integrations_with_consent(
                 .filter(|&&i| i < tools.len())
                 .map(|&i| tools[i].id.clone())
                 .collect();
-            crate::commands::install_hooks::run_for_tools(&tool_ids, chosen.contains(&system_item))
-                .map(|_| true)
-                .map_err(|e| e.to_string())
+            crate::commands::install_hooks::run_for_tools(
+                Some(&tool_ids),
+                chosen.contains(&system_item),
+            )
+            .map(|_| true)
+            .map_err(|e| e.to_string())
         }
     }
 }

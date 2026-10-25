@@ -44,9 +44,18 @@ pub struct Spinner {
 
 impl Spinner {
     pub fn new(message: &str) -> Self {
+        Self::indented(message, 0)
+    }
+
+    /// A spinner drawn `indent` columns in, to sit under a heading.
+    pub fn indented(message: &str, indent: usize) -> Self {
         // indicatif draws on stderr and hides itself when that isn't a terminal.
         let caps = theme::caps();
-        let template = format!("{}{{spinner:.green}} {{msg}}", rail_prefix(&caps));
+        let template = format!(
+            "{}{}{{spinner:.green}} {{msg}}",
+            rail_prefix(&caps),
+            " ".repeat(indent)
+        );
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()

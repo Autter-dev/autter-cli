@@ -322,7 +322,9 @@ autter blame <file>
   Git blame with an AI authorship overlay. Accepts git blame arguments
   (-L, -C, --porcelain, etc.).
 
-  --json   Output in JSON format",
+  --json                Output in JSON format
+  -i, --interactive     Browse the file full-screen: AI, human and untracked
+                        lines, and the prompt behind each AI change",
     },
     HelpEntry {
         name: "diff",
@@ -349,9 +351,11 @@ autter stats [commit]
 
   Show AI authorship statistics for a commit or range.
 
-  --json            Output in JSON format
-  --ignore <pat>    Ignore files matching the given pattern(s)
-  --wait[=secs]     Wait for the authorship note (default 30s); exit 1 if still pending",
+  --json              Output in JSON format
+  --ignore <pat>      Ignore files matching the given pattern(s)
+  --wait[=secs]       Wait for the authorship note (default 30s); exit 1 if still pending
+  -i, --interactive   Browse recent commits full-screen by AI share, with each
+                      commit's breakdown by tool and model",
     },
     HelpEntry {
         name: "file-changes",

@@ -1,0 +1,12 @@
+---
+source: src/commands/whoami.rs
+expression: "render_card(&view(&auth, CloudSyncState::Healthy, 0), &caps())"
+---
+  ▗▟▀▀▙▟▌     Sam (you@company.com)
+  ▐▌  ▐█▌     Signed in · session valid for 89 days
+  ▝▜▄▄▛▜▌ ██  Credentials in file
+
+  Organizations  acme (admin) · Personal
+  Cloud sync     ✓ up to date
+  API            https://api.autter.dev
+  User ID        usr_123

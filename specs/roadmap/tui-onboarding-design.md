@@ -293,6 +293,17 @@ Migration rules:
 - Onboarding no longer uses unconditional color codes, so `NO_COLOR` and `--no-color` apply to it too.
 - `cargo run --example ui_preview` walks the same screens with sample data, including a sign-in that approves itself after six seconds.
 
+**Phase 3 notes (as built):**
+- **Bare `autter`** (`commands::home`) on a terminal: header with mode and account, the latest commit's AI share as a 20-column bar with the top tool, pending uploads when connected, and suggested commands. Only local state is read: config, stored credentials, the local notes cache, and one `git diff`. Bare `autter` with no terminal still prints the overview.
+- **`whoami`**: when stdout is a terminal, a card (header plus Organizations, Cloud sync, API and User ID rows, and a note about held uploads). Piped output and exit codes are unchanged.
+- **`doctor`**: when both streams are terminals, the header replaces the banner, section titles are bold, and each check shows an indented spinner (`Reporter::begin`) that resolves to ✓/⚠/✗ in place. `--json` and piped output are unchanged.
+- **`install-hooks`** run directly at a terminal (without `-v`): the tools sit on a rail opened by "Coding agents" and closed with "N coding tools set up", with "Not detected" as a note. `--yes` onboarding now installs through `run_for_tools(None, true)` so it doesn't draw a second rail.
+
+**Phase 4 notes (as built):** `commands::interactive`, with a shared `View` trait, runner and palette.
+- **`autter stats -i [commit]`**: the last 200 commits from `HEAD` (or the given commit) with time, author, an AI-share bar and percentage, and the subject. Beside or below the list, the selected commit's AI/human/untracked counts and its breakdown by tool and model. Stats are computed newest-first on a background thread, so the list opens immediately.
+- **`autter blame -i <file>`**: the file with a gutter mark per line (teal for AI, plain for human, gray for untracked). A detail strip shows the line's tool, model, commit, author and age. `n`/`N` jump between AI changes, and Enter opens the prompt transcript in an overlay (resolved locally via `cas_bridge`). git blame options such as `-C` still apply.
+- Both views need a terminal on stdin and stdout and fall back to the plain command with a note otherwise. They use the theme's teal and glyphs, honor `NO_COLOR`, and restore the terminal on exit, Ctrl-C or panic (`ratatui::init`).
+
 Phases 1 and 2 are the signup improvement. Phase 3 is the usage improvement. Phase 4 adds new interactive features. Each phase can ship as its own PR.
 
 ---
