@@ -244,6 +244,46 @@ async function readDirtyFiles(filepaths: string[]): Promise<Record<string, strin
   return dirtyFiles;
 }
 
+/**
+ * Repository memory before code (`autter memory-hook pi`): the session briefing
+ * on the first prompt and the sections matching each prompt. Resolves to "" on
+ * any failure or after 4 seconds: memory must never block the agent.
+ */
+async function runMemoryHook(event: 'session' | 'prompt', payload: Record<string, unknown>): Promise<string> {
+  return await new Promise<string>((resolvePromise) => {
+    let settled = false;
+    const out: Buffer[] = [];
+    const done = (text: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(text.trim());
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(AUTTER_BIN, ['memory-hook', 'pi', '--event', event, '--hook-input', 'stdin'], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+    } catch {
+      resolvePromise('');
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // already gone
+      }
+      done('');
+    }, 4000);
+    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stdin?.on('error', () => {});
+    child.on('error', () => done(''));
+    child.on('close', (code) => done(code === 0 ? Buffer.concat(out).toString() : ''));
+    child.stdin?.end(JSON.stringify(payload));
+  });
+}
+
 async function runCheckpoint(payload: CheckpointPayload): Promise<void> {
   await new Promise<void>((resolvePromise) => {
     const child = spawn(AUTTER_BIN, ['checkpoint', 'pi', '--hook-input', 'stdin'], {
@@ -260,6 +300,30 @@ export default function (pi: ExtensionAPI) {
   const pendingCalls = new Map<string, MutatingCall[]>();
   const pendingBashCalls = new Set<string>();
   const toolConfigPromise = buildToolConfig();
+
+  // Repository memory before the agent starts on a prompt: a hidden message
+  // with the session briefing (first prompt) and the sections that match.
+  const sessionsBriefed = new Set<string>();
+  pi.on('before_agent_start', async (event: any, ctx: any) => {
+    try {
+      const sessionPath = ctx?.sessionManager?.getSessionFile?.();
+      const sessionId = sessionPath ? await readSessionId(sessionPath).catch(() => undefined) : undefined;
+      if (!sessionId) return undefined;
+      const prompt: string = typeof event?.prompt === 'string' ? event.prompt : '';
+      const parts: string[] = [];
+      if (!sessionsBriefed.has(sessionId)) {
+        sessionsBriefed.add(sessionId);
+        parts.push(await runMemoryHook('session', { session_id: sessionId, cwd: ctx.cwd }));
+      }
+      if (prompt.trim()) {
+        parts.push(await runMemoryHook('prompt', { session_id: sessionId, cwd: ctx.cwd, prompt }));
+      }
+      const content = parts.filter(Boolean).join('\n\n');
+      return content ? { message: { customType: 'autter-memory', content, display: false } } : undefined;
+    } catch {
+      return undefined;
+    }
+  });
 
   // The agent finished the prompt: have autter read the session file now,
   // including sessions that never edit a file (questions, reviews, planning).

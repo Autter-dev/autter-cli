@@ -202,6 +202,53 @@ export default function ampAutterPlugin(amp: PluginAPI) {
 		}
 	}
 
+	/**
+	 * Repository memory before code (`autter memory-hook amp`): the session
+	 * briefing on a thread's first turn and the sections matching each prompt.
+	 * "" on any failure or after 4 seconds: memory must never block the agent.
+	 */
+	const runMemoryHook = async (event: 'session' | 'prompt', payload: Record<string, unknown>): Promise<string> => {
+		try {
+			const result = await Promise.race([
+				runProcess(AUTTER_BIN, ['memory-hook', 'amp', '--event', event, '--hook-input', 'stdin'], {
+					stdin: JSON.stringify(payload),
+				}),
+				new Promise<null>((resolveTimeout) => setTimeout(() => resolveTimeout(null), 4000)),
+			])
+			return result && result.exitCode === 0 ? result.stdout.trim() : ''
+		} catch {
+			return ''
+		}
+	}
+	const threadsBriefed = new Set<string>()
+
+	// Amp appends an agent.start message after the person's message.
+	amp.on('agent.start', async (event: any) => {
+		try {
+			const threadId: string | undefined = event?.thread?.id
+			const prompt: string =
+				typeof event?.message?.content === 'string'
+					? event.message.content
+					: typeof event?.prompt === 'string'
+						? event.prompt
+						: ''
+			if (!threadId) return undefined
+			const cwd = await resolveRepoRoot([])
+			const parts: string[] = []
+			if (!threadsBriefed.has(threadId)) {
+				threadsBriefed.add(threadId)
+				parts.push(await runMemoryHook('session', { session_id: threadId, cwd }))
+			}
+			if (prompt.trim()) {
+				parts.push(await runMemoryHook('prompt', { session_id: threadId, cwd, prompt }))
+			}
+			const content = parts.filter(Boolean).join('\n\n')
+			return content ? { message: { content, display: false } } : undefined
+		} catch {
+			return undefined
+		}
+	})
+
 	amp.on('tool.call', async (event, ctx) => {
 		const autterInstalled = await ensureAutterInstalled()
 		if (!autterInstalled) {

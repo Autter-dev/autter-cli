@@ -203,6 +203,50 @@ const swallowHookErrors = <Args extends unknown[]>(
   }
 }
 
+/** `autter memory-hook` may take this long before the plugin gives up and injects nothing. */
+const MEMORY_TIMEOUT_MS = 4000
+
+/**
+ * Ask autter for the repository memory briefing (`event`: "session" or
+ * "prompt"). Resolves to the markdown, or "" on any failure: memory must never
+ * get in the agent's way.
+ */
+const runMemoryHook = (event: "session" | "prompt", payload: Record<string, unknown>): Promise<string> => {
+  return new Promise((resolve) => {
+    let settled = false
+    const out: Buffer[] = []
+    const done = (text: string): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(text.trim())
+    }
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(AUTTER_BIN, ["memory-hook", "opencode", "--event", event, "--hook-input", "stdin"], {
+        stdio: ["pipe", "pipe", "ignore"],
+      })
+    } catch (error) {
+      debugLog("failed to start memory-hook", error)
+      resolve("")
+      return
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM")
+      } catch (error) {
+        debugLog("failed to kill timed-out memory-hook", error)
+      }
+      done("")
+    }, MEMORY_TIMEOUT_MS)
+    child.stdout?.on("data", (chunk: Buffer) => out.push(chunk))
+    child.stdin?.on("error", () => {})
+    child.on("error", () => done(""))
+    child.on("close", (code) => done(code === 0 ? Buffer.concat(out).toString() : ""))
+    child.stdin?.end(JSON.stringify(payload))
+  })
+}
+
 const runCheckpoint = (hookInput: string): Promise<void> => {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -275,6 +319,12 @@ const createAutterPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plug
 
   // Track pending calls by callID so we can reference them in the after hook
   const pendingCalls = new Map<string, { repoDir: string; sessionID: string; toolInput: unknown }>()
+
+  // Repository memory before code: the session briefing once per session, and
+  // the sections matching the latest prompt, added to the system prompt.
+  const sessionMemory = new Map<string, string>()
+  const latestPrompt = new Map<string, string>()
+  const promptMemory = new Map<string, { prompt: string; markdown: string }>()
 
   const nearestExistingDirectory = async (pathHint: string): Promise<string | null> => {
     let candidate = pathHint
@@ -445,6 +495,46 @@ const createAutterPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plug
   }
 
   return {
+    // Remember what the person asked, for the memory that matches it.
+    "chat.message": swallowHookErrors(
+      "memory prompt capture failed",
+      async (input: { sessionID: string }, output: { parts: Array<{ type?: string; text?: string; synthetic?: boolean }> }) => {
+        const text = (output?.parts ?? [])
+          .filter((part) => part?.type === "text" && !part.synthetic && typeof part.text === "string")
+          .map((part) => part.text as string)
+          .join("\n")
+          .trim()
+        if (input?.sessionID && text) latestPrompt.set(input.sessionID, text)
+      },
+    ),
+
+    // Inject repository memory into the system prompt (OpenCode reads plugin
+    // system additions on every request; the briefings are cached per session).
+    "experimental.chat.system.transform": swallowHookErrors(
+      "memory injection failed",
+      async (input: { sessionID?: string }, output: { system: string[] }) => {
+        const sessionID = input?.sessionID
+        if (!sessionID || !Array.isArray(output?.system)) return
+        if (!sessionMemory.has(sessionID)) {
+          sessionMemory.set(sessionID, await runMemoryHook("session", { session_id: sessionID, cwd: defaultCwd }))
+        }
+        const prompt = latestPrompt.get(sessionID)
+        let matched = ""
+        if (prompt) {
+          const cached = promptMemory.get(sessionID)
+          if (cached?.prompt === prompt) {
+            matched = cached.markdown
+          } else {
+            matched = await runMemoryHook("prompt", { session_id: sessionID, cwd: defaultCwd, prompt })
+            promptMemory.set(sessionID, { prompt, markdown: matched })
+          }
+        }
+        for (const markdown of [sessionMemory.get(sessionID), matched]) {
+          if (markdown) output.system.push(markdown)
+        }
+      },
+    ),
+
     // The session finished responding: wake autter's transcript reader so the
     // turn is uploaded now rather than on its next periodic sweep.
     event: swallowHookErrors(
