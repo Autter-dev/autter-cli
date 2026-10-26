@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Initial attributions data structure stored in the INITIAL file
@@ -393,22 +394,20 @@ impl PersistedWorkingLog {
 
     /* append checkpoint */
     pub fn append_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), AutterError> {
-        // Read existing checkpoints
-        let mut checkpoints = self.read_all_checkpoints().unwrap_or_default();
+        self.mutate_all_checkpoints(|checkpoints| {
+            // Create a copy, potentially without transcript to reduce storage size.
+            //
+            // Tools that DON'T support refetch (transcript must be kept):
+            // - "mock_ai" - test preset, transcript not stored externally
+            // - Any other agent-v1 custom tools (detected by lack of tool-specific metadata)
+            checkpoints.push(checkpoint.clone());
 
-        // Create a copy, potentially without transcript to reduce storage size.
-        //
-        // Tools that DON'T support refetch (transcript must be kept):
-        // - "mock_ai" - test preset, transcript not stored externally
-        // - Any other agent-v1 custom tools (detected by lack of tool-specific metadata)
-        checkpoints.push(checkpoint.clone());
-
-        // Prune char-level attributions from older checkpoints for the same files
-        // Only the most recent checkpoint per file needs char-level precision
-        self.prune_old_char_attributions(&mut checkpoints);
-
-        // Write all checkpoints back
-        self.write_all_checkpoints(&checkpoints)
+            // Prune char-level attributions from older checkpoints for the same files
+            // Only the most recent checkpoint per file needs char-level precision
+            self.prune_old_char_attributions(checkpoints);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn read_all_checkpoints(&self) -> Result<Vec<Checkpoint>, AutterError> {
@@ -425,15 +424,27 @@ impl PersistedWorkingLog {
         let reader = std::io::BufReader::new(file);
         let mut checkpoints = Vec::new();
 
-        // Parse JSONL file - each line is a separate JSON object
-        for line in reader.lines() {
+        // Parse JSONL file - each line is a separate JSON object. Read raw bytes
+        // so that a corrupt (e.g. NUL-padded or non-UTF-8) line is skipped
+        // instead of failing the whole read and every checkpoint after it.
+        for (index, line) in reader.split(b'\n').enumerate() {
             let line = line?;
-            if line.trim().is_empty() {
+            if line.trim_ascii().is_empty() {
                 continue;
             }
 
-            let checkpoint: Checkpoint = serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let checkpoint: Checkpoint = match serde_json::from_slice(&line) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %checkpoints_file.display(),
+                        line = index + 1,
+                        "skipping corrupt checkpoint line"
+                    );
+                    continue;
+                }
+            };
 
             if checkpoint.api_version != CHECKPOINT_API_VERSION {
                 tracing::debug!(
@@ -535,14 +546,36 @@ impl PersistedWorkingLog {
         // collecting every line into a Vec<String> and join()-ing them into one
         // giant String. On large histories that intermediate buffer (plus the
         // joined copy) was a major peak-memory amplifier.
-        let file = fs::File::create(&checkpoints_file)?;
-        let mut writer = std::io::BufWriter::new(file);
+        //
+        // Write to a uniquely named temp file and rename it over the target so
+        // that a crash or a concurrent writer can never leave a partially
+        // written checkpoints.jsonl behind.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp_file = self.dir.join(format!(
+            "checkpoints.jsonl.{}.{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = Self::write_checkpoints_atomically(&tmp_file, &checkpoints_file, checkpoints);
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_file);
+        }
+        result
+    }
+
+    fn write_checkpoints_atomically(
+        tmp_file: &Path,
+        checkpoints_file: &Path,
+        checkpoints: &[Checkpoint],
+    ) -> Result<(), AutterError> {
+        let mut writer = std::io::BufWriter::new(fs::File::create(tmp_file)?);
         for checkpoint in checkpoints {
             serde_json::to_writer(&mut writer, checkpoint)?;
             writer.write_all(b"\n")?;
         }
         writer.flush()?;
-
+        writer.get_ref().sync_all()?;
+        fs::rename(tmp_file, checkpoints_file)?;
         Ok(())
     }
 
