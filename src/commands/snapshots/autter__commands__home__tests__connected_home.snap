@@ -1,0 +1,14 @@
+---
+source: src/commands/home.rs
+expression: "render(&view(Mode::Connected\n{ account: \"you@company.com \\u{00B7} acme\".to_string() }, Some(commit)),\n&caps())"
+---
+
+  ▗▟▀▀▙▟▌     Autter v2.3.0
+  ▐▌  ▐█▌     Connected · you@company.com · acme
+  ▝▜▄▄▛▜▌ ██  ~/code/app
+
+  Last commit  a1b2c3d  ██████··░░░░░░░░░░░░  62% AI · claude
+               Add retry to the uploader
+  Uploads      none pending
+
+  autter stats · autter blame <file> · autter dash · autter help

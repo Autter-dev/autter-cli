@@ -1,0 +1,7 @@
+---
+source: src/ui/header.rs
+expression: "header().render(&caps(ColorLevel::TrueColor, Charset::Unicode, 120))"
+---
+  ▗▟▀▀▙▟▌     [1mAutter[0m [2mv2.3.0[0m
+  ▐▌  ▐█▌     [2mConnected · you@company.com · acme[0m
+  ▝▜▄▄▛▜▌ [38;2;46;230;197m██[0m  [2m~/code/app · capturing in 3 tools[0m

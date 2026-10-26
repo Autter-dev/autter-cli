@@ -4,8 +4,9 @@ use crate::auth::types::{
 };
 use crate::config;
 use crate::http;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// OAuth client for device authorization flow
 pub struct OAuthClient {
@@ -142,13 +143,33 @@ impl OAuthClient {
         interval: u32,
         expires_in: u32,
     ) -> Result<StoredCredentials, String> {
+        self.poll_for_token_until(device_code, interval, expires_in, &AtomicBool::new(false))
+    }
+
+    /// [`Self::poll_for_token`] that stops early, without another request,
+    /// once `cancel` is set (checked every quarter second while waiting).
+    pub fn poll_for_token_until(
+        &self,
+        device_code: &str,
+        interval: u32,
+        expires_in: u32,
+        cancel: &AtomicBool,
+    ) -> Result<StoredCredentials, String> {
         let url = format!("{}/worker/oauth/token", self.base_url);
         let mut elapsed = 0u32;
         let mut current_interval = interval;
 
         while elapsed < expires_in {
             // Wait before polling
-            thread::sleep(Duration::from_secs(current_interval as u64));
+            let wake = Instant::now() + Duration::from_secs(current_interval as u64);
+            while Instant::now() < wake {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Sign-in was cancelled".to_string());
+                }
+                thread::sleep(
+                    Duration::from_millis(250).min(wake.saturating_duration_since(Instant::now())),
+                );
+            }
             elapsed += current_interval;
 
             let body = serde_json::json!({

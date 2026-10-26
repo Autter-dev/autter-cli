@@ -1,0 +1,7 @@
+---
+source: src/ui/header.rs
+expression: "header().render(&caps(ColorLevel::None, Charset::Unicode, 49))"
+---
+Autter v2.3.0
+Connected · you@company.com · acme
+~/code/app · capturing in 3 tools
