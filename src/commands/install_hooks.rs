@@ -9,6 +9,7 @@ use crate::mdm::spinner::{Spinner, print_diff};
 use crate::mdm::utils::resolve_hook_binary_path;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -17,7 +18,7 @@ const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "10";
 const VISUAL_STUDIO_INSTALLER_ID: &str = "visual-studio";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct InstallOptions {
     dry_run: bool,
     verbose: bool,
@@ -25,6 +26,59 @@ struct InstallOptions {
     include_visual_studio_extension: bool,
     /// When true, also write global git trace2 config and start the daemon.
     apply_system: bool,
+    /// Only these installer ids, when set (the tools chosen in onboarding).
+    only: Option<HashSet<String>>,
+    /// Running inside onboarding's step rail: skip this command's own section
+    /// header and "not detected" list, which onboarding already showed.
+    on_rail: bool,
+    /// Run directly by a person at a terminal: lay the tools out on a rail of
+    /// their own, opened by a step line and closed with a summary.
+    rail_layout: bool,
+}
+
+/// A tool autter can install hooks for, found on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedTool {
+    pub id: String,
+    pub name: String,
+}
+
+/// The tools on this machine that `install-hooks` would set up. A tool whose
+/// version check fails is still listed, so installing it reports why.
+pub fn detect_tools() -> Vec<DetectedTool> {
+    let Ok(binary_path) = resolve_hook_binary_path() else {
+        return Vec::new();
+    };
+    let params = HookInstallerParams { binary_path };
+    let options = InstallOptions::default();
+    get_all_installers()
+        .into_iter()
+        .filter(|installer| should_include_installer(installer.id(), &options))
+        .filter(|installer| match installer.check_hooks(&params) {
+            Ok(check) => check.tool_installed,
+            Err(_) => true,
+        })
+        .map(|installer| DetectedTool {
+            id: installer.id().to_string(),
+            name: installer.name().to_string(),
+        })
+        .collect()
+}
+
+/// Install hooks for `tool_ids` (from [`detect_tools`]; `None` for every
+/// detected tool), plus the global git trace2 config and background service
+/// when `system` is set. Output hangs off onboarding's step rail.
+pub fn run_for_tools(
+    tool_ids: Option<&[String]>,
+    system: bool,
+) -> Result<HashMap<String, String>, AutterError> {
+    let _rail = crate::ui::progress::on_rail();
+    run_with_options(InstallOptions {
+        apply_system: system,
+        only: tool_ids.map(|ids| ids.iter().cloned().collect()),
+        on_rail: true,
+        ..InstallOptions::default()
+    })
 }
 
 /// Installation status for a tool
@@ -349,8 +403,15 @@ fn ensure_daemon(dry_run: bool) {
 /// after the user consents — so `npm install` / bare `install-hooks` no longer
 /// mutate the machine silently.
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
-    let options = parse_install_options(args);
+    let mut options = parse_install_options(args);
+    // Verbose output interleaves diffs, which don't belong on the rail.
+    options.rail_layout =
+        !options.verbose && std::io::stdout().is_terminal() && crate::ui::caps().tty;
+    let _rail = options.rail_layout.then(crate::ui::progress::on_rail);
+    run_with_options(options)
+}
 
+fn run_with_options(options: InstallOptions) -> Result<HashMap<String, String>, AutterError> {
     if options.apply_system {
         // Daemon trace2 config must be in place before any install work starts.
         // Non-fatal: the global git config may be read-only (e.g. Nix store symlink).
@@ -470,6 +531,9 @@ fn parse_install_options(args: &[String]) -> InstallOptions {
 }
 
 fn should_include_installer(id: &str, options: &InstallOptions) -> bool {
+    if let Some(only) = &options.only {
+        return only.contains(id);
+    }
     options.include_visual_studio_extension || id != VISUAL_STUDIO_INSTALLER_ID
 }
 
@@ -587,7 +651,12 @@ async fn async_run_install(
     let mut detailed_results: Vec<(String, InstallResult)> = Vec::new();
 
     // === Coding Agents ===
-    println!("\n{}", paint("1", "Coding Agents"));
+    if options.rail_layout {
+        eprintln!();
+        crate::ui::rail::print_step("Coding agents", None);
+    } else if !options.on_rail {
+        println!("\n{}", paint("1", "Coding Agents"));
+    }
 
     let installers = get_all_installers();
     let mut installed_tools: HashSet<String> = HashSet::new();
@@ -772,7 +841,25 @@ async fn async_run_install(
         }
     }
 
-    if !not_detected.is_empty() {
+    if options.rail_layout {
+        if !not_detected.is_empty() {
+            crate::ui::rail::print_note(&format!("Not detected: {}", not_detected.join(", ")));
+        }
+        let ready = statuses
+            .values()
+            .filter(|status| {
+                matches!(
+                    status,
+                    InstallStatus::Installed | InstallStatus::AlreadyInstalled
+                )
+            })
+            .count();
+        crate::ui::rail::print_end(&match ready {
+            0 => "No coding tools set up".to_string(),
+            1 => "1 coding tool set up".to_string(),
+            n => format!("{n} coding tools set up"),
+        });
+    } else if !not_detected.is_empty() && !options.on_rail {
         println!(
             "{}",
             paint("2", &format!("  Not detected: {}", not_detected.join(", ")))
@@ -793,7 +880,9 @@ async fn async_run_install(
     }
 
     if !any_checked {
-        println!("No compatible IDEs or agent configurations detected. Nothing to install.");
+        if !options.on_rail {
+            println!("No compatible IDEs or agent configurations detected. Nothing to install.");
+        }
     } else if has_changes && options.dry_run {
         println!(
             "\n{}",

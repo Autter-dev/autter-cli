@@ -25,6 +25,12 @@ pub fn handle_autter(args: &[String]) {
         };
 
     if args.is_empty() {
+        // A person at a terminal gets their setup at a glance; `autter help`
+        // still lists every command.
+        if crate::ui::caps().tty {
+            commands::home::print_home();
+            return;
+        }
         print_help();
         return;
     }
@@ -106,6 +112,7 @@ pub fn handle_autter(args: &[String]) {
             | "ask"
             | "logs"
             | "threads"
+            | "memory"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -134,6 +141,7 @@ pub fn handle_autter(args: &[String]) {
 
     match args[0].as_str() {
         "ask" | "logs" | "threads" => commands::ask::handle(&args[0], &args[1..]),
+        "memory" => commands::memory::handle(&args[1..]),
         "help" | "--help" | "-h" => {
             match args.get(1) {
                 Some(cmd) => commands::arg_parser::print_command_help(cmd),
@@ -195,9 +203,6 @@ pub fn handle_autter(args: &[String]) {
         }
         "memory-hook" => {
             commands::memory_hook::handle_memory_hook(&args[1..]);
-        }
-        "memory" => {
-            commands::memory_hook::handle_memory_command(&args[1..]);
         }
         "checkpoint" => {
             if let Some(t) = perf_entry {
@@ -906,7 +911,19 @@ fn handle_ai_blame(args: &[String]) {
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
-    let args = &pp.rest;
+    // `-i`/`--interactive` is autter's own (git blame has no `-i`), so it is
+    // taken out before the git-compatible flags are parsed.
+    let interactive = pp
+        .rest
+        .iter()
+        .any(|arg| arg == "-i" || arg == "--interactive");
+    let args: Vec<String> = pp
+        .rest
+        .iter()
+        .filter(|arg| *arg != "-i" && *arg != "--interactive")
+        .cloned()
+        .collect();
+    let args = &args;
 
     if args.is_empty() {
         let current_dir = env::current_dir()
@@ -1002,6 +1019,17 @@ fn handle_ai_blame(args: &[String]) {
         file_path
     };
 
+    if interactive {
+        if commands::interactive::available() && !options.json {
+            if let Err(e) = commands::interactive::blame::run(&repo, &file_path, &options) {
+                eprintln!("Blame failed: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        eprintln!("autter blame -i needs a terminal; showing plain blame.");
+    }
+
     if let Err(e) = repo.blame(&file_path, &options) {
         eprintln!("Blame failed: {}", e);
         std::process::exit(1);
@@ -1075,10 +1103,15 @@ fn handle_stats(args: &[String]) {
     let mut commit_range: Option<CommitRange> = None;
     let mut ignore_patterns: Vec<String> = Vec::new();
     let mut wait_secs: Option<u64> = None;
+    let mut interactive = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-i" | "--interactive" => {
+                interactive = true;
+                i += 1;
+            }
             "--ignore" => {
                 // Collect all arguments after --ignore until we hit another flag or commit SHA
                 // This supports shell glob expansion: `--ignore *.lock` expands to `--ignore Cargo.lock package.lock`
@@ -1158,6 +1191,18 @@ fn handle_stats(args: &[String]) {
                 }
             }
         }
+    }
+
+    // `-i`: browse recent commits full-screen, starting from the given commit.
+    if interactive {
+        if commands::interactive::available() && !json_output {
+            if let Err(e) = commands::interactive::stats::run(&repo, commit_sha.as_deref()) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        eprintln!("autter stats -i needs a terminal; showing the plain summary.");
     }
 
     let effective_patterns = effective_ignore_patterns(&repo, &ignore_patterns, &[]);

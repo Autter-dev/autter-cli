@@ -648,6 +648,31 @@ impl Repository {
         Ok(analysis)
     }
 
+    /// The file's lines with their attribution, for the interactive blame
+    /// browser: the repo-relative path, the lines blamed, and the analysis
+    /// with AI lines keyed by prompt hash (see [`Self::blame_analysis`]).
+    pub fn blame_for_browser(
+        &self,
+        file_path: &str,
+        options: &AutterBlameOptions,
+    ) -> Result<(String, Vec<String>, BlameAnalysisResult), AutterError> {
+        let options = AutterBlameOptions {
+            use_prompt_hashes_as_names: true,
+            mark_unknown: true,
+            no_output: true,
+            ..options.clone()
+        };
+        let request = self.prepare_blame_request(file_path, &options)?;
+        let (analysis, _authorship_logs, _prompt_commits, _commits_with_notes) = self
+            .run_blame_analysis_pipeline(
+                &request.relative_file_path,
+                &request.line_ranges,
+                &request.options,
+            )?;
+        let lines = request.file_content.lines().map(str::to_string).collect();
+        Ok((request.relative_file_path, lines, analysis))
+    }
+
     pub fn blame_hunks(
         &self,
         file_path: &str,

@@ -1,4 +1,12 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use crate::auth::types::StoredCredentials;
 use crate::auth::{CredentialStore, OAuthClient};
+use crate::ui::signin::{self, SigninEnd, SigninScreen};
+use crate::ui::{self, SelectItem, rail};
 
 /// Result of running the OAuth device-login flow.
 pub enum LoginOutcome {
@@ -6,14 +14,55 @@ pub enum LoginOutcome {
     AlreadyLoggedIn,
     /// A fresh login completed successfully and credentials were stored.
     LoggedIn,
+    /// The user chose not to finish signing in: Esc on the sign-in screen,
+    /// or the last choice after a failed attempt (whose error is kept).
+    Declined { after_error: Option<String> },
+}
+
+/// What stepping away from an interactive sign-in means to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decline {
+    /// `autter onboard`: set up in local mode instead.
+    ContinueLocally,
+    /// `autter login`: stop.
+    Cancel,
+}
+
+impl Decline {
+    fn escape_label(self) -> &'static str {
+        match self {
+            Decline::ContinueLocally => "continue in local mode",
+            Decline::Cancel => "cancel",
+        }
+    }
+}
+
+/// How the caller frames an interactive sign-in.
+#[derive(Debug, Clone, Copy)]
+pub struct LoginUi<'a> {
+    /// Step counter shown beside the title, e.g. `2/4`.
+    pub counter: Option<&'a str>,
+    pub decline: Decline,
+}
+
+/// Run the OAuth2 device-authorization flow as `autter login` does.
+///
+/// Unlike [`handle_login`], this never calls `std::process::exit` (except on
+/// Ctrl-C), so it can be reused by other flows. See [`run_device_login_with`].
+pub fn run_device_login() -> Result<LoginOutcome, String> {
+    run_device_login_with(LoginUi {
+        counter: None,
+        decline: Decline::Cancel,
+    })
 }
 
 /// Run the OAuth2 device-authorization flow.
 ///
-/// Unlike [`handle_login`], this never calls `std::process::exit`, so it can be
-/// reused by other flows (e.g. `autter onboard`). It prints user-facing
-/// instructions to stderr and returns the outcome (or an error string).
-pub fn run_device_login() -> Result<LoginOutcome, String> {
+/// At a terminal this shows the sign-in screen (code, countdown, keys to
+/// reopen the browser or copy the code) and, when an attempt fails, offers to
+/// try again, paste an access token, or step away. Without a terminal it
+/// prints the URL and code and waits, returning the error if it fails.
+pub fn run_device_login_with(login_ui: LoginUi) -> Result<LoginOutcome, String> {
     let store = CredentialStore::new();
 
     let stored = store.load().ok().flatten();
@@ -38,10 +87,14 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
         if ctx.auth_token.is_some() {
             crate::auth::notice::clear_sync_auth_blocked();
             eprintln!("Stored credentials still work. Resuming cloud sync.");
-            resume_cloud_sync_after_login();
+            resume_cloud_sync_after_login(false);
             return Ok(LoginOutcome::LoggedIn);
         }
         eprintln!("Stored credentials could not authenticate. Starting a new sign-in...\n");
+    }
+
+    if ui::is_interactive() {
+        return run_interactive(&store, login_ui);
     }
 
     let client = OAuthClient::new();
@@ -60,12 +113,13 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
         .unwrap_or(&auth_response.verification_uri);
 
     // Display instructions
+    let caps = crate::ui::caps();
     eprintln!("To authorize this device:");
     eprintln!("  1. Open this URL in your browser:");
-    eprintln!("     \x1b[36m{}\x1b[0m", display_url);
+    eprintln!("     {}", caps.paint("36", display_url));
     eprintln!();
     eprintln!("  2. Enter this code when prompted:");
-    eprintln!("     \x1b[1m{}\x1b[0m", auth_response.user_code);
+    eprintln!("     {}", caps.paint("1", &auth_response.user_code));
     eprintln!();
 
     // Try to open browser automatically
@@ -102,28 +156,171 @@ pub fn run_device_login() -> Result<LoginOutcome, String> {
     })?;
 
     crate::auth::notice::clear_sync_auth_blocked();
-    eprintln!("\x1b[1;32m✓ CLI authorization successful.\x1b[0m");
+    let ok = caps.glyphs().ok;
+    eprintln!(
+        "{}",
+        caps.paint("1;32", &format!("{ok} CLI authorization successful."))
+    );
     print_login_identity(&creds.access_token);
-    resume_cloud_sync_after_login();
+    resume_cloud_sync_after_login(false);
 
     Ok(LoginOutcome::LoggedIn)
+}
+
+/// The interactive sign-in loop: browser sign-in, then on failure a choice
+/// to retry, paste a token, or step away.
+fn run_interactive(store: &CredentialStore, login_ui: LoginUi) -> Result<LoginOutcome, String> {
+    loop {
+        let error = match sign_in_with_browser(login_ui) {
+            SigninEnd::Approved(creds) => return finish_interactive(store, &creds, login_ui),
+            SigninEnd::Escaped => {
+                if login_ui.decline == Decline::ContinueLocally {
+                    rail::print_step("Sign in \u{00B7} skipped", login_ui.counter);
+                }
+                return Ok(LoginOutcome::Declined { after_error: None });
+            }
+            SigninEnd::Failed(error) => error,
+        };
+
+        rail::print_warn(&format!("Sign-in didn't finish: {error}"));
+        match failure_choice(login_ui.decline) {
+            FailureChoice::Retry => {}
+            FailureChoice::Token => {
+                let Some(token) = ui::secret("Paste your access token") else {
+                    continue;
+                };
+                match exchange_pat(&token) {
+                    Ok(creds) => return finish_interactive(store, &creds, login_ui),
+                    Err(e) => rail::print_warn(&e),
+                }
+            }
+            FailureChoice::Decline => {
+                return Ok(LoginOutcome::Declined {
+                    after_error: Some(cli_authorization_failure(&error)),
+                });
+            }
+        }
+    }
+}
+
+/// Start a device sign-in, open the browser, and wait on the sign-in screen
+/// while a background thread polls for approval.
+fn sign_in_with_browser(login_ui: LoginUi) -> SigninEnd<StoredCredentials> {
+    let spinner = ui::progress::Spinner::new("Starting sign-in\u{2026}");
+    let started = OAuthClient::new().start_device_flow();
+    spinner.stop();
+    let auth = match started {
+        Ok(auth) => auth,
+        Err(e) => return SigninEnd::Failed(format!("could not start the browser sign-in: {e}")),
+    };
+
+    let url = auth
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| auth.verification_uri.clone());
+    let opened = open_browser(&url).is_ok();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    {
+        let cancel = Arc::clone(&cancel);
+        let device_code = auth.device_code.clone();
+        let (interval, expires_in) = (auth.interval, auth.expires_in);
+        std::thread::spawn(move || {
+            let result = OAuthClient::new().poll_for_token_until(
+                &device_code,
+                interval,
+                expires_in,
+                &cancel,
+            );
+            let _ = tx.send(result);
+        });
+    }
+
+    let screen = SigninScreen {
+        title: rail::titled(&ui::caps(), "Sign in to Autter", login_ui.counter),
+        code: &auth.user_code,
+        url: &url,
+        browser_opened: opened,
+        expires_in: Duration::from_secs(u64::from(auth.expires_in)),
+        escape_label: login_ui.decline.escape_label(),
+    };
+    let end = signin::wait(&screen, rx, || open_browser(&url).is_ok());
+    cancel.store(true, Ordering::Relaxed);
+    end
+}
+
+/// Store approved credentials and show who is signed in.
+fn finish_interactive(
+    store: &CredentialStore,
+    creds: &StoredCredentials,
+    login_ui: LoginUi,
+) -> Result<LoginOutcome, String> {
+    // Authorization is only successful once the credentials are safely stored.
+    store.store(creds).map_err(|e| {
+        format!(
+            "CLI authorization failed: approval succeeded, but credentials could not be saved: {e}\nExisting stored credentials were not changed."
+        )
+    })?;
+    crate::auth::notice::clear_sync_auth_blocked();
+    rail::print_step(
+        &format!("Signed in as {}", identity_summary(&creds.access_token)),
+        login_ui.counter,
+    );
+    resume_cloud_sync_after_login(true);
+    Ok(LoginOutcome::LoggedIn)
+}
+
+enum FailureChoice {
+    Retry,
+    Token,
+    Decline,
+}
+
+fn failure_choice(decline: Decline) -> FailureChoice {
+    let last = match decline {
+        Decline::ContinueLocally => SelectItem::new(
+            "Continue in local mode",
+            "Connect later with `autter onboard --connect`.",
+        ),
+        Decline::Cancel => SelectItem::new("Cancel", "Run `autter login` again anytime."),
+    };
+    let token_hint = format!(
+        "Create one at {} under any organization's Settings \u{2192} Access Tokens.",
+        web_app_url()
+    );
+    let items = [
+        SelectItem::new(
+            "Try again with a new code",
+            "Opens a fresh sign-in in your browser.",
+        ),
+        SelectItem::new("Paste an access token", &token_hint),
+        last,
+    ];
+    match ui::select("What next?", &items, 0) {
+        0 => FailureChoice::Retry,
+        1 => FailureChoice::Token,
+        _ => FailureChoice::Decline,
+    }
 }
 
 fn cli_authorization_failure(detail: impl std::fmt::Display) -> String {
     format!("CLI authorization failed: {detail}\nNo credentials were issued or changed.")
 }
 
-/// Sign in with a Personal Access Token instead of the interactive device flow.
-///
-/// Validates the token by exchanging it for an access token up-front, so a bad
-/// token fails immediately rather than being stored and failing later.
-pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
+/// Exchange a Personal Access Token for credentials, validating it up-front
+/// so a bad token fails immediately rather than being stored.
+fn exchange_pat(token: &str) -> Result<StoredCredentials, String> {
     let token = token.trim();
     if token.is_empty() {
         return Err("No token provided. Usage: autter login --token <token>".to_string());
     }
+    OAuthClient::new().exchange_pat(token)
+}
 
-    let creds = OAuthClient::new().exchange_pat(token)?;
+/// Sign in with a Personal Access Token instead of the interactive device flow.
+pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
+    let creds = exchange_pat(token)?;
 
     let store = CredentialStore::new();
     store
@@ -133,8 +330,26 @@ pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
 
     eprintln!("Successfully logged in with a Personal Access Token.");
     print_login_identity(&creds.access_token);
-    resume_cloud_sync_after_login();
+    resume_cloud_sync_after_login(false);
     Ok(LoginOutcome::LoggedIn)
+}
+
+/// "Name (email) · Org" from the access token's claims, best-effort.
+fn identity_summary(access_token: &str) -> String {
+    let identity = crate::auth::identity::extract_identity_from_access_token(access_token);
+    let name = identity.name.as_deref().filter(|s| !s.is_empty());
+    let email = identity.email.as_deref().filter(|s| !s.is_empty());
+    let mut summary = match (name, email) {
+        (Some(name), Some(email)) => format!("{name} ({email})"),
+        (Some(who), None) | (None, Some(who)) => who.to_string(),
+        (None, None) => "your Autter account".to_string(),
+    };
+    if let Some(org) = identity.active_org()
+        && let Some(org_name) = org.org_name.as_deref().filter(|s| !s.is_empty())
+    {
+        summary.push_str(&format!(" \u{00B7} {org_name}"));
+    }
+    summary
 }
 
 /// Print the signed-in user and active org from the access token's claims
@@ -166,30 +381,40 @@ fn print_login_identity(access_token: &str) {
 /// Restart the background service so it picks up fresh credentials and clears
 /// any in-memory sync backoff. Skipped in test harnesses, which manage their
 /// own daemon lifecycle. Best-effort: a failed restart must not fail login.
-fn resume_cloud_sync_after_login() {
+/// `on_rail` prints the notes under an interactive flow's rail.
+fn resume_cloud_sync_after_login(on_rail: bool) {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
         return;
     }
+    let say = |text: &str| {
+        if on_rail {
+            rail::print_note(text);
+        } else {
+            eprintln!("  {text}");
+        }
+    };
 
     let pending = crate::auth::notice::pending_sync_counts();
     if pending.total() > 0 {
-        eprintln!(
-            "  {} queued locally — restarting background service to upload.",
+        say(&format!(
+            "{} queued locally \u{2014} restarting background service to upload.",
             pending.summary()
-        );
+        ));
     } else {
-        eprintln!("  Restarting background service to resume cloud sync.");
+        say("Restarting background service to resume cloud sync.");
     }
 
     let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
-        eprintln!("  Warning: could not restart background service automatically.");
-        eprintln!("  Run `autter bg restart` if cloud sync does not resume.");
+        say("Warning: could not restart background service automatically.");
+        say("Run `autter bg restart` if cloud sync does not resume.");
         return;
     };
 
     if let Err(error) = crate::commands::daemon::restart_daemon(&daemon_config) {
-        eprintln!("  Warning: could not restart background service: {error}");
-        eprintln!("  Run `autter bg restart` if cloud sync does not resume.");
+        say(&format!(
+            "Warning: could not restart background service: {error}"
+        ));
+        say("Run `autter bg restart` if cloud sync does not resume.");
     }
 }
 
@@ -290,7 +515,15 @@ pub fn handle_login(args: &[String]) {
         Ok(LoginOutcome::AlreadyLoggedIn) => {
             eprintln!("Already logged in. Use 'autter logout' to log out first.");
         }
-        Ok(LoginOutcome::LoggedIn) => {}
+        Ok(LoginOutcome::LoggedIn) => {
+            if ui::is_interactive() {
+                rail::print_end("You're signed in.");
+            }
+        }
+        Ok(LoginOutcome::Declined { after_error }) => {
+            rail::print_end("Sign-in cancelled.");
+            std::process::exit(if after_error.is_some() { 1 } else { 130 });
+        }
         Err(e) => {
             eprintln!("{}", e);
             eprintln!();

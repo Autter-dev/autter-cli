@@ -480,10 +480,11 @@ impl DaemonProcess {
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
     command.env("HOME", test_home);
     // dirs::home_dir uses Windows Known Folders, which ignores HOME and
-    // USERPROFILE. Pin these databases explicitly in test-support binaries.
+    // USERPROFILE. Pin these files explicitly in test-support binaries.
     for (key, filename) in [
         ("AUTTER_TEST_METRICS_DB_PATH", "metrics-db"),
         ("AUTTER_TEST_NOTES_DB_PATH", "notes-db"),
+        ("AUTTER_TEST_CREDENTIALS_PATH", "credentials"),
     ] {
         if !command.get_envs().any(|(name, _)| name == key) {
             command.env(key, test_home.join(".autter/internal").join(filename));

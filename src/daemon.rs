@@ -369,11 +369,35 @@ fn is_storage_full_error(error: &AutterError) -> bool {
     matches!(error, AutterError::IoError(io_error) if io_error.kind() == std::io::ErrorKind::StorageFull)
 }
 
-fn log_side_effect_error(error: &AutterError, family: &str, seq: u64, message: &str) {
+/// Returns true when git exits 128 because the repository does not have the
+/// requested object. `git cat-file -t` reports "could not get object info" in
+/// current git and "Not a valid object name" in older git.
+fn is_missing_object_error(error: &AutterError) -> bool {
+    match error {
+        AutterError::GitCliError {
+            code: Some(128),
+            stderr,
+            ..
+        } => {
+            stderr.contains("could not get object info")
+                || stderr.contains("Not a valid object name")
+        }
+        _ => false,
+    }
+}
+
+fn log_side_effect_error(
+    error: &AutterError,
+    family: &str,
+    seq: u64,
+    command: Option<&str>,
+    message: &str,
+) {
+    let command = command.unwrap_or("unknown");
     if is_storage_full_error(error) {
-        tracing::warn!(%error, %family, seq, "{message}: host disk is full");
+        tracing::warn!(%error, %family, seq, %command, "{message}: host disk is full");
     } else {
-        tracing::error!(%error, %family, seq, "{message}");
+        tracing::error!(%error, %family, seq, %command, "{message}");
     }
 }
 
@@ -5400,6 +5424,20 @@ impl ActorDaemonCoordinator {
                     "trace payload accounting rollback error"
                 );
             }
+            if self.is_shutting_down() {
+                // The worker exits on the shutdown signal, so a connection
+                // that is still open during stop or restart can deliver one
+                // more payload after the receiver is gone.
+                tracing::debug!(
+                    component = "daemon",
+                    phase = "enqueue_trace_payload",
+                    reason = "ingest_worker_stopped_for_shutdown",
+                    "trace payload dropped: daemon is shutting down"
+                );
+                return Err(AutterError::Generic(
+                    "trace payload dropped: daemon is shutting down".to_string(),
+                ));
+            }
             tracing::error!(
                 component = "daemon",
                 phase = "enqueue_trace_payload",
@@ -6120,6 +6158,7 @@ impl ActorDaemonCoordinator {
                                     error,
                                     family,
                                     applied.seq,
+                                    applied.command.primary_command.as_deref(),
                                     "command side effect failed",
                                 );
                             }
@@ -6609,9 +6648,20 @@ impl ActorDaemonCoordinator {
             && let Some(worktree) = cmd.worktree.as_ref()
         {
             let repo = find_repository_in_path(worktree.to_string_lossy().as_ref())?;
-            let stash_commit = repo.find_commit(stash_sha.to_string())?;
-            if let Ok(parent) = stash_commit.parent(0) {
-                return Ok(Some(parent.id().to_string()));
+            match repo.find_commit(stash_sha.to_string()) {
+                Ok(stash_commit) => {
+                    if let Ok(parent) = stash_commit.parent(0) {
+                        return Ok(Some(parent.id().to_string()));
+                    }
+                }
+                Err(error) if is_missing_object_error(&error) => {
+                    tracing::warn!(
+                        %error,
+                        %stash_sha,
+                        "stash commit is not in the repository; using the command head"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -7884,6 +7934,7 @@ impl ActorDaemonCoordinator {
                             &error,
                             &family,
                             applied.seq,
+                            applied.command.primary_command.as_deref(),
                             "async side-effect error",
                         );
                     } else if let Err(error) =
@@ -9487,6 +9538,75 @@ mod tests {
     }
 
     #[test]
+    fn missing_object_error_detects_cat_file_failures() {
+        let current_git = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: git cat-file: could not get object info".to_string(),
+            args: vec!["cat-file".to_string(), "-t".to_string()],
+        };
+        assert!(is_missing_object_error(&current_git));
+
+        let older_git = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: Not a valid object name 0123456789abcdef0123456789abcdef01234567"
+                .to_string(),
+            args: vec!["cat-file".to_string(), "-t".to_string()],
+        };
+        assert!(is_missing_object_error(&older_git));
+
+        let other_failure = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: not a git repository (or any of the parent directories): .git"
+                .to_string(),
+            args: vec!["cat-file".to_string(), "-t".to_string()],
+        };
+        assert!(!is_missing_object_error(&other_failure));
+        assert!(!is_missing_object_error(&AutterError::Generic(
+            "could not get object info".to_string()
+        )));
+    }
+
+    #[test]
+    fn stash_create_head_uses_command_head_when_stash_commit_is_missing() {
+        let tmp = crate::git::test_utils::TmpRepo::new().unwrap();
+        let missing_stash_sha = "0123456789abcdef0123456789abcdef01234567";
+        let semantic_head = "89abcdef0123456789abcdef0123456789abcdef".to_string();
+        let cmd = crate::daemon::domain::NormalizedCommand {
+            scope: crate::daemon::domain::CommandScope::Family(crate::daemon::domain::FamilyKey(
+                "family".to_string(),
+            )),
+            family_key: Some(crate::daemon::domain::FamilyKey("family".to_string())),
+            worktree: Some(tmp.path().to_path_buf()),
+            root_sid: "s1".to_string(),
+            raw_argv: vec!["git".to_string(), "stash".to_string()],
+            primary_command: Some("stash".to_string()),
+            invoked_command: Some("stash".to_string()),
+            invoked_args: Vec::new(),
+            observed_child_commands: Vec::new(),
+            exit_code: 0,
+            started_at_ns: 1,
+            finished_at_ns: 2,
+            pre_repo: None,
+            post_repo: None,
+            inflight_rebase_original_head: None,
+            merge_squash_source_head: None,
+            carryover_snapshot_id: None,
+            stash_target_oid: None,
+            ref_changes: Vec::new(),
+            confidence: crate::daemon::domain::Confidence::Low,
+            wrapper_invocation_id: None,
+        };
+
+        let head = ActorDaemonCoordinator::resolve_stash_create_head_for_event(
+            &cmd,
+            Some(missing_stash_sha),
+            Some(&semantic_head),
+        )
+        .unwrap();
+        assert_eq!(head, Some(semantic_head));
+    }
+
+    #[test]
     fn storage_full_error_detects_disk_full_io_errors() {
         let disk_full = AutterError::IoError(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
@@ -10236,6 +10356,49 @@ mod tests {
         assert!(coord.is_shutting_down());
         // Allow tokio to run the ingest worker's shutdown select arm.
         tokio::task::yield_now().await;
+    }
+
+    /// A payload that arrives after the worker exited for shutdown is a
+    /// benign race, not a worker crash.
+    #[tokio::test]
+    async fn enqueue_after_shutdown_is_not_reported_as_worker_crash() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        coord.request_shutdown();
+        let tx = coord.trace_ingest_tx.get().unwrap();
+        for _ in 0..100 {
+            if tx.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(tx.is_closed(), "ingest worker must exit on shutdown");
+
+        let payload = make_start_payload(&["git", "commit", "-m", "test"]);
+        let error = coord.enqueue_trace_payload(payload).unwrap_err();
+        assert!(
+            error.to_string().contains("daemon is shutting down"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(coord.queued_trace_payloads.load(Ordering::Relaxed), 0);
+    }
+
+    /// A closed ingest channel without a shutdown request is still a worker
+    /// crash, and it stops the daemon.
+    #[tokio::test]
+    async fn enqueue_after_unexpected_worker_exit_reports_crash() {
+        let coord = ActorDaemonCoordinator::new();
+        let (tx, rx) = mpsc::channel::<Value>(1);
+        drop(rx);
+        coord.trace_ingest_tx.set(tx).unwrap();
+
+        let payload = make_start_payload(&["git", "commit", "-m", "test"]);
+        let error = coord.enqueue_trace_payload(payload).unwrap_err();
+        assert!(
+            error.to_string().contains("worker may have crashed"),
+            "unexpected error: {error}"
+        );
+        assert!(coord.is_shutting_down());
     }
 
     /// Concurrent enqueues from multiple threads must never deadlock or

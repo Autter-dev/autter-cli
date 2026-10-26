@@ -25,6 +25,10 @@ const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
         name: "ask",
         skill_md: include_str!("../../skills/ask/SKILL.md"),
     },
+    EmbeddedSkill {
+        name: "repo-memory",
+        skill_md: include_str!("../../skills/repo-memory/SKILL.md"),
+    },
 ];
 
 /// Result of installing skills
