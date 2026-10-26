@@ -141,10 +141,6 @@ fn parse_options(command: &str, args: &[String]) -> Result<Options, String> {
     Ok(options)
 }
 
-fn component(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-}
-
 fn response_json(response: crate::http::Response) -> Result<Value, AutterError> {
     let code = response.status_code;
     let text = response
@@ -215,14 +211,19 @@ fn print_table(columns: &[String], rows: &[Vec<Value>]) {
     }
 }
 
-fn run(command: &str, mut options: Options) -> Result<(), AutterError> {
-    let mut context = ApiContext::new(None).with_timeout(210);
+/// An API context signed in for the chosen organization (`--org`, else the
+/// active one), and that organization's slug. Shared with `autter memory`.
+pub(crate) fn org_api_context(
+    organization: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(ApiContext, String), AutterError> {
+    let mut context = ApiContext::new(None).with_timeout(timeout_secs);
     let token = context
         .auth_token
         .as_ref()
         .ok_or_else(|| AutterError::Generic("Sign in with `autter login` first.".into()))?;
     let identity = extract_identity_from_access_token(token);
-    let selected = if let Some(slug) = options.organization.as_deref() {
+    let selected = if let Some(slug) = organization {
         identity
             .orgs
             .iter()
@@ -245,7 +246,16 @@ fn run(command: &str, mut options: Options) -> Result<(), AutterError> {
             || AutterError::Generic("Could not authenticate for this organization.".into()),
         )?);
     }
-    let base = format!("/api/cli/orgs/{}/ask", component(slug));
+    Ok((context, slug.to_owned()))
+}
+
+pub(crate) fn component(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn run(command: &str, mut options: Options) -> Result<(), AutterError> {
+    let (context, slug) = org_api_context(options.organization.as_deref(), 210)?;
+    let base = format!("/api/cli/orgs/{}/ask", component(&slug));
     let result = match command {
         "ask" => {
             if let Some(id) = options.thread.as_deref() {
