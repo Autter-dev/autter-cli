@@ -5,7 +5,9 @@
 //! endpoints on the server.
 
 use crate::api::client::ApiClient;
-use crate::api::types::{CommitAuthorshipSummary, FileChangeCount, FileChangeUploadResponse};
+use crate::api::types::{
+    CommitAuthorshipSummary, FileChangeCount, FileChangeUploadResponse, RepoBadgeLink,
+};
 use crate::error::AutterError;
 
 fn require_success(
@@ -57,6 +59,17 @@ impl ApiClient {
             self.context()
                 .post_json("/worker/file-changes/upload", &request)?,
             "File-change upload",
+        )?;
+        serde_json::from_str(&body).map_err(AutterError::JsonError)
+    }
+
+    /// Ask for (or create) the public token behind the repository's live
+    /// `AI-written` badge, served at `/api/public/repos/<token>/badge.svg`.
+    pub fn create_repo_badge_link(&self, repo_url: &str) -> Result<RepoBadgeLink, AutterError> {
+        let request = serde_json::json!({ "repo_url": repo_url });
+        let body = require_success(
+            self.context().post_json("/cli/repo-badge-link", &request)?,
+            "Repo badge link",
         )?;
         serde_json::from_str(&body).map_err(AutterError::JsonError)
     }

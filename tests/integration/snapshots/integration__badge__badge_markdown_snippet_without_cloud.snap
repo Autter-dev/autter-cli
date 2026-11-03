@@ -1,0 +1,12 @@
+---
+source: tests/integration/badge.rs
+expression: output
+---
+AI-written: 69%  (9 AI-accepted of 13 added lines)
+Window: 2 non-merge commits all time, 2 with authorship notes
+
+README snippet:
+
+  [![AI-written](https://img.shields.io/badge/AI--written-69%25-5b5bd6)](https://autter.dev)
+
+Static badge with today's number (this repository has no remote to link to Autter). Run `autter badge --write` for one that updates from a committed file.

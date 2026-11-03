@@ -16,6 +16,7 @@ mod amp;
 mod antigravity;
 mod attribution_tracker_comprehensive;
 mod background_agent_attribution;
+mod badge;
 mod bash_attribution;
 mod bash_tool_benchmark;
 mod bash_tool_conformance;
