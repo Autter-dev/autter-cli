@@ -749,7 +749,7 @@ fn upload_commit_authorship_summary(
     }
 }
 
-fn current_repo_url(repo: &Repository) -> Option<String> {
+pub(crate) fn current_repo_url(repo: &Repository) -> Option<String> {
     repo.get_default_remote()
         .ok()
         .flatten()

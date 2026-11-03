@@ -376,7 +376,16 @@ autter wrapped [options]
   --include-prompt-text   Include the first 120 characters of the longest
                           prompt; off by default so prompt text stays private
   --json                  Output the summary as JSON (the share-card contract)
-  --no-color              Plain text, no ANSI colors",
+  --no-color              Plain text, no ANSI colors
+
+  --share                 Publish the summary as a page at app.autter.dev/wrapped/<token>
+                          with a share image, and print its link. Sharing again for
+                          the same year and repository updates the same page.
+  --hide-repo             With --share: show no repository name on the page
+  --unshare <url|token>   Take a share page down
+
+  Sharing needs a connected account (autter login); nothing is sent in local mode.
+  See app.autter.dev/wrapped/demo for a sample page.",
     },
     HelpEntry {
         name: "file-changes",

@@ -509,6 +509,19 @@ impl ApiContext {
         (agent, request)
     }
 
+    /// Create a DELETE request with common headers (User-Agent, X-Distinct-ID).
+    pub fn http_delete(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+        let agent = http::build_agent(timeout_secs);
+        let request = agent
+            .delete(url)
+            .set(
+                "User-Agent",
+                &format!("autter/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+        (agent, request)
+    }
+
     /// Create a new API context, automatically using stored credentials if available
     /// If base_url is None, uses api_base_url from config (which can be set via config file, env var, or defaults)
     /// Uses Config::fresh() to support runtime config updates (daemon mode)
@@ -635,6 +648,25 @@ impl ApiContext {
         let url = self.build_url(endpoint)?;
 
         let (_agent, mut request) = Self::http_get(&url, self.timeout_secs);
+
+        if let Some(api_key) = &self.api_key {
+            request = request.set("X-API-Key", api_key);
+            if let Some(identity) = &self.author_identity {
+                request = request.set("X-Author-Identity", identity);
+            }
+        }
+        if let Some(token) = &self.auth_token {
+            request = request.set("Authorization", &format!("Bearer {}", token));
+        }
+
+        http::send(request).map_err(|e| AutterError::Generic(format!("HTTP request failed: {}", e)))
+    }
+
+    /// Make a DELETE request
+    pub fn delete(&self, endpoint: &str) -> Result<http::Response, AutterError> {
+        let url = self.build_url(endpoint)?;
+
+        let (_agent, mut request) = Self::http_delete(&url, self.timeout_secs);
 
         if let Some(api_key) = &self.api_key {
             request = request.set("X-API-Key", api_key);

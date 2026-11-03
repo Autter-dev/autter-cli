@@ -397,3 +397,233 @@ fn wrapped_rejects_bad_arguments() {
         );
     }
 }
+
+// --- Sharing -----------------------------------------------------------------
+
+/// A signed-in account in the test home: the file credential store holds a
+/// long-lived access token, so `ApiContext::new` sends it as a Bearer token.
+fn sign_in(repo: &TestRepo) {
+    let path = repo
+        .test_home_path()
+        .join(".autter")
+        .join("internal")
+        .join("credentials");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let far_future = 4_102_444_800i64; // 2100-01-01
+    fs::write(
+        &path,
+        json!({
+            "access_token": "test-access-token",
+            "refresh_token": "test-refresh-token",
+            "access_token_expires_at": far_future,
+            "refresh_token_expires_at": far_future,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn run_against(repo: &TestRepo, server: &mockito::Server, args: &[&str]) -> std::process::Output {
+    let mut full = vec!["wrapped", "--year", YEAR, "--no-color"];
+    full.extend_from_slice(args);
+    repo.autter_command(&full)
+        .env("AUTTER_API_BASE_URL", server.url())
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
+        .output()
+        .expect("autter wrapped should run")
+}
+
+#[test]
+fn wrapped_share_flags_are_validated() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("README.md"), "# Hello\n").unwrap();
+    repo.stage_all_and_commit("Initial").unwrap();
+
+    for args in [
+        vec!["wrapped", "--hide-repo"],
+        vec!["wrapped", "--unshare"],
+        vec!["wrapped", "--unshare", "https://app.autter.dev/me"],
+        vec!["wrapped", "--unshare", "not a token"],
+        vec!["wrapped", "--share", "--unshare", "tok1"],
+    ] {
+        let output = repo.autter_command(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn wrapped_share_sends_nothing_in_local_mode() {
+    let mut repo = TestRepo::new();
+    build_fixture(&mut repo); // prompt_storage = local
+    sign_in(&repo);
+    let mut server = mockito::Server::new();
+    let post = server
+        .mock("POST", "/api/cli/wrapped-share")
+        .expect(0)
+        .create();
+    let delete = server
+        .mock("DELETE", mockito::Matcher::Any)
+        .expect(0)
+        .create();
+
+    let output = run_against(&repo, &server, &["--share"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("local mode"), "{stderr}");
+
+    let output = run_against(&repo, &server, &["--unshare", "tok1"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local mode"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    post.assert();
+    delete.assert();
+}
+
+#[test]
+fn wrapped_share_without_sign_in_sends_nothing() {
+    let mut repo = TestRepo::new();
+    build_fixture(&mut repo);
+    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    let mut server = mockito::Server::new();
+    let post = server
+        .mock("POST", "/api/cli/wrapped-share")
+        .expect(0)
+        .create();
+
+    let output = run_against(&repo, &server, &["--share"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("autter login"), "{stderr}");
+    post.assert();
+}
+
+#[test]
+fn wrapped_share_posts_the_summary_and_prints_the_link() {
+    let mut repo = TestRepo::new();
+    build_fixture(&mut repo);
+    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    sign_in(&repo);
+    let mut server = mockito::Server::new();
+    let post = server
+        .mock("POST", "/api/cli/wrapped-share")
+        .match_header("authorization", "Bearer test-access-token")
+        .match_body(mockito::Matcher::PartialJson(json!({
+            "hide_repo": true,
+            "include_prompt_text": false,
+            "wrapped": {
+                "schema_version": "wrapped/1.0.0",
+                "year": 2031,
+                "commits": 4,
+                "ai_percent": 64.29,
+                "longest_prompt": {"snippet": null}
+            }
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"token":"tok1","url":"https://app.autter.dev/wrapped/tok1","image_url":"https://app.autter.dev/public/wrapped/tok1/card.png"}"#)
+        .expect(2)
+        .create();
+
+    let output = run_against(&repo, &server, &["--share", "--hide-repo"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("autter.dev/wrapped"),
+        "card first: {stdout}"
+    );
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with("Shared at https://app.autter.dev/wrapped/tok1"),
+        "{stdout}"
+    );
+
+    // With --json, stdout stays the exact contract and the link goes to stderr.
+    let output = run_against(&repo, &server, &["--share", "--hide-repo", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let summary: Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is the JSON contract");
+    assert_eq!(summary["year"], 2031);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("https://app.autter.dev/wrapped/tok1"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    post.assert();
+}
+
+#[test]
+fn wrapped_share_reports_server_errors_in_one_line() {
+    let mut repo = TestRepo::new();
+    build_fixture(&mut repo);
+    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    sign_in(&repo);
+    let mut server = mockito::Server::new();
+    let post = server
+        .mock("POST", "/api/cli/wrapped-share")
+        .with_status(403)
+        .with_body(r#"{"error":"forbidden"}"#)
+        .create();
+
+    let output = run_against(&repo, &server, &["--share"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a member"), "{stderr}");
+    post.assert();
+}
+
+#[test]
+fn wrapped_unshare_deletes_by_link_or_token() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("README.md"), "# Hello\n").unwrap();
+    repo.stage_all_and_commit("Initial").unwrap();
+    let mut repo = repo;
+    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    sign_in(&repo);
+    let mut server = mockito::Server::new();
+    let ok = server
+        .mock("DELETE", "/api/cli/wrapped-share/tok1")
+        .match_header("authorization", "Bearer test-access-token")
+        .with_status(204)
+        .expect(2)
+        .create();
+    let gone = server
+        .mock("DELETE", "/api/cli/wrapped-share/tok2")
+        .with_status(404)
+        .with_body(r#"{"error":"not found"}"#)
+        .create();
+
+    for arg in ["https://app.autter.dev/wrapped/tok1", "tok1"] {
+        let output = run_against(&repo, &server, &["--unshare", arg]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Removed"));
+    }
+    let output = run_against(&repo, &server, &["--unshare", "tok2"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already removed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ok.assert();
+    gone.assert();
+}

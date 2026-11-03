@@ -15,9 +15,17 @@ A Spotify-Wrapped-style summary of your year of AI-assisted coding in a reposito
 - The terminal card shows the headline percentage in block digits, a twelve-bar monthly chart, the rows above and an `autter.dev/wrapped` footer. It honors `NO_COLOR` and `--no-color`, falls back to ASCII on terminals without Unicode, and is deterministic for a given summary so screenshots come out the same every time.
 - With fewer than three noted commits in the year, the command prints a short note instead of a card.
 
+## Sharing
+
+- **`--share`** publishes the summary as a page at `app.autter.dev/wrapped/<token>` with a 1200x630 share image, prints the link after the card and opens it in the browser at a terminal. Sharing again for the same user, year and repository updates the same page and keeps the link. With `--json`, stdout stays the exact JSON contract and the link goes to stderr.
+- **`--hide-repo`** shows no repository name on the page.
+- **`--unshare <url-or-token>`** takes a page down.
+
+Sharing needs a connected account and sends nothing in local mode. Each server refusal is one line: not signed in, not a member of the organization, too large, nothing to share yet, or the server's own message. `app.autter.dev/wrapped/demo` shows a sample page.
+
 ## Privacy
 
-Nothing leaves the machine. The longest prompt is measured from transcripts already in the local cache; prompts that only exist remotely are skipped. Its text is never printed or included in the JSON unless `--include-prompt-text` is passed, and then only the first 120 characters.
+Nothing leaves the machine unless you pass `--share`, and then only the JSON summary. The longest prompt is measured from transcripts already in the local cache; prompts that only exist remotely are skipped. Its text is never printed or included in the JSON unless `--include-prompt-text` is passed, and then only the first 120 characters.
 
 ## JSON
 

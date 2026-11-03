@@ -3,13 +3,23 @@
 //! prints the JSON contract for the share-image pipeline, or draws the
 //! fixed-width card. The card is 60 columns, deterministic for a given
 //! summary, and goes to stdout so it can be piped into a screenshot tool.
+//! `--share` publishes the JSON as a page with a share image through
+//! `api::wrapped_share`; `--unshare` takes one down.
 
+use crate::api::client::{
+    ApiClient, ApiContext, access_token_for_org, resolve_org_for_repo_cached,
+};
+use crate::api::wrapped_share::{
+    ShareError, WrappedShareResponse, build_share_request, share_token_from,
+};
 use crate::authorship::ignore::effective_ignore_patterns;
+use crate::authorship::post_commit::current_repo_url;
 use crate::authorship::wrapped::{
     MIN_COMMITS_FOR_CARD, WrappedOptions, WrappedSummary, wrapped_summary,
 };
 use crate::commands::{self, arg_parser};
 use crate::git::find_repository;
+use crate::git::repository::Repository;
 use crate::ui;
 use crate::ui::rail;
 use crate::ui::theme::{Charset, TermCaps};
@@ -50,6 +60,9 @@ pub fn handle_wrapped(args: &[String]) {
     let mut all_authors = false;
     let mut include_prompt_text = false;
     let mut ignore_patterns: Vec<String> = Vec::new();
+    let mut share = false;
+    let mut hide_repo = false;
+    let mut unshare: Option<String> = None;
 
     let usage = |message: &str| -> ! {
         eprintln!("{message}");
@@ -93,12 +106,29 @@ pub fn handle_wrapped(args: &[String]) {
             "--all-authors" => all_authors = true,
             "--include-prompt-text" => include_prompt_text = true,
             "--ignore" => ignore_patterns.push(take_value("a pattern")),
+            "--share" => share = true,
+            "--hide-repo" => hide_repo = true,
+            "--unshare" => {
+                let raw = take_value("a share link or token");
+                match share_token_from(&raw) {
+                    Some(token) => unshare = Some(token),
+                    None => usage(&format!(
+                        "--unshare expects a share link (app.autter.dev/wrapped/<token>) or a token, got '{raw}'"
+                    )),
+                }
+            }
             other => usage(&format!("Unknown wrapped argument: {other}")),
         }
         i += 1;
     }
     if all_authors && author.is_some() {
         usage("--author and --all-authors cannot be combined");
+    }
+    if hide_repo && !share {
+        usage("--hide-repo only applies with --share");
+    }
+    if unshare.is_some() && share {
+        usage("--share and --unshare cannot be combined");
     }
 
     let repo = match find_repository(&Vec::<String>::new()) {
@@ -108,6 +138,24 @@ pub fn handle_wrapped(args: &[String]) {
             std::process::exit(commands::EXIT_RUNTIME_ERROR);
         }
     };
+
+    if let Some(token) = unshare {
+        let client = match share_client(&repo) {
+            Ok(client) => client,
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(commands::EXIT_RUNTIME_ERROR);
+            }
+        };
+        match client.unshare_wrapped(&token) {
+            Ok(()) => println!("Removed the share page for {token}."),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(commands::EXIT_RUNTIME_ERROR);
+            }
+        }
+        return;
+    }
 
     let author = if all_authors {
         None
@@ -137,6 +185,25 @@ pub fn handle_wrapped(args: &[String]) {
         }
     };
 
+    // Sharing needs a connected account; check before printing anything so
+    // the reason is the last line on screen.
+    let client = if share {
+        if !summary.has_enough_data() {
+            print!("{}", render(&summary, &card_caps()));
+            eprintln!("{}", ShareError::NothingToShare);
+            std::process::exit(commands::EXIT_RUNTIME_ERROR);
+        }
+        match share_client(&repo) {
+            Ok(client) => Some(client),
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(commands::EXIT_RUNTIME_ERROR);
+            }
+        }
+    } else {
+        None
+    };
+
     if arg_parser::json() {
         match serde_json::to_string_pretty(&summary) {
             Ok(json) => println!("{json}"),
@@ -145,10 +212,68 @@ pub fn handle_wrapped(args: &[String]) {
                 std::process::exit(commands::EXIT_RUNTIME_ERROR);
             }
         }
-        return;
+    } else {
+        print!("{}", render(&summary, &card_caps()));
     }
 
-    print!("{}", render(&summary, &card_caps()));
+    let Some(client) = client else {
+        return;
+    };
+    let body = build_share_request(
+        &summary,
+        current_repo_url(&repo).as_deref(),
+        include_prompt_text,
+        hide_repo,
+    );
+    match client.share_wrapped(&body) {
+        Ok(response) => announce_share(&response, arg_parser::json()),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(commands::EXIT_RUNTIME_ERROR);
+        }
+    }
+}
+
+/// The signed-in client for sharing: an org-scoped token for the repository's
+/// org when the account has one, else the stored sign-in. Local mode and a
+/// missing sign-in stop here, before anything is sent.
+fn share_client(repo: &Repository) -> Result<ApiClient, String> {
+    if !crate::config::platform_sync_enabled_now() {
+        return Err(
+            "Sharing is off in local mode: nothing leaves this machine. Run `autter onboard` to connect an account."
+                .to_string(),
+        );
+    }
+    let client = if let Some(repo_url) = current_repo_url(repo)
+        && let Some(org) = resolve_org_for_repo_cached(&repo_url)
+        && let Some(token) = access_token_for_org(&org)
+    {
+        ApiClient::new(ApiContext::with_auth(None, token))
+    } else {
+        ApiClient::new(ApiContext::new(None))
+    };
+    if !client.is_logged_in() && !client.has_api_key() {
+        return Err(ShareError::LoginRequired.to_string());
+    }
+    Ok(client)
+}
+
+/// The share link, after the card (or on stderr after `--json`, keeping
+/// stdout the exact contract), opened in the browser at a terminal.
+fn announce_share(response: &WrappedShareResponse, json: bool) {
+    let caps = card_caps();
+    let line = format!("Shared at {}", caps.accent(&response.url));
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+    if crate::utils::is_interactive_terminal()
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && let Err(e) = crate::commands::personal_dashboard::open_browser(&response.url)
+    {
+        eprintln!("Could not open the browser: {e}");
+    }
 }
 
 fn current_year() -> i32 {
