@@ -112,6 +112,7 @@ pub fn handle_autter(args: &[String]) {
             | "ask"
             | "logs"
             | "threads"
+            | "badge"
             | "memory"
             | "context"
             | "mcp"
@@ -195,6 +196,9 @@ pub fn handle_autter(args: &[String]) {
                 log_message("stats", "info", None)
             }
             handle_stats(&args[1..]);
+        }
+        "badge" => {
+            commands::badge::handle_badge(&args[1..]);
         }
         "wrapped" => {
             if is_interactive_terminal() {

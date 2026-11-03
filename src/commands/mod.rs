@@ -1,6 +1,7 @@
 pub mod arg_parser;
 pub mod ask;
 pub mod autter_handlers;
+pub mod badge;
 pub mod blame;
 pub mod checkpoint_agent;
 pub mod ci_handlers;
