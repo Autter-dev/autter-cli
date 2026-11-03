@@ -7,10 +7,13 @@
 //! hand (by default the changed ones) with the ledger lines about those areas,
 //! the way reviews read them; `areas` and `ledger` list them. Coding agents reach these
 //! through the installed `repo-memory` skill when the Autter MCP server is not
-//! connected. Nothing is sent in local mode or for repositories excluded from
-//! prompt sharing.
+//! connected. `autter memory skills install` writes the repository's own
+//! memory skill (served by Autter) into the checkout so every teammate's agent
+//! gets it from git. Nothing is sent in local mode or for repositories
+//! excluded from prompt sharing.
 use crate::commands::arg_parser::{self, ScanMode};
 use crate::commands::ask::{component, org_api_context};
+use crate::commands::memory_skills;
 use crate::config::{Config, PromptStorageMode};
 use crate::error::AutterError;
 use crate::git::repository::{Repository, discover_repository_in_path_no_git_exec};
@@ -54,6 +57,10 @@ struct Options {
     paths: Vec<String>,
     kinds: Vec<String>,
     limit: Option<u32>,
+    /// `skills install --force`: replace files Autter did not write.
+    force: bool,
+    /// `skills install --print` (same as `skills preview`): print, write nothing.
+    print: bool,
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -70,6 +77,15 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 options.subcommand = arg.to_owned();
             } else {
                 options.words.push(arg.to_owned());
+            }
+            index += 1;
+            continue;
+        }
+        if options.subcommand == "skills" && (arg == "--force" || arg == "--print") {
+            if arg == "--force" {
+                options.force = true;
+            } else {
+                options.print = true;
             }
             index += 1;
             continue;
@@ -124,13 +140,24 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             Err(format!("memory {} takes no arguments", options.subcommand))
         }
         "areas" | "ledger" => Ok(options),
-        "" => Err("memory needs a subcommand: search, for, show, areas or ledger".into()),
+        "skills" => match options.words.as_slice() {
+            [action] if action == "install" => Ok(options),
+            [action] if action == "preview" && !options.force => Ok(options),
+            [action] if action == "preview" => {
+                Err("memory skills preview writes nothing, so it takes no --force".into())
+            }
+            _ => Err("memory skills needs install or preview".into()),
+        },
+        "" => Err("memory needs a subcommand: search, for, show, areas, ledger or skills".into()),
         other => Err(format!("unknown memory subcommand: {other}")),
     }
 }
 
 /// Why the cloud must not be asked about this repository, if it must not.
-fn sharing_refusal(platform_sync: bool, storage: PromptStorageMode) -> Option<&'static str> {
+pub(crate) fn sharing_refusal(
+    platform_sync: bool,
+    storage: PromptStorageMode,
+) -> Option<&'static str> {
     if !platform_sync {
         Some(LOCAL_MODE)
     } else if storage == PromptStorageMode::Local {
@@ -141,11 +168,11 @@ fn sharing_refusal(platform_sync: bool, storage: PromptStorageMode) -> Option<&'
 }
 
 /// `(name, url)` pairs, as `Repository::remotes_with_urls` returns them.
-type Remotes = Vec<(String, String)>;
+pub(crate) type Remotes = Vec<(String, String)>;
 
 /// The repository to ask about (`--repo`, else this checkout's default remote,
 /// normalized to https) and the remotes the sharing policy is checked against.
-fn target_repository(
+pub(crate) fn target_repository(
     explicit: Option<&str>,
     local: Option<&Repository>,
 ) -> Result<(String, Option<Remotes>), AutterError> {
@@ -192,11 +219,14 @@ fn repo_relative(workdir: &Path, cwd: &Path, path: &str) -> Option<String> {
     Some(text)
 }
 
-/// The files `autter memory for` asks about: the arguments, made relative to
-/// the checkout root, or the files changed in the working tree when none are
-/// given. Outside a checkout (with `--repo`) arguments are taken as
-/// repository paths.
-fn files_for(words: &[String], local: Option<&Repository>) -> Result<Vec<String>, AutterError> {
+/// The files a command asks about: `words` made relative to the checkout
+/// root, or the files changed in the working tree when none are given.
+/// Outside a checkout (with `--repo`) the words are taken as repository paths.
+/// At most [`MAX_FILES`]; may be empty. Shared with `autter context`.
+pub(crate) fn resolve_files(
+    words: &[String],
+    local: Option<&Repository>,
+) -> Result<Vec<String>, AutterError> {
     let mut files: Vec<String> = match local {
         Some(repo) if !words.is_empty() => {
             let cwd = std::env::current_dir()?;
@@ -235,16 +265,36 @@ fn files_for(words: &[String], local: Option<&Repository>) -> Result<Vec<String>
     };
     files.retain(|file| !file.is_empty());
     files.dedup();
+    files.truncate(MAX_FILES);
+    Ok(files)
+}
+
+/// The files `autter memory for` asks about: [`resolve_files`], which must
+/// find at least one.
+fn files_for(words: &[String], local: Option<&Repository>) -> Result<Vec<String>, AutterError> {
+    let files = resolve_files(words, local)?;
     if files.is_empty() {
         return Err(AutterError::Generic(
             "Nothing changed in this checkout. Name the files: autter memory for <file>...".into(),
         ));
     }
-    files.truncate(MAX_FILES);
     Ok(files)
 }
 
 fn response_json(response: crate::http::Response) -> Result<Value, AutterError> {
+    response_json_or(
+        response,
+        "This Autter deployment does not serve repository memory to the CLI yet.",
+    )
+}
+
+/// The JSON body of a 200, else the error the CLI prints for it. `missing`
+/// is the message for a 404 without a message of its own: the route itself
+/// is missing, so the backend is older than this command.
+pub(crate) fn response_json_or(
+    response: crate::http::Response,
+    missing: &str,
+) -> Result<Value, AutterError> {
     let code = response.status_code;
     let value: Option<Value> = response
         .as_str()
@@ -262,9 +312,7 @@ fn response_json(response: crate::http::Response) -> Result<Value, AutterError> 
         .map(str::to_owned);
     let message = match (code, message) {
         (401, _) => "Your Autter sign-in has expired. Run `autter login`.".to_owned(),
-        (404, None) => {
-            "This Autter deployment does not serve repository memory to the CLI yet.".to_owned()
-        }
+        (404, None) => missing.to_owned(),
         (_, Some(message)) => {
             let repos: Vec<&str> = value["detail"]["available_repos"]
                 .as_array()
@@ -285,14 +333,14 @@ fn response_json(response: crate::http::Response) -> Result<Value, AutterError> 
 }
 
 /// Text from the server, without terminal control sequences.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect()
 }
 
 /// One line of at most `max` characters.
-fn excerpt(text: &str, max: usize) -> String {
+pub(crate) fn excerpt(text: &str, max: usize) -> String {
     let flat = clean(text).split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max {
         format!("{}…", flat.chars().take(max - 1).collect::<String>())
@@ -595,6 +643,9 @@ fn run(options: Options) -> Result<(), AutterError> {
     } else {
         Vec::new()
     };
+    if options.subcommand == "skills" {
+        return run_skills(&options, &repository, local.as_ref());
+    }
     let (context, slug) = org_api_context(options.organization.as_deref(), 60)?;
     let base = format!("/api/cli/orgs/{}/memory", component(&slug));
     let result = if options.subcommand == "search" {
@@ -659,6 +710,60 @@ fn run(options: Options) -> Result<(), AutterError> {
         _ => print!("{}", render_show(&result)),
     }
     Ok(())
+}
+
+/// `autter memory skills install|preview`: fetch the repository's memory
+/// skill files from Autter and write them into this checkout (or print them).
+fn run_skills(
+    options: &Options,
+    repository: &str,
+    local: Option<&Repository>,
+) -> Result<(), AutterError> {
+    let preview = options.print || options.words.first().is_some_and(|w| w == "preview");
+    // Writing needs a checkout to write into; find it before asking the cloud.
+    let root = if preview {
+        None
+    } else {
+        let repo = local.ok_or_else(|| {
+            AutterError::Generic(
+                "Run this inside the repository's checkout to write its skill files, or print them with `autter memory skills preview`.".into(),
+            )
+        })?;
+        Some(repo.workdir()?)
+    };
+    let (context, slug) = org_api_context(options.organization.as_deref(), 60)?;
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    params.append_pair("repository", repository);
+    let result = response_json_or(
+        context.get(&format!(
+            "/api/cli/orgs/{}/repo-memory/skill?{}",
+            component(&slug),
+            params.finish()
+        ))?,
+        memory_skills::MISSING_ROUTE,
+    )?;
+    if arg_parser::json() && preview {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let files = memory_skills::skill_files(&result)?;
+    let Some(root) = root else {
+        print!("{}", memory_skills::render_preview(&result, &files));
+        return Ok(());
+    };
+    let outcomes = memory_skills::install_files(&root, &files, options.force);
+    if arg_parser::json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&memory_skills::outcomes_json(&result, &outcomes))?
+        );
+    } else {
+        print!("{}", memory_skills::render_install(&result, &outcomes));
+    }
+    match memory_skills::refusal(&outcomes) {
+        Some(message) => Err(AutterError::Generic(message)),
+        None => Ok(()),
+    }
 }
 
 pub fn handle(args: &[String]) {
@@ -974,5 +1079,26 @@ mod tests {
         );
         let bare = json!({ "repo": "acme/api", "areas": [] });
         assert!(render_areas(&bare).starts_with("acme/api's memory has no area pages yet."));
+    }
+
+    #[test]
+    fn skills_take_install_or_preview_with_their_flags() {
+        let install = parse_options(&args(&["skills", "install", "--force"])).unwrap();
+        assert_eq!(install.words, vec!["install"]);
+        assert!(install.force);
+        assert!(!install.print);
+        let print = parse_options(&args(&[
+            "skills", "install", "--print", "--repo", "acme/api",
+        ]))
+        .unwrap();
+        assert!(print.print);
+        assert_eq!(print.repository.as_deref(), Some("acme/api"));
+        assert!(parse_options(&args(&["skills", "preview"])).is_ok());
+        assert!(parse_options(&args(&["skills"])).is_err());
+        assert!(parse_options(&args(&["skills", "remove"])).is_err());
+        assert!(parse_options(&args(&["skills", "install", "extra"])).is_err());
+        assert!(parse_options(&args(&["skills", "preview", "--force"])).is_err());
+        // --force means nothing to the other subcommands.
+        assert!(parse_options(&args(&["show", "--force"])).is_err());
     }
 }

@@ -370,4 +370,10 @@ Use `autter ask` for evidence-backed system questions, `autter logs` for structu
 
 ### Repository memory
 
-Use `autter memory search "<question>"` to rank what Autter knows about the repository you're in (its shared memory pages, learnings, production lessons, team rules, past findings, wiki and code) by meaning, `autter memory for [<file>...]` to read the memory's area pages for the files you're editing (with what worked and what didn't there), and `autter memory show`, `areas` and `ledger` to browse it. Add `--json` for coding agents; the `repo-memory` skill tells them to use these when the Autter MCP server isn't connected. Nothing is sent in local mode or for repositories excluded from sharing.
+Use `autter memory search "<question>"` to rank what Autter knows about the repository you're in (its shared memory pages, learnings, production lessons, team rules, past findings, wiki and code) by meaning, `autter memory for [<file>...]` to read the memory's area pages for the files you're editing (with what worked and what didn't there), and `autter memory show`, `areas` and `ledger` to browse it. Add `--json` for coding agents. Nothing is sent in local mode or for repositories excluded from sharing.
+
+For coding agents, `autter context "<task>"` is the one call to start with: the memory facts (with `rmf_…` ids to cite), wiki pages and code structure that matter for the task, ranked and cut to a token budget, as Markdown. It is the CLI form of the `get_context` MCP tool, and the `repo-memory` skill tells agents to use it when the Autter MCP server isn't connected. `autter memory skills install` writes the repository's memory skill into the checkout (`.agents/skills/autter-repo-memory/SKILL.md` and a Cursor rule) so teammates' agents get it from git.
+
+### Connect your agents to Autter's MCP server
+
+`autter mcp connect` adds Autter's MCP server to every installed agent's user-level config (Claude Code, Codex, Cursor, VS Code, Gemini CLI, OpenCode). Only the URL is written; each agent signs you in with your Autter account the first time it uses it. `--dry-run` shows the changes, `--agent <name>` picks agents, and `autter mcp disconnect` removes the entry again.
