@@ -68,7 +68,8 @@ impl ApiClient {
     pub fn create_repo_badge_link(&self, repo_url: &str) -> Result<RepoBadgeLink, AutterError> {
         let request = serde_json::json!({ "repo_url": repo_url });
         let body = require_success(
-            self.context().post_json("/cli/repo-badge-link", &request)?,
+            self.context()
+                .post_json("/api/cli/repo-badge-link", &request)?,
             "Repo badge link",
         )?;
         serde_json::from_str(&body).map_err(AutterError::JsonError)

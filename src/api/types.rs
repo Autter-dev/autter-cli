@@ -171,7 +171,7 @@ pub struct CommitAuthorshipSummary {
     pub hunks: serde_json::Value,
 }
 
-/// Response of `POST /cli/repo-badge-link`: the public token behind a
+/// Response of `POST /api/cli/repo-badge-link`: the public token behind a
 /// repository's live `AI-written` badge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoBadgeLink {

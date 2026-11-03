@@ -4,7 +4,7 @@
 //! snippet is one of:
 //!
 //! * a live badge served by Autter, when the repository is linked to an
-//!   organization and the user is signed in (`POST /cli/repo-badge-link`
+//!   organization and the user is signed in (`POST /api/cli/repo-badge-link`
 //!   hands back the public token behind `/api/public/repos/<token>/badge.svg`);
 //! * a static shields.io badge carrying the local number, for everyone else.
 //!
