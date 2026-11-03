@@ -516,6 +516,35 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), AutterError> {
     Ok(())
 }
 
+/// Copy `path` next to itself as `<name>.autter-backup-<timestamp>` before
+/// autter edits it. None when there is no file to back up.
+pub fn backup_file(path: &Path) -> Result<Option<PathBuf>, AutterError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut backup = dir.join(format!("{name}.autter-backup-{stamp}"));
+    let mut n = 2;
+    while backup.exists() {
+        backup = dir.join(format!("{name}.autter-backup-{stamp}-{n}"));
+        n += 1;
+    }
+    fs::copy(path, &backup).map_err(|e| {
+        AutterError::Generic(format!(
+            "Failed to back up {} to {}: {}",
+            path.display(),
+            backup.display(),
+            e
+        ))
+    })?;
+    Ok(Some(backup))
+}
+
 /// Ensure parent directory exists
 pub fn ensure_parent_dir(path: &Path) -> Result<(), AutterError> {
     if let Some(parent) = path.parent() {

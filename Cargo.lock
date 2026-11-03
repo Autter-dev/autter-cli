@@ -303,6 +303,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
@@ -2186,6 +2187,9 @@ name = "jsonc-parser"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8de0ffda8def4eb16ed430641db8056c2509b20e38f2dd327bdb4c83239f88c4"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "kasuari"
@@ -3914,6 +3918,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

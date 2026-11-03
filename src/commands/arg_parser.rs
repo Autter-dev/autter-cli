@@ -642,6 +642,8 @@ autter login [--token <token>]
 autter memory for [<file>...] [--repo <remote|owner/repo>] [--org <slug>] [--json]
 autter memory show [<page>] [--repo <remote|owner/repo>] [--org <slug>] [--json]
 autter memory areas | ledger [--repo <remote|owner/repo>] [--org <slug>] [--json]
+autter memory skills install [--force] [--print] [--repo <remote|owner/repo>] [--org <slug>]
+autter memory skills preview [--repo <remote|owner/repo>] [--org <slug>] [--json]
 
   for     Print the area pages of the memory covering these files (default: the
           files changed in this checkout), most specific first: how that part of
@@ -657,10 +659,70 @@ autter memory areas | ledger [--repo <remote|owner/repo>] [--org <slug>] [--json
   show    Print the repository memory home page, its areas and pages, or one page.
   areas   List the area pages and the part of the codebase each covers.
   ledger  Print what worked, what didn't, and what the team waves off.
+  skills  install writes the repository's memory skill from Autter into this
+          checkout (.agents/skills/autter-repo-memory/SKILL.md and a Cursor
+          rule) so teammates' agents get it from git once committed. It
+          replaces only files Autter wrote (autter_generated: true in their
+          frontmatter); --force replaces others too. preview (or install
+          --print) prints the files and writes nothing.
+
+  For one bounded answer for a task (facts, wiki and code), use
+  `autter context \"<task>\"`.
 
   The repository is this checkout's default remote unless --repo is given.
   Uses your autter login. Nothing is sent in local mode or for repositories
   excluded from sharing. Use --json in scripts and coding agents.",
+    },
+    HelpEntry {
+        name: "context",
+        aliases: &[],
+        summary: "What Autter knows that matters for a task, for coding agents",
+        body: "autter context <task> [--path <file>]... [--symbol <name>]... [--budget 300..16000]
+               [--include memory,wiki,code] [--since <cursor>]
+               [--repo <remote|owner/repo>] [--org <slug>] [--json]
+
+  One call that returns, for the task, the repository memory facts, wiki pages
+  and code structure that matter, ranked and cut to a token budget, as Markdown
+  for an agent to read: one line per item with its source, title, path, the
+  fact id to cite (rmf_...), and where to read more. The same as the get_context
+  MCP tool, for agents not connected to the Autter MCP server.
+
+  --path      A file the task is about (repeatable; default: the files changed
+              in this checkout). Relative to where you run the command.
+  --symbol    A function, class or type the task is about (repeatable).
+  --budget    Tokens of context to return (default: the server's, 300 to 16000).
+  --include   Only these stores, comma-separated: memory, wiki, code.
+  --since     The cursor a previous call printed: leaves out what it already
+              returned unchanged.
+  --json      The raw response.
+
+  The repository is this checkout's default remote unless --repo is given.
+  Uses your autter login. Nothing is sent in local mode or for repositories
+  excluded from sharing.",
+    },
+    HelpEntry {
+        name: "mcp",
+        aliases: &[],
+        summary: "Connect your coding agents to Autter's MCP server",
+        body: "autter mcp connect [--agent <name>]... [--dry-run] [--json]
+autter mcp disconnect [--agent <name>]... [--dry-run] [--json]
+
+  connect     Add Autter's MCP server (<api base>/mcp) as `autter` to the
+              user-level MCP config of each installed agent: Claude Code
+              (claude mcp add, else ~/.claude.json), Codex (codex mcp add, else
+              ~/.codex/config.toml), Cursor (~/.cursor/mcp.json), VS Code (the
+              user mcp.json), Gemini CLI (~/.gemini/settings.json) and OpenCode
+              (~/.config/opencode/opencode.json). Only the URL is written: the
+              server signs you in with OAuth the first time an agent uses it.
+              An existing `autter` entry is replaced, never duplicated.
+  disconnect  Remove only the `autter` entry from each agent.
+
+  --agent     Only this agent (repeatable or comma-separated): claude, codex,
+              cursor, vscode, gemini, opencode.
+  --dry-run   Show the commands and file changes without making them.
+
+  Agents that are not installed are skipped. Every file is backed up next to
+  itself (<file>.autter-backup-<time>) before it is changed.",
     },
     HelpEntry {
         name: "telemetry",

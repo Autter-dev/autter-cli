@@ -47,6 +47,7 @@ mod claude_code;
 mod codex;
 mod commit_post_stats_benchmark;
 mod config_pattern_detection;
+mod context_command;
 mod continue_cli;
 mod cross_repo_cwd_attribution;
 mod cursor;
