@@ -39,6 +39,7 @@ pub mod telemetry;
 pub mod upgrade;
 pub mod usage_hints;
 pub mod whoami;
+pub mod wrapped;
 
 /// Process exit codes for `autter` subcommands.
 ///

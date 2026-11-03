@@ -1,0 +1,38 @@
+---
+source: tests/integration/wrapped.rs
+expression: card
+---
+  ▗▟▀▀▙▟▌     Autter Wrapped 2031
+  ▐▌  ▐█▌     test@example.com
+  ▝▜▄▄▛▜▌ ██  4 commits · 4 with authorship notes
+
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│    ███  █  █  ██  █                                      │
+│   █     █  █     █                                       │
+│   ████  █████   █                                        │
+│   █   █    █   █                                         │
+│    ███     █  █  ██                                      │
+│                                                          │
+│   of the lines added in 2031 were written with AI        │
+│                                                          │
+│   AI share by month                      peak Jul 100%   │
+│                           ██                             │
+│           ▅▅              ██                             │
+│           ██              ██                             │
+│   ▁▁  ·   ██  ·   ·   ·   ██  ·   ·   ·   ·   ·          │
+│   Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec        │
+│                                                          │
+│   Top agent      mock_ai · 6 lines                       │
+│   Top model      mock_ai/unknown-model · 6 lines         │
+│   Most prompted  src/app.rs · 3 prompts                  │
+│   Longest prompt 155 chars · 29 words · claude           │
+│   Streak         2 days in a row with AI commits         │
+│   Busiest day    Monday · most AI lines                  │
+│                                                          │
+│   4 commits · 9 AI lines                                 │
+│   5 human · 0 untracked lines                            │
+│                                                          │
+│                                     autter.dev/wrapped   │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

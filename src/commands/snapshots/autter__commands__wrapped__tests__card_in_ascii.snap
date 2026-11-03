@@ -1,0 +1,38 @@
+---
+source: src/commands/wrapped.rs
+expression: "render(&summary(), &caps(ColorLevel::None, Charset::Ascii))"
+---
+Autter Wrapped 2026
+you@company.com
+94 commits · 90 with authorship notes
+
++----------------------------------------------------------+
+|                                                          |
+|   ##### ####  ##  #                                      |
+|       #     #    #                                       |
+|      #   ###    #                                        |
+|     #       #  #                                         |
+|     #   ####  #  ##                                      |
+|                                                          |
+|   of the lines added in 2026 were written with AI        |
+|                                                          |
+|   AI share by month                      peak Jul 100%   |
+|                   ##      ##              ##             |
+|                   ##  ##  ##          ##  ##             |
+|       ##          ##  ##  ##          ##  ##             |
+|   ##  ##  __  .   ##  ##  ##  .       ##  ##  .          |
+|   Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec        |
+|                                                          |
+|   Top agent      claude · 3,100 lines                    |
+|   Top model      claude-opus-5-5 · 2,400 lines           |
+|   Most prompted  …ands/autter_handlers.rs · 42 prompts   |
+|   Longest prompt 1,834 chars · 312 words · claude        |
+|   Streak         14 days in a row with AI commits        |
+|   Busiest day    Tuesday · most AI lines                 |
+|                                                          |
+|   94 commits · 3,940 AI lines                            |
+|   1,200 human · 290 untracked lines                      |
+|                                                          |
+|                                     autter.dev/wrapped   |
+|                                                          |
++----------------------------------------------------------+

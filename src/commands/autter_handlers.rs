@@ -196,6 +196,12 @@ pub fn handle_autter(args: &[String]) {
             }
             handle_stats(&args[1..]);
         }
+        "wrapped" => {
+            if is_interactive_terminal() {
+                log_message("wrapped", "info", None)
+            }
+            commands::wrapped::handle_wrapped(&args[1..]);
+        }
         "file-changes" => {
             commands::file_changes::handle_file_changes(&args[1..]);
         }

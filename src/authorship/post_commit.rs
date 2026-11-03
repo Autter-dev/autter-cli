@@ -768,7 +768,9 @@ fn current_branch(repo: &Repository) -> Option<String> {
         .and_then(|head_ref| head_ref.shorthand().ok())
 }
 
-fn transcript_paths_by_prompt_key(checkpoints: &[Checkpoint]) -> HashMap<String, String> {
+pub(crate) fn transcript_paths_by_prompt_key(
+    checkpoints: &[Checkpoint],
+) -> HashMap<String, String> {
     let mut transcript_paths = HashMap::new();
     for checkpoint in checkpoints {
         let (Some(agent_id), Some(metadata)) = (&checkpoint.agent_id, &checkpoint.agent_metadata)
@@ -794,7 +796,9 @@ fn transcript_paths_by_prompt_key(checkpoints: &[Checkpoint]) -> HashMap<String,
     transcript_paths
 }
 
-fn first_user_prompts_by_path(paths: impl Iterator<Item = String>) -> HashMap<String, String> {
+pub(crate) fn first_user_prompts_by_path(
+    paths: impl Iterator<Item = String>,
+) -> HashMap<String, String> {
     let mut prompts = HashMap::new();
     for path in paths {
         if prompts.contains_key(&path) {

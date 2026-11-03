@@ -194,6 +194,8 @@ autter stats <start_sha>..<end_sha> --json
 
 It computes % AI code, AI lines generated vs committed, acceptance rates, and human overrides, broken down by tool and model. More in the [stats command reference](https://autter.dev/docs/cli/reference#stats).
 
+For a year at a glance, `autter wrapped` draws a screenshot-ready card of your AI-assisted coding in the repository: AI share by month, top agent and model, most-prompted file, longest prompt, streak and busiest weekday. `--json` prints the same numbers; prompt text never leaves the machine unless you pass `--include-prompt-text`.
+
 <details>
 <summary>Example JSON output</summary>
 

@@ -358,6 +358,27 @@ autter stats [commit]
                       commit's breakdown by tool and model",
     },
     HelpEntry {
+        name: "wrapped",
+        aliases: &[],
+        summary: "Your year of AI-assisted coding in this repo, as a share card",
+        body: "\
+autter wrapped [options]
+
+  A Spotify-Wrapped-style summary of the current user's AI-assisted coding
+  in this repository for one year: AI share overall and by month, the top
+  agent and model, the most-prompted file, the longest prompt, the longest
+  streak and the busiest weekday. Printed as a fixed-width card made for
+  screenshots. Nothing leaves the machine.
+
+  --year <yyyy>           Year to summarize (default: the current year)
+  --author <email>        Commits by this author (default: git user.email)
+  --all-authors           Every author in the repository
+  --include-prompt-text   Include the first 120 characters of the longest
+                          prompt; off by default so prompt text stays private
+  --json                  Output the summary as JSON (the share-card contract)
+  --no-color              Plain text, no ANSI colors",
+    },
+    HelpEntry {
         name: "file-changes",
         aliases: &[],
         summary: "Show the most frequently changed files in this repo",

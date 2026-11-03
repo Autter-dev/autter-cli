@@ -912,7 +912,7 @@ fn parse_checkpoint_request_count(stdout: &str) -> u64 {
 fn autter_command_requires_daemon_sync(args: &[&str]) -> bool {
     matches!(
         autter_primary_command(args),
-        Some("blame" | "continue" | "diff" | "prompts" | "search" | "stats")
+        Some("blame" | "continue" | "diff" | "prompts" | "search" | "stats" | "wrapped")
     )
 }
 
