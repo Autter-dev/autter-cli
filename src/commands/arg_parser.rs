@@ -358,6 +358,72 @@ autter stats [commit]
                       commit's breakdown by tool and model",
     },
     HelpEntry {
+        name: "badge",
+        aliases: &[],
+        summary: "README badge with the repo's AI-written share",
+        body: "\
+autter badge [--since <date|duration> | --all-time] [--json] [--write [path]]
+
+  Print the share of this repository's added lines that were written by AI
+  (AI-accepted lines / added lines, over commits with an authorship note) and
+  a README badge snippet reading `AI-written | 72%`. The snippet is copied to
+  the clipboard when stderr is a terminal.
+
+  By default the last 90 days of non-merge commits on the current branch are
+  counted. Commits without an authorship note add nothing to the share but
+  are counted, so the output reports coverage. At most 2000 commits are
+  walked. Files matching .autter-ignore are left out.
+
+  --since <value>     Count commits since a date (2025-08-05) or duration
+                      (30 days ago); anything `git log --since` accepts
+  --all-time          Count every commit reachable from HEAD
+  --ignore <pat>      Also ignore files matching the given pattern(s)
+  --json              Print the shields.io endpoint payload: schemaVersion,
+                      label, message and color, plus ai_percent, ai_accepted,
+                      added_lines, commits, commits_with_authorship, since
+                      and capped
+  --write [path]      Also write that payload to a file (default
+                      .autter/badge.json) that shields.io can read once it is
+                      committed: https://img.shields.io/endpoint?url=<raw url>
+
+  Badge colors: no data lightgrey; under 25% light blue (74c0fc);
+  25-49% blue (007ec6); 50-74% indigo (5b5bd6); 75% and up teal (2ee6c5).
+
+  When the repository is linked to Autter and you are signed in, the snippet
+  uses a live badge served by Autter; otherwise it is a static shields.io
+  badge with the local number.",
+    },
+    HelpEntry {
+        name: "wrapped",
+        aliases: &[],
+        summary: "Your year of AI-assisted coding in this repo, as a share card",
+        body: "\
+autter wrapped [options]
+
+  A Spotify-Wrapped-style summary of the current user's AI-assisted coding
+  in this repository for one year: AI share overall and by month, the top
+  agent and model, the most-prompted file, the longest prompt, the longest
+  streak and the busiest weekday. Printed as a fixed-width card made for
+  screenshots. Nothing leaves the machine.
+
+  --year <yyyy>           Year to summarize (default: the current year)
+  --author <email>        Commits by this author (default: git user.email)
+  --all-authors           Every author in the repository
+  --include-prompt-text   Include the first 120 characters of the longest
+                          prompt; off by default so prompt text stays private
+  --json                  Output the summary as JSON (the share-card contract)
+  --no-color              Plain text, no ANSI colors
+
+  --share                 Publish the summary as a page at app.autter.dev/wrapped/<token>
+                          with a share image, and print its link. Sharing again for
+                          the same year and repository updates the same page.
+  --hide-repo             With --share: show no repository name on the page
+  --unshare <url|token>   Take a share page down
+
+  Sharing needs a connected account (autter login); nothing is sent in local mode.
+  See app.autter.dev/wrapped/demo for a sample page.",
+    },
+    HelpEntry {
         name: "file-changes",
         aliases: &[],
         summary: "Show the most frequently changed files in this repo",

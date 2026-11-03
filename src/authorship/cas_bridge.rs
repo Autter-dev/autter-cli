@@ -201,13 +201,11 @@ pub fn first_user_prompt_from_transcript_file(path: &str) -> Result<Option<Strin
     }))
 }
 
-/// Resolve transcript messages from a `cas:<hash>` URL.
-///
-/// Lookup order:
-/// 1. Local SQLite cache (`cas_cache`)
-/// 2. Local sync queue (`cas_sync_queue`, not yet uploaded)
-/// 3. Cloud CAS API (when authenticated)
-pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, AutterError> {
+/// Resolve transcript messages from a `cas:<hash>` URL using only what is
+/// on this machine: the local cache, then the not-yet-uploaded sync queue.
+/// Never contacts the platform, so it is safe for commands that must keep
+/// prompt text local.
+pub fn resolve_cas_messages_local(messages_url: &str) -> Result<Option<Vec<Message>>, AutterError> {
     let Some(hash) = messages_url.strip_prefix("cas:") else {
         return Ok(None);
     };
@@ -229,6 +227,27 @@ pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, 
         {
             return Ok(Some(messages));
         }
+    }
+
+    Ok(None)
+}
+
+/// Resolve transcript messages from a `cas:<hash>` URL.
+///
+/// Lookup order:
+/// 1. Local SQLite cache (`cas_cache`)
+/// 2. Local sync queue (`cas_sync_queue`, not yet uploaded)
+/// 3. Cloud CAS API (when authenticated)
+pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, AutterError> {
+    let Some(hash) = messages_url.strip_prefix("cas:") else {
+        return Ok(None);
+    };
+    if hash.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(messages) = resolve_cas_messages_local(messages_url)? {
+        return Ok(Some(messages));
     }
 
     let cfg = config::Config::fresh();

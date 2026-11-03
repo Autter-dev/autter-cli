@@ -171,6 +171,20 @@ pub struct CommitAuthorshipSummary {
     pub hunks: serde_json::Value,
 }
 
+/// Response of `POST /api/cli/repo-badge-link`: the public token behind a
+/// repository's live `AI-written` badge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoBadgeLink {
+    /// Public token that names the repository in the badge route.
+    pub token: String,
+    /// Full badge URL, when the server prefers to state it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_url: Option<String>,
+    /// The repository's Autter page, which the badge links to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_url: Option<String>,
+}
+
 /// Aggregated file-change count uploaded by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChangeCount {
