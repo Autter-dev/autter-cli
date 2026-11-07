@@ -1235,9 +1235,28 @@ fn build_config() -> Config {
     let kind_from_env = notes_backend_kind_from_env();
     let url_from_env = env::var("AUTTER_NOTES_BACKEND_URL").ok();
 
+    // Older connected onboarding wrote `{ kind: "http", backend_url: null }`,
+    // which never wrote local git notes even though onboarding promised it
+    // did. Treat that exact onboarding-written shape as `both`: the change is
+    // purely additive (local notes are written too; reads still fall back to
+    // the cloud cache), so nothing is lost. An env override, a custom
+    // backend_url, or a config that never completed onboarding keeps `http`.
+    let file_kind = file_backend.as_ref().map(|b| {
+        let onboarding_connected_shape = b.kind == NotesBackendKind::Http
+            && b.backend_url.is_none()
+            && file_cfg
+                .as_ref()
+                .and_then(|c| c.onboarding_completed)
+                .unwrap_or(false);
+        if onboarding_connected_shape {
+            NotesBackendKind::Both
+        } else {
+            b.kind
+        }
+    });
     let notes_backend = NotesBackendConfig {
         kind: kind_from_env
-            .or_else(|| file_backend.as_ref().map(|b| b.kind))
+            .or(file_kind)
             .unwrap_or(NotesBackendKind::GitNotes),
         backend_url: url_from_env
             .or_else(|| file_backend.as_ref().and_then(|b| b.backend_url.clone())),

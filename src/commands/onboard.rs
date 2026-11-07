@@ -34,10 +34,9 @@
 //! only for the integrations the user checks interactively, or all of them
 //! with an explicit `--yes`.
 //!
-//! Note: the full authorship-note → Postgres dual-write (keeping local git
-//! notes while also uploading the note itself) is delivered alongside the
-//! in-repo backend. Today, connected mode keeps local git notes and uploads
-//! prompt/usage data via the existing CAS upload path.
+//! Connected mode uses the `both` notes backend: every authorship note is
+//! written to local git notes (refs/notes/ai) first and then queued for upload
+//! to the org's data plane, alongside prompt/usage data via the CAS path.
 
 use std::collections::BTreeMap;
 
@@ -530,12 +529,15 @@ fn setup_connected(
         }
     }
 
-    // Connected mode: upload prompts (CAS) and authorship notes to the hosted
-    // data plane. `backend_url: None` resolves to DEFAULT_NOTES_BACKEND_URL
-    // (the API base) via Config::notes_backend_url().
+    // Connected mode: keep authorship notes in local git notes (refs/notes/ai)
+    // AND upload them, plus prompts (CAS), to the hosted data plane. The `Both`
+    // backend writes the git note first, so attribution still travels with the
+    // repo (push/fetch, plain `git notes`) and survives switching back to local
+    // mode. `backend_url: None` resolves to DEFAULT_NOTES_BACKEND_URL (the API
+    // base) via Config::notes_backend_url().
     cfg.prompt_storage = Some("default".to_string());
     cfg.notes_backend = Some(NotesBackendConfig {
-        kind: NotesBackendKind::Http,
+        kind: NotesBackendKind::Both,
         backend_url: None,
     });
 
@@ -549,8 +551,8 @@ fn setup_connected(
         rail::print_step(&format!("Connected as {who}"), None);
     }
     rail::print_note(
-        "Attribution is still written locally to git notes (refs/notes/ai).\n\
-         Prompt and usage data also sync to your org's Autter dashboard.",
+        "Attribution is written to local git notes (refs/notes/ai) and also\n\
+         synced, with prompt and usage data, to your org's Autter dashboard.",
     );
     Ok(())
 }
