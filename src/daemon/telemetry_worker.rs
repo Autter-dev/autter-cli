@@ -433,24 +433,19 @@ fn flush_commit_summaries() {
             }
         };
 
-        let client = if let Some(org) = row
-            .repo_url
-            .as_deref()
-            .and_then(crate::api::client::resolve_org_for_repo_cached)
-        {
-            match crate::api::client::access_token_for_org(&org) {
-                Some(token) => ApiClient::new(ApiContext::with_auth(None, token)),
-                None => {
-                    let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let _ = lock.mark_commit_summary_failed(
-                        &pending_row.commit_sha,
-                        "could not mint org-scoped token",
-                    );
-                    continue;
-                }
+        // Only upload to an org that connected this repo; otherwise keep it here.
+        let client = match crate::api::client::route_for_repo(row.repo_url.as_deref()) {
+            crate::api::client::RepoRoute::Upload(client) => client,
+            crate::api::client::RepoRoute::NotConnected => {
+                let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = lock.defer_unconnected_commit_summary(&pending_row.commit_sha);
+                continue;
             }
-        } else {
-            ApiClient::new(ApiContext::new(None))
+            crate::api::client::RepoRoute::Unavailable(reason) => {
+                let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = lock.mark_commit_summary_failed(&pending_row.commit_sha, &reason);
+                continue;
+            }
         };
 
         let result = client.upload_commit_authorship_summary(&row, &get_or_create_distinct_id());
@@ -463,6 +458,10 @@ fn flush_commit_summaries() {
                     note_durable_sync_authenticated();
                     crate::auth::notice::clear_upload_failure_for("commit_summaries");
                 }
+            }
+            Err(error) if crate::api::data_plane::is_repo_not_connected(&error) => {
+                // The server knows better than our cached answer: park it.
+                let _ = lock.defer_unconnected_commit_summary(&pending_row.commit_sha);
             }
             Err(error) => {
                 let _ =
@@ -1106,24 +1105,21 @@ pub fn flush_notes() {
         return;
     }
 
-    // Route each note to the org that owns its repo. Notes whose repo isn't known
-    // or isn't tracked by any org go to the home org (org = None → default token).
+    // Route each note to the org that connected its repo. A note whose repo no
+    // org of the user's has connected (or that has no repo) stays on this
+    // machine; it is never sent to the login org instead.
     type NoteBatchRow = (String, String, Option<String>);
     let mut groups: std::collections::HashMap<Option<String>, Vec<NoteBatchRow>> =
         std::collections::HashMap::new();
     for note in &pending {
-        let org = note
-            .repo_url
-            .as_deref()
-            .and_then(crate::api::client::resolve_org_for_repo_cached);
-        groups.entry(org).or_default().push((
+        groups.entry(note.repo_url.clone()).or_default().push((
             note.commit_sha.clone(),
             note.content.clone(),
             note.repo_url.clone(),
         ));
     }
 
-    for (org_opt, batch) in groups {
+    for (repo_opt, batch) in groups {
         let commit_shas: Vec<String> = batch.iter().map(|(sha, _, _)| sha.clone()).collect();
         let entries: Vec<NoteEntry> = batch
             .iter()
@@ -1134,65 +1130,75 @@ pub fn flush_notes() {
             })
             .collect();
 
-        // Pick the client for this org. A resolved org mints an org-scoped token;
-        // if minting fails we defer (mark failed → retry) rather than misroute.
-        let group_client = match &org_opt {
-            Some(org) => match crate::api::client::access_token_for_org(org) {
-                Some(token) => {
-                    ApiClient::new(ApiContext::with_auth(Some(backend_url.clone()), token))
+        let group_client = match crate::api::client::route_for_repo_at(
+            repo_opt.as_deref(),
+            Some(backend_url.clone()),
+        ) {
+            crate::api::client::RepoRoute::Upload(client) => client,
+            crate::api::client::RepoRoute::NotConnected => {
+                if let Ok(db) = crate::notes::db::NotesDatabase::global()
+                    && let Ok(mut lock) = db.lock()
+                {
+                    let _ = lock.defer_unconnected(&commit_shas);
                 }
-                None => {
-                    if let Ok(db) = crate::notes::db::NotesDatabase::global()
-                        && let Ok(mut lock) = db.lock()
-                    {
-                        let _ = lock.mark_failed(&commit_shas, "could not mint org-scoped token");
-                    }
-                    continue;
+                continue;
+            }
+            crate::api::client::RepoRoute::Unavailable(reason) => {
+                if let Ok(db) = crate::notes::db::NotesDatabase::global()
+                    && let Ok(mut lock) = db.lock()
+                {
+                    let _ = lock.mark_failed(&commit_shas, &reason);
                 }
-            },
-            None => ApiClient::new(ApiContext::new(Some(backend_url.clone()))),
+                continue;
+            }
         };
 
         let request = NotesUploadRequest { entries };
         match group_client.upload_notes(request) {
             Ok(resp) => {
+                // Notes the server refused because the repo isn't connected are
+                // parked; only the rest count as uploaded or failed.
+                let rejected: std::collections::HashSet<&str> = resp
+                    .rejected
+                    .iter()
+                    .filter(|r| r.error == crate::api::client::REPO_NOT_CONNECTED)
+                    .map(|r| r.commit_sha.as_str())
+                    .collect();
+                let (parked, rest): (Vec<String>, Vec<String>) = commit_shas
+                    .iter()
+                    .cloned()
+                    .partition(|sha| rejected.contains(sha.as_str()));
+                let other_failures = resp.failure_count.saturating_sub(parked.len());
+
                 if resp.success_count > 0 {
                     note_durable_sync_authenticated();
-                    if resp.failure_count == 0 {
+                    if other_failures == 0 {
                         crate::auth::notice::clear_upload_failure_for("notes");
                     }
                 }
                 tracing::debug!(
                     success = resp.success_count,
                     failure = resp.failure_count,
-                    org = org_opt.as_deref().unwrap_or("home"),
+                    not_connected = parked.len(),
                     "notes: uploaded batch"
                 );
                 if let Ok(db) = crate::notes::db::NotesDatabase::global()
                     && let Ok(mut lock) = db.lock()
                 {
-                    if resp.failure_count == 0 {
-                        let _ = lock.mark_synced(&commit_shas);
+                    let _ = lock.defer_unconnected(&parked);
+                    if other_failures == 0 {
+                        let _ = lock.mark_synced(&rest);
                     } else {
                         // Server reported partial failures but doesn't identify which
-                        // entries failed. Mark the whole group failed so all entries
+                        // entries failed. Mark the rest of the group failed so they
                         // retry on the next flush cycle.
-                        note_durable_sync_upload_failed(
-                            "notes",
-                            &format!(
-                                "partial failure: {}/{} entries failed",
-                                resp.failure_count,
-                                commit_shas.len()
-                            ),
+                        let reason = format!(
+                            "partial failure: {}/{} entries failed",
+                            other_failures,
+                            rest.len()
                         );
-                        let _ = lock.mark_failed(
-                            &commit_shas,
-                            &format!(
-                                "partial failure: {}/{} entries failed",
-                                resp.failure_count,
-                                commit_shas.len()
-                            ),
-                        );
+                        note_durable_sync_upload_failed("notes", &reason);
+                        let _ = lock.mark_failed(&rest, &reason);
                     }
                 }
             }
@@ -1229,20 +1235,27 @@ pub fn flush_notes() {
 /// via `Config::notes_backend_url()`); otherwise fall back to the API base
 /// URL (legacy behavior).
 fn cas_client() -> (ApiClient, bool) {
+    let (client, enabled, _) = cas_target();
+    (client, enabled)
+}
+
+/// [`cas_client`], plus the data-plane base URL when it is the hosted one
+/// (`None` for a self-hosted plane, which has a single org and no routing).
+fn cas_target() -> (ApiClient, bool, Option<Option<String>>) {
     let cfg = Config::fresh();
     let dataplane_url = if cfg.notes_backend_kind().uses_http() {
         cfg.notes_backend_url().map(|s| s.to_string())
     } else {
         None
     };
-    let context = ApiContext::new(dataplane_url);
+    let context = ApiContext::new(dataplane_url.clone());
     let target_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
     let using_hosted = target_url == crate::config::DEFAULT_API_BASE_URL
         || target_url == crate::config::DEFAULT_NOTES_BACKEND_URL;
     let enabled = !using_hosted || client.is_logged_in() || client.has_api_key();
-    (client, enabled)
+    (client, enabled, using_hosted.then_some(dataplane_url))
 }
 
 fn flush_cas(records: Vec<CasSyncPayload>) {
@@ -1254,7 +1267,7 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
         );
         return;
     }
-    let (client, enabled) = cas_client();
+    let (client, enabled, hosted_base) = cas_target();
     if !enabled {
         tracing::debug!("telemetry: skipping CAS flush, not logged in");
         return;
@@ -1288,6 +1301,46 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
         return;
     }
 
+    // On the hosted plane, each transcript goes to the org that connected its
+    // repo (from `metadata.repo_url`). Transcripts whose repo no org of the
+    // user's has connected, or with no repo at all, stay on this machine.
+    let Some(base_url) = hosted_base else {
+        upload_cas_objects(&client, cas_objects);
+        return;
+    };
+    let mut by_repo: std::collections::HashMap<Option<String>, Vec<CasObject>> =
+        std::collections::HashMap::new();
+    for object in cas_objects {
+        by_repo
+            .entry(object.metadata.get("repo_url").cloned())
+            .or_default()
+            .push(object);
+    }
+    for (repo_url, objects) in by_repo {
+        match crate::api::client::route_for_repo_at(repo_url.as_deref(), base_url.clone()) {
+            crate::api::client::RepoRoute::Upload(repo_client) => {
+                upload_cas_objects(&repo_client, objects);
+            }
+            crate::api::client::RepoRoute::NotConnected => {
+                let hashes: Vec<String> = objects.iter().map(|o| o.hash.clone()).collect();
+                defer_cas_unconnected(&hashes);
+            }
+            crate::api::client::RepoRoute::Unavailable(reason) => {
+                let hashes: Vec<String> = objects.iter().map(|o| o.hash.clone()).collect();
+                mark_cas_upload_failed(&hashes, &reason);
+            }
+        }
+    }
+}
+
+fn defer_cas_unconnected(hashes: &[String]) {
+    if let Ok(db) = crate::authorship::internal_db::InternalDatabase::global() {
+        let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = lock.defer_cas_unconnected(hashes);
+    }
+}
+
+fn upload_cas_objects(client: &ApiClient, cas_objects: Vec<CasObject>) {
     for chunk in cas_objects.chunks(50) {
         let hashes: Vec<String> = chunk.iter().map(|o| o.hash.clone()).collect();
         let request = CasUploadRequest {
@@ -1311,12 +1364,17 @@ fn flush_cas(records: Vec<CasSyncPayload>) {
                     note_durable_sync_authenticated();
                     crate::auth::notice::clear_upload_failure_for("transcripts");
                 }
-                let failed_hashes: Vec<String> = response
-                    .results
-                    .iter()
-                    .filter(|result| result.status != "ok")
-                    .map(|result| result.hash.clone())
-                    .collect();
+                // Refused because the repo isn't connected: park, don't retry.
+                let mut parked_hashes = Vec::new();
+                let mut failed_hashes = Vec::new();
+                for result in response.results.iter().filter(|r| r.status != "ok") {
+                    if result.error.as_deref() == Some(crate::api::client::REPO_NOT_CONNECTED) {
+                        parked_hashes.push(result.hash.clone());
+                    } else {
+                        failed_hashes.push(result.hash.clone());
+                    }
+                }
+                defer_cas_unconnected(&parked_hashes);
                 if !failed_hashes.is_empty() {
                     mark_cas_upload_failed(&failed_hashes, "org database rejected CAS object");
                 }

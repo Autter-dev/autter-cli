@@ -286,8 +286,14 @@ fn acquire_refresh_file_lock() -> Option<crate::utils::LockFile> {
 /// Prefix marking a Personal Access Token (mirrors the backend).
 const PAT_PREFIX: &str = "autter_pat_";
 
-/// In-process cache: repo remote URL → resolved owning org id (None = untracked).
-static ORG_RESOLVE_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<String>>>> =
+/// How long a repo → org answer is trusted before asking the server again, so a
+/// repo connected (or disconnected) on the web is picked up by a running daemon.
+const ORG_RESOLVE_TTL_SECS: i64 = 3_600;
+
+/// In-process cache: repo remote URL → (owning org id, None = no org connected it;
+/// unix time it was resolved). Only answers from the server are cached, never
+/// errors: an outage must not turn into "this repo isn't connected".
+static ORG_RESOLVE_CACHE: Lazy<Mutex<std::collections::HashMap<String, (Option<String>, i64)>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// In-process cache: org id → (access token, unix expiry).
@@ -295,8 +301,8 @@ static ORG_TOKEN_CACHE: Lazy<Mutex<std::collections::HashMap<String, (String, i6
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Load the stored Personal Access Token (the refresh-token slot), if the user is
-/// logged in with a PAT. Per-org routing only works with a PAT; device refresh
-/// tokens return None so callers fall back to the single home-org token.
+/// logged in with a PAT. Only a PAT can mint tokens for other orgs; a device
+/// login is scoped to the one org it signed in to.
 fn load_stored_pat() -> Option<String> {
     let creds = CredentialStore::new().load().ok().flatten()?;
     if creds.is_refresh_token_expired() {
@@ -308,29 +314,108 @@ fn load_stored_pat() -> Option<String> {
     Some(creds.refresh_token)
 }
 
-/// Resolve which org owns the repo at `repo_url`, cached in-process. Returns None
-/// when no org tracks it, the user isn't logged in with a PAT, or resolution fails
-/// — callers then fall back to the home org.
-pub fn resolve_org_for_repo_cached(repo_url: &str) -> Option<String> {
+/// Error text a queue stores on items parked because their repo isn't connected
+/// to any of the user's orgs. Matches the server's rejection reason.
+pub const REPO_NOT_CONNECTED: &str = "repo_not_connected";
+
+/// How long parked items wait before their repo is checked again.
+pub const UNCONNECTED_RECHECK_SECS: i64 = 86_400;
+
+/// Ask the server which of the user's orgs connected `repo_url`. Uses the PAT
+/// when logged in with one, otherwise the device login's access token.
+/// `Ok(None)`: no org connected it. `Err`: couldn't find out right now.
+fn resolve_org_for_repo(
+    repo_url: &str,
+    access_token: Option<&str>,
+) -> Result<Option<String>, String> {
+    let now = chrono::Utc::now().timestamp();
     if let Ok(cache) = ORG_RESOLVE_CACHE.lock()
-        && let Some(hit) = cache.get(repo_url)
+        && let Some((hit, at)) = cache.get(repo_url)
+        && now - *at < ORG_RESOLVE_TTL_SECS
     {
-        return hit.clone();
+        return Ok(hit.clone());
     }
-    let pat = load_stored_pat()?;
-    let resolved = OAuthClient::new()
-        .resolve_org_for_repo(&pat, repo_url)
-        .ok()
-        .flatten();
+    let client = OAuthClient::new();
+    let resolved = if let Some(pat) = load_stored_pat() {
+        client.resolve_org_for_repo(&pat, repo_url)?
+    } else if let Some(token) = access_token {
+        client.resolve_org_for_repo_with_token(token, repo_url)?
+    } else {
+        return Err("not logged in".to_string());
+    };
     if let Ok(mut cache) = ORG_RESOLVE_CACHE.lock() {
-        cache.insert(repo_url.to_string(), resolved.clone());
+        cache.insert(repo_url.to_string(), (resolved.clone(), now));
     }
-    resolved
+    Ok(resolved)
+}
+
+/// Resolve which org owns the repo at `repo_url`, cached in-process. Returns None
+/// when no org has connected it, or it can't be resolved right now. For reads
+/// (memory, badge, wrapped); uploads use [`route_for_repo`], which tells those
+/// two cases apart.
+pub fn resolve_org_for_repo_cached(repo_url: &str) -> Option<String> {
+    let token = try_load_auth_token().ok();
+    resolve_org_for_repo(repo_url, token.as_deref()).ok().flatten()
+}
+
+/// Where one repo's data may be uploaded.
+pub enum RepoRoute {
+    /// Upload with this client; its token is scoped to the org that connected the repo.
+    Upload(ApiClient),
+    /// None of the user's orgs connected this repo (or the login can't reach the
+    /// org that did). Keep the data on the machine and check again later
+    /// ([`UNCONNECTED_RECHECK_SECS`]); never send it to the login org instead.
+    NotConnected,
+    /// Couldn't decide right now (offline, not logged in, server error). Retry
+    /// on the normal schedule.
+    Unavailable(String),
+}
+
+/// Decide where data for `repo_url` goes. Data without a repo is kept local:
+/// there is no way to show it belongs to any org.
+pub fn route_for_repo(repo_url: Option<&str>) -> RepoRoute {
+    route_for_repo_at(repo_url, None)
+}
+
+/// [`route_for_repo`] against a specific API base URL (`None` = configured default).
+pub fn route_for_repo_at(repo_url: Option<&str>, base_url: Option<String>) -> RepoRoute {
+    let Some(repo_url) = repo_url.map(str::trim).filter(|url| !url.is_empty()) else {
+        return RepoRoute::NotConnected;
+    };
+    let default = ApiClient::new(ApiContext::new(base_url.clone()));
+    let Some(login_token) = default.context().auth_token.clone() else {
+        // An API key is bound to one org and can't be routed; the server still
+        // refuses repos that org hasn't connected.
+        if default.has_api_key() {
+            return RepoRoute::Upload(default);
+        }
+        return RepoRoute::Unavailable("not logged in".to_string());
+    };
+    let org = match resolve_org_for_repo(repo_url, Some(&login_token)) {
+        Ok(Some(org)) => org,
+        Ok(None) => return RepoRoute::NotConnected,
+        Err(err) => return RepoRoute::Unavailable(err),
+    };
+    let login_org = crate::auth::identity::extract_identity_from_access_token(&login_token)
+        .active_org_id;
+    if login_org.as_deref() == Some(org.as_str()) {
+        return RepoRoute::Upload(default);
+    }
+    if load_stored_pat().is_none() {
+        // A device login is scoped to one org and can't mint a token for
+        // another. The repo belongs to that other org, not the login org.
+        return RepoRoute::NotConnected;
+    }
+    match access_token_for_org(&org) {
+        Some(token) => RepoRoute::Upload(ApiClient::new(ApiContext::with_auth(base_url, token))),
+        None => RepoRoute::Unavailable(format!("could not get a token for org {}", org)),
+    }
 }
 
 /// Get an access token scoped to `org_id`, minted from the stored PAT and cached
-/// in-process until near expiry. Returns None if not logged in with a PAT or the
-/// mint fails (caller should NOT fall back to another org — retry instead).
+/// in-process until near expiry. Without a PAT, returns the login token only if
+/// it is already scoped to `org_id`. Returns None otherwise or if the mint fails
+/// (caller should NOT fall back to another org — retry instead).
 pub fn access_token_for_org(org_id: &str) -> Option<String> {
     let now = chrono::Utc::now().timestamp();
     if let Ok(cache) = ORG_TOKEN_CACHE.lock()
@@ -339,7 +424,13 @@ pub fn access_token_for_org(org_id: &str) -> Option<String> {
     {
         return Some(token.clone());
     }
-    let pat = load_stored_pat()?;
+    let Some(pat) = load_stored_pat() else {
+        // A device login can't mint tokens, but its own token already works
+        // for the org it signed in to.
+        let token = try_load_auth_token().ok()?;
+        let identity = crate::auth::identity::extract_identity_from_access_token(&token);
+        return (identity.active_org_id.as_deref() == Some(org_id)).then_some(token);
+    };
     let creds = OAuthClient::new()
         .exchange_pat_for_org(&pat, Some(org_id))
         .ok()?;

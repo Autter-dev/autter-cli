@@ -49,11 +49,14 @@ pub enum TranscriptDestination {
 ///
 /// `checkpoints` is the working log for the commit being processed; it is the
 /// only place the transcript file path is available (via `agent_metadata`).
+/// `repo_url` is the commit's remote: it travels with each transcript so the
+/// upload only goes to an org that connected that repo.
 pub fn enqueue_prompt_transcripts(
     prompts: &mut BTreeMap<String, PromptRecord>,
     sessions: &mut BTreeMap<String, SessionRecord>,
     checkpoints: &[Checkpoint],
     destination: TranscriptDestination,
+    repo_url: Option<&str>,
 ) {
     if prompts.is_empty() && sessions.is_empty() {
         return;
@@ -71,7 +74,9 @@ pub fn enqueue_prompt_transcripts(
         let Some(path) = transcript_paths.get(hash) else {
             continue;
         };
-        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id, destination) {
+        if let Ok(Some(cas_hash)) =
+            enqueue_transcript_file(path, &record.agent_id, destination, repo_url)
+        {
             record.messages_url = Some(format!("cas:{cas_hash}"));
         }
     }
@@ -83,7 +88,9 @@ pub fn enqueue_prompt_transcripts(
         let Some(path) = transcript_paths.get(session_key) else {
             continue;
         };
-        if let Ok(Some(cas_hash)) = enqueue_transcript_file(path, &record.agent_id, destination) {
+        if let Ok(Some(cas_hash)) =
+            enqueue_transcript_file(path, &record.agent_id, destination, repo_url)
+        {
             record.messages_url = Some(format!("cas:{cas_hash}"));
         }
     }
@@ -117,6 +124,7 @@ fn enqueue_transcript_file(
     path: &str,
     agent_id: &AgentId,
     destination: TranscriptDestination,
+    repo_url: Option<&str>,
 ) -> Result<Option<String>, AutterError> {
     let Some(messages) = messages_from_transcript_file(path)? else {
         return Ok(None);
@@ -141,6 +149,9 @@ fn enqueue_transcript_file(
     metadata.insert("tool".to_string(), agent_id.tool.clone());
     metadata.insert("model".to_string(), agent_id.model.clone());
     metadata.insert("session_id".to_string(), agent_id.id.clone());
+    if let Some(repo_url) = repo_url {
+        metadata.insert("repo_url".to_string(), repo_url.to_string());
+    }
 
     let db = InternalDatabase::global()?;
     let mut db_lock = db

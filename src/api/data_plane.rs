@@ -27,6 +27,13 @@ fn require_success(
     Ok(body.to_string())
 }
 
+/// True when an upload failed because the server refused the repo: it isn't
+/// connected to the token's org. The data should be kept local, not retried soon.
+pub fn is_repo_not_connected(err: &AutterError) -> bool {
+    let message = err.to_string();
+    message.contains("status 403") && message.contains(crate::api::client::REPO_NOT_CONNECTED)
+}
+
 impl ApiClient {
     pub fn upload_commit_authorship_summary(
         &self,

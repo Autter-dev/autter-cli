@@ -283,6 +283,16 @@ impl FileChangesDatabase {
         Ok(count)
     }
 
+    /// Rows kept on this machine because their repo isn't connected to any of
+    /// the user's orgs.
+    pub fn count_unconnected(&self) -> Result<i64, AutterError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM file_change_counts WHERE synced = 0 AND last_sync_error = ?1",
+            params![crate::api::client::REPO_NOT_CONNECTED],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Hold every row waiting for upload. Local counts are unaffected; the
     /// rows are just never dequeued until [`Self::release_held`]. A held row
     /// touched again stays held, because its aggregate includes held data.

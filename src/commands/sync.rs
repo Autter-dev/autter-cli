@@ -14,7 +14,31 @@ use std::io::IsTerminal;
 #[derive(Debug, Serialize)]
 struct SyncStatusOutput {
     cloud_sync: crate::auth::notice::CloudSyncStatusReport,
+    /// Records kept on this machine because their repository isn't connected
+    /// to any of your orgs. They are never uploaded to another org.
+    not_connected: NotConnectedCounts,
     ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct NotConnectedCounts {
+    notes: i64,
+    commit_summaries: i64,
+    transcripts: i64,
+    file_changes: i64,
+    total: i64,
+}
+
+impl From<crate::upload_hold::QueueCounts> for NotConnectedCounts {
+    fn from(counts: crate::upload_hold::QueueCounts) -> Self {
+        Self {
+            notes: counts.notes,
+            commit_summaries: counts.commit_summaries,
+            transcripts: counts.transcripts,
+            file_changes: counts.file_changes,
+            total: counts.total(),
+        }
+    }
 }
 
 pub fn handle_sync(args: &[String]) {
@@ -176,6 +200,7 @@ fn print_status(args: &[String]) {
     if arg_parser::json() {
         let output = SyncStatusOutput {
             cloud_sync: report,
+            not_connected: crate::upload_hold::unconnected_counts().into(),
             ok,
         };
         println!(
@@ -218,6 +243,17 @@ fn print_human_status(report: &crate::auth::notice::CloudSyncStatusReport) {
         print_pending_line("  file-change records", report.pending.file_changes);
     } else {
         println!("Pending uploads: none");
+    }
+
+    let kept = crate::upload_hold::unconnected_counts();
+    if kept.total() > 0 {
+        println!(
+            "Kept on this computer (repository not connected to any of your orgs): {} authorship notes, {} commit summaries, {} transcripts, {} file-change records",
+            kept.notes, kept.commit_summaries, kept.transcripts, kept.file_changes
+        );
+        println!(
+            "  They upload once an org connects the repository (checked daily). They are never sent to another org."
+        );
     }
 
     if let Some(remediation) = &report.remediation {

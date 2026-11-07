@@ -562,6 +562,53 @@ impl NotesDatabase {
         Ok(())
     }
 
+    /// Park notes whose repo isn't connected to any of the user's orgs. They
+    /// stay on disk and are offered again after
+    /// [`crate::api::client::UNCONNECTED_RECHECK_SECS`], in case the repo gets
+    /// connected. `attempts` is left alone: this isn't a failure, and counting
+    /// it would eventually give up on the note for good.
+    pub fn defer_unconnected(&mut self, commit_shas: &[String]) -> Result<(), AutterError> {
+        if commit_shas.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now();
+        let tx = self.conn.transaction()?;
+        for sha in commit_shas {
+            tx.execute(
+                r#"UPDATE notes
+                   SET processing_started_at = NULL,
+                       last_sync_error       = ?1,
+                       last_sync_at          = ?2,
+                       next_retry_at         = ?2 + ?3
+                   WHERE commit_sha = ?4 AND synced = 0"#,
+                params![
+                    crate::api::client::REPO_NOT_CONNECTED,
+                    now,
+                    crate::api::client::UNCONNECTED_RECHECK_SECS,
+                    sha
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `(notes, commit_summaries)` kept on this machine because their repo
+    /// isn't connected to any of the user's orgs.
+    pub fn count_unconnected(&self) -> Result<(i64, i64), AutterError> {
+        let notes = self.conn.query_row(
+            "SELECT COUNT(*) FROM notes WHERE synced = 0 AND last_sync_error = ?1",
+            params![crate::api::client::REPO_NOT_CONNECTED],
+            |row| row.get(0),
+        )?;
+        let summaries = self.conn.query_row(
+            "SELECT COUNT(*) FROM commit_summary_queue WHERE last_sync_error = ?1",
+            params![crate::api::client::REPO_NOT_CONNECTED],
+            |row| row.get(0),
+        )?;
+        Ok((notes, summaries))
+    }
+
     // ----- Commit summary queue -----
 
     pub fn enqueue_commit_summary(
@@ -707,6 +754,29 @@ impl NotesDatabase {
                  next_retry_at = ?2 + (1 << MIN(attempts + 1, 8)) * 5
                WHERE commit_sha = ?3"#,
             params![error, now, commit_sha],
+        )?;
+        Ok(())
+    }
+
+    /// Park a commit summary whose repo isn't connected to any of the user's
+    /// orgs. See [`Self::defer_unconnected`].
+    pub fn defer_unconnected_commit_summary(
+        &mut self,
+        commit_sha: &str,
+    ) -> Result<(), AutterError> {
+        let now = unix_now();
+        self.conn.execute(
+            r#"UPDATE commit_summary_queue SET
+                 processing_started_at = NULL,
+                 last_sync_error = ?1,
+                 next_retry_at = ?2 + ?3
+               WHERE commit_sha = ?4"#,
+            params![
+                crate::api::client::REPO_NOT_CONNECTED,
+                now,
+                crate::api::client::UNCONNECTED_RECHECK_SECS,
+                commit_sha
+            ],
         )?;
         Ok(())
     }
