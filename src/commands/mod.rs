@@ -28,6 +28,7 @@ pub mod mcp;
 pub mod memory;
 pub mod memory_hook;
 pub mod memory_skills;
+pub mod notes_backfill;
 pub mod notes_migrate;
 pub mod onboard;
 pub mod personal_dashboard;

@@ -370,6 +370,9 @@ fn handle_notes_subcommand(args: &[String]) {
         "migrate" => {
             commands::notes_migrate::handle_notes_migrate(&args[1..]);
         }
+        "backfill" => {
+            commands::notes_backfill::handle_notes_backfill(&args[1..]);
+        }
         "--help" | "-h" | "help" => {
             eprintln!("autter notes - Notes backend management commands");
             eprintln!();
@@ -377,6 +380,9 @@ fn handle_notes_subcommand(args: &[String]) {
             eprintln!();
             eprintln!("Subcommands:");
             eprintln!("  migrate    Bulk-upload existing git notes to your org's database");
+            eprintln!(
+                "  backfill   Write notes stored only in the local notes database into refs/notes/ai"
+            );
             eprintln!();
             eprintln!("Run 'autter notes <subcommand> --help' for details.");
         }

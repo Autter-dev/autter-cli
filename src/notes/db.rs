@@ -824,6 +824,38 @@ impl NotesDatabase {
         Ok(result)
     }
 
+    /// Every commit SHA that has a note row, pending upload or synced cache.
+    ///
+    /// Used by the local-notes backfill, which copies these rows into
+    /// `refs/notes/ai` for the commits that belong to a given repository.
+    pub fn all_note_shas(&self) -> Result<Vec<String>, AutterError> {
+        let mut stmt = self.conn.prepare("SELECT commit_sha FROM notes")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Whether the notes table holds any row at all. A cheap guard so the
+    /// automatic backfill does no git work on machines that never stored a
+    /// note here.
+    pub fn has_any_notes(&self) -> Result<bool, AutterError> {
+        let exists: i64 = self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM notes)", [], |row| row.get(0))?;
+        Ok(exists != 0)
+    }
+
+    /// Whether the notes database file exists, without creating it the way
+    /// [`Self::global`] would.
+    pub fn exists_on_disk() -> bool {
+        Self::database_path()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    }
+
     /// Retrieve note content for a slice of commit SHAs.
     ///
     /// Only SHAs that exist in the database are returned; missing SHAs are absent

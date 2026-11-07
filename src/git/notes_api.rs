@@ -45,7 +45,11 @@ fn write_note_with_kind(
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
             http_write_note(commit_sha, content, repo_url.as_deref())
         }
-        NotesBackendKind::GitNotes => crate::git::refs::notes_add(repo, commit_sha, content),
+        NotesBackendKind::GitNotes => {
+            let git_result = crate::git::refs::notes_add(repo, commit_sha, content);
+            after_git_notes_write(repo, &git_result);
+            git_result
+        }
         NotesBackendKind::Both => {
             // Git notes are the durable local copy; write them first. The
             // HTTP enqueue is best-effort — a failure must not lose the git
@@ -55,8 +59,18 @@ fn write_note_with_kind(
             if let Err(e) = http_write_note(commit_sha, content, repo_url.as_deref()) {
                 tracing::warn!(%e, commit_sha, "both backend: cloud note enqueue failed");
             }
+            after_git_notes_write(repo, &git_result);
             git_result
         }
+    }
+}
+
+/// After a successful git-notes write, copy into `refs/notes/ai` any notes this
+/// repository has only in the notes database (written while the machine used
+/// the `http` backend). Runs once per repository; see `notes_backfill`.
+fn after_git_notes_write(repo: &Repository, git_result: &Result<(), AutterError>) {
+    if git_result.is_ok() {
+        crate::git::notes_backfill::maybe_auto_backfill(repo);
     }
 }
 
@@ -72,13 +86,18 @@ pub fn write_notes_batch(
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
             http_write_batch(entries, repo_url.as_deref())
         }
-        NotesBackendKind::GitNotes => crate::git::refs::notes_add_batch(repo, entries),
+        NotesBackendKind::GitNotes => {
+            let git_result = crate::git::refs::notes_add_batch(repo, entries);
+            after_git_notes_write(repo, &git_result);
+            git_result
+        }
         NotesBackendKind::Both => {
             let git_result = crate::git::refs::notes_add_batch(repo, entries);
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
             if let Err(e) = http_write_batch(entries, repo_url.as_deref()) {
                 tracing::warn!(%e, count = entries.len(), "both backend: cloud notes enqueue failed");
             }
+            after_git_notes_write(repo, &git_result);
             git_result
         }
     }
