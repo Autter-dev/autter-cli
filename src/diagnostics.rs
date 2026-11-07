@@ -1072,7 +1072,7 @@ fn wait_for_daemon_family_status(
 /// Waits until the daemon has no side effects in flight for the repo, so that
 /// deleting the repo does not race them. Returns at once when the daemon is not
 /// reachable or is too old to report in-flight side effects.
-fn wait_for_daemon_family_idle(repo_path: &Path, deadline: Instant) {
+pub(crate) fn wait_for_daemon_family_idle(repo_path: &Path, deadline: Instant) {
     let Ok(config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
         return;
     };

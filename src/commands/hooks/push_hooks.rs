@@ -31,7 +31,7 @@ pub fn run_pre_push_hook_managed(parsed_args: &ParsedGitInvocation, repository: 
     }
 }
 
-fn should_skip_authorship_push(command_args: &[String]) -> bool {
+pub(crate) fn should_skip_authorship_push(command_args: &[String]) -> bool {
     is_dry_run(command_args)
         || command_args.iter().any(|a| a == "-d" || a == "--delete")
         || command_args.iter().any(|a| a == "--mirror")

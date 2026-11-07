@@ -76,8 +76,23 @@ pub fn load_rebase_note_cache(
     // fires during `rebase --continue` for a human-resolved conflict commit —
     // in that case we must still run the slow-path rewrite to transfer attribution
     // for any AI lines that survived the merge.
+    //
+    // A new commit's note is also NOT "already processed" when it is byte-identical to
+    // one of the original commits' notes. That is what git itself produces when
+    // `notes.rewriteRef` covers `refs/notes/ai` (autter's installer sets it): git copies
+    // the original note verbatim onto the rewritten commit, with the original line ranges.
+    // If the rebase shifted lines, those ranges are stale, so we must recompute them
+    // instead of trusting the copy.
+    let original_blob_oid_set: HashSet<&String> = original_note_blob_oids.values().collect();
     let mut new_commits_with_notes = HashSet::new();
     for (commit, blob_oid) in &new_commit_note_blob_oids {
+        if original_blob_oid_set.contains(blob_oid) {
+            tracing::debug!(
+                "Commit {} carries a note copied verbatim by git (notes.rewriteRef); recomputing",
+                commit
+            );
+            continue;
+        }
         if let Some(content) = blob_contents.get(blob_oid)
             && let Ok(log) = AuthorshipLog::deserialize_from_string(content)
             && !log.attestations.is_empty()

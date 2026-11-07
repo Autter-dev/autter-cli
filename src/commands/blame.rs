@@ -54,6 +54,10 @@ pub struct BlameHunk {
     pub committer_tz: String,
     /// Whether this is a boundary commit
     pub is_boundary: bool,
+    /// Path of the file in `commit_sha`, from git blame's porcelain `filename` line.
+    /// Differs from the current path when git blame followed a rename; authorship
+    /// notes record lines under the path the file had in that commit.
+    pub orig_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -789,6 +793,7 @@ impl Repository {
             committer_time: i64,
             committer_tz: String,
             boundary: bool,
+            filename: Option<String>,
         }
 
         let mut hunks: Vec<BlameHunk> = Vec::new();
@@ -858,6 +863,10 @@ impl Repository {
                 cur_meta.boundary = true;
                 continue;
             }
+            if let Some(rest) = line.strip_prefix("filename ") {
+                cur_meta.filename = Some(unquote_git_path(rest));
+                continue;
+            }
 
             // Header line: either 4 fields (new hunk) or 3 fields (continuation)
             let mut parts = line.split_whitespace();
@@ -906,6 +915,7 @@ impl Repository {
                         committer_time: cur_meta.committer_time,
                         committer_tz: cur_meta.committer_tz.clone(),
                         is_boundary: cur_meta.boundary,
+                        orig_path: cur_meta.filename.clone(),
                     });
                 }
 
@@ -964,6 +974,7 @@ impl Repository {
                 committer_time: cur_meta.committer_time,
                 committer_tz: cur_meta.committer_tz.clone(),
                 is_boundary: cur_meta.boundary,
+                orig_path: cur_meta.filename.clone(),
             });
         }
 
@@ -1146,7 +1157,15 @@ fn overlay_ai_authorship(
             }
 
             // Check each line in this hunk for AI authorship using compact schema
-            // IMPORTANT: Use the original line numbers from the commit, not the current line numbers
+            // IMPORTANT: Use the original line numbers from the commit, not the current line numbers.
+            // Likewise use the path the file had in that commit: after `git mv`, git blame
+            // follows the rename back to the original commit, whose note records the lines
+            // under the old path.
+            let note_path: &str = hunk
+                .orig_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or(file_path);
             let num_lines = hunk.range.1 - hunk.range.0 + 1;
             for i in 0..num_lines {
                 let current_line_num = hunk.range.0 + i;
@@ -1154,7 +1173,7 @@ fn overlay_ai_authorship(
 
                 if let Some((author, prompt_hash, prompt)) = authorship_log.get_line_attribution(
                     repo,
-                    file_path,
+                    note_path,
                     orig_line_num,
                     &mut foreign_prompts_cache,
                 ) {
@@ -2529,4 +2548,71 @@ fn parse_line_range(range_str: &str) -> Option<(u32, u32)> {
     }
 
     None
+}
+
+/// Undo git's C-style path quoting (used in porcelain `filename` lines when a path
+/// contains special or non-ASCII characters and `core.quotePath` is on).
+fn unquote_git_path(raw: &str) -> String {
+    let raw = raw.trim_end_matches(['\r', '\n']);
+    let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return raw.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' || i + 1 >= bytes.len() {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let next = bytes[i + 1];
+        match next {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'v' => out.push(0x0b),
+            b'"' => out.push(b'"'),
+            b'\\' => out.push(b'\\'),
+            b'0'..=b'7'
+                if i + 3 < bytes.len()
+                    && (b'0'..=b'7').contains(&bytes[i + 2])
+                    && (b'0'..=b'7').contains(&bytes[i + 3]) =>
+            {
+                let oct = &inner[i + 1..i + 4];
+                match u8::from_str_radix(oct, 8) {
+                    Ok(v) => out.push(v),
+                    Err(_) => out.extend_from_slice(&bytes[i..i + 4]),
+                }
+                i += 4;
+                continue;
+            }
+            other => {
+                out.push(b'\\');
+                out.push(other);
+            }
+        }
+        i += 2;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod unquote_git_path_tests {
+    use super::unquote_git_path;
+
+    #[test]
+    fn leaves_plain_paths_alone() {
+        assert_eq!(unquote_git_path("src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn unquotes_escapes_and_octal_utf8() {
+        assert_eq!(unquote_git_path("\"a\\\"b.txt\""), "a\"b.txt");
+        assert_eq!(unquote_git_path("\"caf\\303\\251.txt\""), "café.txt");
+    }
 }

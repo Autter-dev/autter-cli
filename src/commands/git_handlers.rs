@@ -234,6 +234,12 @@ fn handle_git_inner(args: &[String]) {
         let repository = find_repository(&parsed.global_args).ok();
         let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
 
+        if parsed.command.as_deref() == Some("push")
+            && let Some(worktree) = worktree.as_deref()
+        {
+            wait_for_pending_notes_before_push(&parsed, worktree);
+        }
+
         let pre_state = worktree
             .as_deref()
             .and_then(crate::git::repo_state::read_head_state_for_worktree);
@@ -395,6 +401,28 @@ fn parse_alias_tokens(value: &str) -> Option<Vec<String>> {
     }
 
     Some(tokens)
+}
+
+/// How long `git push` waits for the daemon to finish writing notes for recent
+/// commits. The daemon pushes `refs/notes/ai` right after the user's push, so a
+/// note still being written when the push starts would miss that push and only
+/// reach the remote on the next one (or never, if there is no next one).
+const PUSH_PENDING_NOTES_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Before a push, wait (bounded) until the daemon has no side effects in flight
+/// for this repository, so authorship notes for a commit made moments ago are
+/// written before the daemon pushes notes. Returns at once when notes do not
+/// live in git refs, when the push would not push notes, or when the daemon is
+/// idle, unreachable or too old to report in-flight work.
+fn wait_for_pending_notes_before_push(parsed: &ParsedGitInvocation, worktree: &std::path::Path) {
+    if !config::Config::get().notes_backend_kind().uses_git_notes() {
+        return;
+    }
+    if crate::commands::hooks::push_hooks::should_skip_authorship_push(&parsed.command_args) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + PUSH_PENDING_NOTES_WAIT;
+    crate::diagnostics::wait_for_daemon_family_idle(worktree, deadline);
 }
 
 /// In async (wrapper-to-daemon) mode, after a successful `git commit`, poll for
