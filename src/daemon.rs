@@ -9042,10 +9042,22 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     crate::observability::install_panic_hook();
     coordinator_inner.telemetry_worker = Some(telemetry_handle.clone());
 
-    // Spawn the transcript worker BEFORE wrapping coordinator in Arc
-    if config::Config::get()
-        .get_feature_flags()
-        .transcript_streaming
+    // Spawn the transcript worker BEFORE wrapping coordinator in Arc.
+    //
+    // The worker sweeps every agent's session history on startup, so it waits
+    // for the user's setup choice: a daemon started before onboarding (by the
+    // git proxy or a plain `autter` command) reads nothing. Onboarding restarts
+    // a running daemon once the choice is saved, which starts the worker then.
+    let collection_consented = crate::config::collection_consented_now();
+    if !collection_consented {
+        tracing::info!(
+            "transcript worker not started: onboarding has not been completed (run `autter onboard`)"
+        );
+    }
+    if collection_consented
+        && config::Config::get()
+            .get_feature_flags()
+            .transcript_streaming
     {
         // Named "transcripts-db" for backwards compatibility with existing installations.
         // TODO: rename to "streams-db" with a migration that moves the file.

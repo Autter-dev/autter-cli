@@ -10,7 +10,7 @@
 //! These run without a background service, so nothing can drain the queues
 //! behind the test's back; "held" is observed through `autter sync status`.
 
-use crate::repos::test_repo::{DaemonTestScope, GitTestMode, TestRepo};
+use crate::repos::test_repo::{DaemonTestScope, GitTestMode, TestRepo, connected_mode};
 use autter::file_changes::FileChangesDatabase;
 use autter::notes::db::NotesDatabase;
 use serde_json::Value;
@@ -77,7 +77,9 @@ fn sign_in_offline(repo: &TestRepo) {
 
 #[test]
 fn transcript_backlog_from_completed_legacy_migration_requires_consent() {
-    let repo = repo_without_service();
+    let mut repo = repo_without_service();
+    // `sync import` only works in connected mode.
+    repo.patch_autter_config(connected_mode);
     let internal = repo.test_home_path().join(".autter/internal");
     fs::create_dir_all(&internal).unwrap();
     // Version 2.2.1 already applied the old hold, but could subsequently queue
@@ -129,7 +131,9 @@ fn transcript_backlog_from_completed_legacy_migration_requires_consent() {
 
 #[test]
 fn legacy_backlog_is_held_until_explicit_import() {
-    let repo = repo_without_service();
+    let mut repo = repo_without_service();
+    // `sync import` only works in connected mode.
+    repo.patch_autter_config(connected_mode);
     let _ = fs::remove_file(hold_marker(&repo));
     seed_backlog(&repo);
 

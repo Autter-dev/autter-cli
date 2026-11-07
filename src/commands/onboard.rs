@@ -89,7 +89,10 @@ pub fn handle_onboard(args: &[String]) {
 
     let logged_in = matches!(collect_auth_status().state, AuthState::LoggedIn);
     let interactive = ui::is_interactive();
-    let ask_mode = !(choose_connect || choose_local || logged_in);
+    // Being signed in is not a choice to upload: credentials can come from
+    // `autter login` or an install nonce without the user ever picking
+    // connected mode. Only `--connect` or the interactive answer turns sync on.
+    let ask_mode = !(choose_connect || choose_local);
 
     if ask_mode && !interactive {
         // Non-interactive shell with no explicit choice: don't block automated
@@ -117,12 +120,8 @@ pub fn handle_onboard(args: &[String]) {
         true
     } else if choose_local {
         false
-    } else if logged_in {
-        // Already authenticated (e.g. via an install nonce): treat as connected
-        // without prompting.
-        true
     } else {
-        prompt_mode_choice(steps.next().as_deref())
+        prompt_mode_choice(steps.next().as_deref(), logged_in)
     };
     steps.set_total(plan.total(connect));
 
@@ -142,7 +141,12 @@ pub fn handle_onboard(args: &[String]) {
                 crate::upload_hold::PURGE_COMMAND,
             );
         }
-        if let Err(e) = setup_connected(&mut file_config, logged_in, !ask_mode, &mut steps) {
+        if let Err(e) = setup_connected(
+            &mut file_config,
+            logged_in,
+            !ask_mode || logged_in,
+            &mut steps,
+        ) {
             report.problem(
                 format!(
                     "Could not connect to the Autter platform ({e}); set up in local mode instead"
@@ -338,11 +342,16 @@ fn restart_daemon_for_mode_change() -> Result<(), String> {
 }
 
 /// The interactive connected-vs-local choice, as an arrow-key selector.
-fn prompt_mode_choice(counter: Option<&str>) -> bool {
+fn prompt_mode_choice(counter: Option<&str>, logged_in: bool) -> bool {
+    let connected_hint = if logged_in {
+        "Powers prompt search, team dashboards, and PR authorship views. Uses the account you're signed in with."
+    } else {
+        "Powers prompt search, team dashboards, and PR authorship views. Sign-in opens in your browser."
+    };
     let items = [
         SelectItem::new(
             "Connected — link this machine to your Autter org (recommended)",
-            "Powers prompt search, team dashboards, and PR authorship views. Sign-in opens in your browser.",
+            connected_hint,
         ),
         SelectItem::new(
             "Local only — everything stays on this machine",
@@ -683,7 +692,7 @@ fn print_status_summary() {
 
 /// Show the current telemetry setting and where to inspect what's sent.
 fn print_telemetry_summary(cfg: &config::FileConfig) {
-    let enabled = cfg.telemetry_oss.as_deref() != Some("off");
+    let enabled = config::telemetry_oss_opted_in(cfg.telemetry_oss.as_deref());
     eprintln!();
     if enabled {
         eprintln!("Anonymous telemetry is ON. Everything sent is logged at:");

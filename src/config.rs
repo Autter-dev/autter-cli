@@ -577,20 +577,31 @@ impl Config {
 
     /// Whether this machine may send data to the Autter platform at all.
     ///
-    /// Local mode is `prompt_storage = "local"` (what `autter onboard --local`
-    /// writes, and what onboarding itself treats as "not connected"). In local
-    /// mode nothing is uploaded: metrics, transcripts (CAS), authorship notes,
-    /// commit summaries and file-change counts all stay on the machine, even
-    /// when credentials are present. Every platform uploader must check this
-    /// before it builds an API client or enqueues upload-only data.
+    /// This is the single source of truth for cloud sync. The status line
+    /// (`whoami`, `sync status`, `doctor`, `autter` home) and every uploader
+    /// (metrics, commit summaries, transcripts/CAS, authorship notes,
+    /// file-change counts) must agree on it, so "Cloud upload: off" always
+    /// means nothing is sent.
     ///
-    /// Connected mode is every other value. Uploads there still require valid
-    /// credentials; this predicate only says the mode permits them.
+    /// Sync is opt-in. It is on only in connected mode, which needs both:
+    /// - `prompt_storage` is not `"local"`, and
+    /// - the notes backend uploads over HTTP (`notes_backend.kind` is `http`
+    ///   or `both`).
+    ///
+    /// The HTTP notes backend is written only by an explicit choice to connect
+    /// (`autter onboard --connect`, or the connected answer in interactive
+    /// onboarding). Its default is git notes, so a fresh install, and a
+    /// machine that only ran `autter login`, never upload. `autter onboard
+    /// --local` writes `prompt_storage = "local"`, which wins over any
+    /// notes backend (a contradictory config fails closed).
+    ///
+    /// Uploads still require valid credentials; this predicate only says the
+    /// mode permits them.
     ///
     /// Anonymous telemetry (`telemetry_oss`, PostHog/Sentry) is a separate,
     /// separately consented setting and is not governed by this predicate.
     pub fn platform_sync_enabled(&self) -> bool {
-        self.prompt_storage != PromptStorageMode::Local.as_str()
+        sync_mode_permits_upload(&self.prompt_storage, self.notes_backend.kind)
     }
 
     /// Returns the effective prompt storage mode for a given repository.
@@ -1071,11 +1082,9 @@ fn build_config() -> Config {
                 .ok()
         })
         .collect();
-    let telemetry_oss_disabled = file_cfg
-        .as_ref()
-        .and_then(|c| c.telemetry_oss.clone())
-        .filter(|s| s == "off")
-        .is_some();
+    let telemetry_oss_disabled = !telemetry_oss_opted_in(
+        file_cfg.as_ref().and_then(|c| c.telemetry_oss.as_deref()),
+    );
     let telemetry_enterprise_dsn = file_cfg
         .as_ref()
         .and_then(|c| c.telemetry_enterprise_dsn.clone())
@@ -1223,14 +1232,7 @@ fn build_config() -> Config {
 
     // Resolve notes_backend config: env vars override file config, which overrides defaults.
     let file_backend = file_cfg.as_ref().and_then(|c| c.notes_backend.clone());
-    let kind_from_env = env::var("AUTTER_NOTES_BACKEND_KIND")
-        .ok()
-        .and_then(|s| match s.as_str() {
-            "http" => Some(NotesBackendKind::Http),
-            "git_notes" | "git-notes" => Some(NotesBackendKind::GitNotes),
-            "both" => Some(NotesBackendKind::Both),
-            _ => None,
-        });
+    let kind_from_env = notes_backend_kind_from_env();
     let url_from_env = env::var("AUTTER_NOTES_BACKEND_URL").ok();
 
     let notes_backend = NotesBackendConfig {
@@ -1525,6 +1527,54 @@ pub fn skills_dir_path() -> Option<PathBuf> {
     autter_dir_path().map(|dir| dir.join("skills"))
 }
 
+/// Whether the persisted `telemetry_oss` value is an opt-in. Anonymous
+/// telemetry is off until the user says yes (`"on"`, written by onboarding or
+/// `autter telemetry on`); an unset value means nobody asked yet, so nothing is
+/// collected or sent before that choice. Every reader of `telemetry_oss` uses
+/// this so the status output and the senders agree.
+pub fn telemetry_oss_opted_in(value: Option<&str>) -> bool {
+    value == Some("on")
+}
+
+/// Whether the user has made a setup choice that permits background
+/// collection on this machine (the transcript worker and its sweep of agent
+/// session history): onboarding finished in either mode, or connected mode is
+/// configured explicitly. Before that, nothing is read from agent history.
+///
+/// Test builds treat an explicit `AUTTER_TEST_CONFIG_PATCH` as that choice,
+/// since the harness configures each repository directly instead of running
+/// onboarding.
+pub fn collection_consented_now() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if env::var_os("AUTTER_TEST_CONFIG_PATCH").is_some() {
+        return true;
+    }
+
+    if platform_sync_enabled_now() {
+        return true;
+    }
+    load_file_config().and_then(|cfg| cfg.onboarding_completed) == Some(true)
+}
+
+/// The connected-mode rule behind [`Config::platform_sync_enabled`] and
+/// [`platform_sync_enabled_now`]. Keep both on this one function so the status
+/// line and the uploaders can never disagree.
+fn sync_mode_permits_upload(prompt_storage: &str, notes_backend: NotesBackendKind) -> bool {
+    prompt_storage != PromptStorageMode::Local.as_str() && notes_backend.uses_http()
+}
+
+/// Parse `AUTTER_NOTES_BACKEND_KIND`, matching the resolution in `build_config`.
+fn notes_backend_kind_from_env() -> Option<NotesBackendKind> {
+    env::var("AUTTER_NOTES_BACKEND_KIND")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "http" => Some(NotesBackendKind::Http),
+            "git_notes" | "git-notes" => Some(NotesBackendKind::GitNotes),
+            "both" => Some(NotesBackendKind::Both),
+            _ => None,
+        })
+}
+
 /// [`Config::platform_sync_enabled`] on a fresh config snapshot.
 ///
 /// Long-lived processes (the daemon) must use this rather than
@@ -1532,22 +1582,45 @@ pub fn skills_dir_path() -> Option<PathBuf> {
 /// immediately, even if the daemon restart that follows onboarding fails.
 ///
 /// Deliberately cheaper than `Config::fresh()` (which probes for the git
-/// binary): it only reads `prompt_storage`, because it runs on hot paths such
-/// as every recorded metric event. The result must stay identical to
-/// `Config::fresh().platform_sync_enabled()`.
+/// binary): it only reads `prompt_storage` and the notes backend kind, because
+/// it runs on hot paths such as every recorded metric event. The result must
+/// stay identical to `Config::fresh().platform_sync_enabled()`.
 pub fn platform_sync_enabled_now() -> bool {
-    #[cfg(any(test, feature = "test-support"))]
-    if let Ok(patch_json) = env::var("AUTTER_TEST_CONFIG_PATCH")
-        && let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json)
-        && let Some(prompt_storage) = patch.prompt_storage
-        && matches!(prompt_storage.as_str(), "default" | "notes" | "local")
-    {
-        return prompt_storage != PromptStorageMode::Local.as_str();
-    }
+    let file_cfg = load_file_config();
+    let prompt_storage = file_cfg
+        .as_ref()
+        .and_then(|cfg| cfg.prompt_storage.clone())
+        .filter(|value| matches!(value.as_str(), "default" | "notes" | "local"))
+        .unwrap_or_else(|| PromptStorageMode::Default.as_str().to_string());
+    let notes_backend = notes_backend_kind_from_env()
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.notes_backend.as_ref().map(|nb| nb.kind))
+        })
+        .unwrap_or(NotesBackendKind::GitNotes);
 
-    load_file_config()
-        .and_then(|cfg| cfg.prompt_storage)
-        .is_none_or(|prompt_storage| prompt_storage != PromptStorageMode::Local.as_str())
+    // Mirror the test config patch, which `Config::fresh()` applies last.
+    #[cfg(any(test, feature = "test-support"))]
+    let (prompt_storage, notes_backend) = {
+        let mut prompt_storage = prompt_storage;
+        let mut notes_backend = notes_backend;
+        if let Ok(patch_json) = env::var("AUTTER_TEST_CONFIG_PATCH")
+            && let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json)
+        {
+            if let Some(patched) = patch.prompt_storage
+                && matches!(patched.as_str(), "default" | "notes" | "local")
+            {
+                prompt_storage = patched;
+            }
+            if let Some(nb) = patch.notes_backend {
+                notes_backend = nb.kind;
+            }
+        }
+        (prompt_storage, notes_backend)
+    };
+
+    sync_mode_permits_upload(&prompt_storage, notes_backend)
 }
 
 /// Public accessor for ID file path (~/.autter/internal/distinct_id)
@@ -2394,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_platform_sync_disabled_only_in_local_mode() {
+    fn test_platform_sync_enabled_only_in_connected_mode() {
         let local = create_test_config_with_include_prompts(vec![], vec![], "local", None);
         assert!(
             !local.platform_sync_enabled(),
@@ -2407,12 +2480,28 @@ mod tests {
         local_http.notes_backend.kind = NotesBackendKind::Http;
         assert!(!local_http.platform_sync_enabled());
 
-        for connected in ["default", "notes"] {
-            let cfg = create_test_config_with_include_prompts(vec![], vec![], connected, None);
+        for prompt_storage in ["default", "notes"] {
+            // Fresh install / logged in but never connected: the notes backend
+            // is still the git-notes default, so nothing may upload. This is
+            // the state where the status line said "Cloud upload: off" while
+            // the daemon uploaded metrics and transcripts.
+            let not_connected =
+                create_test_config_with_include_prompts(vec![], vec![], prompt_storage, None);
+            assert_eq!(not_connected.notes_backend.kind, NotesBackendKind::GitNotes);
             assert!(
-                cfg.platform_sync_enabled(),
-                "prompt_storage={connected} is connected mode"
+                !not_connected.platform_sync_enabled(),
+                "prompt_storage={prompt_storage} without the HTTP notes backend is not connected"
             );
+
+            for kind in [NotesBackendKind::Http, NotesBackendKind::Both] {
+                let mut connected =
+                    create_test_config_with_include_prompts(vec![], vec![], prompt_storage, None);
+                connected.notes_backend.kind = kind;
+                assert!(
+                    connected.platform_sync_enabled(),
+                    "prompt_storage={prompt_storage} with notes_backend={kind} is connected mode"
+                );
+            }
         }
     }
 

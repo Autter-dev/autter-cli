@@ -2,9 +2,11 @@
 
 ## OSS Mode
 
-If you install Autter open source and don't login **no code, prompts, or agent usage data is ever sent to Autter**. Autter runs entirely on your machine and writes attribution data into your local git repository and prompts to a local SQLite.
+Unless you choose connected mode (`autter onboard --connect`, or "Connected" in `autter onboard`), **no code, prompts, or agent usage data is ever sent to Autter**. Signing in with `autter login` alone does not turn on uploads. Autter runs entirely on your machine and writes attribution data into your local git repository and prompts to a local SQLite. `autter whoami` and `autter sync status` show "Cloud upload: off" exactly when nothing is being uploaded.
 
-The only data Autter sends externally in open source mode is error and exception telemetry, which is enabled by default to help us improve the tool. You can disable or redirect it at any time by turning `telemetry_oss` to `off`. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options) for details.
+Before you finish `autter onboard`, Autter does not read your AI agents' session history, and plain commands such as `autter status` or `autter doctor` do not start the background service.
+
+The only other data Autter can send is anonymous error and usage telemetry. It is off until you opt in during `autter onboard` or with `autter telemetry on`, and you can turn it off at any time by setting `telemetry_oss` to `off`. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options) for details.
 
 ## Data
 

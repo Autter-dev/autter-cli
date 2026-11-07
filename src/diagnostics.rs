@@ -197,6 +197,17 @@ pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
     let mut details = initial.details(&config);
     details.push(format!("initial state: {}", initial.summary));
 
+    // Before onboarding, a stopped service is expected: starting it is a
+    // system integration that needs consent, so doctor must not do it.
+    if initial.state == DaemonHealthState::NotRunning && !crate::config::collection_consented_now()
+    {
+        details.push("not started: run `autter onboard` to set up this machine".to_string());
+        return DiagnosticCheckResult::skipped(
+            "not running; starts after setup (`autter onboard`)",
+            details,
+        );
+    }
+
     let fix = match initial.state {
         DaemonHealthState::Healthy => None,
         DaemonHealthState::NotRunning => Some((

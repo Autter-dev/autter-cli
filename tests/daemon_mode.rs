@@ -10,8 +10,8 @@ use autter::daemon::{
 use autter::git::find_repository_in_path;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::{
-    DaemonTestCompletionLogEntry, DaemonTestScope, GitTestMode, TestRepo, get_binary_path,
-    real_git_executable,
+    DaemonTestCompletionLogEntry, DaemonTestScope, GitTestMode, TestRepo, connected_mode,
+    get_binary_path, real_git_executable,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -777,7 +777,7 @@ fn assert_post_commit_uploads_prompt_cas(mode: GitTestMode) {
     let mut repo = TestRepo::new_with_mode_and_daemon_scope(mode, DaemonTestScope::Dedicated);
     repo.patch_autter_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("default".to_string());
+        connected_mode(patch);
         patch.telemetry_oss_disabled = Some(true);
     });
 

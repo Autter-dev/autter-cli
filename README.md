@@ -125,7 +125,7 @@ Environment overrides: `AUTTER_API_BASE_URL`, `AUTTER_WEB_URL`, `AUTTER_NOTES_BA
 
 ### Telemetry
 
-Autter reports **anonymous** usage analytics and error data so the tool can improve. Telemetry is **on by default**, is confirmed during `autter onboard`, and is built to be safe and fully auditable:
+Autter reports **anonymous** usage analytics and error data so the tool can improve. Telemetry is **off until you opt in** during `autter onboard` (or with `autter telemetry on`), and is built to be safe and fully auditable:
 
 - **Never any personal data** — no code, prompts, file paths, repo names, usernames, or IP addresses.
 - **Only coarse, anonymous signals** — a random install ID, device info (OS, CPU architecture, core count), the Autter version, and error/exception messages.

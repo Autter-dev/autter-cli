@@ -9,7 +9,7 @@
 //! which makes the connected run a control for the local-mode assertions.
 
 use crate::repos::test_file::ExpectedLineExt;
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{TestRepo, connected_mode};
 use autter::config::{NotesBackendConfig, NotesBackendKind};
 use autter::daemon::{ControlRequest, TelemetryEnvelope, send_control_request};
 use autter::metrics::{CommittedValues, EventAttributes, MetricEvent, PosEncoded};
@@ -31,13 +31,9 @@ fn local_mode_repo() -> TestRepo {
 
 fn connected_mode_repo() -> TestRepo {
     TestRepo::new_dedicated_daemon_with_initial_config(|patch| {
-        patch.prompt_storage = Some("default".to_string());
+        connected_mode(patch);
         patch.telemetry_oss_disabled = Some(true);
         patch.feature_flags = Some(serde_json::json!({"transcript_sweep": false}));
-        patch.notes_backend = Some(NotesBackendConfig {
-            kind: NotesBackendKind::GitNotes,
-            backend_url: None,
-        });
     })
 }
 
@@ -186,7 +182,7 @@ fn doctor_reports_local_mode_as_not_uploading() {
 /// is ordinary prompt text, so secret redaction cannot hide a missing repo gate.
 fn streamed_prompt_is_queued(excluded: bool) -> bool {
     let repo = TestRepo::new_dedicated_daemon_with_initial_config(|patch| {
-        patch.prompt_storage = Some("default".to_string());
+        connected_mode(patch);
         patch.telemetry_oss_disabled = Some(true);
         patch.disable_version_checks = Some(true);
         patch.disable_auto_updates = Some(true);

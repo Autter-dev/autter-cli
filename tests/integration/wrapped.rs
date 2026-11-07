@@ -1,7 +1,7 @@
 //! `autter wrapped`: a fixture year of commits with explicit checkpoints
 //! and dates, checked through the JSON contract and the `--no-color` card.
 
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{TestRepo, connected_mode};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -492,7 +492,7 @@ fn wrapped_share_sends_nothing_in_local_mode() {
 fn wrapped_share_without_sign_in_sends_nothing() {
     let mut repo = TestRepo::new();
     build_fixture(&mut repo);
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     let mut server = mockito::Server::new();
     let post = server
         .mock("POST", "/api/cli/wrapped-share")
@@ -510,7 +510,7 @@ fn wrapped_share_without_sign_in_sends_nothing() {
 fn wrapped_share_posts_the_summary_and_prints_the_link() {
     let mut repo = TestRepo::new();
     build_fixture(&mut repo);
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     sign_in(&repo);
     let mut server = mockito::Server::new();
     let post = server
@@ -570,7 +570,7 @@ fn wrapped_share_posts_the_summary_and_prints_the_link() {
 fn wrapped_share_reports_server_errors_in_one_line() {
     let mut repo = TestRepo::new();
     build_fixture(&mut repo);
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     sign_in(&repo);
     let mut server = mockito::Server::new();
     let post = server
@@ -592,7 +592,7 @@ fn wrapped_unshare_deletes_by_link_or_token() {
     fs::write(repo.path().join("README.md"), "# Hello\n").unwrap();
     repo.stage_all_and_commit("Initial").unwrap();
     let mut repo = repo;
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     sign_in(&repo);
     let mut server = mockito::Server::new();
     let ok = server

@@ -3,7 +3,7 @@
 //! tests are not logged in: a command that gets past the sharing policy stops
 //! at "Sign in", which makes the connected run the control.
 
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{TestRepo, connected_mode};
 
 fn repo_with_remote() -> TestRepo {
     let repo = TestRepo::new();
@@ -40,7 +40,7 @@ fn memory_search_sends_nothing_in_local_mode() {
 fn memory_search_sends_nothing_for_an_excluded_repository() {
     let mut repo = repo_with_remote();
     repo.patch_autter_config(|patch| {
-        patch.prompt_storage = Some("default".to_string());
+        connected_mode(patch);
         patch.exclude_prompts_in_repositories = Some(vec!["https://github.com/acme/*".to_string()]);
     });
     let output = memory_error(&repo, &["memory", "search", "how do we retry"]);
@@ -56,7 +56,7 @@ fn memory_search_sends_nothing_for_an_excluded_repository() {
 #[test]
 fn memory_search_in_connected_mode_needs_a_login() {
     let mut repo = repo_with_remote();
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     let output = memory_error(&repo, &["memory", "search", "how do we retry"]);
     assert!(output.contains("autter login"), "{output}");
 }
@@ -88,7 +88,7 @@ fn memory_for_files_sends_nothing_in_local_mode() {
 #[test]
 fn memory_for_without_changes_asks_for_files() {
     let mut repo = repo_with_remote();
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     let output = memory_error(&repo, &["memory", "for"]);
     assert!(
         output.contains("Nothing changed in this checkout"),

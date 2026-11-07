@@ -119,9 +119,15 @@ pub fn handle_autter(args: &[String]) {
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
-            DaemonTelemetryInitResult, init_daemon_telemetry_handle,
+            DaemonTelemetryInitResult, init_daemon_telemetry_handle_with,
         };
-        match init_daemon_telemetry_handle() {
+        // Before onboarding, plain commands use a daemon that is already
+        // running but never start one: the background service is a system
+        // integration that needs the user's consent. Agent checkpoints come
+        // from hooks the user already installed, so they may still start it.
+        let allow_spawn =
+            args[0].as_str() == "checkpoint" || crate::config::collection_consented_now();
+        match init_daemon_telemetry_handle_with(allow_spawn) {
             DaemonTelemetryInitResult::Connected | DaemonTelemetryInitResult::Skipped => {}
             DaemonTelemetryInitResult::Failed(err) => {
                 eprintln!(
