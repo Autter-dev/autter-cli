@@ -220,6 +220,7 @@ pub fn post_commit_with_final_state(
             &mut authorship_log.metadata.sessions,
             &parent_working_log,
             destination,
+            current_repo_url(repo).as_deref(),
         );
     }
 
@@ -646,9 +647,7 @@ fn upload_commit_authorship_summary(
     checkpoints: &[Checkpoint],
     hunks_json: Option<&str>,
 ) {
-    use crate::api::client::{
-        ApiClient, ApiContext, access_token_for_org, resolve_org_for_repo_cached,
-    };
+    use crate::api::client::{RepoRoute, route_for_repo};
     use crate::api::types::CommitAuthorshipSummary;
 
     // The summary queue is upload-only (nothing local reads it), so local mode
@@ -718,20 +717,20 @@ fn upload_commit_authorship_summary(
 
     // Attempt an immediate upload for the normal online case. Every early
     // return below is safe because the durable daemon queue owns the retry.
-    let client = if let Some(repo_url) = row.repo_url.as_deref()
-        && let Some(org) = resolve_org_for_repo_cached(repo_url)
-    {
-        let Some(token) = access_token_for_org(&org) else {
+    // A repo that no org of the user's has connected stays on this machine:
+    // never fall back to the login org, which would put a personal or client
+    // repo's prompts into a workplace's dashboard.
+    let client = match route_for_repo(row.repo_url.as_deref()) {
+        RepoRoute::Upload(client) => client,
+        RepoRoute::NotConnected => {
+            if let Ok(db) = crate::notes::db::NotesDatabase::global() {
+                let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = lock.defer_unconnected_commit_summary(commit_sha);
+            }
             return;
-        };
-        ApiClient::new(ApiContext::with_auth(None, token))
-    } else {
-        ApiClient::new(ApiContext::new(None))
+        }
+        RepoRoute::Unavailable(_) => return,
     };
-
-    if !client.is_logged_in() {
-        return;
-    }
 
     match client.upload_commit_authorship_summary(&row, &crate::config::get_or_create_distinct_id())
     {

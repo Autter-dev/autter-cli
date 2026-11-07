@@ -186,6 +186,30 @@ pub fn held_counts() -> QueueCounts {
     held
 }
 
+/// Items kept on this machine because their repository isn't connected to any
+/// of the user's orgs. Best-effort: an unavailable database counts as zero.
+pub fn unconnected_counts() -> QueueCounts {
+    let mut kept = QueueCounts::default();
+    if let Ok(db) = crate::notes::db::NotesDatabase::global()
+        && let Ok(db) = db.lock()
+        && let Ok((n, s)) = db.count_unconnected()
+    {
+        kept.notes = n;
+        kept.commit_summaries = s;
+    }
+    if let Ok(db) = crate::authorship::internal_db::InternalDatabase::global()
+        && let Ok(db) = db.lock()
+    {
+        kept.transcripts = db.count_unconnected_cas().unwrap_or(0);
+    }
+    if let Ok(db) = crate::file_changes::FileChangesDatabase::global()
+        && let Ok(db) = db.lock()
+    {
+        kept.file_changes = db.count_unconnected().unwrap_or(0);
+    }
+    kept
+}
+
 /// One-time migration: hold every item queued by autter 2.2.0 or earlier.
 ///
 /// Must run before anything drains a queue. Returns `Ok(true)` when the

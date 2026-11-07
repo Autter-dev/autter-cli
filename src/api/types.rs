@@ -141,6 +141,17 @@ pub struct NotesUploadRequest {
 pub struct NotesUploadResponse {
     pub success_count: usize,
     pub failure_count: usize,
+    /// Notes the server refused because their repo isn't connected to the
+    /// token's org. Absent from older servers.
+    #[serde(default)]
+    pub rejected: Vec<NotesUploadRejection>,
+}
+
+/// One note the server refused, and why (`repo_not_connected`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesUploadRejection {
+    pub commit_sha: String,
+    pub error: String,
 }
 
 /// Response from a notes read request — maps commit_sha → note content.
@@ -211,6 +222,10 @@ pub struct FileChangeUploadFailure {
 pub struct FileChangeUploadResponse {
     #[serde(default)]
     pub failed: Vec<FileChangeUploadFailure>,
+    /// Rows the server refused because their repo isn't connected to the
+    /// token's org. Absent from older servers.
+    #[serde(default)]
+    pub rejected: Vec<FileChangeUploadFailure>,
 }
 
 /// Single result from CA prompt store batch read

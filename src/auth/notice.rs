@@ -536,12 +536,15 @@ fn read_pending_sync_counts() -> Option<PendingSyncCounts> {
     let file_changes = crate::file_changes::FileChangesDatabase::global()
         .ok()
         .and_then(|db| db.lock().ok()?.count_pending().ok())?;
+    // Items parked because their repo isn't connected aren't waiting on the
+    // upload pipeline; counting them would make a healthy sync look stuck.
+    let kept = crate::upload_hold::unconnected_counts();
     Some(PendingSyncCounts {
         metrics,
-        notes,
-        commit_summaries,
-        transcripts,
-        file_changes,
+        notes: (notes - kept.notes).max(0),
+        commit_summaries: (commit_summaries - kept.commit_summaries).max(0),
+        transcripts: (transcripts - kept.transcripts).max(0),
+        file_changes: (file_changes - kept.file_changes).max(0),
     })
 }
 

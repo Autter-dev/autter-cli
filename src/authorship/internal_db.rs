@@ -528,6 +528,43 @@ impl InternalDatabase {
         Ok(self.conn.execute(&sql, params.as_slice())?)
     }
 
+    /// Park transcripts whose repo isn't connected to any of the user's orgs.
+    /// They stay queued and are offered again after
+    /// [`crate::api::client::UNCONNECTED_RECHECK_SECS`]. `attempts` is left
+    /// alone, so waiting for a repo to be connected never gives up on them.
+    pub fn defer_cas_unconnected(&mut self, hashes: &[String]) -> Result<usize, AutterError> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+        let sql = format!(
+            "UPDATE cas_sync_queue
+             SET status = 'pending', last_sync_error = ?, last_sync_at = ?,
+                 next_retry_at = ?, processing_started_at = NULL
+             WHERE hash IN ({})",
+            placeholders.join(",")
+        );
+        let error = crate::api::client::REPO_NOT_CONNECTED;
+        let next_retry_at = now.saturating_add(crate::api::client::UNCONNECTED_RECHECK_SECS);
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&error, &now, &next_retry_at];
+        params.extend(hashes.iter().map(|hash| hash as &dyn rusqlite::ToSql));
+        Ok(self.conn.execute(&sql, params.as_slice())?)
+    }
+
+    /// Transcripts kept on this machine because their repo isn't connected to
+    /// any of the user's orgs.
+    pub fn count_unconnected_cas(&self) -> Result<i64, AutterError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM cas_sync_queue WHERE last_sync_error = ?1",
+            params![crate::api::client::REPO_NOT_CONNECTED],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Get cached CAS messages by hash
     pub fn get_cas_cache(&self, hash: &str) -> Result<Option<String>, AutterError> {
         let result = self.conn.query_row(

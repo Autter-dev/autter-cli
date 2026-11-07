@@ -61,7 +61,9 @@ pub fn top_changed_files(repo_key: &str, limit: usize) -> Result<Vec<FileChangeR
 
 /// Upload pending rows to the org database when in connected mode and authenticated.
 pub fn flush_pending_to_cloud() {
-    use crate::api::client::{ApiClient, access_token_for_org, resolve_org_for_repo_cached};
+    use crate::api::client::{
+        ApiClient, REPO_NOT_CONNECTED, RepoRoute, UNCONNECTED_RECHECK_SECS, route_for_repo_at,
+    };
     use crate::api::types::{FileChangeCount, FileChangeUploadResponse};
     use crate::config;
 
@@ -130,29 +132,26 @@ pub fn flush_pending_to_cloud() {
 
     let distinct_id = config::get_or_create_distinct_id();
 
-    let mut groups: std::collections::HashMap<Option<String>, Vec<db::PendingFileChangeRow>> =
+    // Each repo's counts go only to the org that connected that repo. A repo no
+    // org of the user's has connected keeps its counts on this machine.
+    let mut groups: std::collections::HashMap<String, Vec<db::PendingFileChangeRow>> =
         std::collections::HashMap::new();
 
     for row in pending {
-        let org = resolve_org_for_repo_cached(&row.repo_url);
-        groups.entry(org).or_default().push(row);
+        groups.entry(row.repo_url.clone()).or_default().push(row);
     }
 
-    for (org_opt, batch) in groups {
-        let client = match &org_opt {
-            Some(org) => match access_token_for_org(org) {
-                Some(token) => ApiClient::new(crate::api::client::ApiContext::with_auth(
-                    Some(backend_url.clone()),
-                    token,
-                )),
-                None => {
-                    mark_batch_failed(&batch, "could not mint org-scoped token", 300);
-                    continue;
-                }
-            },
-            None => ApiClient::new(crate::api::client::ApiContext::new(Some(
-                backend_url.clone(),
-            ))),
+    for (repo_url, batch) in groups {
+        let client = match route_for_repo_at(Some(&repo_url), Some(backend_url.clone())) {
+            RepoRoute::Upload(client) => client,
+            RepoRoute::NotConnected => {
+                mark_batch_failed(&batch, REPO_NOT_CONNECTED, UNCONNECTED_RECHECK_SECS as u64);
+                continue;
+            }
+            RepoRoute::Unavailable(reason) => {
+                mark_batch_failed(&batch, &reason, 300);
+                continue;
+            }
         };
 
         let rows: Vec<FileChangeCount> = batch
@@ -168,8 +167,12 @@ pub fn flush_pending_to_cloud() {
             .collect();
 
         match client.upload_file_change_counts(&rows, &distinct_id) {
-            Ok(FileChangeUploadResponse { failed }) => {
+            Ok(FileChangeUploadResponse { failed, rejected }) => {
                 let failed_keys: std::collections::HashSet<(String, String)> = failed
+                    .into_iter()
+                    .map(|row| (row.repo_url, row.file_path))
+                    .collect();
+                let rejected_keys: std::collections::HashSet<(String, String)> = rejected
                     .into_iter()
                     .map(|row| (row.repo_url, row.file_path))
                     .collect();
@@ -177,7 +180,8 @@ pub fn flush_pending_to_cloud() {
                 let mut by_repo: std::collections::HashMap<String, Vec<String>> =
                     std::collections::HashMap::new();
                 for row in &batch {
-                    if failed_keys.contains(&(row.repo_url.clone(), row.file_path.clone())) {
+                    let key = (row.repo_url.clone(), row.file_path.clone());
+                    if failed_keys.contains(&key) || rejected_keys.contains(&key) {
                         continue;
                     }
                     by_repo
@@ -198,6 +202,21 @@ pub fn flush_pending_to_cloud() {
                 {
                     for (repo_url, paths) in by_repo {
                         let _ = lock.mark_synced(&repo_url, &paths);
+                    }
+                }
+
+                // Refused by the server because the repo isn't connected: park.
+                if !rejected_keys.is_empty()
+                    && let Ok(db) = FileChangesDatabase::global()
+                    && let Ok(mut lock) = db.lock()
+                {
+                    for (repo_url, file_path) in rejected_keys {
+                        let _ = lock.mark_failed(
+                            &repo_url,
+                            &[file_path],
+                            REPO_NOT_CONNECTED,
+                            UNCONNECTED_RECHECK_SECS as u64,
+                        );
                     }
                 }
 

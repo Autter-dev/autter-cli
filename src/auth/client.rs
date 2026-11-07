@@ -292,15 +292,34 @@ impl OAuthClient {
             .map_err(|e| format!("Token sign-in failed: {}", e))
     }
 
-    /// Resolve which org owns a repository (by `owner/repo` or remote URL), so a
-    /// push can be routed to the right org. Returns `None` when no org tracks it
-    /// (the caller should fall back to the PAT's home org).
+    /// Resolve which of the PAT owner's orgs has connected a repository (by
+    /// `owner/repo` or remote URL), so a push can be routed to the right org.
+    /// `Ok(None)` means no org has connected it: its data stays on the machine.
     pub fn resolve_org_for_repo(&self, pat: &str, repo: &str) -> Result<Option<String>, String> {
-        let url = format!("{}/worker/oauth/resolve-org", self.base_url);
-        let body = serde_json::json!({ "pat": pat, "repo": repo });
+        self.post_resolve_org(serde_json::json!({ "pat": pat, "repo": repo }), None)
+    }
 
+    /// Same as [`Self::resolve_org_for_repo`] for a device-code login, which has
+    /// no PAT: the caller is identified by its access token instead.
+    pub fn resolve_org_for_repo_with_token(
+        &self,
+        access_token: &str,
+        repo: &str,
+    ) -> Result<Option<String>, String> {
+        self.post_resolve_org(serde_json::json!({ "repo": repo }), Some(access_token))
+    }
+
+    fn post_resolve_org(
+        &self,
+        body: serde_json::Value,
+        bearer: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let url = format!("{}/worker/oauth/resolve-org", self.base_url);
         let (_agent, request) = ApiContext::http_post(&url, Some(30));
-        let request = request.set("Content-Type", "application/json");
+        let mut request = request.set("Content-Type", "application/json");
+        if let Some(token) = bearer {
+            request = request.set("Authorization", &format!("Bearer {}", token));
+        }
         let response = http::send_with_body(request, &body.to_string())
             .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
