@@ -746,12 +746,37 @@ fn handle_checkpoint(args: &[String]) {
     if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
         println!("checkpoint_requests={}", sent_count);
         println!("session_activity_requests={}", activity_count);
+    } else if sent_count > 0 {
+        warn_if_commits_cannot_be_captured();
     }
 
     if perf {
         eprintln!(
             "[perf] checkpoint: total={:.1}ms",
             t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// A checkpoint only becomes attribution when the commit is observed, and that
+/// needs git's global trace2 config pointing at the background service (the
+/// git proxy relies on it too). Without it the checkpoint is recorded, status
+/// shows the AI lines, and the commit then drops them with no message. Check
+/// at most every 10 minutes (it runs `git config`) and warn at most hourly.
+fn warn_if_commits_cannot_be_captured() {
+    use crate::authorship::stranded_commits::should_warn_now;
+    if !should_warn_now("capture_config_checked", 600) {
+        return;
+    }
+    let git_cmd = crate::config::Config::get().git_cmd().to_string();
+    let target = crate::diagnostics::GitDiagnosticTarget::new("git", git_cmd);
+    let check = crate::diagnostics::check_trace2_global_config(&target);
+    if check.status == crate::diagnostics::DiagnosticStatus::Failed
+        && should_warn_now("capture_not_configured", 3600)
+    {
+        eprintln!(
+            "[autter] warning: this checkpoint was recorded, but git isn't set up to report commits to autter ({}), so the commit won't be attributed. Run `autter install --system`, then `autter doctor`.",
+            check.summary
         );
     }
 }

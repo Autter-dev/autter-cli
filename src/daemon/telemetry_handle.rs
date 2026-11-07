@@ -134,6 +134,15 @@ pub fn init_daemon_telemetry_handle_with(allow_spawn: bool) -> DaemonTelemetryIn
     {
         // Test builds never spawn a daemon, so there is nothing to gate.
         let _ = allow_spawn;
+        // Tests simulate a background service that is stopped, crashed or
+        // unreachable (the production `ensure_daemon_running` failure) with
+        // AUTTER_TEST_DAEMON_UNAVAILABLE=1.
+        if std::env::var("AUTTER_TEST_DAEMON_UNAVAILABLE").is_ok_and(|v| v == "1") {
+            let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));
+            return DaemonTelemetryInitResult::Failed(
+                "background service unavailable (test)".to_string(),
+            );
+        }
         let socket_path = std::env::var("AUTTER_DAEMON_CONTROL_SOCKET")
             .ok()
             .filter(|p| !p.trim().is_empty())
@@ -179,7 +188,16 @@ pub fn init_daemon_telemetry_handle_with(allow_spawn: bool) -> DaemonTelemetryIn
             }
         } else {
             match crate::daemon::DaemonConfig::from_env_or_default_paths() {
-                Ok(config) if crate::commands::daemon::daemon_is_up(&config) => config,
+                // Same verdict as doctor/whoami: a busy service is running.
+                Ok(config)
+                    if matches!(
+                        crate::commands::daemon::probe_daemon_health(&config).state,
+                        crate::commands::daemon::DaemonHealthState::Healthy
+                            | crate::commands::daemon::DaemonHealthState::Outdated
+                    ) =>
+                {
+                    config
+                }
                 _ => {
                     let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));
                     return DaemonTelemetryInitResult::Skipped;

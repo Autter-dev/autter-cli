@@ -19,6 +19,7 @@ pub mod rebase_authorship;
 pub mod repo_share;
 pub mod secrets;
 pub mod squash_recovery;
+pub mod stranded_commits;
 pub mod stats;
 pub mod transcript;
 pub mod virtual_attribution;

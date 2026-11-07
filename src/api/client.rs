@@ -314,6 +314,35 @@ fn load_stored_pat() -> Option<String> {
     Some(creds.refresh_token)
 }
 
+/// One readable line for a failed API call, instead of a bare status code or a
+/// proxy's HTML error page. Keeps the `"<operation> failed with status <code>"`
+/// prefix that callers match on (e.g. `status 403` + `repo_not_connected`).
+pub fn describe_http_failure(operation: &str, status: u16, body: &str) -> String {
+    let hint = match status {
+        401 => Some("your sign-in has expired; run `autter login`"),
+        429 => Some("rate limited; it is retried automatically"),
+        502..=504 => Some(
+            "Autter's API is temporarily unreachable; nothing is lost, queued data is retried automatically",
+        ),
+        500..=599 => Some(
+            "Autter's API returned a server error; nothing is lost, queued data is retried automatically",
+        ),
+        _ => None,
+    };
+    let trimmed = body.trim();
+    let looks_like_page = trimmed.starts_with('<') || trimmed.to_ascii_lowercase().contains("<html");
+    let detail = if trimmed.is_empty() || looks_like_page {
+        String::new()
+    } else {
+        let short: String = trimmed.chars().take(300).collect();
+        format!(": {short}")
+    };
+    match hint {
+        Some(hint) => format!("{operation} failed with status {status} ({hint}){detail}"),
+        None => format!("{operation} failed with status {status}{detail}"),
+    }
+}
+
 /// Error text a queue stores on items parked because their repo isn't connected
 /// to any of the user's orgs. Matches the server's rejection reason.
 pub const REPO_NOT_CONNECTED: &str = "repo_not_connected";

@@ -280,7 +280,14 @@ fn background_service_running() -> bool {
     let Ok(config) = crate::daemon::DaemonConfig::from_env_or_default_paths() else {
         return false;
     };
-    crate::commands::daemon::daemon_is_up(&config)
+    // The same probe `autter doctor` and `autter bg status` use, so whoami and
+    // status can't call a busy service "stopped" while doctor calls it
+    // running (the old 100ms readiness check did exactly that).
+    use crate::commands::daemon::{DaemonHealthState, probe_daemon_health};
+    matches!(
+        probe_daemon_health(&config).state,
+        DaemonHealthState::Healthy | DaemonHealthState::Outdated
+    )
 }
 
 /// Detect whether the user should be told that cloud upload is not working.

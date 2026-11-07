@@ -460,9 +460,24 @@ fn start_daemon_detached_with_config(
     remove_stale_daemon_files(&config);
 
     if daemon_startup_is_blocked(&config) {
+        // A service holds the lock but didn't answer the quick probe: it is
+        // still starting, or busy. Give it the caller's full budget before
+        // calling it down (a 100ms probe used to send commits made right after
+        // a restart down the no-attribution path).
+        if wait_for_daemon_up(&config, timeout) {
+            return Ok(config);
+        }
+        // Still silent: it is hung. Restart it in the background so this
+        // command isn't held up, and so the next one finds a working service.
+        let scheduled = schedule_hung_daemon_restart(&config);
         return Err(format!(
-            "daemon startup blocked: lock held at {}",
-            config.lock_path.display()
+            "the background service is running but not responding (lock held at {}){}",
+            config.lock_path.display(),
+            if scheduled {
+                "; restarting it in the background"
+            } else {
+                ""
+            }
         ));
     }
 
@@ -495,6 +510,29 @@ fn powershell_single_quote_literal(value: &OsStr) -> String {
 
 #[cfg(any(windows, not(any(test, feature = "test-support"))))]
 fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
+    spawn_autter_bg_detached(config, "run")
+}
+
+/// How often a hung service may be restarted automatically.
+#[cfg(not(any(test, feature = "test-support")))]
+const HUNG_DAEMON_RESTART_INTERVAL_SECS: u64 = 300;
+
+/// Start `autter bg restart` detached, at most once per
+/// [`HUNG_DAEMON_RESTART_INTERVAL_SECS`]. Returns whether one was started.
+#[cfg(not(any(test, feature = "test-support")))]
+fn schedule_hung_daemon_restart(config: &DaemonConfig) -> bool {
+    if !crate::authorship::stranded_commits::should_warn_now(
+        "auto_restart_hung_service",
+        HUNG_DAEMON_RESTART_INTERVAL_SECS,
+    ) {
+        return false;
+    }
+    tracing::warn!("background service is not responding; restarting it in the background");
+    spawn_autter_bg_detached(config, "restart").is_ok()
+}
+
+#[cfg(any(windows, not(any(test, feature = "test-support"))))]
+fn spawn_autter_bg_detached(config: &DaemonConfig, subcommand: &str) -> Result<(), String> {
     // Use current_autter_exe() instead of current_exe() to resolve through
     // symlinks. When the current exe is the git shim (e.g. ~/.local/bin/git),
     // current_exe() would spawn `git daemon run` which re-enters handle_git()
@@ -505,8 +543,9 @@ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
     #[cfg(windows)]
     {
         let script = format!(
-            "Start-Process -FilePath {} -ArgumentList @('bg','run') -WorkingDirectory {} -WindowStyle Hidden",
+            "Start-Process -FilePath {} -ArgumentList @('bg','{}') -WorkingDirectory {} -WindowStyle Hidden",
             powershell_single_quote_literal(exe.as_os_str()),
+            subcommand,
             powershell_single_quote_literal(Path::new(&runtime_dir).as_os_str())
         );
         let mut child = Command::new("powershell.exe");
@@ -552,7 +591,7 @@ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
         let mut child = Command::new(exe);
         child
             .arg("bg")
-            .arg("run")
+            .arg(subcommand)
             .current_dir(&runtime_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -324,7 +324,12 @@ impl OAuthClient {
             .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
         if response.status_code != 200 {
-            return Err(format!("resolve-org failed ({})", response.status_code));
+            let body = response.as_str().unwrap_or_default();
+            return Err(crate::api::client::describe_http_failure(
+                "Looking up which org connected this repository",
+                response.status_code,
+                body,
+            ));
         }
 
         let body = response

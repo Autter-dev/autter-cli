@@ -160,11 +160,31 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     // the two commands always agree. This starts (or restarts) the service
     // when needed, so it must run before the end-to-end checkpoint check.
     reporter.begin(SECTION_SERVICE, "checking the background service");
-    let daemon_check = check_from_diagnostic(
+    // What the service looked like before doctor touched it: a stopped or hung
+    // service that doctor restarts must not read as a plain pass, because
+    // commits made while it was down weren't attributed.
+    let initial_service_state = crate::daemon::DaemonConfig::from_env_or_default_paths()
+        .ok()
+        .map(|config| crate::commands::daemon::probe_daemon_health(&config));
+    let mut daemon_check = check_from_diagnostic(
         SECTION_SERVICE,
         "background service",
         crate::diagnostics::ensure_daemon_ready_for_self_checks(),
     );
+    if daemon_check.status == DoctorStatus::Passed
+        && let Some(initial) = initial_service_state.as_ref()
+        && matches!(
+            initial.state,
+            crate::commands::daemon::DaemonHealthState::NotRunning
+                | crate::commands::daemon::DaemonHealthState::Unresponsive
+        )
+    {
+        daemon_check.status = DoctorStatus::Warning;
+        daemon_check.summary = format!(
+            "{} -- doctor restarted it; commits made while it was down are checked under \"missed commits\"",
+            initial.summary
+        );
+    }
     // Skipped means the service is intentionally not running (before
     // onboarding), so there is nothing to send a git event to.
     let daemon_check_skipped = daemon_check.status == DoctorStatus::Skipped;
@@ -276,6 +296,12 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
             "skipped -- fix the background service check first",
         ));
     }
+
+    // Commits in this repository that were made while capture was down (the
+    // service stopped or hung, or trace2 not configured) and so never got a
+    // note. Their checkpoints are still on disk; rebuild the notes now.
+    reporter.begin(SECTION_E2E, "looking for commits that missed attribution");
+    reporter.add(check_stranded_commits());
 
     // AI agent hooks: would an edit made right now actually checkpoint?
     reporter.begin(SECTION_AGENTS, "checking agent hooks");
@@ -486,6 +512,77 @@ fn check_config_file() -> DoctorCheck {
 
 /// When run inside a repository, verify the allow/exclude repository filters
 /// do not block it -- a filtered-out repo records no attribution at all.
+fn check_stranded_commits() -> DoctorCheck {
+    use crate::authorship::stranded_commits::{recover_stranded_commits, short_sha};
+    let name = "missed commits";
+    let Ok(repo) = crate::git::find_repository_in_path(".") else {
+        return skipped_check(SECTION_E2E, name, "not inside a git repository");
+    };
+    let author = repo.effective_author_identity().formatted_or_unknown();
+    let recovery = match recover_stranded_commits(&repo, "HEAD", &author) {
+        Ok(recovery) => recovery,
+        Err(err) => {
+            return DoctorCheck {
+                section: SECTION_E2E,
+                name: name.to_string(),
+                status: DoctorStatus::Warning,
+                summary: "couldn't check this repository for commits that missed attribution"
+                    .to_string(),
+                details: vec![err.to_string()],
+                remediation: None,
+            };
+        }
+    };
+    if recovery.is_empty() {
+        return DoctorCheck {
+            section: SECTION_E2E,
+            name: name.to_string(),
+            status: DoctorStatus::Passed,
+            summary: "no recent commits in this repository are missing attribution".to_string(),
+            details: Vec::new(),
+            remediation: None,
+        };
+    }
+    let mut details: Vec<String> = recovery
+        .recovered
+        .iter()
+        .map(|sha| format!("recovered {}", short_sha(sha)))
+        .collect();
+    details.extend(
+        recovery
+            .failed
+            .iter()
+            .map(|(sha, err)| format!("could not recover {}: {}", short_sha(sha), err)),
+    );
+    if recovery.failed.is_empty() {
+        DoctorCheck {
+            section: SECTION_E2E,
+            name: name.to_string(),
+            status: DoctorStatus::Warning,
+            summary: format!(
+                "{} commit(s) were made while capture was down and had no attribution; doctor rebuilt it from the saved checkpoints",
+                recovery.recovered.len()
+            ),
+            details,
+            remediation: None,
+        }
+    } else {
+        DoctorCheck {
+            section: SECTION_E2E,
+            name: name.to_string(),
+            status: DoctorStatus::Failed,
+            summary: format!(
+                "{} commit(s) made while capture was down still have no attribution",
+                recovery.failed.len()
+            ),
+            details,
+            remediation: Some(
+                "fix the background service and trace2 checks above, then run `autter doctor` again; the checkpoints are kept until then".to_string(),
+            ),
+        }
+    }
+}
+
 fn check_repository() -> DoctorCheck {
     let name = "repository".to_string();
     let Ok(repo) = crate::git::find_repository_in_path(".") else {

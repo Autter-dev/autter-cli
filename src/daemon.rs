@@ -3063,16 +3063,43 @@ fn apply_rewrite_side_effect(
     let pre_append_log = repo.storage.read_rewrite_events()?;
     match &rewrite_event {
         RewriteLogEvent::Commit { commit } => {
-            let final_state_override =
-                normalized_carryover_snapshot_ref.or(committed_final_state.as_ref());
-            post_commit_with_final_state(
-                &repo,
-                commit.base_commit.clone(),
-                commit.commit_sha.clone(),
-                author.clone(),
-                true,
-                final_state_override,
-            )?;
+            // Commits made while this service was stopped, crashed or
+            // unreachable left their checkpoints behind under their parent's
+            // sha. Rebuild those notes first (oldest first) so this commit's
+            // carried-over attributions are complete.
+            if let Some(base) = commit.base_commit.as_deref()
+                && base != "initial"
+            {
+                match crate::authorship::stranded_commits::recover_stranded_commits(
+                    &repo, base, &author,
+                ) {
+                    Ok(recovery) if !recovery.recovered.is_empty() => tracing::info!(
+                        recovered = recovery.recovered.len(),
+                        failed = recovery.failed.len(),
+                        "recovered attribution for commits made while the service was unavailable"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(%error, "stranded commit scan failed"),
+                }
+            }
+            // The git proxy writes the note itself when it can't reach this
+            // service; a late trace2 event for that commit must not overwrite
+            // it with an empty one.
+            let base_for_check = commit.base_commit.as_deref().unwrap_or("initial");
+            let already_written = commit_has_authorship_log(&repo, &commit.commit_sha)
+                && !repo.storage.has_working_log(base_for_check);
+            if !already_written {
+                let final_state_override =
+                    normalized_carryover_snapshot_ref.or(committed_final_state.as_ref());
+                post_commit_with_final_state(
+                    &repo,
+                    commit.base_commit.clone(),
+                    commit.commit_sha.clone(),
+                    author.clone(),
+                    true,
+                    final_state_override,
+                )?;
+            }
         }
         RewriteLogEvent::CommitAmend { commit_amend } => {
             let final_state_override =

@@ -19,10 +19,9 @@ fn require_success(
         .as_str()
         .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
     if status_code != 200 {
-        return Err(AutterError::Generic(format!(
-            "{} failed with status {}: {}",
-            operation, status_code, body
-        )));
+        return Err(AutterError::Generic(
+            crate::api::client::describe_http_failure(operation, status_code, body),
+        ));
     }
     Ok(body.to_string())
 }

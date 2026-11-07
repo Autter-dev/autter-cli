@@ -215,13 +215,25 @@ fn handle_git_inner(args: &[String]) {
     // Initialize the daemon telemetry handle so we can send wrapper state.
     // If the daemon isn't available, fall back to a plain passthrough proxy
     // (no invocation_id, no wrapper state, no extra GIT_* env vars).
+    let daemon_init = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
     let daemon_connected = matches!(
-        crate::daemon::telemetry_handle::init_daemon_telemetry_handle(),
+        daemon_init,
         crate::daemon::telemetry_handle::DaemonTelemetryInitResult::Connected
     );
 
     if !daemon_connected {
         let exit_status = proxy_to_git(args, false, None);
+        // `Failed` means the service should be running but can't be reached
+        // (stopped, crashed, still starting, hung). Without it nothing records
+        // this command's attribution, so don't let that pass silently.
+        if exit_status.success()
+            && let crate::daemon::telemetry_handle::DaemonTelemetryInitResult::Failed(reason) =
+                &daemon_init
+        {
+            run_proxy_hook_guarded("service_unavailable_fallback", || {
+                attribute_without_service(&parsed, reason)
+            });
+        }
         exit_with_status(exit_status);
     }
 
@@ -299,6 +311,81 @@ fn handle_git_inner(args: &[String]) {
 }
 
 #[cfg(feature = "test-support")]
+/// The background service couldn't be reached for a git command that changes
+/// history. For a plain `git commit`, write the commit's authorship note here,
+/// from the checkpoints already on disk, the same way the service would have
+/// (this also catches up any earlier commits stranded the same way). For other
+/// history-changing commands, which need the service to carry notes across the
+/// rewrite, warn instead of losing attribution silently.
+fn attribute_without_service(parsed: &ParsedGitInvocation, reason: &str) {
+    if !crate::config::collection_consented_now() {
+        return;
+    }
+    let Some(command) = parsed.command.as_deref() else {
+        return;
+    };
+    let is_plain_commit = command == "commit"
+        && !parsed
+            .command_args
+            .iter()
+            .any(|arg| arg == "--amend" || arg == "--dry-run");
+
+    if is_plain_commit {
+        let Ok(repo) = find_repository(&parsed.global_args) else {
+            return;
+        };
+        let author = repo.effective_author_identity().formatted_or_unknown();
+        match crate::authorship::stranded_commits::recover_stranded_commits(&repo, "HEAD", &author)
+        {
+            Ok(recovery) if recovery.failed.is_empty() && !recovery.recovered.is_empty() => {
+                eprintln!(
+                    "[autter] The background service isn't reachable ({reason}), so autter recorded attribution for {} directly. Run `autter doctor` to get the service back.",
+                    plural_commits(recovery.recovered.len())
+                );
+            }
+            Ok(recovery) if !recovery.failed.is_empty() => {
+                eprintln!(
+                    "[autter] warning: the background service isn't reachable ({reason}) and autter couldn't record attribution for {}. The checkpoints are kept; run `autter doctor` to recover them.",
+                    plural_commits(recovery.failed.len())
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "[autter] warning: the background service isn't reachable ({reason}) and autter couldn't check this commit's attribution: {err}. Run `autter doctor`."
+                );
+            }
+        }
+        return;
+    }
+
+    if matches!(
+        command,
+        "commit"
+            | "rebase"
+            | "cherry-pick"
+            | "merge"
+            | "pull"
+            | "reset"
+            | "revert"
+            | "stash"
+            | "am"
+    ) && crate::authorship::stranded_commits::should_warn_now("service_unavailable_rewrite", 600)
+    {
+        eprintln!(
+            "[autter] warning: the background service isn't reachable ({reason}), so attribution wasn't carried through this `git {command}`. Run `autter doctor` to get the service back."
+        );
+    }
+}
+
+fn plural_commits(count: usize) -> String {
+    if count == 1 {
+        "this commit".to_string()
+    } else {
+        format!("{count} commits")
+    }
+}
+
 pub fn resolve_alias_invocation(
     parsed_args: &ParsedGitInvocation,
     repository: &Repository,
