@@ -29,8 +29,11 @@ fn switch_to_local_only_writes_git_notes_without_daemon_restart() {
     // config still says http. Committed with raw git because the harness
     // commit helpers fetch the authorship log from git notes, which the http
     // backend intentionally does not write.
-    let mut first = repo.filename("first.txt");
-    first.set_contents(lines!["connected mode line".ai()]);
+    // Scoped: the file handle borrows `repo`, which is patched mutably below.
+    {
+        let mut first = repo.filename("first.txt");
+        first.set_contents(lines!["connected mode line".ai()]);
+    }
     repo.git(&["add", "."]).unwrap();
     repo.git(&["commit", "-m", "commit while connected"])
         .unwrap();
@@ -124,6 +127,7 @@ fn switch_from_http_to_both_backfills_earlier_notes_into_git() {
         "the first git-notes write under `both` must backfill the http-era note \
          for {first_sha} into refs/notes/ai"
     );
+    let mut first = repo.filename("first.txt");
     first.assert_committed_lines(lines!["connected mode line".ai()]);
     second.assert_committed_lines(lines!["both mode line".ai()]);
 
