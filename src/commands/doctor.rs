@@ -746,24 +746,108 @@ fn vscode_native_hooks_check() -> Option<DoctorCheck> {
             details: chain.lines,
             remediation: None,
         }),
-        VsCodeChainOutcome::Complete => Some(DoctorCheck {
-            section: SECTION_AGENTS,
-            name,
-            status: DoctorStatus::Passed,
-            summary:
-                "Copilot agent-mode capture chain is complete (restart VS Code if hooks were just installed)"
-                    .to_string(),
-            details: chain.lines,
-            remediation: None,
-        }),
-        VsCodeChainOutcome::Incomplete => Some(DoctorCheck {
-            section: SECTION_AGENTS,
-            name,
-            status: DoctorStatus::Failed,
-            summary: "Copilot agent-mode edits are likely NOT being captured".to_string(),
-            details: chain.lines,
-            remediation: Some("run `autter install-hooks` and restart VS Code".to_string()),
-        }),
+        VsCodeChainOutcome::Complete => {
+            let (status, summary) = copilot_capture_verdict(
+                crate::commands::checkpoint_agent::hook_heartbeat::read("github-copilot"),
+                crate::commands::checkpoint_agent::hook_heartbeat::now(),
+            );
+            Some(DoctorCheck {
+                section: SECTION_AGENTS,
+                name,
+                status,
+                summary,
+                details: chain.lines,
+                remediation: (status != DoctorStatus::Passed).then(|| {
+                    "check the dropped-edit reason above; if it persists, run `autter install-hooks` and restart VS Code".to_string()
+                }),
+            })
+        }
+        VsCodeChainOutcome::Incomplete => {
+            // Hooks can also load from a workspace `.github/hooks` file, so a
+            // recent checkpoint means capture works even if our chain looks
+            // incomplete.
+            let recent_checkpoint =
+                crate::commands::checkpoint_agent::hook_heartbeat::read("github-copilot")
+                    .and_then(|heartbeat| heartbeat.last_checkpoint_at)
+                    .filter(|at| {
+                        crate::commands::checkpoint_agent::hook_heartbeat::now().saturating_sub(*at)
+                            < 7 * 86_400
+                    });
+            Some(DoctorCheck {
+                section: SECTION_AGENTS,
+                name,
+                status: if recent_checkpoint.is_some() {
+                    DoctorStatus::Warning
+                } else {
+                    DoctorStatus::Failed
+                },
+                summary: if recent_checkpoint.is_some() {
+                    "Copilot checkpoints are arriving, but the user-level hook setup is incomplete"
+                        .to_string()
+                } else {
+                    "Copilot agent-mode edits are likely NOT being captured".to_string()
+                },
+                details: chain.lines,
+                remediation: Some("run `autter install-hooks` and restart VS Code".to_string()),
+            })
+        }
+    }
+}
+
+/// Turn the Copilot hook heartbeat into a doctor verdict once the hook chain
+/// is installed: has a Copilot edit actually been checkpointed, and was the
+/// most recent edit dropped?
+fn copilot_capture_verdict(
+    heartbeat: Option<crate::commands::checkpoint_agent::hook_heartbeat::HookHeartbeat>,
+    now: u64,
+) -> (DoctorStatus, String) {
+    use crate::commands::checkpoint_agent::hook_heartbeat::describe_age;
+
+    let Some(heartbeat) = heartbeat else {
+        return (
+            DoctorStatus::Passed,
+            "Copilot agent hooks are installed; no Copilot agent edit seen yet (make one in agent mode, then re-run doctor)"
+                .to_string(),
+        );
+    };
+    let dropped_after_last_checkpoint =
+        match (heartbeat.last_error_at, heartbeat.last_checkpoint_at) {
+            (Some(error_at), Some(checkpoint_at)) => error_at > checkpoint_at,
+            (Some(_), None) => true,
+            _ => false,
+        };
+    if dropped_after_last_checkpoint {
+        let reason = heartbeat
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "unknown reason".to_string());
+        return (
+            DoctorStatus::Warning,
+            format!(
+                "Copilot hooks run, but the last Copilot edit ({}) was not checkpointed: {}",
+                describe_age(
+                    heartbeat.last_error_at.unwrap_or(heartbeat.last_run_at),
+                    now
+                ),
+                reason
+            ),
+        );
+    }
+    match heartbeat.last_checkpoint_at {
+        Some(at) => (
+            DoctorStatus::Passed,
+            format!(
+                "Copilot agent-mode capture is working (last Copilot checkpoint {})",
+                describe_age(at, now)
+            ),
+        ),
+        None => (
+            DoctorStatus::Passed,
+            format!(
+                "Copilot agent hooks are running (last {}); no Copilot edit checkpointed yet",
+                describe_age(heartbeat.last_run_at, now)
+            ),
+        ),
     }
 }
 
@@ -1502,5 +1586,76 @@ mod tests {
             next_step_from_checks(&[make_check(DoctorStatus::Passed)]),
             None
         );
+    }
+
+    fn heartbeat(
+        last_outcome: crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome,
+        last_checkpoint_at: Option<u64>,
+        last_error_at: Option<u64>,
+        last_error: Option<&str>,
+    ) -> crate::commands::checkpoint_agent::hook_heartbeat::HookHeartbeat {
+        crate::commands::checkpoint_agent::hook_heartbeat::HookHeartbeat {
+            last_run_at: 1_000,
+            last_outcome,
+            last_detail: None,
+            last_checkpoint_at,
+            last_error_at,
+            last_error: last_error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn copilot_verdict_without_activity_passes_with_a_hint() {
+        let (status, summary) = copilot_capture_verdict(None, 2_000);
+        assert_eq!(status, DoctorStatus::Passed);
+        assert!(
+            summary.contains("no Copilot agent edit seen yet"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn copilot_verdict_reports_the_last_checkpoint() {
+        use crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome;
+        let (status, summary) = copilot_capture_verdict(
+            Some(heartbeat(
+                HookOutcome::Skipped,
+                Some(1_000 - 300),
+                None,
+                None,
+            )),
+            1_000,
+        );
+        assert_eq!(status, DoctorStatus::Passed);
+        assert!(summary.contains("capture is working"), "{summary}");
+        assert!(summary.contains("5 min ago"), "{summary}");
+    }
+
+    #[test]
+    fn copilot_verdict_warns_when_the_latest_edit_was_dropped() {
+        use crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome;
+        let (status, summary) = copilot_capture_verdict(
+            Some(heartbeat(
+                HookOutcome::Error,
+                Some(500),
+                Some(900),
+                Some("cwd not found in hook_input"),
+            )),
+            1_000,
+        );
+        assert_eq!(status, DoctorStatus::Warning);
+        assert!(summary.contains("cwd not found in hook_input"), "{summary}");
+
+        // A dropped edit followed by a good checkpoint is fine again.
+        let (status, _) = copilot_capture_verdict(
+            Some(heartbeat(
+                HookOutcome::Checkpoint,
+                Some(950),
+                Some(900),
+                Some("x"),
+            )),
+            1_000,
+        );
+        assert_eq!(status, DoctorStatus::Passed);
     }
 }

@@ -605,39 +605,66 @@ pub(crate) fn inspect_vscode_native_hooks_chain() -> VsCodeNativeHooksChain {
         .join(".copilot")
         .join("hooks")
         .join("autter.json");
-    let hooks_file_present = hooks_file.exists();
+    let hook_file_problem = copilot_hook_file_problem(&hooks_file);
     lines.push(format!(
         "  Hook file {}: {}",
         hooks_file.display(),
-        if hooks_file_present {
-            "present"
-        } else {
-            "MISSING"
-        }
+        hook_file_problem
+            .as_deref()
+            .unwrap_or("present (PreToolUse and PostToolUse run autter)")
     ));
 
-    let mut any_location_enabled = false;
+    // VS Code's own default for `chat.hookFilesLocations` includes
+    // ~/.copilot/hooks from this version on, so an unset setting is fine there.
+    // A user-set object replaces the defaults, so it must list the dir itself.
+    let defaults_load_copilot_hooks = parse_version_triple(&version_str)
+        .map(|v| v >= VSCODE_DEFAULT_COPILOT_HOOKS_LOCATION_VERSION)
+        .unwrap_or(false);
+    let mut location_enabled = false;
+    let mut locations_overridden = false;
+    let mut hooks_disabled = false;
     for settings_path in settings_paths_for_products(&["Code", "Code - Insiders"]) {
         if !settings_path.exists() {
             continue;
         }
-        let (use_hooks, copilot_location) = read_chat_hook_settings(&settings_path);
+        let settings = read_chat_hook_settings(&settings_path);
         lines.push(format!("  Settings {}:", settings_path.display()));
         lines.push(format!(
             "    chat.useHooks: {}",
-            format_setting_bool(use_hooks)
+            format_setting_bool(settings.use_hooks)
         ));
         lines.push(format!(
             "    chat.hookFilesLocations[\"{}\"]: {}",
             VSCODE_USER_COPILOT_HOOKS_LOCATION,
-            format_setting_bool(copilot_location)
+            if settings.has_locations_setting {
+                format_setting_bool(settings.copilot_location)
+            } else {
+                "<setting not set: VS Code defaults apply>"
+            }
         ));
-        if copilot_location == Some(true) {
-            any_location_enabled = true;
+        if settings.use_hooks == Some(false) {
+            hooks_disabled = true;
+        }
+        if settings.copilot_location == Some(true) {
+            location_enabled = true;
+        } else if settings.has_locations_setting {
+            locations_overridden = true;
         }
     }
+    if !location_enabled && !locations_overridden && defaults_load_copilot_hooks {
+        location_enabled = true;
+        lines.push(format!(
+            "  chat.hookFilesLocations: not set, and VS Code's default includes {}",
+            VSCODE_USER_COPILOT_HOOKS_LOCATION
+        ));
+    }
+    if hooks_disabled {
+        lines.push("  chat.useHooks is false: VS Code runs no agent hooks at all".to_string());
+    }
 
-    if hooks_file_present && any_location_enabled {
+    lines.extend(copilot_heartbeat_lines());
+
+    if hook_file_problem.is_none() && location_enabled && !hooks_disabled {
         lines.push(
             "  Chain status: OK — Copilot agent-mode edits should checkpoint (restart VS Code if hooks were just installed)"
                 .to_string(),
@@ -657,15 +684,129 @@ pub(crate) fn inspect_vscode_native_hooks_chain() -> VsCodeNativeHooksChain {
     }
 }
 
+/// VS Code version whose built-in default `chat.hookFilesLocations` includes
+/// `~/.copilot/hooks` (checked against VS Code 1.144.0's bundled defaults; it
+/// may have been added earlier).
+const VSCODE_DEFAULT_COPILOT_HOOKS_LOCATION_VERSION: (u32, u32, u32) = (1, 144, 0);
+
+/// What's wrong with `~/.copilot/hooks/autter.json`, or `None` when both
+/// PreToolUse and PostToolUse run `autter checkpoint github-copilot` with a
+/// binary that exists.
+pub(crate) fn copilot_hook_file_problem(hooks_file: &Path) -> Option<String> {
+    let content = match fs::read_to_string(hooks_file) {
+        Ok(content) => content,
+        Err(_) => return Some("MISSING".to_string()),
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Some("not valid JSON — VS Code will ignore it".to_string());
+    };
+    let mut missing_events = Vec::new();
+    let mut missing_binary: Option<String> = None;
+    for event in ["PreToolUse", "PostToolUse"] {
+        let command = json
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| {
+                entries.iter().find_map(|entry| {
+                    entry
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .filter(|c| c.contains("checkpoint") && c.contains("github-copilot"))
+                })
+            });
+        match command {
+            None => missing_events.push(event),
+            Some(command) => {
+                if let Some(binary) = hook_command_binary(command)
+                    && !Path::new(&binary).exists()
+                {
+                    missing_binary = Some(binary);
+                }
+            }
+        }
+    }
+    if !missing_events.is_empty() {
+        return Some(format!(
+            "no autter checkpoint command for {}",
+            missing_events.join(" and ")
+        ));
+    }
+    missing_binary.map(|binary| format!("runs {binary}, which no longer exists"))
+}
+
+/// The executable an installed hook command runs: everything before
+/// ` checkpoint github-copilot`, with surrounding quotes removed. `None` when it
+/// is a bare name resolved through PATH.
+fn hook_command_binary(command: &str) -> Option<String> {
+    let binary = command.split(" checkpoint ").next()?.trim();
+    let binary = binary.trim_matches(|c| c == '"' || c == '\'');
+    if binary.contains('/') || binary.contains('\\') {
+        Some(binary.to_string())
+    } else {
+        None
+    }
+}
+
+/// When Copilot's hook last ran on this machine, from the heartbeat
+/// `autter checkpoint github-copilot` records.
+pub(crate) fn copilot_heartbeat_lines() -> Vec<String> {
+    use crate::commands::checkpoint_agent::hook_heartbeat::{self, HookOutcome};
+
+    let Some(heartbeat) = hook_heartbeat::read("github-copilot") else {
+        return vec!["  Copilot hook activity: none recorded yet on this machine".to_string()];
+    };
+    let now = hook_heartbeat::now();
+    let outcome = match heartbeat.last_outcome {
+        HookOutcome::Checkpoint => "checkpoint sent",
+        HookOutcome::Activity => "prompt or turn event",
+        HookOutcome::Skipped => "skipped a non-edit tool",
+        HookOutcome::Error => "edit dropped",
+    };
+    let mut lines = vec![format!(
+        "  Copilot hook last ran: {} ({})",
+        hook_heartbeat::describe_age(heartbeat.last_run_at, now),
+        outcome
+    )];
+    lines.push(match heartbeat.last_checkpoint_at {
+        Some(at) => format!(
+            "  Last Copilot checkpoint: {}",
+            hook_heartbeat::describe_age(at, now)
+        ),
+        None => "  Last Copilot checkpoint: never".to_string(),
+    });
+    if let (Some(at), Some(reason)) = (heartbeat.last_error_at, heartbeat.last_error.as_deref()) {
+        lines.push(format!(
+            "  Last dropped Copilot edit: {} — {}",
+            hook_heartbeat::describe_age(at, now),
+            reason
+        ));
+    }
+    lines
+}
+
+struct ChatHookSettings {
+    use_hooks: Option<bool>,
+    /// Whether `chat.hookFilesLocations` is set at all (a set value replaces
+    /// VS Code's defaults rather than merging with them).
+    has_locations_setting: bool,
+    copilot_location: Option<bool>,
+}
+
 /// Read `chat.useHooks` and the `~/.copilot/hooks` entry of
 /// `chat.hookFilesLocations` from a VS Code settings.json (JSONC tolerated).
-fn read_chat_hook_settings(settings_path: &Path) -> (Option<bool>, Option<bool>) {
+fn read_chat_hook_settings(settings_path: &Path) -> ChatHookSettings {
     use crate::mdm::utils::VSCODE_USER_COPILOT_HOOKS_LOCATION;
     use jsonc_parser::ParseOptions;
     use jsonc_parser::cst::CstRootNode;
 
+    let unknown = ChatHookSettings {
+        use_hooks: None,
+        has_locations_setting: false,
+        copilot_location: None,
+    };
     let Ok(content) = fs::read_to_string(settings_path) else {
-        return (None, None);
+        return unknown;
     };
     let parse_input = if content.trim().is_empty() {
         "{}".to_string()
@@ -673,10 +814,10 @@ fn read_chat_hook_settings(settings_path: &Path) -> (Option<bool>, Option<bool>)
         content
     };
     let Ok(root) = CstRootNode::parse(&parse_input, &ParseOptions::default()) else {
-        return (None, None);
+        return unknown;
     };
     let Some(object) = root.object_value() else {
-        return (None, None);
+        return unknown;
     };
 
     let use_hooks = object
@@ -685,14 +826,19 @@ fn read_chat_hook_settings(settings_path: &Path) -> (Option<bool>, Option<bool>)
         .and_then(|value| value.as_boolean_lit())
         .map(|lit| lit.value());
 
-    let copilot_location = object
-        .object_value("chat.hookFilesLocations")
+    let locations = object.object_value("chat.hookFilesLocations");
+    let copilot_location = locations
+        .as_ref()
         .and_then(|locations| locations.get(VSCODE_USER_COPILOT_HOOKS_LOCATION))
         .and_then(|prop| prop.value())
         .and_then(|value| value.as_boolean_lit())
         .map(|lit| lit.value());
 
-    (use_hooks, copilot_location)
+    ChatHookSettings {
+        use_hooks,
+        has_locations_setting: object.get("chat.hookFilesLocations").is_some(),
+        copilot_location,
+    }
 }
 
 fn format_setting_bool(value: Option<bool>) -> &'static str {
@@ -1963,5 +2109,69 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, "exit code 1: output collection did not finish");
+    }
+
+    #[test]
+    fn copilot_hook_file_problem_checks_events_and_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_file = dir.path().join("autter.json");
+        assert_eq!(
+            copilot_hook_file_problem(&hooks_file).as_deref(),
+            Some("MISSING")
+        );
+
+        let binary = dir.path().join("autter");
+        fs::write(&binary, "").unwrap();
+        let command = format!(
+            "{} checkpoint github-copilot --hook-input stdin",
+            binary.display()
+        );
+        let good = serde_json::json!({"hooks": {
+            "PreToolUse": [{"type": "command", "command": command}],
+            "PostToolUse": [{"type": "command", "command": command}],
+        }});
+        fs::write(&hooks_file, good.to_string()).unwrap();
+        assert_eq!(copilot_hook_file_problem(&hooks_file), None);
+
+        let only_pre = serde_json::json!({"hooks": {
+            "PreToolUse": [{"type": "command", "command": command}],
+        }});
+        fs::write(&hooks_file, only_pre.to_string()).unwrap();
+        assert_eq!(
+            copilot_hook_file_problem(&hooks_file).as_deref(),
+            Some("no autter checkpoint command for PostToolUse")
+        );
+
+        let stale =
+            "/nonexistent/autter-old/bin/autter checkpoint github-copilot --hook-input stdin";
+        let stale_json = serde_json::json!({"hooks": {
+            "PreToolUse": [{"type": "command", "command": stale}],
+            "PostToolUse": [{"type": "command", "command": stale}],
+        }});
+        fs::write(&hooks_file, stale_json.to_string()).unwrap();
+        assert!(
+            copilot_hook_file_problem(&hooks_file)
+                .unwrap()
+                .contains("no longer exists")
+        );
+
+        fs::write(&hooks_file, "{not json").unwrap();
+        assert!(
+            copilot_hook_file_problem(&hooks_file)
+                .unwrap()
+                .contains("not valid JSON")
+        );
+    }
+
+    #[test]
+    fn hook_command_binary_ignores_bare_names() {
+        assert_eq!(
+            hook_command_binary("autter checkpoint github-copilot --hook-input stdin"),
+            None
+        );
+        assert_eq!(
+            hook_command_binary("\"/opt/my tools/autter\" checkpoint github-copilot"),
+            Some("/opt/my tools/autter".to_string())
+        );
     }
 }

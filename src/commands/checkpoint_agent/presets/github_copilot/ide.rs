@@ -146,11 +146,6 @@ pub(super) fn parse_vscode_native_hooks(
     hook_event_name: &str,
     trace_id: &str,
 ) -> Result<Vec<ParsedHookEvent>, AutterError> {
-    let cwd = parse::optional_str_multi(data, &["cwd", "workspace_folder", "workspaceFolder"])
-        .ok_or_else(|| AutterError::PresetError("cwd not found in hook_input".to_string()))?;
-
-    let dirty_files = super::dirty_files_from_hook_data(data, cwd);
-
     let session_id = super::extract_session_id(data);
 
     let tool_name =
@@ -169,10 +164,6 @@ pub(super) fn parse_vscode_native_hooks(
         .get("tool_response")
         .or_else(|| data.get("toolResponse"));
 
-    // Extract file paths from tool_input and tool_response only (not session-level data)
-    let extracted_paths =
-        super::extract_filepaths_from_vscode_hook_payload(tool_input, tool_response, cwd);
-
     let transcript_path = transcript_path_from_hook_data(data).map(|s| s.to_string());
 
     if let Some(ref path) = transcript_path
@@ -184,12 +175,42 @@ pub(super) fn parse_vscode_native_hooks(
         ));
     }
 
-    if !is_likely_copilot_native_hook(transcript_path.as_deref()) {
+    // VS Code's Copilot agent only sends `transcript_path` once it has written
+    // a session transcript, which needs workspace storage: a window with no
+    // folder open, or a session whose transcript hasn't started, sends the
+    // hook without it. Such a payload is still Copilot's when its tool name or
+    // tool-call id is one only VS Code's agent produces.
+    let is_copilot = match transcript_path.as_deref() {
+        Some(_) => is_likely_copilot_native_hook(transcript_path.as_deref()),
+        None => is_vscode_copilot_payload(data),
+    };
+    if !is_copilot {
         return Err(AutterError::PresetError(format!(
             "Skipping VS Code hook for non-Copilot session (tool_name: {}).",
             tool_name,
         )));
     }
+
+    // VS Code sets `cwd` to the workspace folder; with no folder open it sends
+    // none, so fall back to the directory of the file being edited (the
+    // repository is discovered from each file's path either way).
+    let cwd: String =
+        match parse::optional_str_multi(data, &["cwd", "workspace_folder", "workspaceFolder"]) {
+            Some(cwd) => cwd.to_string(),
+            None => infer_cwd_from_tool_paths(tool_input, tool_response).ok_or_else(|| {
+                AutterError::PresetError(
+                    "cwd not found in hook_input and no absolute file path to infer it from"
+                        .to_string(),
+                )
+            })?,
+        };
+    let cwd = cwd.as_str();
+
+    let dirty_files = super::dirty_files_from_hook_data(data, cwd);
+
+    // Extract file paths from tool_input and tool_response only (not session-level data)
+    let extracted_paths =
+        super::extract_filepaths_from_vscode_hook_payload(tool_input, tool_response, cwd);
 
     let tool_class = classify_copilot_tool(tool_name);
     let is_bash = tool_class == ToolClass::Bash;
@@ -365,6 +386,70 @@ pub(super) fn is_likely_copilot_native_hook(transcript_path: Option<&str>) -> bo
         return false;
     }
     looks_like_copilot_transcript_path(path)
+}
+
+/// Tool names only VS Code's built-in Copilot agent uses. The Copilot CLI
+/// uses `create`, `str_replace`, `edit`, `bash` and Claude-style `Edit`/`Write`/
+/// `Bash`, so none of these overlap with it (`apply_patch` is shared and is
+/// left out on purpose).
+const VSCODE_ONLY_COPILOT_TOOLS: [&str; 12] = [
+    "create_file",
+    "replace_string_in_file",
+    "multi_replace_string_in_file",
+    "insert_edit_into_file",
+    "edit_notebook_file",
+    "run_in_terminal",
+    "delete_file",
+    "rename_file",
+    "move_file",
+    "copilot_insertedit",
+    "copilot_replacestring",
+    "vscode_editfile_internal",
+];
+
+/// Whether a PreToolUse/PostToolUse payload with no transcript path comes from
+/// VS Code's Copilot agent rather than the Copilot CLI: either its tool name is
+/// VS Code-only, or its tool-call id carries the `__vscode-<n>` suffix VS Code
+/// appends to every tool call it runs.
+pub(super) fn is_vscode_copilot_payload(data: &serde_json::Value) -> bool {
+    let tool_name = parse::optional_str_multi(data, &["tool_name", "toolName"])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if VSCODE_ONLY_COPILOT_TOOLS.contains(&tool_name.as_str()) {
+        return true;
+    }
+    parse::optional_str_multi(data, &["tool_use_id", "toolUseId"])
+        .is_some_and(|id| id.contains("__vscode"))
+}
+
+/// The directory of the first absolute file path in the tool call, used as
+/// `cwd` when VS Code sends none (a window with no folder open).
+fn infer_cwd_from_tool_paths(
+    tool_input: Option<&serde_json::Value>,
+    tool_response: Option<&serde_json::Value>,
+) -> Option<String> {
+    let mut raw_paths = Vec::new();
+    if let Some(value) = tool_input {
+        super::collect_tool_paths(value, &mut raw_paths);
+    }
+    if let Some(value) = tool_response {
+        super::collect_tool_paths(value, &mut raw_paths);
+    }
+    raw_paths.iter().find_map(|raw| {
+        let normalized = super::normalize_hook_path(raw, "")?;
+        let is_absolute =
+            normalized.starts_with('/') || normalized.as_bytes().get(1) == Some(&b':');
+        if !is_absolute {
+            return None;
+        }
+        let parent = Path::new(&normalized).parent()?;
+        let parent = parent.to_string_lossy().replace('\\', "/");
+        if parent.is_empty() {
+            None
+        } else {
+            Some(parent)
+        }
+    })
 }
 
 fn is_supported_vscode_edit_tool_name(tool_name: &str) -> bool {

@@ -714,3 +714,101 @@ fn test_run_in_terminal_no_changes() {
         }
     }
 }
+
+/// VS Code's Copilot agent sends `transcript_path` only once it has written a
+/// session transcript; with no folder open (no workspace storage) it sends
+/// neither `transcript_path` nor `cwd`. Those hooks used to be routed to the
+/// Copilot CLI parser, which treated `replace_string_in_file` / `create_file`
+/// as non-edit tools and dropped the checkpoint, so the AI's lines came out
+/// untracked. They must be attributed to Copilot.
+#[test]
+fn test_vscode_copilot_hooks_without_transcript_path_are_attributed() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("app.py");
+
+    fs_write(&file_path, "print('human')\n");
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("app.py");
+    file.assert_committed_lines(crate::lines!["print('human')".unattributed_human(),]);
+
+    // 1) Folder open but no transcript yet: cwd present, transcript_path absent.
+    let tool_use_id = "toolu_vrtx_01ABC__vscode-1762596000001";
+    let new_content = "print('human')\nprint('copilot one')\n";
+    let pre = json!({
+        "timestamp": "2026-11-08T10:00:00.000Z",
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-sess-no-transcript",
+        "tool_name": "replace_string_in_file",
+        "tool_input": {
+            "filePath": file_path.to_str().unwrap(),
+            "oldString": "print('human')\n",
+            "newString": new_content
+        },
+        "tool_use_id": tool_use_id,
+        "cwd": repo.path().to_str().unwrap()
+    });
+    run_copilot_hook(&repo, &pre);
+    fs_write(&file_path, new_content);
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+    post["tool_response"] = json!("");
+    run_copilot_hook(&repo, &post);
+
+    repo.sync_daemon();
+    repo.git(&["add", "app.py"]).unwrap();
+    repo.commit("Copilot edit without transcript").unwrap();
+    repo.sync_daemon();
+    file.assert_committed_lines(crate::lines![
+        "print('human')".unattributed_human(),
+        "print('copilot one')".ai(),
+    ]);
+
+    // 2) No folder open: neither transcript_path nor cwd. A new file, created
+    //    by `create_file`, is still attributed to Copilot.
+    let created_path = repo.path().join("created.py");
+    let created_content = "def created():\n    return 1\n";
+    let create_pre = json!({
+        "timestamp": "2026-11-08T10:01:00.000Z",
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-sess-empty-window",
+        "tool_name": "create_file",
+        "tool_input": {
+            "filePath": created_path.to_str().unwrap(),
+            "content": created_content
+        },
+        "tool_use_id": "toolu_vrtx_01DEF__vscode-1762596000002"
+    });
+    run_copilot_hook(&repo, &create_pre);
+    fs_write(&created_path, created_content);
+    let mut create_post = create_pre.clone();
+    create_post["hook_event_name"] = json!("PostToolUse");
+    create_post["tool_response"] = json!("");
+    run_copilot_hook(&repo, &create_post);
+
+    repo.sync_daemon();
+    repo.git(&["add", "created.py"]).unwrap();
+    repo.commit("Copilot creates a file with no folder open")
+        .unwrap();
+    repo.sync_daemon();
+    let mut created = repo.filename("created.py");
+    created.assert_committed_lines(crate::lines!["def created():".ai(), "    return 1".ai(),]);
+    // app.py is unchanged by the second commit.
+    file.assert_committed_lines(crate::lines![
+        "print('human')".unattributed_human(),
+        "print('copilot one')".ai(),
+    ]);
+}
+
+fn run_copilot_hook(repo: &TestRepo, payload: &Value) {
+    repo.autter(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &payload.to_string(),
+    ])
+    .unwrap();
+}
+
+fn fs_write(path: &std::path::Path, content: &str) {
+    std::fs::write(path, content).unwrap();
+}

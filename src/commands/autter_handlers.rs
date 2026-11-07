@@ -533,6 +533,14 @@ fn handle_checkpoint(args: &[String]) {
     ) {
         Ok(r) => r,
         Err(e) => {
+            let message = e.to_string();
+            crate::commands::checkpoint_agent::hook_heartbeat::record(
+                preset_name,
+                crate::commands::checkpoint_agent::hook_heartbeat::outcome_for_preset_error(
+                    &message,
+                ),
+                Some(&message),
+            );
             eprintln!("{} preset error: {}", preset_name, e);
             std::process::exit(0);
         }
@@ -676,6 +684,11 @@ fn handle_checkpoint(args: &[String]) {
                     );
                 }
                 Err(e) => {
+                    crate::commands::checkpoint_agent::hook_heartbeat::record(
+                        preset_name,
+                        crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome::Error,
+                        Some(&format!("background service unavailable: {}", e)),
+                    );
                     eprintln!("Background worker unavailable, checkpoint dropped: {}", e);
                     std::process::exit(0);
                 }
@@ -688,6 +701,11 @@ fn handle_checkpoint(args: &[String]) {
             );
         }
         if let Err(e) = send_result {
+            crate::commands::checkpoint_agent::hook_heartbeat::record(
+                preset_name,
+                crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome::Error,
+                Some(&format!("could not reach the background service: {}", e)),
+            );
             eprintln!("Failed to send checkpoint to background worker: {}", e);
             std::process::exit(0);
         }
@@ -695,6 +713,16 @@ fn handle_checkpoint(args: &[String]) {
             activity_count += 1;
         } else {
             sent_count += 1;
+        }
+    }
+
+    // Let `autter doctor` tell "installed" from "working" for this agent.
+    {
+        use crate::commands::checkpoint_agent::hook_heartbeat::{HookOutcome, record};
+        if sent_count > 0 {
+            record(preset_name, HookOutcome::Checkpoint, None);
+        } else if activity_count > 0 {
+            record(preset_name, HookOutcome::Activity, None);
         }
     }
 

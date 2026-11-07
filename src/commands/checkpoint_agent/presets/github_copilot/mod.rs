@@ -34,8 +34,14 @@ fn parse_session_activity(
     data: &serde_json::Value,
     trace_id: &str,
 ) -> Result<Vec<ParsedHookEvent>, AutterError> {
+    // A VS Code window with no folder open sends no cwd; there is no
+    // repository to wake a transcript reader for, so this is a skip.
     let cwd = parse::optional_str_multi(data, &["cwd", "workspace_folder", "workspaceFolder"])
-        .ok_or_else(|| AutterError::PresetError("cwd not found in hook_input".to_string()))?;
+        .ok_or_else(|| {
+            AutterError::PresetError(
+                "Skipping Copilot session activity: cwd not found in hook_input".to_string(),
+            )
+        })?;
     let session_id = extract_session_id(data);
     let transcript_path = ide::transcript_path_from_hook_data(data);
 
@@ -123,7 +129,12 @@ impl AgentPreset for GithubCopilotPreset {
             )
             .is_some();
 
-            if !has_transcript_path {
+            // VS Code's agent omits transcript_path when it has no transcript
+            // (no folder open, or the session's transcript hasn't started), so
+            // a missing path alone doesn't mean the Copilot CLI: the tool name
+            // and tool-call id tell them apart. Routing those payloads to the
+            // CLI parser dropped every VS Code edit as a "non-edit tool".
+            if !has_transcript_path && !ide::is_vscode_copilot_payload(&data) {
                 return cli::parse_cli_hooks(&data, hook_event_name, trace_id);
             }
             return ide::parse_vscode_native_hooks(&data, hook_event_name, trace_id);
@@ -409,5 +420,129 @@ mod tests {
             .parse(&input, "t_test123456789a")
             .unwrap();
         assert!(matches!(events[0], ParsedHookEvent::PreFileEdit(_)));
+    }
+
+    /// VS Code with no transcript yet (or no folder open) omits transcript_path.
+    /// Its VS Code-only tool names must still reach the IDE parser: routing them
+    /// to the CLI parser dropped every edit as a "non-edit tool".
+    #[test]
+    fn dispatches_ide_for_vscode_tool_without_transcript_path() {
+        let input = json!({
+            "timestamp": "2026-11-08T10:00:00.000Z",
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-no-transcript",
+            "cwd": "/home/user/project",
+            "tool_name": "replace_string_in_file",
+            "tool_input": {
+                "filePath": "/home/user/project/src/main.rs",
+                "oldString": "a",
+                "newString": "b"
+            },
+            "tool_use_id": "toolu_01__vscode-1762596000000"
+        })
+        .to_string();
+        let events = GithubCopilotPreset
+            .parse(&input, "t_test123456789a")
+            .unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.tool, "github-copilot");
+                assert!(!e.context.metadata.contains_key("source"));
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/home/user/project/src/main.rs")]
+                );
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    /// A window with no folder open sends neither transcript_path nor cwd; the
+    /// edit is still checkpointed, with cwd taken from the edited file.
+    #[test]
+    fn vscode_post_tool_use_without_cwd_or_transcript_infers_cwd() {
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-empty-window",
+            "tool_name": "create_file",
+            "tool_input": {
+                "filePath": "/home/user/scratch/notes.md",
+                "content": "hello"
+            },
+            "tool_response": "",
+            "tool_use_id": "call_abc__vscode-17"
+        })
+        .to_string();
+        let events = GithubCopilotPreset
+            .parse(&input, "t_test123456789a")
+            .unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(e.context.agent_id.tool, "github-copilot");
+                assert_eq!(e.context.cwd, PathBuf::from("/home/user/scratch"));
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/home/user/scratch/notes.md")]
+                );
+                assert!(e.stream_source.is_none());
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    /// `apply_patch` exists in both agents; VS Code's `__vscode-` tool-call id
+    /// tells them apart when there is no transcript_path.
+    #[test]
+    fn shared_tool_name_routes_by_vscode_tool_use_id() {
+        let patch = "*** Begin Patch\n*** Update File: /home/user/project/a.txt\n@@\n-old\n+new\n*** End Patch";
+        let vscode = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": "/home/user/project",
+            "tool_name": "apply_patch",
+            "tool_input": {"input": patch},
+            "tool_use_id": "call_1__vscode-42"
+        })
+        .to_string();
+        match &GithubCopilotPreset
+            .parse(&vscode, "t_test123456789a")
+            .unwrap()[0]
+        {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.tool, "github-copilot");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+
+        let cli = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": "/home/user/project",
+            "tool_name": "apply_patch",
+            "tool_input": {"input": patch}
+        })
+        .to_string();
+        match &GithubCopilotPreset.parse(&cli, "t_test123456789a").unwrap()[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.tool, "github-copilot-cli");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    /// Read tools from VS Code with no transcript are still skipped, as skips.
+    #[test]
+    fn vscode_read_tool_without_transcript_is_skipped() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": "/home/user/project",
+            "tool_name": "read_file",
+            "tool_input": {"filePath": "/home/user/project/a.txt"},
+            "tool_use_id": "call_2__vscode-43"
+        })
+        .to_string();
+        let err = GithubCopilotPreset
+            .parse(&input, "t_test123456789a")
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Skipping"), "{err}");
     }
 }
