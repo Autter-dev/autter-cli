@@ -83,6 +83,18 @@ pub fn handle_onboard(args: &[String]) {
         print_telemetry_summary(&file_config);
         eprintln!();
         eprintln!("Already set up. Re-run with `autter onboard --force` to change your choice.");
+        // "Set up" is the saved mode, not working capture: doctor used to send
+        // people here, and this branch never touches trace2. Name the command
+        // that does.
+        let git_cmd = config::Config::get().git_cmd().to_string();
+        let trace2 = crate::diagnostics::check_trace2_global_config(
+            &crate::diagnostics::GitDiagnosticTarget::new("configured git", &git_cmd),
+        );
+        if trace2.status == crate::diagnostics::DiagnosticStatus::Failed {
+            eprintln!(
+                "Git capture is not set up, so commits don't get authorship notes. Fix: run `autter install --system`, then `autter doctor`."
+            );
+        }
         return;
     }
 
@@ -163,12 +175,30 @@ pub fn handle_onboard(args: &[String]) {
     // System integrations (IDE hooks, global git trace2, daemon) require
     // explicit consent. Picking a mode (`--local`/`--connect`) or re-running
     // (`--force`) is not consent; only interactive choices or `--yes` are.
-    if let Err(e) = apply_system_integrations_with_consent(assume_yes, &mut steps) {
-        report.problem(
-            format!("Could not install IDE/agent hooks and git capture settings ({e})"),
-            "autter install --system",
-        );
-    }
+    // Without them commits get no authorship notes, so a declined or skipped
+    // setup is reported as unfinished, never as "all set".
+    let capture = match apply_system_integrations_with_consent(assume_yes, &mut steps) {
+        Ok(SystemCapture::Applied(issues)) => {
+            for issue in issues {
+                report.problem(issue.what, issue.fix);
+            }
+            true
+        }
+        Ok(SystemCapture::NotSetUp) => {
+            report.problem(
+                "Git capture and the background service are not set up, so commits don't get authorship notes yet",
+                "autter install --system",
+            );
+            false
+        }
+        Err(e) => {
+            report.problem(
+                format!("Could not install IDE/agent hooks and git capture settings ({e})"),
+                "autter install --system",
+            );
+            false
+        }
+    };
 
     // After connect: offer to keep or discard any pre-login upload backlog.
     if file_config.prompt_storage.as_deref() != Some("local")
@@ -205,6 +235,18 @@ pub fn handle_onboard(args: &[String]) {
             ),
             crate::commands::daemon::RESTART_COMMAND,
         );
+    }
+
+    // "Mode configured" is not "capture verified": the closing summary only
+    // says "You're all set!" after a real git event reached a healthy
+    // background service through the trace2 config just written.
+    if capture && report.is_clean() && !in_test_harness() {
+        let spinner = ui::progress::Spinner::new("Verifying git capture\u{2026}");
+        let issues = crate::diagnostics::verify_capture();
+        spinner.stop();
+        for issue in issues {
+            report.problem(issue.what, issue.fix);
+        }
     }
 
     // Reflect the mode actually configured: a connect attempt can fall back
@@ -585,7 +627,7 @@ fn render_finished(connected: bool, report: &SetupReport, caps: &TermCaps) -> St
         out.push_str(&rail::end(
             caps,
             &format!(
-                "{} Authorship is recorded automatically on every commit.",
+                "{} Capture verified: every commit gets an authorship note.",
                 caps.paint("1;32", "You're all set!")
             ),
         ));
@@ -611,6 +653,16 @@ fn render_finished(connected: bool, report: &SetupReport, caps: &TermCaps) -> St
             }
             out.push_str(&format!("{bar}    Fix: {}\n", cyan(&problem.fix)));
         }
+        out.push_str(&format!(
+            "{bar}  {}\n",
+            caps.paint(
+                "2",
+                &format!(
+                    "Your choice ({} mode) is saved; capture isn't verified until the steps above are fixed.",
+                    if connected { "connected" } else { "local" }
+                )
+            )
+        ));
         out.push_str(&rail::end(
             caps,
             &format!(
@@ -704,26 +756,44 @@ fn print_telemetry_summary(cfg: &config::FileConfig) {
     }
 }
 
+/// Whether git capture (global trace2 + background service) was set up.
+#[derive(Debug, PartialEq, Eq)]
+enum SystemCapture {
+    /// Applied, with whatever could not be written or started.
+    Applied(Vec<crate::diagnostics::CaptureIssue>),
+    /// Declined, unchecked, or skipped for lack of consent.
+    NotSetUp,
+}
+
+fn in_test_harness() -> bool {
+    std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
+}
+
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
-/// Returns whether any integrations were installed, or the install error.
 ///
 /// Only `assume_yes` (`--yes`) applies them all without asking. Interactive
 /// runs list the detected tools with everything checked, so Enter installs
 /// everything and unchecking all is "not now"; non-interactive runs without
-/// `--yes` leave them off.
+/// `--yes` leave them off and say so.
 fn apply_system_integrations_with_consent(
     assume_yes: bool,
     steps: &mut Steps,
-) -> Result<bool, String> {
-    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return Ok(false);
+) -> Result<SystemCapture, String> {
+    let decision = integration_decision(assume_yes, ui::is_interactive());
+    // Test harnesses manage their own daemon and trace2 setup: honour the
+    // consent decision without touching the machine.
+    if in_test_harness() {
+        return Ok(match decision {
+            IntegrationDecision::Apply => SystemCapture::Applied(Vec::new()),
+            IntegrationDecision::Ask | IntegrationDecision::Skip => SystemCapture::NotSetUp,
+        });
     }
 
-    match integration_decision(assume_yes, ui::is_interactive()) {
+    match decision {
         IntegrationDecision::Apply => {
             rail::print_step("Installing integrations", None);
             crate::commands::install_hooks::run_for_tools(None, true)
-                .map(|_| true)
+                .map(|outcome| SystemCapture::Applied(outcome.system_issues))
                 .map_err(|e| e.to_string())
         }
         IntegrationDecision::Skip => {
@@ -731,7 +801,7 @@ fn apply_system_integrations_with_consent(
             eprintln!(
                 "Skipping system integrations (non-interactive, no --yes). Run `autter install --system` to install them."
             );
-            Ok(false)
+            Ok(SystemCapture::NotSetUp)
         }
         IntegrationDecision::Ask => {
             let spinner =
@@ -764,7 +834,7 @@ fn apply_system_integrations_with_consent(
             let chosen = ui::multiselect(&question, &items, &all);
             if chosen.is_empty() {
                 rail::print_note("Skipped. Run `autter install --system` when you're ready.");
-                return Ok(false);
+                return Ok(SystemCapture::NotSetUp);
             }
 
             let tool_ids: Vec<String> = chosen
@@ -772,12 +842,14 @@ fn apply_system_integrations_with_consent(
                 .filter(|&&i| i < tools.len())
                 .map(|&i| tools[i].id.clone())
                 .collect();
-            crate::commands::install_hooks::run_for_tools(
-                Some(&tool_ids),
-                chosen.contains(&system_item),
-            )
-            .map(|_| true)
-            .map_err(|e| e.to_string())
+            let system = chosen.contains(&system_item);
+            let outcome = crate::commands::install_hooks::run_for_tools(Some(&tool_ids), system)
+                .map_err(|e| e.to_string())?;
+            Ok(if system {
+                SystemCapture::Applied(outcome.system_issues)
+            } else {
+                SystemCapture::NotSetUp
+            })
         }
     }
 }
@@ -1002,6 +1074,27 @@ mod tests {
         );
         // The daemon fix is the canonical restart command.
         assert!(text.contains("Fix: autter bg restart"), "{text}");
+        assert!(text.contains("Fix: autter install --system"), "{text}");
+    }
+
+    #[test]
+    fn all_set_claims_verified_capture_and_warnings_say_the_mode_is_saved() {
+        let text = render_finished(false, &SetupReport::default(), &plain());
+        assert!(text.contains("Capture verified"), "{text}");
+        assert!(
+            !text.contains("recorded automatically"),
+            "the old unverified claim must be gone: {text}"
+        );
+
+        let mut report = SetupReport::default();
+        report.problem(
+            "Git capture and the background service are not set up, so commits don't get authorship notes yet",
+            "autter install --system",
+        );
+        let text = render_finished(false, &report, &plain());
+        assert!(!text.contains("You're all set"), "{text}");
+        assert!(!text.contains("Capture verified"), "{text}");
+        assert!(text.contains("Your choice (local mode) is saved"), "{text}");
         assert!(text.contains("Fix: autter install --system"), "{text}");
     }
 

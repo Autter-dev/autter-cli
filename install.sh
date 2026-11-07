@@ -647,10 +647,19 @@ fi
 # which used to print a bare "/dev/tty: Device not configured" error. Actually
 # try to open it instead.
 echo ""
+ONBOARD_STATUS=0
 if ( : </dev/tty ) 2>/dev/null; then
-    ${INSTALL_DIR}/autter onboard </dev/tty || true
+    ${INSTALL_DIR}/autter onboard </dev/tty || ONBOARD_STATUS=$?
 else
-    ${INSTALL_DIR}/autter onboard || true
+    ${INSTALL_DIR}/autter onboard || ONBOARD_STATUS=$?
+fi
+# Onboarding exits non-zero when a step needs attention ("Set up with
+# warnings", or git capture not set up yet); it has already printed each fix.
+# The binary install itself succeeded, so don't fail the installer, but don't
+# let the success lines below read as a finished setup either.
+if [ "$ONBOARD_STATUS" -ne 0 ]; then
+    echo ""
+    warn "autter is installed, but setup isn't finished: onboarding listed the remaining steps above. Check with: autter doctor"
 fi
 
 # PATH guidance goes LAST so it is the message left on screen after the

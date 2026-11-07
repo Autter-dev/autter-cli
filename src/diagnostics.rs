@@ -52,7 +52,10 @@ const REMEDIATION_TRACE2_INGESTION: &str = concat!(
     "`, then `autter doctor`"
 );
 const REMEDIATION_TRACE2_CONFIG_INSPECT: &str = "check that git runs at all (`git --version`) and that your global git config is readable, then re-run `autter doctor`";
-const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install --system` (or `autter onboard`) to write the required trace2 settings to your global git config, then re-run `autter doctor`";
+// Not `autter onboard`: once onboarding is complete it only prints a status
+// summary, and without a terminal it skips integrations, so it never writes
+// trace2 for someone who already ran it.
+const REMEDIATION_TRACE2_CONFIG_MISSING: &str = "run `autter install --system` to write the required trace2 settings to your global git config, then re-run `autter doctor`";
 const REMEDIATION_TRACE2_FILE: &str = "check that your global git config is writable and that no GIT_TRACE2* environment variables are set, then re-run `autter doctor`; if the trace2 config check also failed, run `autter install --system`";
 
 /// Fallback when the attribution self-check fails for an unrecognized reason.
@@ -1561,6 +1564,122 @@ fn format_status(status: Option<i32>) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
+/// One reason capture is not working, with the one command that fixes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureIssue {
+    pub what: String,
+    pub fix: String,
+}
+
+impl CaptureIssue {
+    pub fn new(what: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            what: what.into(),
+            fix: fix.into(),
+        }
+    }
+}
+
+/// The fix to show for a failed check: its remediation, or `fallback`.
+fn issue_from_check(check: DiagnosticCheckResult, fallback: &str) -> CaptureIssue {
+    CaptureIssue::new(
+        check.summary,
+        check.remediation.unwrap_or_else(|| fallback.to_string()),
+    )
+}
+
+/// Is commit capture actually working right now? Onboarding and
+/// `autter install --system` run this at the end and only report success when
+/// it returns no issues, so "You're all set!" can no longer follow a skipped
+/// trace2 setup or a background service that timed out.
+///
+/// Covers what every commit depends on: the background service is healthy,
+/// git's global trace2 config points at it (for the git autter runs and the
+/// git on PATH), and a real git event reaches it. The slower end-to-end
+/// checkpoint round-trip stays in `autter doctor`.
+pub fn verify_capture() -> Vec<CaptureIssue> {
+    let mut issues = Vec::new();
+    let git_cmd = Config::get().git_cmd().to_string();
+
+    let service = ensure_daemon_ready_for_self_checks();
+    let service_ok = service.status == DiagnosticStatus::Passed;
+    if !service_ok {
+        issues.push(issue_from_check(service, REMEDIATION_DAEMON_FAILED));
+    }
+
+    for target in [
+        GitDiagnosticTarget::new("configured git", &git_cmd),
+        GitDiagnosticTarget::new("terminal git", "git"),
+    ] {
+        // Same binary twice (the usual case): check it once.
+        if target.label == "terminal git" && git_cmd == "git" {
+            continue;
+        }
+        let check = check_trace2_global_config(&target);
+        if check.status == DiagnosticStatus::Failed {
+            let mut issue = issue_from_check(check, REMEDIATION_TRACE2_CONFIG_MISSING);
+            issue.what = format!("{} ({})", issue.what, target.label);
+            issues.push(issue);
+        }
+    }
+
+    if service_ok {
+        let ingestion = check_daemon_trace2_ingestion(&git_cmd);
+        if ingestion.status == DiagnosticStatus::Failed {
+            issues.push(issue_from_check(ingestion, REMEDIATION_TRACE2_INGESTION));
+        }
+    }
+    issues
+}
+
+/// Repair a trace2 config that autter itself wrote but that no longer points
+/// at this machine's background service (an older install location, a moved
+/// home folder). The user already consented to that config when it was
+/// written, so doctor fixes it in place instead of telling them to.
+///
+/// Never writes trace2 for someone who has none, and never replaces a target
+/// that isn't autter's: those still need `autter install --system`. Returns a
+/// line describing the repair, or `None` when nothing was changed.
+pub fn repair_stale_trace2_config(git_program: &str) -> Option<String> {
+    let expected = crate::daemon::DaemonConfig::from_env_or_default_paths()
+        .ok()?
+        .trace2_event_target();
+    let mut commands = Vec::new();
+    let targets =
+        read_global_git_config_values(&mut commands, git_program, TRACE2_EVENT_TARGET_KEY).ok()?;
+    if !trace2_targets_are_stale_autter(&targets, &expected) {
+        return None;
+    }
+    let set = |key: &str, value: &str| {
+        std::process::Command::new(git_program)
+            .args(["config", "--global", "--replace-all", key, value])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if set(TRACE2_EVENT_TARGET_KEY, &expected)
+        && set(TRACE2_EVENT_NESTING_KEY, TRACE2_EVENT_NESTING_VALUE)
+    {
+        Some(format!(
+            "repaired: {TRACE2_EVENT_TARGET_KEY} pointed at an old autter location ({}); now {expected}",
+            targets.join(", ")
+        ))
+    } else {
+        None
+    }
+}
+
+/// True when every configured trace2 event target is an autter target, but
+/// none is this machine's current one.
+fn trace2_targets_are_stale_autter(targets: &[String], expected: &str) -> bool {
+    !targets.is_empty()
+        && !targets.iter().any(|t| t == expected)
+        && targets
+            .iter()
+            .all(|t| t.to_ascii_lowercase().contains("autter"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +1819,34 @@ mod tests {
     fn attribution_remediation_falls_back_for_unknown_errors() {
         let msg = attribution_self_check_remediation("something unexpected went wrong", None);
         assert_eq!(msg, REMEDIATION_ATTRIBUTION_FALLBACK);
+    }
+
+    #[test]
+    fn stale_trace2_repair_only_touches_old_autter_targets() {
+        let expected = "af_unix:stream:/home/me/.autter/internal/daemon/trace2.sock";
+        let old = "af_unix:stream:/Users/old/.autter/internal/daemon/trace2.sock".to_string();
+        assert!(trace2_targets_are_stale_autter(&[old.clone()], expected));
+        // Nothing configured: needs consent, not a silent write.
+        assert!(!trace2_targets_are_stale_autter(&[], expected));
+        // Already right.
+        assert!(!trace2_targets_are_stale_autter(
+            &[expected.to_string()],
+            expected
+        ));
+        // Someone else's target is never replaced.
+        assert!(!trace2_targets_are_stale_autter(
+            &["/tmp/my-own-trace.json".to_string()],
+            expected
+        ));
+        assert!(!trace2_targets_are_stale_autter(
+            &[old, "/tmp/my-own-trace.json".to_string()],
+            expected
+        ));
+    }
+
+    #[test]
+    fn trace2_remediation_never_sends_people_back_to_onboard() {
+        assert!(!REMEDIATION_TRACE2_CONFIG_MISSING.contains("onboard"));
+        assert!(REMEDIATION_TRACE2_CONFIG_MISSING.contains("autter install --system"));
     }
 }

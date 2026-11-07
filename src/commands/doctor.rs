@@ -38,7 +38,7 @@ const SECTION_E2E: &str = "End-to-end checkpoint";
 const SECTION_AGENTS: &str = "AI agent hooks";
 const SECTION_ACCOUNT: &str = "Account & sync";
 
-const REMEDIATION_TRACE2_THEN_ATTRIBUTION: &str = "a trace2 check failed above — attribution depends on it. run `autter install --system` (or `autter onboard`), then `autter doctor`";
+const REMEDIATION_TRACE2_THEN_ATTRIBUTION: &str = "a trace2 check failed above — attribution depends on it. run `autter install --system`, then `autter doctor`";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -141,6 +141,11 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     }
 
     let git_cmd = Config::get().git_cmd().to_string();
+    // A trace2 config autter wrote earlier that points at an old service
+    // location is repaired in place (the user consented when it was written),
+    // before any check that sends a git event through it. Missing or foreign
+    // config is only reported: that needs `autter install --system`.
+    let trace2_repair = crate::diagnostics::repair_stale_trace2_config(&git_cmd);
 
     // Setup: git binary/version, config file parse, repository eligibility.
     reporter.begin(SECTION_SETUP, "checking git");
@@ -200,11 +205,14 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         ("trace2 config (terminal git)", &terminal_target),
     ] {
         reporter.begin(SECTION_TRACE2, &format!("checking {name}"));
-        let check = check_from_diagnostic(
+        let mut check = check_from_diagnostic(
             SECTION_TRACE2,
             name,
             crate::diagnostics::check_trace2_global_config(target),
         );
+        if let Some(repair) = &trace2_repair {
+            check.details.insert(0, repair.clone());
+        }
         if check.status == DoctorStatus::Failed {
             trace2_blocking = true;
         }
@@ -255,7 +263,7 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
             // failed checks above before the stage-specific remediation.
             e2e_check.remediation = Some(match e2e_check.remediation.take() {
                 Some(stage) => format!(
-                    "a trace2 check failed above — attribution depends on it. run `autter install` first, then: {stage}"
+                    "a trace2 check failed above — attribution depends on it. run `autter install --system` first, then: {stage}"
                 ),
                 None => REMEDIATION_TRACE2_THEN_ATTRIBUTION.to_string(),
             });
@@ -707,14 +715,14 @@ fn claude_shell_capture_check() -> Option<DoctorCheck> {
             section: SECTION_AGENTS,
             name: "Claude Code shell edits".to_string(),
             status: DoctorStatus::Warning,
-            summary: "NOT captured -- edits Claude makes with shell commands are committed as untracked".to_string(),
+            summary:
+                "NOT captured -- edits Claude makes with shell commands are committed as untracked"
+                    .to_string(),
             details: vec![format!(
                 "the {} hook matcher in Claude Code settings excludes the Bash tool",
                 missing_events.join("/")
             )],
-            remediation: Some(
-                "run `autter install-hooks`, then restart Claude Code".to_string(),
-            ),
+            remediation: Some("run `autter install-hooks`, then restart Claude Code".to_string()),
         }),
     }
 }
@@ -1132,14 +1140,11 @@ fn check_sync_queue() -> DoctorCheck {
             );
             details.push("delete them with `autter sync purge --force`".to_string());
         }
-        return DoctorCheck {
-            section: SECTION_ACCOUNT,
-            name,
-            status: DoctorStatus::Passed,
-            summary: "local mode — nothing is uploaded to the Autter platform".to_string(),
-            details,
-            remediation: None,
-        };
+        // Signed in but in local mode is the case people mistake for
+        // "connected": say it here, with the same verdict `whoami` and
+        // `autter status` print (both read `platform_sync_enabled`).
+        let signed_in = matches!(collect_auth_status().state, AuthState::LoggedIn);
+        return local_mode_sync_check(name, signed_in, details);
     }
 
     // Notes stay in git notes; cloud upload queues are not checked.
@@ -1238,6 +1243,33 @@ fn check_sync_queue() -> DoctorCheck {
 // ===========================================================================
 // Plumbing
 // ===========================================================================
+
+/// The sync-queue verdict in local mode. Signed in but not connected is a
+/// warning: nothing uploads, though the account suggests it would.
+fn local_mode_sync_check(name: String, signed_in: bool, details: Vec<String>) -> DoctorCheck {
+    if signed_in {
+        DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: "signed in, but this machine is in local mode — cloud upload is off and nothing reaches your org's dashboard".to_string(),
+            details,
+            remediation: Some(
+                "run `autter onboard --connect` to upload (ignore this if you want local only)"
+                    .to_string(),
+            ),
+        }
+    } else {
+        DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Passed,
+            summary: "local mode — nothing is uploaded to the Autter platform".to_string(),
+            details,
+            remediation: None,
+        }
+    }
+}
 
 fn check_from_diagnostic(
     section: &'static str,
@@ -1569,6 +1601,31 @@ mod tests {
         assert_eq!(value["next_step"], "do the thing");
         // Passed checks with no remediation omit the key entirely.
         assert!(value["checks"][0].get("remediation").is_none());
+    }
+
+    #[test]
+    fn signed_in_local_mode_warns_that_cloud_upload_is_off() {
+        let check = local_mode_sync_check("durable sync queue".to_string(), true, Vec::new());
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(
+            check.summary.contains("cloud upload is off"),
+            "{}",
+            check.summary
+        );
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|fix| fix.contains("autter onboard --connect"))
+        );
+
+        let check = local_mode_sync_check("durable sync queue".to_string(), false, Vec::new());
+        assert_eq!(check.status, DoctorStatus::Passed);
+    }
+
+    #[test]
+    fn trace2_remediations_never_send_people_back_to_onboard() {
+        assert!(!REMEDIATION_TRACE2_THEN_ATTRIBUTION.contains("onboard"));
     }
 
     #[test]

@@ -148,6 +148,14 @@ fn doctor_and_bg_status_agree_on_service_health() {
         serde_json::from_str(&raw_status[start..=end]).expect("valid bg status JSON");
     assert_eq!(status["health"]["state"], "healthy", "{raw_status}");
     assert_eq!(status["ok"], true, "{raw_status}");
+    assert_eq!(
+        status["git_capture"]["trace2_configured"], true,
+        "{raw_status}"
+    );
+    assert!(
+        !raw_status.contains("git capture (trace2) is not configured"),
+        "{raw_status}"
+    );
 
     let raw = repo
         .autter(&["doctor", "--json"])
@@ -187,4 +195,76 @@ fn doctor_skip_trace2_flag_skips_event_capture_check() {
         "{}",
         raw
     );
+}
+
+/// `bg status` used to say "healthy" while doctor failed trace2: a running
+/// service records nothing unless git's trace2 config points at it.
+#[test]
+fn bg_status_reports_missing_git_capture() {
+    let repo = TestRepo::new();
+    let raw_status = repo
+        .autter(&["bg", "status"])
+        .expect("bg status still succeeds: the service itself is healthy");
+    let start = raw_status.find('{').expect("bg status prints JSON");
+    let end = raw_status.rfind('}').expect("bg status prints JSON");
+    let status: serde_json::Value =
+        serde_json::from_str(&raw_status[start..=end]).expect("valid bg status JSON");
+    assert_eq!(
+        status["git_capture"]["trace2_configured"], false,
+        "{raw_status}"
+    );
+    assert!(
+        raw_status.contains("git capture (trace2) is not configured"),
+        "{raw_status}"
+    );
+    assert!(
+        raw_status.contains("autter install --system"),
+        "{raw_status}"
+    );
+}
+
+/// A trace2 config autter wrote for an old service location is repaired by
+/// doctor instead of sending the user to re-run setup.
+#[test]
+fn doctor_repairs_a_stale_autter_trace2_target() {
+    let repo = TestRepo::new();
+    repo.git_og(&[
+        "config",
+        "--global",
+        "trace2.eventTarget",
+        "af_unix:stream:/nonexistent/old-home/.autter/internal/daemon/trace2.sock",
+    ])
+    .expect("write a stale trace2.eventTarget");
+    repo.git_og(&["config", "--global", "trace2.eventNesting", "10"])
+        .expect("write trace2.eventNesting");
+
+    let _ = repo.autter(&["doctor", "--json"]);
+
+    let expected = DaemonConfig::trace2_event_target_for_path(&repo.daemon_trace_socket_path());
+    let actual = repo
+        .git_og(&["config", "--global", "--get-all", "trace2.eventTarget"])
+        .expect("trace2.eventTarget is still set");
+    assert_eq!(
+        actual.trim(),
+        expected,
+        "doctor should repoint the stale target"
+    );
+}
+
+/// Doctor never writes trace2 for someone who has none, or replaces a target
+/// that isn't autter's: that needs explicit consent (`install --system`).
+#[test]
+fn doctor_leaves_foreign_trace2_targets_alone() {
+    let repo = TestRepo::new();
+    let foreign = repo.test_home_path().join("my-own-trace.json");
+    let foreign = foreign.to_string_lossy().to_string();
+    repo.git_og(&["config", "--global", "trace2.eventTarget", &foreign])
+        .expect("write a foreign trace2.eventTarget");
+
+    let _ = repo.autter(&["doctor", "--json"]);
+
+    let actual = repo
+        .git_og(&["config", "--global", "--get-all", "trace2.eventTarget"])
+        .expect("trace2.eventTarget is still set");
+    assert_eq!(actual.trim(), foreign);
 }

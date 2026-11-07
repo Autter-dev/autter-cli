@@ -597,6 +597,10 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
     // so the two commands can no longer disagree about service health.
     let health = probe_daemon_health(&config);
     let daemon_running = health.control_socket || health.trace_socket || health.lock_held;
+    // A healthy service records nothing unless git's trace2 config points at
+    // it. Report that next to service health so `bg status` can't read as
+    // "all good" while doctor fails trace2.
+    let git_capture = git_capture_status();
 
     // Check if the path is inside a git repository before contacting the daemon.
     // When run outside a git repo, still report service health but skip the
@@ -608,6 +612,7 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
             "git_repo": in_repo,
             "daemon_running": daemon_running,
             "health": health,
+            "git_capture": git_capture,
             "cloud_sync": cloud_sync,
         });
         println!(
@@ -618,6 +623,7 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
             eprintln!("{}. Fix: run `{RESTART_COMMAND}`.", health.summary);
             std::process::exit(1);
         }
+        warn_if_git_capture_off(&git_capture);
         return Ok(());
     }
 
@@ -632,6 +638,7 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
         "seq": daemon_response.seq,
         "data": daemon_response.data,
         "error": daemon_response.error,
+        "git_capture": git_capture,
         "cloud_sync": cloud_sync,
     });
     println!(
@@ -642,7 +649,31 @@ fn handle_status(repo_working_dir: String) -> Result<(), String> {
         eprintln!("{}. Fix: run `{RESTART_COMMAND}`.", health.summary);
         std::process::exit(1);
     }
+    warn_if_git_capture_off(&git_capture);
     Ok(())
+}
+
+/// Whether git's global trace2 config points at this service, for `bg status`.
+/// Reads git config only; the slower live event probe stays in `autter doctor`.
+fn git_capture_status() -> serde_json::Value {
+    let git_cmd = crate::config::Config::get().git_cmd().to_string();
+    let check = crate::diagnostics::check_trace2_global_config(
+        &crate::diagnostics::GitDiagnosticTarget::new("configured git", &git_cmd),
+    );
+    let configured = check.status == crate::diagnostics::DiagnosticStatus::Passed;
+    serde_json::json!({
+        "trace2_configured": configured,
+        "summary": check.summary,
+        "fix": (!configured).then_some(check.remediation).flatten(),
+    })
+}
+
+fn warn_if_git_capture_off(git_capture: &serde_json::Value) {
+    if git_capture["trace2_configured"] == serde_json::Value::Bool(false) {
+        eprintln!(
+            "The background service is running, but git capture (trace2) is not configured, so commits are not recorded. Fix: run `autter install --system`, then `autter doctor`."
+        );
+    }
 }
 
 fn handle_tail(args: &[String]) -> Result<(), String> {

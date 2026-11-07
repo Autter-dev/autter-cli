@@ -193,7 +193,13 @@ fn run_claude_bash(repo: &TestRepo, tool_use_id: &str, command: &str) {
     if !transcript_path.exists() {
         fs::copy(fixture_path("example-claude-code.jsonl"), &transcript_path).unwrap();
     }
-    let pre = claude_bash_hook(&repo_root, &transcript_path, "PreToolUse", tool_use_id, command);
+    let pre = claude_bash_hook(
+        &repo_root,
+        &transcript_path,
+        "PreToolUse",
+        tool_use_id,
+        command,
+    );
     repo.autter(&["checkpoint", "claude", "--hook-input", &pre])
         .expect("claude Bash pre-hook should succeed");
 
@@ -208,7 +214,13 @@ fn run_claude_bash(repo: &TestRepo, tool_use_id: &str, command: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let post = claude_bash_hook(&repo_root, &transcript_path, "PostToolUse", tool_use_id, command);
+    let post = claude_bash_hook(
+        &repo_root,
+        &transcript_path,
+        "PostToolUse",
+        tool_use_id,
+        command,
+    );
     repo.autter(&["checkpoint", "claude", "--hook-input", &post])
         .expect("claude Bash post-hook should succeed");
 }
@@ -318,7 +330,11 @@ fn test_claude_bash_does_not_claim_human_edit_made_just_before() {
     // the post-hook to sweep into the AI checkpoint.
     fs::write(&file_path, "base line\nunchecked human line\n").unwrap();
 
-    run_claude_bash(&repo, "bash-echo-2", "echo 'claude shell line' >> shared.txt");
+    run_claude_bash(
+        &repo,
+        "bash-echo-2",
+        "echo 'claude shell line' >> shared.txt",
+    );
 
     commit_file(&repo, "shared.txt", "After Claude bash");
     file.assert_committed_lines(lines![

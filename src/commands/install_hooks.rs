@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "10";
+const TRACE2_EVENT_BRIEF_KEY: &str = "trace2.eventBrief";
 const VISUAL_STUDIO_INSTALLER_ID: &str = "visual-studio";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,7 +72,7 @@ pub fn detect_tools() -> Vec<DetectedTool> {
 pub fn run_for_tools(
     tool_ids: Option<&[String]>,
     system: bool,
-) -> Result<HashMap<String, String>, AutterError> {
+) -> Result<InstallOutcome, AutterError> {
     let _rail = crate::ui::progress::on_rail();
     run_with_options(InstallOptions {
         apply_system: system,
@@ -313,7 +314,14 @@ fn remove_global_git_config_section(git_cmd: &str, section: &str) -> Result<(), 
     }
 }
 
-fn configure_daemon_trace2(dry_run: bool) -> Result<(), AutterError> {
+/// Point git's trace2 event stream at the background service. Returns whether
+/// the global git config changed.
+///
+/// Merges into the user's `[trace2]` section instead of replacing it: only the
+/// keys autter needs are written, and `trace2.eventBrief` (which strips fields
+/// autter reads from the event stream) is removed. Other trace2 settings the
+/// user has, such as `normalTarget` or `perfTarget`, are left alone.
+fn configure_daemon_trace2(dry_run: bool) -> Result<bool, AutterError> {
     let runtime_config = config::Config::fresh();
 
     ensure_global_git_config_dirs()?;
@@ -322,25 +330,80 @@ fn configure_daemon_trace2(dry_run: bool) -> Result<(), AutterError> {
     let event_target = daemon_config.trace2_event_target();
 
     if dry_run {
-        return Ok(());
+        return Ok(false);
     }
 
-    // Fully reset any existing trace2 config the user may have set
-    // (e.g. trace2.normalTarget, trace2.perfTarget, trace2.configParams, etc.)
-    // before writing only the keys we need.
-    remove_global_git_config_section(runtime_config.git_cmd(), "trace2")?;
+    let git_cmd = runtime_config.git_cmd();
+    let mut changed = false;
+    for (key, value) in [
+        (TRACE2_EVENT_TARGET_KEY, event_target.as_str()),
+        (TRACE2_EVENT_NESTING_KEY, TRACE2_EVENT_NESTING_VALUE),
+    ] {
+        if global_git_config_values(git_cmd, key) != [value.to_string()] {
+            replace_global_git_config_value(git_cmd, key, value)?;
+            changed = true;
+        }
+    }
+    if !global_git_config_values(git_cmd, TRACE2_EVENT_BRIEF_KEY).is_empty() {
+        unset_global_git_config_key(git_cmd, TRACE2_EVENT_BRIEF_KEY)?;
+        changed = true;
+    }
+    Ok(changed)
+}
 
-    set_global_git_config_value(
-        runtime_config.git_cmd(),
-        TRACE2_EVENT_TARGET_KEY,
-        &event_target,
-    )?;
-    set_global_git_config_value(
-        runtime_config.git_cmd(),
-        TRACE2_EVENT_NESTING_KEY,
-        TRACE2_EVENT_NESTING_VALUE,
-    )?;
-    Ok(())
+/// Every value of a global git config key (empty when unset or unreadable).
+fn global_git_config_values(git_cmd: &str, key: &str) -> Vec<String> {
+    Command::new(git_cmd)
+        .args(["config", "--global", "--get-all", key])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Set a global key to exactly one value, replacing any duplicates.
+fn replace_global_git_config_value(
+    git_cmd: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), AutterError> {
+    let status = Command::new(git_cmd)
+        .args(["config", "--global", "--replace-all", key, value])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AutterError::Generic(format!(
+            "failed to set global git config key '{key}'"
+        )))
+    }
+}
+
+fn unset_global_git_config_key(git_cmd: &str, key: &str) -> Result<(), AutterError> {
+    let status = Command::new(git_cmd)
+        .args(["config", "--global", "--unset-all", key])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    // Exit code 5 means the key isn't set, which is fine.
+    if status.success() || status.code() == Some(5) {
+        Ok(())
+    } else {
+        Err(AutterError::Generic(format!(
+            "failed to unset global git config key '{key}'"
+        )))
+    }
 }
 
 /// Align Git's native notes rewrite/display with Autter's authorship namespace
@@ -370,30 +433,24 @@ fn configure_authorship_notes_refs(dry_run: bool) {
     }
 }
 
-fn ensure_daemon(dry_run: bool) {
+/// (Re)start the background service so it picks up the freshly-written trace2
+/// config. A failure is returned, not just printed, so callers never report
+/// success after the service timed out.
+fn ensure_daemon(dry_run: bool) -> Result<(), String> {
     if dry_run {
-        return;
+        return Ok(());
     }
 
     // Don't touch daemon inside test harnesses
-    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
-        || std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
-    {
-        return;
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return Ok(());
     }
 
-    let Ok(daemon_config) = DaemonConfig::from_env_or_default_paths() else {
-        return;
-    };
+    let daemon_config = DaemonConfig::from_env_or_default_paths()
+        .map_err(|e| format!("could not locate the background service: {e}"))?;
 
-    // Restart daemon so it picks up the freshly-written trace2 config.
     // Uses soft shutdown → hard kill escalation if needed.
-    if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
-        eprintln!(
-            "[autter] warning: failed to restart background service: {}",
-            e
-        );
-    }
+    crate::commands::daemon::restart_daemon(&daemon_config)
 }
 
 /// Main entry point for install-hooks command.
@@ -407,18 +464,90 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
     // Verbose output interleaves diffs, which don't belong on the rail.
     options.rail_layout =
         !options.verbose && std::io::stdout().is_terminal() && crate::ui::caps().tty;
-    let _rail = options.rail_layout.then(crate::ui::progress::on_rail);
-    run_with_options(options)
+    let rail = options.rail_layout.then(crate::ui::progress::on_rail);
+    let apply_system = options.apply_system && !options.dry_run;
+    let mut outcome = run_with_options(options)?;
+    drop(rail);
+
+    if apply_system {
+        // Report success for the system part only once capture is verified.
+        if outcome.system_issues.is_empty() && !in_test_harness() {
+            let spinner = crate::ui::progress::Spinner::new("Verifying git capture\u{2026}");
+            outcome.system_issues = crate::diagnostics::verify_capture();
+            spinner.stop();
+        }
+        if !outcome.system_issues.is_empty() {
+            return Err(AutterError::Generic(format_system_issues(
+                &outcome.system_issues,
+            )));
+        }
+        eprintln!("{}", system_summary(outcome.trace2_changed));
+    }
+    Ok(outcome.statuses)
 }
 
-fn run_with_options(options: InstallOptions) -> Result<HashMap<String, String>, AutterError> {
+/// What one install run did.
+#[derive(Debug, Default)]
+pub struct InstallOutcome {
+    /// Per-tool install status, as reported to metrics.
+    pub statuses: HashMap<String, String>,
+    /// Whether the global git trace2 config was written or changed.
+    pub trace2_changed: bool,
+    /// Why git capture or the background service could not be set up. Empty
+    /// when the system part was not requested or succeeded.
+    pub system_issues: Vec<crate::diagnostics::CaptureIssue>,
+}
+
+fn in_test_harness() -> bool {
+    std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
+}
+
+/// The closing line for a successful `install --system`, which must never
+/// read as "nothing happened" when it wrote git config.
+fn system_summary(trace2_changed: bool) -> String {
+    if trace2_changed {
+        "Git capture set up: wrote trace2 settings to your global git config, started the background service, and verified that commits reach it.".to_string()
+    } else {
+        "Git capture verified: trace2 settings were already in place and commits reach the background service.".to_string()
+    }
+}
+
+/// Each capture problem with its fix, for the install error message.
+fn format_system_issues(issues: &[crate::diagnostics::CaptureIssue]) -> String {
+    let mut out =
+        String::from("git capture is not working, so commits won't get authorship notes:");
+    for issue in issues {
+        out.push_str(&format!(
+            "\n  \u{2022} {}\n    Fix: {}",
+            issue.what, issue.fix
+        ));
+    }
+    out.push_str("\nThen run `autter doctor` to confirm.");
+    out
+}
+
+fn run_with_options(options: InstallOptions) -> Result<InstallOutcome, AutterError> {
+    let mut outcome = InstallOutcome::default();
     if options.apply_system {
         // Daemon trace2 config must be in place before any install work starts.
-        // Non-fatal: the global git config may be read-only (e.g. Nix store symlink).
-        if let Err(e) = configure_daemon_trace2(options.dry_run) {
-            eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
+        // A failure doesn't stop the hook install (the global git config may be
+        // read-only, e.g. a Nix store symlink), but it is reported, never
+        // swallowed into a success.
+        match configure_daemon_trace2(options.dry_run) {
+            Ok(changed) => outcome.trace2_changed = changed,
+            Err(e) => outcome.system_issues.push(crate::diagnostics::CaptureIssue::new(
+                format!("Could not write git's trace2 settings to your global git config ({e})"),
+                "make sure your global git config (~/.gitconfig) is writable, then run `autter install --system`",
+            )),
         }
-        ensure_daemon(options.dry_run);
+        if let Err(e) = ensure_daemon(options.dry_run) {
+            outcome
+                .system_issues
+                .push(crate::diagnostics::CaptureIssue::new(
+                    format!("Could not start the background service ({e})"),
+                    crate::commands::daemon::RESTART_COMMAND,
+                ));
+        }
     }
 
     // Always align Git notes refs with Autter's authorship namespace — even when
@@ -446,17 +575,8 @@ fn run_with_options(options: InstallOptions) -> Result<HashMap<String, String>, 
         cleanup_legacy_envelope_logs();
     }
 
-    Ok(to_hashmap(statuses))
-}
-
-/// Apply global git trace2 + start/restart the daemon. Called from onboard after
-/// the user consents to system integration.
-pub fn apply_system_integrations(dry_run: bool) -> Result<(), AutterError> {
-    if let Err(e) = configure_daemon_trace2(dry_run) {
-        eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
-    }
-    ensure_daemon(dry_run);
-    Ok(())
+    outcome.statuses = to_hashmap(statuses);
+    Ok(outcome)
 }
 
 /// Full uninstall: agent hooks + global trace2 + stop daemon.
@@ -881,7 +1001,15 @@ async fn async_run_install(
 
     if !any_checked {
         if !options.on_rail {
-            println!("No compatible IDEs or agent configurations detected. Nothing to install.");
+            if options.apply_system {
+                // `--system` still writes git capture settings and starts the
+                // background service, so "Nothing to install" would be false.
+                println!("No coding agents detected, so no agent hooks were installed.");
+            } else {
+                println!(
+                    "No compatible IDEs or agent configurations detected. Nothing to install."
+                );
+            }
         }
     } else if has_changes && options.dry_run {
         println!(
