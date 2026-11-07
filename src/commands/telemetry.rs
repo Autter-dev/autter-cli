@@ -13,6 +13,11 @@
 use crate::config;
 
 pub fn handle_telemetry(args: &[String]) {
+    // Help in any position (`telemetry off --help`) never changes the setting.
+    if crate::commands::arg_parser::wants_help(args) {
+        print_help();
+        return;
+    }
     match args.first().map(|s| s.as_str()) {
         None | Some("status") => print_status(),
         Some("log") | Some("logs") => print_log(&args[1..]),

@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use std::{ffi::OsStr, path::Path};
 
 pub fn handle_daemon(args: &[String]) {
-    if args.is_empty() || is_help(args[0].as_str()) {
+    // Help in any position (`bg stop --help`) prints help and never acts.
+    if args.is_empty() || is_help(args[0].as_str()) || crate::commands::arg_parser::wants_help(args)
+    {
         print_help();
         std::process::exit(0);
     }
@@ -913,6 +915,12 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) {
 #[cfg(windows)]
 fn wait_for_process_exit(_pid: u32, _timeout: Duration) {
     // On Windows, hard_kill_daemon uses taskkill /F which is synchronous.
+}
+
+/// Whether the background service is running or still starting up: what
+/// `stop_daemon` would act on.
+pub(crate) fn daemon_is_running_or_starting(config: &DaemonConfig) -> bool {
+    daemon_is_up(config) || daemon_startup_is_blocked(config)
 }
 
 /// Shut down the running daemon (soft then hard) and wait for it to fully exit.

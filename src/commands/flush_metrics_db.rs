@@ -10,7 +10,8 @@ use crate::metrics::{MetricEvent, MetricsBatch};
 const MAX_BATCH_SIZE: usize = 1000;
 
 /// Handle the flush-metrics-db command
-pub fn handle_flush_metrics_db(_args: &[String]) {
+pub fn handle_flush_metrics_db(args: &[String]) {
+    crate::commands::arg_parser::reject_any_args("flush-metrics-db", args);
     if let Err(e) = crate::upload_hold::ensure_legacy_migration() {
         eprintln!("flush-metrics-db: skipping (could not apply the upload hold: {e})");
         return;

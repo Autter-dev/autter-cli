@@ -6,8 +6,8 @@ use crate::mdm::utils::{
     MIN_CODE_VERSION, get_editor_version, home_dir,
     install_vsc_editor_extension_with_vsix_fallback, is_github_codespaces,
     is_vsc_editor_extension_installed, parse_version, resolve_editor_cli,
-    settings_paths_for_products, should_process_settings_target, update_vscode_chat_hook_settings,
-    version_meets_requirement,
+    settings_paths_for_products, should_process_settings_target, uninstall_autter_editor_extension,
+    update_vscode_chat_hook_settings, version_meets_requirement,
 };
 use std::path::PathBuf;
 
@@ -229,15 +229,18 @@ impl HookInstaller for VSCodeInstaller {
     fn uninstall_extras(
         &self,
         _params: &HookInstallerParams,
-        _dry_run: bool,
+        dry_run: bool,
     ) -> Result<Vec<UninstallResult>, AutterError> {
-        // Note: Extension must be uninstalled manually
-        Ok(vec![UninstallResult {
-            changed: false,
-            diff: None,
-            message: "VS Code: Extension must be uninstalled manually through the editor"
-                .to_string(),
-        }])
+        // install_extras put the autter extension in; take it out again. The
+        // chat hook settings stay: they only enable VS Code's hook folders,
+        // which other tools share, and autter's own hook file there is removed
+        // with the GitHub Copilot hooks.
+        Ok(vec![uninstall_autter_editor_extension(
+            "VS Code",
+            resolve_editor_cli("code"),
+            "autter.autter-vscode",
+            dry_run,
+        )])
     }
 }
 
@@ -271,16 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn test_vscode_uninstall_extras_returns_manual_message() {
-        let installer = VSCodeInstaller;
-        let params = HookInstallerParams {
-            binary_path: std::path::PathBuf::from("/usr/local/bin/autter"),
-        };
-
-        let results = installer.uninstall_extras(&params, false).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].changed);
-        assert!(results[0].message.contains("manually"));
+    fn test_vscode_uninstall_extras_no_cli_reports_nothing_removed() {
+        // Without an editor CLI there's no extension autter could have
+        // installed, so uninstall must not claim to remove one.
+        let result =
+            uninstall_autter_editor_extension("VS Code", None, "autter.autter-vscode", false);
+        assert!(!result.changed);
+        assert!(result.message.is_empty());
     }
 
     #[test]

@@ -1,13 +1,13 @@
 use crate::commands::checkpoint_agent::presets::cursor::CURSOR_SESSION_ACTIVITY_EVENTS;
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{
-    HookCheckResult, HookInstaller, HookInstallerParams, InstallResult,
+    HookCheckResult, HookInstaller, HookInstallerParams, InstallResult, UninstallResult,
 };
 use crate::mdm::utils::{
     MIN_CURSOR_VERSION, generate_diff, get_editor_version, home_dir,
     install_vsc_editor_extension_with_vsix_fallback, is_vsc_editor_extension_installed,
     parse_version, resolve_editor_cli, settings_paths_for_products, should_process_settings_target,
-    version_meets_requirement, write_atomic,
+    uninstall_autter_editor_extension, version_meets_requirement, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -435,6 +435,20 @@ impl HookInstaller for CursorInstaller {
         }
 
         Ok(results)
+    }
+
+    fn uninstall_extras(
+        &self,
+        _params: &HookInstallerParams,
+        dry_run: bool,
+    ) -> Result<Vec<UninstallResult>, AutterError> {
+        // install_extras installs the autter extension into Cursor too.
+        Ok(vec![uninstall_autter_editor_extension(
+            "Cursor",
+            resolve_editor_cli("cursor"),
+            "autter.autter-vscode",
+            dry_run,
+        )])
     }
 }
 

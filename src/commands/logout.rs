@@ -1,7 +1,8 @@
 use crate::auth::CredentialStore;
 
 /// Handle the `autter logout` command
-pub fn handle_logout(_args: &[String]) {
+pub fn handle_logout(args: &[String]) {
+    crate::commands::arg_parser::reject_any_args("logout", args);
     let store = CredentialStore::new();
 
     // Check if currently logged in

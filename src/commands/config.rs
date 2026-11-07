@@ -160,8 +160,9 @@ pub fn handle_config(args: &[String]) {
         return;
     }
 
-    // Check for help flags
-    if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+    // Check for help flags, in any position (`config set key --help` must not
+    // store "--help" as the value).
+    if args[0] == "help" || crate::commands::arg_parser::wants_help(args) {
         print_config_help();
         return;
     }

@@ -14,6 +14,10 @@ pub fn handle_squash_authorship(args: &[String]) {
                 // Dry-run flag is parsed but not used in current implementation
                 i += 1;
             }
+            other if other.starts_with('-') => {
+                // An unknown option must not be taken as a branch or sha.
+                crate::commands::arg_parser::exit_unknown_option("squash-authorship", other);
+            }
             _ => {
                 // Positional arguments: base_branch, new_sha, old_sha
                 if base_branch.is_none() {

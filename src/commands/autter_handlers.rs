@@ -79,6 +79,18 @@ pub fn handle_autter(args: &[String]) {
     // Record the subcommand so any later panic report can name it.
     crate::observability::set_current_command(args[0].as_str());
 
+    // `-h`/`--help` anywhere after the subcommand (`autter uninstall --help`)
+    // prints that command's help and exits 0 here, before the background
+    // service is contacted and before the handler runs, so asking for help can
+    // never install, uninstall, log out, upload or open anything. Handlers
+    // listed in `handles_own_help` print richer per-subcommand help and check
+    // for it before any work; they still skip the background service below.
+    let help_requested = commands::arg_parser::wants_help(&args[1..]);
+    if help_requested && !commands::arg_parser::handles_own_help(args[0].as_str()) {
+        commands::arg_parser::print_command_help(args[0].as_str());
+        std::process::exit(0);
+    }
+
     // Initialize the global telemetry handle so that observability and CAS
     // events are routed over the control socket instead of being written to
     // per-PID log files.
@@ -86,7 +98,7 @@ pub fn handle_autter(args: &[String]) {
     // Skip for commands that must work without a running background service
     // (help, version, config, d management, debug, doctor, upgrade) so users
     // can always diagnose and recover from a broken state.
-    let needs_daemon = !matches!(
+    let works_without_daemon = matches!(
         args[0].as_str(),
         "help"
             | "--help"
@@ -105,6 +117,7 @@ pub fn handle_autter(args: &[String]) {
             | "install-hooks"
             | "install"
             | "uninstall-hooks"
+            | "uninstall"
             | "telemetry"
             | "login"
             | "logout"
@@ -117,6 +130,9 @@ pub fn handle_autter(args: &[String]) {
             | "context"
             | "mcp"
     );
+    // A help request never needs the background service: `stats --help` used
+    // to fail when it was unreachable while `--help stats` worked.
+    let needs_daemon = !help_requested && !works_without_daemon;
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
             DaemonTelemetryInitResult, init_daemon_telemetry_handle_with,
@@ -282,16 +298,11 @@ pub fn handle_autter(args: &[String]) {
             }
         },
         "uninstall" => match commands::install_hooks::run_full_uninstall(&args[1..]) {
+            // run_full_uninstall prints a line for each thing it actually removed.
             Ok(statuses) => {
                 if let Ok(statuses_value) = serde_json::to_value(&statuses) {
                     log_message("uninstall", "info", Some(statuses_value));
                 }
-                eprintln!(
-                    "Removed IDE/agent hooks, global git trace2 config, and stopped the background service."
-                );
-                eprintln!(
-                    "Binary and PATH entries were left in place. Delete them manually if desired."
-                );
             }
             Err(e) => {
                 eprintln!("Uninstall failed: {}", e);

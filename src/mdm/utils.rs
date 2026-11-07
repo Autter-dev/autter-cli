@@ -714,6 +714,90 @@ pub fn is_vsc_editor_extension_installed(
     )))
 }
 
+/// Uninstall a VS Code-family editor extension (VS Code, Cursor) through the
+/// editor CLI. Output is captured, like [`install_vsc_editor_extension`].
+pub fn uninstall_vsc_editor_extension(
+    cli: &EditorCliCommand,
+    extension_id: &str,
+) -> Result<(), AutterError> {
+    let output = cli
+        .command(&["--uninstall-extension", extension_id])
+        .output()
+        .map_err(|e| {
+            AutterError::Generic(format!("{} --uninstall-extension failed: {e}", cli.program))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tracing::debug!(
+        "{} --uninstall-extension {} failed: {}",
+        cli.program,
+        extension_id,
+        combined.trim()
+    );
+    Err(AutterError::Generic(format!(
+        "{} extension uninstall failed",
+        cli.program
+    )))
+}
+
+/// Remove autter's extension from a VS Code-family editor during uninstall.
+/// Reports `changed` only when the extension was there and is now gone (or,
+/// in a dry run, would be removed). `editor` is the display name ("VS Code").
+pub fn uninstall_autter_editor_extension(
+    editor: &str,
+    cli: Option<EditorCliCommand>,
+    extension_id: &str,
+    dry_run: bool,
+) -> crate::mdm::hook_installer::UninstallResult {
+    use crate::mdm::hook_installer::UninstallResult;
+    let Some(cli) = cli else {
+        // No editor CLI: nothing autter could have installed the extension with.
+        return UninstallResult {
+            changed: false,
+            diff: None,
+            message: String::new(),
+        };
+    };
+    match is_vsc_editor_extension_installed(&cli, extension_id) {
+        Ok(false) => UninstallResult {
+            changed: false,
+            diff: None,
+            message: String::new(),
+        },
+        Ok(true) if dry_run => UninstallResult {
+            changed: true,
+            diff: None,
+            message: format!("{editor}: Pending extension removal"),
+        },
+        Ok(true) => match uninstall_vsc_editor_extension(&cli, extension_id) {
+            Ok(()) => UninstallResult {
+                changed: true,
+                diff: None,
+                message: format!("{editor}: Extension removed"),
+            },
+            Err(e) => UninstallResult {
+                changed: false,
+                diff: None,
+                message: format!(
+                    "{editor}: Couldn't remove the extension ({e}). Remove it from the editor's Extensions view, or run: {} --uninstall-extension {extension_id}",
+                    cli.program
+                ),
+            },
+        },
+        Err(e) => UninstallResult {
+            changed: false,
+            diff: None,
+            message: format!("{editor}: Couldn't check for the extension ({e})"),
+        },
+    }
+}
+
 /// Install a VS Code extension.
 ///
 /// The editor CLI's stdout/stderr are captured, not inherited: the raw output

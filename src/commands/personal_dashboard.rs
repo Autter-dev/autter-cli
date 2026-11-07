@@ -1,5 +1,6 @@
 /// Handle the `autter personal-dashboard` command
-pub fn handle_personal_dashboard(_args: &[String]) {
+pub fn handle_personal_dashboard(args: &[String]) {
+    crate::commands::arg_parser::reject_any_args("dashboard", args);
     let dashboard_url = personal_dashboard_url();
 
     eprintln!("Opening dashboard: {}", dashboard_url);

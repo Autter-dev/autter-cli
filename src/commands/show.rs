@@ -7,6 +7,10 @@ use crate::git::notes_api::{
 use crate::git::repository::{CommitRange, Repository};
 
 pub fn handle_show(args: &[String]) {
+    // A revision never starts with `-`: an option here is a typo, not a ref.
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+        crate::commands::arg_parser::exit_unknown_option("show", flag);
+    }
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
         Err(e) => {

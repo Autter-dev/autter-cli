@@ -14,7 +14,8 @@ use crate::auth::client::OAuthClient;
 ///
 /// Exits with code 1 on failure (silently) so install script can run `autter login`.
 /// Exits with code 0 on success.
-pub fn handle_exchange_nonce(_args: &[String]) {
+pub fn handle_exchange_nonce(args: &[String]) {
+    crate::commands::arg_parser::reject_any_args("exchange-nonce", args);
     // Read from environment variables (injected by install script)
     let nonce = std::env::var("INSTALL_NONCE")
         .ok()

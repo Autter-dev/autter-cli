@@ -557,23 +557,41 @@ autter install-hooks [options]
   --system                    Also write global git trace2 config and start the daemon
                               (preferred via `autter onboard`, which asks for consent)
   --skills                    Also install agent skill files
-  --visual-studio-extension   Also install the Visual Studio extension (Windows)",
+  --visual-studio-extension   Also install the Visual Studio extension (Windows)
+  --dry-run                   Show what would change without changing anything
+  -v, --verbose               Show the diff of every file that changes",
     },
     HelpEntry {
         name: "uninstall-hooks",
         aliases: &[],
         summary: "Remove autter hooks from all detected tools",
-        body: "autter uninstall-hooks\n\n  Remove autter hooks from all detected tools.",
+        body: "\
+autter uninstall-hooks [options]
+
+  Remove autter hooks, and the editor extensions autter installed, from all
+  detected tools. Global git trace2 config and the background service are left
+  alone; use `autter uninstall` for those too.
+
+  --dry-run       Show what would be removed without removing anything
+  -v, --verbose   Show the diff of every file that changes",
     },
     HelpEntry {
         name: "uninstall",
         aliases: &[],
         summary: "Remove hooks, git trace2 config, and stop the background service",
         body: "\
-autter uninstall [--dry-run]
+autter uninstall [--yes] [--dry-run] [--verbose]
 
-  Remove IDE/agent hooks, clear global git trace2 settings, and stop the
-  background service. Does not delete the binary or PATH entries.",
+  Remove IDE/agent hooks and the editor extensions autter installed, clear
+  global git trace2 settings, and stop the background service. Does not delete
+  the binary or PATH entries.
+
+  Asks for confirmation at a terminal. Without a terminal (scripts, CI) it
+  refuses unless --yes is given.
+
+  -y, --yes       Don't ask for confirmation
+  --dry-run       Show what would be removed without removing anything
+  -v, --verbose   Show the diff of every file that changes",
     },
     HelpEntry {
         name: "ci",
@@ -804,6 +822,80 @@ autter telemetry <subcommand>
   on | off          Enable or disable telemetry",
     },
 ];
+
+/// True when `args` (a subcommand's arguments) ask for help: `-h` or `--help`
+/// in any position before a `--` separator. Exact matches only, so a value such
+/// as a commit message that merely mentions `--help` doesn't count.
+pub fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-h" || a == "--help")
+}
+
+/// Subcommands whose own handler prints richer (often per-subcommand) help and
+/// checks for `-h`/`--help` in every position before doing any work. Every
+/// other subcommand gets its help from the dispatcher, which never calls the
+/// handler at all. A command is only listed here once its handler is known to
+/// return on help before any side effect: list it and it can no longer be
+/// protected by the dispatcher.
+const HANDLES_OWN_HELP: &[&str] = &[
+    "ask",
+    "logs",
+    "threads",
+    "memory",
+    "context",
+    "mcp",
+    "ci",
+    "debug",
+    "onboard",
+    "onboarding",
+    "setup",
+    "login",
+    "whoami",
+    "notes",
+    "sync",
+    "telemetry",
+    "config",
+    "bg",
+    "d",
+    "daemon",
+];
+
+/// Whether the dispatcher should leave `-h`/`--help` to the subcommand's own
+/// handler (see [`HANDLES_OWN_HELP`]).
+pub fn handles_own_help(cmd: &str) -> bool {
+    HANDLES_OWN_HELP.contains(&cmd)
+}
+
+/// The error a subcommand prints for an argument it doesn't accept.
+pub fn unknown_option_message(cmd: &str, arg: &str) -> String {
+    format!(
+        "error: unknown option '{arg}' for 'autter {cmd}'\nRun 'autter {cmd} --help' for usage."
+    )
+}
+
+/// Print [`unknown_option_message`] and exit with the usage-error code. Used by
+/// subcommands that change the machine, so a mistyped flag never runs them
+/// with defaults the user didn't ask for.
+pub fn exit_unknown_option(cmd: &str, arg: &str) -> ! {
+    eprintln!("{}", unknown_option_message(cmd, arg));
+    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+}
+
+/// Exit with a usage error when `args` holds anything at all: for subcommands
+/// that take no arguments.
+pub fn reject_any_args(cmd: &str, args: &[String]) {
+    if let Some(arg) = args.first() {
+        exit_unknown_option(cmd, arg);
+    }
+}
+
+/// Whether `cmd` (or one of its aliases) has an entry in the help registry.
+pub fn has_command_help(cmd: &str) -> bool {
+    HELP_REGISTRY
+        .iter()
+        .any(|e| e.name == cmd || e.aliases.contains(&cmd))
+}
 
 /// Print the detailed help for a single subcommand, falling back to the
 /// top-level overview for unknown commands.

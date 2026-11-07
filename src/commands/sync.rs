@@ -42,6 +42,11 @@ impl From<crate::upload_hold::QueueCounts> for NotConnectedCounts {
 }
 
 pub fn handle_sync(args: &[String]) {
+    // Help in any position (`sync purge --help`) never purges or uploads.
+    if crate::commands::arg_parser::wants_help(args) {
+        print_help();
+        return;
+    }
     match args.first().map(|s| s.as_str()) {
         None => print_status(args),
         Some("status") => print_status(&args[1..]),

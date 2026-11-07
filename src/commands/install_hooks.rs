@@ -460,7 +460,13 @@ fn ensure_daemon(dry_run: bool) -> Result<(), String> {
 /// after the user consents — so `npm install` / bare `install-hooks` no longer
 /// mutate the machine silently.
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
-    let mut options = parse_install_options(args);
+    let mut options = match parse_install_options(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        }
+    };
     // Verbose output interleaves diffs, which don't belong on the rail.
     options.rail_layout =
         !options.verbose && std::io::stdout().is_terminal() && crate::ui::caps().tty;
@@ -579,60 +585,190 @@ fn run_with_options(options: InstallOptions) -> Result<InstallOutcome, AutterErr
     Ok(outcome)
 }
 
-/// Full uninstall: agent hooks + global trace2 + stop daemon.
-pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
-    let mut dry_run = false;
-    let mut verbose = false;
+/// Flags accepted by `autter uninstall`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct FullUninstallOptions {
+    pub dry_run: bool,
+    pub verbose: bool,
+    /// Skip the confirmation prompt (`--yes`/`-y`).
+    pub yes: bool,
+}
+
+/// Parse `autter uninstall` flags. Anything else is an error, so a mistyped
+/// flag never runs the uninstall with defaults the user didn't ask for.
+pub(crate) fn parse_full_uninstall_options(
+    args: &[String],
+) -> Result<FullUninstallOptions, String> {
+    let mut options = FullUninstallOptions::default();
     for arg in args {
-        if arg == "--dry-run" || arg == "--dry-run=true" {
-            dry_run = true;
-        }
-        if arg == "--verbose" || arg == "-v" {
-            verbose = true;
+        match arg.as_str() {
+            "--dry-run" | "--dry-run=true" => options.dry_run = true,
+            "--dry-run=false" => options.dry_run = false,
+            "--verbose" | "-v" => options.verbose = true,
+            "--yes" | "-y" => options.yes = true,
+            other => {
+                return Err(crate::commands::arg_parser::unknown_option_message(
+                    "uninstall",
+                    other,
+                ));
+            }
         }
     }
+    Ok(options)
+}
 
-    let statuses = run_uninstall(
-        &[
-            if dry_run {
-                "--dry-run".to_string()
-            } else {
-                String::new()
-            },
-            if verbose {
-                "--verbose".to_string()
-            } else {
-                String::new()
-            },
-        ]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>(),
-    )?;
+/// What `autter uninstall` should do about confirmation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UninstallConsent {
+    /// Go ahead: `--yes`, or a dry run that changes nothing.
+    Proceed,
+    /// Ask at the terminal first.
+    Ask,
+    /// No terminal to ask at and no `--yes`: refuse.
+    Refuse,
+}
 
-    if !dry_run {
-        let git_cmd = config::Config::fresh().git_cmd().to_string();
-        if let Err(e) = remove_global_git_config_section(&git_cmd, "trace2") {
-            eprintln!("Warning: could not remove global trace2 config: {e}");
-        }
-        if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths()
-            && let Err(e) = crate::commands::daemon::stop_daemon(
-                &daemon_config,
-                std::time::Duration::from_secs(5),
-            )
-        {
-            eprintln!("Warning: could not stop background service: {e}");
-        }
+pub(crate) fn uninstall_consent(
+    options: &FullUninstallOptions,
+    interactive: bool,
+) -> UninstallConsent {
+    if options.yes || options.dry_run {
+        UninstallConsent::Proceed
+    } else if interactive {
+        UninstallConsent::Ask
     } else {
-        eprintln!(
-            "[dry-run] would remove global git trace2 config and stop the background service"
-        );
+        UninstallConsent::Refuse
     }
+}
+
+fn confirm_full_uninstall() -> bool {
+    use std::io::{BufRead, Write};
+    eprintln!("This removes autter from this machine's tools:");
+    eprintln!("  - hooks from every coding agent and editor autter set up");
+    eprintln!("  - the editor extensions autter installed (VS Code, Cursor)");
+    eprintln!("  - autter's global git trace2 settings");
+    eprintln!("  - the background service (it is stopped)");
+    eprintln!("The autter binary, PATH entries and git notes are kept.");
+    eprint!("Uninstall? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Whether the global git config has a `[trace2]` section to remove.
+fn global_git_config_has_section(git_cmd: &str, section: &str) -> bool {
+    Command::new(git_cmd)
+        .args([
+            "config",
+            "--global",
+            "--get-regexp",
+            &format!("^{}\\.", section),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Full uninstall: agent hooks and editor extensions, global trace2, and stop
+/// the daemon. Asks first at a terminal; without one it needs `--yes`. Prints
+/// a line only for what was actually removed.
+pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
+    let options = match parse_full_uninstall_options(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        }
+    };
+
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    match uninstall_consent(&options, interactive) {
+        UninstallConsent::Proceed => {}
+        UninstallConsent::Ask => {
+            if !confirm_full_uninstall() {
+                eprintln!("Uninstall cancelled. Nothing was changed.");
+                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+            }
+        }
+        UninstallConsent::Refuse => {
+            eprintln!(
+                "error: `autter uninstall` removes autter's hooks, editor extensions, git trace2 settings and background service."
+            );
+            eprintln!(
+                "There's no terminal to confirm at, so nothing was changed. Re-run with --yes to uninstall, or --dry-run to see what would be removed."
+            );
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        }
+    }
+
+    let mut hook_args = Vec::new();
+    if options.dry_run {
+        hook_args.push("--dry-run".to_string());
+    }
+    if options.verbose {
+        hook_args.push("--verbose".to_string());
+    }
+    let statuses = run_uninstall(&hook_args)?;
+
+    let git_cmd = config::Config::fresh().git_cmd().to_string();
+    let had_trace2 = global_git_config_has_section(&git_cmd, "trace2");
+    let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths().ok();
+    let daemon_running = daemon_config
+        .as_ref()
+        .is_some_and(crate::commands::daemon::daemon_is_running_or_starting);
+
+    let mut removed: Vec<&str> = Vec::new();
+    if statuses
+        .values()
+        .any(|s| s == InstallStatus::Installed.as_str())
+    {
+        removed.push("IDE/agent hooks and editor extensions");
+    }
+
+    if options.dry_run {
+        if had_trace2 {
+            eprintln!("[dry-run] would remove the global git trace2 config");
+        }
+        if daemon_running {
+            eprintln!("[dry-run] would stop the background service");
+        }
+        return Ok(statuses);
+    }
+
+    if had_trace2 {
+        match remove_global_git_config_section(&git_cmd, "trace2") {
+            Ok(()) => removed.push("global git trace2 config"),
+            Err(e) => eprintln!("Warning: could not remove global trace2 config: {e}"),
+        }
+    }
+    if daemon_running && let Some(daemon_config) = daemon_config.as_ref() {
+        match crate::commands::daemon::stop_daemon(daemon_config, std::time::Duration::from_secs(5))
+        {
+            Ok(()) => removed.push("background service (stopped)"),
+            Err(e) => eprintln!("Warning: could not stop background service: {e}"),
+        }
+    }
+
+    if removed.is_empty() {
+        eprintln!(
+            "Nothing to uninstall: no autter hooks, trace2 config or running background service were found."
+        );
+    } else {
+        eprintln!("Removed: {}.", removed.join(", "));
+    }
+    eprintln!("Binary and PATH entries were left in place. Delete them manually if desired.");
 
     Ok(statuses)
 }
 
-fn parse_install_options(args: &[String]) -> InstallOptions {
+/// Parse `autter install-hooks` flags. Unknown arguments are an error, so a
+/// typo (or a flag from a newer version) never runs a real install.
+fn parse_install_options(args: &[String]) -> Result<InstallOptions, String> {
     let mut options = InstallOptions::default();
 
     for arg in args {
@@ -643,11 +779,16 @@ fn parse_install_options(args: &[String]) -> InstallOptions {
             "--skills" => options.install_skills = true,
             "--visual-studio-extension" => options.include_visual_studio_extension = true,
             "--system" => options.apply_system = true,
-            _ => {}
+            other => {
+                return Err(crate::commands::arg_parser::unknown_option_message(
+                    "install-hooks",
+                    other,
+                ));
+            }
         }
     }
 
-    options
+    Ok(options)
 }
 
 fn should_include_installer(id: &str, options: &InstallOptions) -> bool {
@@ -736,19 +877,36 @@ fn parse_git_og_cmd_path(contents: &str) -> Option<String> {
     })
 }
 
-/// Main entry point for uninstall-hooks command
-pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
-    // Parse flags
+/// Parse `autter uninstall-hooks` flags into `(dry_run, verbose)`. Unknown
+/// arguments are an error.
+pub(crate) fn parse_uninstall_hooks_options(args: &[String]) -> Result<(bool, bool), String> {
     let mut dry_run = false;
     let mut verbose = false;
     for arg in args {
-        if arg == "--dry-run" || arg == "--dry-run=true" {
-            dry_run = true;
-        }
-        if arg == "--verbose" || arg == "-v" {
-            verbose = true;
+        match arg.as_str() {
+            "--dry-run" | "--dry-run=true" => dry_run = true,
+            "--dry-run=false" => dry_run = false,
+            "--verbose" | "-v" => verbose = true,
+            other => {
+                return Err(crate::commands::arg_parser::unknown_option_message(
+                    "uninstall-hooks",
+                    other,
+                ));
+            }
         }
     }
+    Ok((dry_run, verbose))
+}
+
+/// Main entry point for uninstall-hooks command
+pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
+    let (dry_run, verbose) = match parse_uninstall_hooks_options(args) {
+        Ok(flags) => flags,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        }
+    };
 
     // Match the path resolution used at install time so uninstall targets the
     // same hook entries.
@@ -1241,50 +1399,58 @@ async fn async_run_uninstall(
                     continue;
                 }
 
-                if !check_result.hooks_installed {
+                let hooks_were_installed = check_result.hooks_installed;
+                if !hooks_were_installed {
                     statuses.insert(id.to_string(), InstallStatus::NotFound);
-                    continue;
+                } else {
+                    any_checked = true;
+
+                    // Uninstall hooks
+                    let spinner = Spinner::new(&format!("{}: removing hooks", name));
+                    spinner.start();
+
+                    match installer.uninstall_hooks(params, dry_run) {
+                        Ok(Some(diff)) => {
+                            if dry_run {
+                                spinner.pending(&format!("{}: Pending removal", name));
+                            } else {
+                                spinner.success(&format!("{}: Hooks removed", name));
+                            }
+                            if verbose {
+                                println!();
+                                print_diff(&diff);
+                            }
+                            has_changes = true;
+                            statuses.insert(id.to_string(), InstallStatus::Installed);
+                        }
+                        Ok(None) => {
+                            spinner.success(&format!("{}: No hooks to remove", name));
+                            statuses.insert(id.to_string(), InstallStatus::AlreadyInstalled);
+                        }
+                        Err(e) => {
+                            spinner.error(&format!("{}: Failed to remove hooks", name));
+                            eprintln!("  Error: {}", e);
+                            statuses.insert(id.to_string(), InstallStatus::NotFound);
+                        }
+                    }
                 }
 
-                any_checked = true;
-
-                // Uninstall hooks
-                let spinner = Spinner::new(&format!("{}: removing hooks", name));
-                spinner.start();
-
-                match installer.uninstall_hooks(params, dry_run) {
-                    Ok(Some(diff)) => {
-                        if dry_run {
-                            spinner.pending(&format!("{}: Pending removal", name));
-                        } else {
-                            spinner.success(&format!("{}: Hooks removed", name));
-                        }
-                        if verbose {
-                            println!();
-                            print_diff(&diff);
-                        }
-                        has_changes = true;
-                        statuses.insert(id.to_string(), InstallStatus::Installed);
-                    }
-                    Ok(None) => {
-                        spinner.success(&format!("{}: No hooks to remove", name));
-                        statuses.insert(id.to_string(), InstallStatus::AlreadyInstalled);
-                    }
-                    Err(e) => {
-                        spinner.error(&format!("{}: Failed to remove hooks", name));
-                        eprintln!("  Error: {}", e);
-                        statuses.insert(id.to_string(), InstallStatus::NotFound);
-                    }
-                }
-
-                // Uninstall extras
+                // Uninstall extras (editor extensions etc.) even when the hook
+                // config is already gone: install may have added them without
+                // hooks, and leaving them behind was a reported bug.
                 match installer.uninstall_extras(params, dry_run) {
                     Ok(results) => {
                         for result in results {
                             if result.changed {
                                 has_changes = true;
+                                any_checked = true;
+                                statuses.insert(id.to_string(), InstallStatus::Installed);
                             }
-                            if !result.message.is_empty() {
+                            // A tool whose hooks were already gone only
+                            // gets a line when something was removed.
+                            if !result.message.is_empty()
+                                && (result.changed || hooks_were_installed)
+                            {
                                 let extra_spinner = Spinner::new(&result.message);
                                 extra_spinner.start();
                                 if result.changed {
@@ -1311,17 +1477,18 @@ async fn async_run_uninstall(
         }
     }
 
-    if !any_checked {
-        println!("No autter hooks found to uninstall.");
-    } else if has_changes && dry_run {
-        println!(
-            "\n{}",
-            paint("33", "⚠ Dry-run mode (default). No changes were made.")
-        );
-        println!("To apply these changes, run:");
-        println!("{}", paint("1", "  autter uninstall-hooks --dry-run=false"));
-    } else if !has_changes {
-        println!("All autter hooks have been removed.");
+    // Only report what actually changed: a run that found nothing says so.
+    if !has_changes {
+        if any_checked {
+            println!("Nothing to remove: autter's hooks were already gone.");
+        } else {
+            println!("No autter hooks found to uninstall.");
+        }
+    } else if dry_run {
+        println!("\n{}", paint("33", "⚠ Dry run. No changes were made."));
+        println!("Run the same command without --dry-run to apply these changes.");
+    } else {
+        println!("Removed autter's hooks from the tools listed above.");
     }
 
     Ok(statuses)
@@ -1423,9 +1590,69 @@ mod tests {
         }
     }
 
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_install_options_rejects_unknown_args() {
+        // `install --foo` used to run a real install with the flag ignored.
+        let err = parse_install_options(&strings(&["--sytem"]))
+            .err()
+            .expect("unknown flag must be rejected");
+        assert!(err.contains("unknown option '--sytem'"), "{err}");
+        assert!(err.contains("autter install-hooks --help"), "{err}");
+        assert!(parse_install_options(&strings(&["extra"])).is_err());
+    }
+
+    #[test]
+    fn parse_uninstall_hooks_options_rejects_unknown_args() {
+        assert_eq!(
+            parse_uninstall_hooks_options(&strings(&["--dry-run", "-v"])).unwrap(),
+            (true, true)
+        );
+        assert_eq!(
+            parse_uninstall_hooks_options(&strings(&["--dry-run=false"])).unwrap(),
+            (false, false)
+        );
+        assert!(parse_uninstall_hooks_options(&strings(&["--force"])).is_err());
+    }
+
+    #[test]
+    fn parse_full_uninstall_options_accepts_yes_and_rejects_unknown() {
+        let options =
+            parse_full_uninstall_options(&strings(&["--yes", "--dry-run", "--verbose"])).unwrap();
+        assert!(options.yes && options.dry_run && options.verbose);
+        assert!(parse_full_uninstall_options(&strings(&["-y"])).unwrap().yes);
+        let err = parse_full_uninstall_options(&strings(&["--all"]))
+            .err()
+            .expect("unknown flag must be rejected");
+        assert!(err.contains("autter uninstall --help"), "{err}");
+    }
+
+    #[test]
+    fn uninstall_needs_confirmation_or_yes() {
+        let plain = FullUninstallOptions::default();
+        assert_eq!(uninstall_consent(&plain, true), UninstallConsent::Ask);
+        // No terminal and no --yes: refuse rather than uninstall silently.
+        assert_eq!(uninstall_consent(&plain, false), UninstallConsent::Refuse);
+        let yes = FullUninstallOptions {
+            yes: true,
+            ..Default::default()
+        };
+        assert_eq!(uninstall_consent(&yes, false), UninstallConsent::Proceed);
+        assert_eq!(uninstall_consent(&yes, true), UninstallConsent::Proceed);
+        // A dry run changes nothing, so it never needs confirmation.
+        let dry = FullUninstallOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        assert_eq!(uninstall_consent(&dry, false), UninstallConsent::Proceed);
+    }
+
     #[test]
     fn parse_install_options_defaults_visual_studio_extension_to_disabled() {
-        let options = parse_install_options(&[]);
+        let options = parse_install_options(&[]).unwrap();
 
         assert!(!options.include_visual_studio_extension);
         assert!(!should_include_installer(
@@ -1443,7 +1670,7 @@ mod tests {
             "--skills".to_string(),
             "-v".to_string(),
         ];
-        let options = parse_install_options(&args);
+        let options = parse_install_options(&args).unwrap();
 
         assert!(options.dry_run);
         assert!(options.verbose);
