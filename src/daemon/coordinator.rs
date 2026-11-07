@@ -196,6 +196,7 @@ mod tests {
             ref_changes: Vec::new(),
             confidence: Confidence::Low,
             wrapper_invocation_id: None,
+            agent_env: None,
         }
     }
 
@@ -222,6 +223,7 @@ mod tests {
             ref_changes: Vec::new(),
             confidence: Confidence::Low,
             wrapper_invocation_id: None,
+            agent_env: None,
         }
     }
 

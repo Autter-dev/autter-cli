@@ -68,6 +68,10 @@ pub struct NormalizedCommand {
     pub confidence: Confidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapper_invocation_id: Option<String>,
+    /// Background-agent detection variables from the command's own environment,
+    /// reported by git through trace2 `def_param` events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

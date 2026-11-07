@@ -17,6 +17,7 @@ const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "10";
 const TRACE2_EVENT_BRIEF_KEY: &str = "trace2.eventBrief";
+const TRACE2_ENV_VARS_KEY: &str = "trace2.envVars";
 const VISUAL_STUDIO_INSTALLER_ID: &str = "visual-studio";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -348,7 +349,38 @@ fn configure_daemon_trace2(dry_run: bool) -> Result<bool, AutterError> {
         unset_global_git_config_key(git_cmd, TRACE2_EVENT_BRIEF_KEY)?;
         changed = true;
     }
+    // Ask git to report the background-agent detection variables of every command, so
+    // the daemon decides "was this commit made by a cloud agent?" from the committing
+    // shell rather than from the daemon's own (frozen) environment. Names the user
+    // already lists are kept.
+    let existing_env_vars = global_git_config_values(git_cmd, TRACE2_ENV_VARS_KEY);
+    let merged_env_vars = merge_trace2_env_vars(
+        &existing_env_vars,
+        &crate::authorship::background_agent::trace2_env_vars_value(),
+    );
+    if existing_env_vars != [merged_env_vars.clone()] {
+        replace_global_git_config_value(git_cmd, TRACE2_ENV_VARS_KEY, &merged_env_vars)?;
+        changed = true;
+    }
     Ok(changed)
+}
+
+/// Union of the comma-separated names in `existing` values and `required`, keeping
+/// the user's names first and in order.
+fn merge_trace2_env_vars(existing: &[String], required: &str) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for name in existing
+        .iter()
+        .flat_map(|value| value.split(','))
+        .chain(required.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(",")
 }
 
 /// Every value of a global git config key (empty when unset or unreadable).

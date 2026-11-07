@@ -709,7 +709,12 @@ fn proxy_to_git(
             }
             if let Some(id) = wrapper_invocation_id {
                 cmd.env("AUTTER_WRAPPER_INVOCATION_ID", id);
-                cmd.env("GIT_TRACE2_ENV_VARS", "AUTTER_WRAPPER_INVOCATION_ID");
+                // Also report the background-agent detection variables so the daemon can
+                // attribute this command using its own environment.
+                cmd.env(
+                    "GIT_TRACE2_ENV_VARS",
+                    crate::authorship::background_agent::trace2_env_vars_value(),
+                );
             }
             unsafe {
                 let setpgid_flag = should_setpgid;
@@ -740,7 +745,12 @@ fn proxy_to_git(
             }
             if let Some(id) = wrapper_invocation_id {
                 cmd.env("AUTTER_WRAPPER_INVOCATION_ID", id);
-                cmd.env("GIT_TRACE2_ENV_VARS", "AUTTER_WRAPPER_INVOCATION_ID");
+                // Also report the background-agent detection variables so the daemon can
+                // attribute this command using its own environment.
+                cmd.env(
+                    "GIT_TRACE2_ENV_VARS",
+                    crate::authorship::background_agent::trace2_env_vars_value(),
+                );
             }
 
             #[cfg(windows)]

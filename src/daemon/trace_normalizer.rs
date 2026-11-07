@@ -54,6 +54,7 @@ pub struct TraceNormalizerState {
     pub sid_to_family: HashMap<String, FamilyKey>,
     pub prestart_root_cmd_names: HashMap<String, String>,
     pub root_wrapper_invocation_id: HashMap<String, String>,
+    pub root_agent_env: HashMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +126,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
             let _ = self.state.sid_to_worktree.remove(root_sid);
             let _ = self.state.sid_to_family.remove(root_sid);
             let _ = self.state.prestart_root_cmd_names.remove(root_sid);
+            let _ = self.state.root_agent_env.remove(root_sid);
         }
         removed
     }
@@ -154,6 +156,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
             let _ = self.state.sid_to_worktree.remove(&root_sid);
             let _ = self.state.sid_to_family.remove(&root_sid);
             let _ = self.state.prestart_root_cmd_names.remove(&root_sid);
+            let _ = self.state.root_agent_env.remove(&root_sid);
             removed.push(OrphanTraceRoot {
                 root_sid,
                 raw_argv: Vec::new(),
@@ -181,6 +184,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
                 let _ = self.state.sid_to_worktree.remove(root_sid);
                 let _ = self.state.sid_to_family.remove(root_sid);
                 let _ = self.state.prestart_root_cmd_names.remove(root_sid);
+                let _ = self.state.root_agent_env.remove(root_sid);
                 removed.push(OrphanTraceRoot {
                     root_sid: root_sid.clone(),
                     raw_argv: Vec::new(),
@@ -554,6 +558,19 @@ impl<B: GitBackend> TraceNormalizer<B> {
             self.state
                 .root_wrapper_invocation_id
                 .insert(root_sid.to_string(), value.to_string());
+        } else if let Some(param) = payload.get("param").and_then(Value::as_str)
+            && crate::authorship::background_agent::DETECTION_ENV_VARS.contains(&param)
+            && let Some(value) = payload.get("value").and_then(Value::as_str)
+            && !value.is_empty()
+        {
+            // Child processes report their (inherited) environment under the same root;
+            // the root process reports first, so keep the first value seen.
+            self.state
+                .root_agent_env
+                .entry(root_sid.to_string())
+                .or_default()
+                .entry(param.to_string())
+                .or_insert_with(|| value.to_string());
         }
         Ok(None)
     }
@@ -1068,6 +1085,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
             ref_changes,
             confidence,
             wrapper_invocation_id: self.state.root_wrapper_invocation_id.remove(root_sid),
+            agent_env: self.state.root_agent_env.remove(root_sid),
         };
 
         trace_debug_lifecycle(&format!(

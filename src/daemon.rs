@@ -2426,6 +2426,9 @@ fn materialize_commit_authorship_from_persisted_state_unchecked(
         author.to_string(),
         true,
         Some(&final_state),
+        // The command that made this commit is long gone, so its environment is unknown.
+        // Never fall back to the daemon's own environment.
+        &crate::authorship::background_agent::AgentEnv::default(),
     )?;
 
     Ok(true)
@@ -2961,6 +2964,7 @@ fn apply_rewrite_side_effect(
     rewrite_event: RewriteLogEvent,
     carryover_snapshot: Option<&HashMap<String, String>>,
     reset_pathspecs: Option<&[String]>,
+    agent_env: &crate::authorship::background_agent::AgentEnv,
 ) -> Result<(), AutterError> {
     let mut repo = find_repository_in_path(worktree)?;
     let author = repo.effective_author_identity().formatted_or_unknown();
@@ -3098,6 +3102,7 @@ fn apply_rewrite_side_effect(
                     author.clone(),
                     true,
                     final_state_override,
+                    agent_env,
                 )?;
             }
         }
@@ -3110,6 +3115,7 @@ fn apply_rewrite_side_effect(
                 &commit_amend.amended_commit_sha,
                 author.clone(),
                 final_state_override,
+                agent_env,
             )?;
         }
         _ => {
@@ -8042,6 +8048,11 @@ impl ActorDaemonCoordinator {
             }
         };
 
+        // Background-agent detection must use the committing command's environment
+        // (reported by git through trace2), never the daemon's own environment.
+        let agent_env = crate::authorship::background_agent::AgentEnv::from_pairs(
+            cmd.agent_env.iter().flatten(),
+        );
         for rewrite_event in rewrite_events {
             if let Some(worktree) = cmd.worktree.as_ref() {
                 let worktree = worktree.to_string_lossy().to_string();
@@ -8052,6 +8063,7 @@ impl ActorDaemonCoordinator {
                     rewrite_event.clone(),
                     carryover_snapshot.as_ref(),
                     reset_pathspecs.as_deref(),
+                    &agent_env,
                 )?;
             }
         }
@@ -9952,6 +9964,7 @@ mod tests {
             ref_changes: Vec::new(),
             confidence: crate::daemon::domain::Confidence::Low,
             wrapper_invocation_id: None,
+            agent_env: None,
         };
 
         let head = ActorDaemonCoordinator::resolve_stash_create_head_for_event(

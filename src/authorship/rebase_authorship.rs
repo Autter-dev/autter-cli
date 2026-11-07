@@ -3027,15 +3027,19 @@ pub fn rewrite_authorship_after_commit_amend(
         amended_commit,
         _human_author,
         None,
+        &crate::authorship::background_agent::AgentEnv::from_process(),
     )
 }
 
+/// `agent_env` is the environment of the `git commit --amend` command; see
+/// [`post_commit::post_commit_with_final_state`].
 pub fn rewrite_authorship_after_commit_amend_with_snapshot(
     repo: &Repository,
     original_commit: &str,
     amended_commit: &str,
     human_author: String,
     final_state_override: Option<&HashMap<String, String>>,
+    agent_env: &crate::authorship::background_agent::AgentEnv,
 ) -> Result<AuthorshipLog, AutterError> {
     use crate::authorship::virtual_attribution::VirtualAttributions;
 
@@ -3117,37 +3121,15 @@ pub fn rewrite_authorship_after_commit_amend_with_snapshot(
     authorship_log.metadata.base_commit_sha = amended_commit.to_string();
 
     // Fill unattributed lines with bg agent attribution (same as post_commit path)
-    if !matches!(
-        crate::authorship::background_agent::detect(),
-        crate::authorship::background_agent::BackgroundAgent::None
-            | crate::authorship::background_agent::BackgroundAgent::WithHooks { .. }
-    ) {
-        let diff_base = if parent_sha == "initial" {
-            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        } else {
-            &parent_sha
-        };
-        if let Ok(added_lines) = repo.diff_added_lines(diff_base, amended_commit, None) {
-            let committed_hunks: std::collections::HashMap<
-                String,
-                Vec<crate::authorship::authorship_log::LineRange>,
-            > = added_lines
-                .into_iter()
-                .filter(|(_, lines)| !lines.is_empty())
-                .map(|(path, lines)| {
-                    (
-                        path,
-                        crate::authorship::authorship_log::LineRange::compress_lines(&lines),
-                    )
-                })
-                .collect();
-            crate::authorship::background_agent::fill_unattributed_lines(
-                &mut authorship_log,
-                &committed_hunks,
-                &human_author,
-            );
-        }
-    }
+    let background_agent = crate::authorship::background_agent::detect_in(agent_env);
+    crate::authorship::background_agent::fill_unattributed_commit_lines(
+        repo,
+        &background_agent,
+        &mut authorship_log,
+        &parent_sha,
+        amended_commit,
+        &human_author,
+    );
 
     // Preserve human contributors from the original commit's note — deleting a
     // KnownHuman-attributed line removes the attribution coordinate but must not

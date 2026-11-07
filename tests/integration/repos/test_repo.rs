@@ -2263,6 +2263,12 @@ impl TestRepo {
                 DaemonConfig::trace2_event_target_for_path(&self.daemon_trace_socket_path()),
             );
             command.env("GIT_TRACE2_EVENT_NESTING", Self::trace2_nesting_value());
+            // Mirrors the global `trace2.envVars` that `autter install` writes, so git
+            // reports background-agent detection variables to the daemon.
+            command.env(
+                "GIT_TRACE2_ENV_VARS",
+                autter::authorship::background_agent::trace2_env_vars_value(),
+            );
         }
 
         if self.git_mode.uses_hooks() {

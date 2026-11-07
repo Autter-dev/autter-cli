@@ -568,6 +568,7 @@ mod tests {
             }],
             confidence: Confidence::Low,
             wrapper_invocation_id: None,
+            agent_env: None,
         }
     }
 

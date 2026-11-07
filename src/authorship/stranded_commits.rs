@@ -212,6 +212,9 @@ pub fn recover_stranded_commit(
         author.to_string(),
         true,
         Some(&final_state),
+        // The shell that made this commit is gone, so its environment is unknown;
+        // never credit untracked lines to a background agent on a guess.
+        &crate::authorship::background_agent::AgentEnv::default(),
     )?;
     Ok(())
 }

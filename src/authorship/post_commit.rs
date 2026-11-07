@@ -72,9 +72,13 @@ pub fn post_commit(
         human_author,
         supress_output,
         None,
+        &crate::authorship::background_agent::AgentEnv::from_process(),
     )
 }
 
+/// `agent_env` is the environment of the git command that made the commit. It decides
+/// whether the commit came from a background agent; inside the daemon it must come from
+/// the command's trace2 data, never from the daemon's own environment.
 pub fn post_commit_with_final_state(
     repo: &Repository,
     base_commit: Option<String>,
@@ -82,6 +86,7 @@ pub fn post_commit_with_final_state(
     human_author: String,
     supress_output: bool,
     final_state_override: Option<&HashMap<String, String>>,
+    agent_env: &crate::authorship::background_agent::AgentEnv,
 ) -> Result<(String, AuthorshipLog), AutterError> {
     // Use base_commit parameter if provided, otherwise use "initial" for empty repos
     // This matches the convention in checkpoint.rs
@@ -145,37 +150,15 @@ pub fn post_commit_with_final_state(
     // No-hooks background agents (Devin, Codex Cloud, etc.) may not fire checkpoints
     // for all edits. Attribute any committed lines that have no existing attestation
     // ("holes") to the detected agent, preserving explicit attributions.
-    if !matches!(
-        crate::authorship::background_agent::detect(),
-        crate::authorship::background_agent::BackgroundAgent::None
-            | crate::authorship::background_agent::BackgroundAgent::WithHooks { .. }
-    ) {
-        let diff_base = if parent_sha == "initial" {
-            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        } else {
-            &parent_sha
-        };
-        if let Ok(added_lines) = repo.diff_added_lines(diff_base, &commit_sha, None) {
-            let committed_hunks: HashMap<
-                String,
-                Vec<crate::authorship::authorship_log::LineRange>,
-            > = added_lines
-                .into_iter()
-                .filter(|(_, lines)| !lines.is_empty())
-                .map(|(path, lines)| {
-                    (
-                        path,
-                        crate::authorship::authorship_log::LineRange::compress_lines(&lines),
-                    )
-                })
-                .collect();
-            crate::authorship::background_agent::fill_unattributed_lines(
-                &mut authorship_log,
-                &committed_hunks,
-                &human_author,
-            );
-        }
-    }
+    let background_agent = crate::authorship::background_agent::detect_in(agent_env);
+    crate::authorship::background_agent::fill_unattributed_commit_lines(
+        repo,
+        &background_agent,
+        &mut authorship_log,
+        &parent_sha,
+        &commit_sha,
+        &human_author,
+    );
 
     // Long-lived daemon processes should read a fresh config snapshot.
     // Always use Config::fresh() to support runtime config updates
