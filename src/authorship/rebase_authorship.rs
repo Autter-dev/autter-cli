@@ -185,8 +185,11 @@ pub fn rewrite_authorship_if_needed(
             }
             // --squash always fails if repo is not clean
             // this clears old working logs in the event you reset, make manual changes, reset, try again
-            repo.storage
-                .delete_working_log_for_base_commit(&merge_squash.base_head)?;
+            // (`cherry-pick -n` may run on a dirty tree, so its live log is kept.)
+            if !merge_squash.preserve_working_log {
+                repo.storage
+                    .delete_working_log_for_base_commit(&merge_squash.base_head)?;
+            }
             if merge_squash.staged_file_blobs.is_empty() {
                 tracing::debug!(
                     "Skipping immediate merge --squash pre-commit prep for {} because no staged snapshot was captured; commit replay will reconstruct from the committed final state",
@@ -1191,11 +1194,27 @@ pub fn rewrite_authorship_after_rebase_v2(
     // Step 1: Use AI-touched files directly from the note cache as pathspecs.
     // This eliminates a diff-tree --stdin subprocess call entirely.
     // The collect_changed_file_contents step will correctly filter to only files that changed.
-    let pathspecs: Vec<String> = note_cache.ai_touched_files.iter().cloned().collect();
+    let mut pathspecs: Vec<String> = note_cache.ai_touched_files.iter().cloned().collect();
     timing_phases.push((
         format!("pathspecs_from_note_cache ({} files)", pathspecs.len()),
         0,
     ));
+
+    // If the branch we rebased onto renamed an AI-touched file, the original
+    // commits changed it under its old path and the rebased commits change it
+    // under the new one. Track both paths, and move the original attribution to
+    // the new path once it is loaded, so it follows the file.
+    let upstream_renames = match new_commits.first() {
+        Some(first_new_commit) if !pathspecs.is_empty() => {
+            upstream_renames_for_rebase(repo, original_head, first_new_commit, &pathspecs)
+        }
+        _ => HashMap::new(),
+    };
+    for new_path in upstream_renames.values() {
+        if !pathspecs.contains(new_path) {
+            pathspecs.push(new_path.clone());
+        }
+    }
 
     if pathspecs.is_empty() {
         // No AI-touched files were rewritten. Preserve metadata-only / prompt-only notes by remapping
@@ -1379,6 +1398,18 @@ pub fn rewrite_authorship_after_rebase_v2(
         format!("attribution_reconstruction ({} pathspecs)", pathspecs.len()),
         va_phase_start.elapsed().as_millis(),
     ));
+
+    for (old_path, new_path) in &upstream_renames {
+        if current_attributions.contains_key(new_path) {
+            continue;
+        }
+        if let Some(attrs) = current_attributions.remove(old_path) {
+            current_attributions.insert(new_path.clone(), attrs);
+        }
+        if let Some(content) = current_file_contents.remove(old_path) {
+            current_file_contents.insert(new_path.clone(), content);
+        }
+    }
 
     // Step 2c: Read blob contents — only for the FIRST commit that touches each file.
     // Subsequent commits use hunk-based transfer which doesn't need blob content.
@@ -2002,6 +2033,65 @@ pub fn rewrite_authorship_after_rebase_v2(
 /// * `source_commits` - Vector of source commit SHAs (commits being cherry-picked), oldest first
 /// * `new_commits` - Vector of new commit SHAs (after cherry-pick), oldest first
 /// * `_human_author` - The human author identifier (unused in this implementation)
+/// Renames of `paths` made by the branch a rebase replayed onto: compares the
+/// fork point of the original branch with the parent of the first rebased
+/// commit, with rename detection. Returns old path -> new path. Best effort: any
+/// git failure yields no renames, which is the previous behavior.
+fn upstream_renames_for_rebase(
+    repo: &Repository,
+    original_head: &str,
+    first_new_commit: &str,
+    paths: &[String],
+) -> HashMap<String, String> {
+    let wanted: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let Some(merge_base) = repo
+        .merge_base(original_head.to_string(), first_new_commit.to_string())
+        .ok()
+        .flatten()
+    else {
+        return HashMap::new();
+    };
+    let mut args = repo.global_args_for_exec();
+    args.extend([
+        "diff".to_string(),
+        "--no-ext-diff".to_string(),
+        "--name-status".to_string(),
+        "--find-renames".to_string(),
+        "-z".to_string(),
+        merge_base,
+        format!("{}^", first_new_commit),
+    ]);
+    let Ok(output) = exec_git(&args) else {
+        return HashMap::new();
+    };
+    parse_name_status_renames(&output.stdout, &wanted)
+}
+
+/// Parse `git diff --name-status -z` output and keep renames whose old path is
+/// in `wanted`.
+fn parse_name_status_renames(raw: &[u8], wanted: &HashSet<&str>) -> HashMap<String, String> {
+    let mut renames = HashMap::new();
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .map(|f| String::from_utf8_lossy(f).to_string());
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            continue;
+        }
+        if status.starts_with('R') || status.starts_with('C') {
+            let (Some(old_path), Some(new_path)) = (fields.next(), fields.next()) else {
+                break;
+            };
+            if status.starts_with('R') && wanted.contains(old_path.as_str()) {
+                renames.insert(old_path, new_path);
+            }
+        } else if fields.next().is_none() {
+            break;
+        }
+    }
+    renames
+}
+
 pub fn rewrite_authorship_after_cherry_pick(
     repo: &Repository,
     source_commits: &[String],
@@ -4804,4 +4894,25 @@ pub fn transform_attributions_to_final_state(
         prompts,
         ts,
     ))
+}
+
+#[cfg(test)]
+mod upstream_rename_parse_tests {
+    use super::parse_name_status_renames;
+    use std::collections::HashSet;
+
+    #[test]
+    fn keeps_only_wanted_renames() {
+        let raw = b"R100\0old.txt\0new.txt\0M\0other.txt\0R087\0skip.txt\0moved.txt\0C100\0a.txt\0b.txt\0";
+        let wanted: HashSet<&str> = ["old.txt", "a.txt"].into_iter().collect();
+        let renames = parse_name_status_renames(raw, &wanted);
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames.get("old.txt").map(String::as_str), Some("new.txt"));
+    }
+
+    #[test]
+    fn empty_output_has_no_renames() {
+        let wanted: HashSet<&str> = ["old.txt"].into_iter().collect();
+        assert!(parse_name_status_renames(b"", &wanted).is_empty());
+    }
 }

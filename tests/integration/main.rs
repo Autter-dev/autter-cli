@@ -14,6 +14,7 @@ mod ai_tab;
 mod amend;
 mod amp;
 mod antigravity;
+mod attribution_rewrites;
 mod attribution_tracker_comprehensive;
 mod background_agent_attribution;
 mod badge;

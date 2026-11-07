@@ -186,6 +186,11 @@ pub struct MergeSquashEvent {
     pub base_head: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub staged_file_blobs: HashMap<String, String>,
+    /// Keep the base commit's working log instead of clearing it. `merge --squash`
+    /// needs a clean tree, so a leftover log there is stale; `cherry-pick -n`
+    /// does not, so uncommitted attribution may still be live and must be kept.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preserve_working_log: bool,
 }
 
 impl MergeSquashEvent {
@@ -202,7 +207,15 @@ impl MergeSquashEvent {
             base_branch,
             base_head,
             staged_file_blobs,
+            preserve_working_log: false,
         }
+    }
+
+    /// The squashed changes came from `git cherry-pick -n`, so the base commit's
+    /// working log may hold live uncommitted attribution.
+    pub fn with_preserved_working_log(mut self) -> Self {
+        self.preserve_working_log = true;
+        self
     }
 }
 

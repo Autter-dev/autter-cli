@@ -394,9 +394,7 @@ worktree_test_wrappers! {
 }
 
 worktree_test_wrappers! {
-    fn notes_sync_fetch_does_not_import_authorship_notes() {
-        let mode = TestRepo::git_mode();
-
+    fn notes_sync_fetch_imports_authorship_notes_without_clobbering_local() {
         let (local, _upstream) = TestRepo::new_with_remote();
 
         fs::write(local.path().join("fetch-seed.txt"), "seed\n")
@@ -437,19 +435,51 @@ worktree_test_wrappers! {
             "local note should be absent before fetch"
         );
 
+        // A local-only note on another commit must survive the fetch (merge, not overwrite).
+        fs::write(local.path().join("local-only.txt"), "local\n")
+            .expect("failed to write local-only file");
+        local
+            .git_og(&["add", "local-only.txt"])
+            .expect("add should succeed");
+        local
+            .git_og(&["commit", "-m", "local-only commit"])
+            .expect("local-only commit should succeed");
+        let local_sha = local
+            .git_og(&["rev-parse", "HEAD"])
+            .expect("rev-parse should succeed")
+            .trim()
+            .to_string();
+        local
+            .git_og(&[
+                "notes",
+                "--ref=ai",
+                "add",
+                "-m",
+                "local-only-note",
+                local_sha.as_str(),
+            ])
+            .expect("adding local note should succeed");
+
         local
             .git(&["fetch", "origin"])
             .expect("fetch should succeed");
 
         let fetched_note = local.read_authorship_note(&seed_sha);
-        match mode {
-            GitTestMode::Daemon | GitTestMode::WrapperDaemon => assert!(
-                fetched_note.is_none(),
-                "plain git fetch should not import authorship note for commit {} in {:?} mode",
-                seed_sha,
-                mode
-            ),
-        }
+        assert!(
+            fetched_note
+                .as_deref()
+                .is_some_and(|note| note.contains("fetch-seed-note")),
+            "plain git fetch should import the remote authorship note for commit {}",
+            seed_sha
+        );
+        let local_note = local.read_authorship_note(&local_sha);
+        assert!(
+            local_note
+                .as_deref()
+                .is_some_and(|note| note.contains("local-only-note")),
+            "plain git fetch must keep local-only authorship note for commit {}",
+            local_sha
+        );
     }
 }
 

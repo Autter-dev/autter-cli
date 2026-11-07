@@ -1774,6 +1774,58 @@ fn apply_pull_notes_sync_side_effect(
     Ok(())
 }
 
+/// Import authorship notes after a plain `git fetch`, the same way `git pull`
+/// and `autter fetch-notes` do: notes land in a tracking ref and are merged into
+/// `refs/notes/ai`, so local notes are never overwritten.
+fn apply_fetch_notes_sync_side_effect(
+    worktree: &str,
+    command: Option<&str>,
+    args: &[String],
+) -> Result<(), AutterError> {
+    if !crate::config::Config::get()
+        .notes_backend_kind()
+        .uses_git_notes()
+    {
+        return Ok(());
+    }
+    // autter's own notes fetch is a `git fetch` with a `refs/notes/...` refspec;
+    // reacting to it would fetch again forever. A user fetching notes by hand
+    // has already done what this would do. A dry run fetches nothing.
+    if args.iter().any(|arg| arg.contains("refs/notes/") || arg == "--dry-run") {
+        return Ok(());
+    }
+    let repo = find_repository_in_path(worktree)?;
+    let parsed = parsed_invocation_for_side_effect(command, args);
+    let remotes: Vec<String> = if parsed.command_args.iter().any(|arg| arg == "--all") {
+        repo.remotes()
+            .ok()
+            .map(|r| {
+                (0..r.len())
+                    .filter_map(|i| r.get(i).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        match fetch_remote_from_args(&repo, &parsed) {
+            Ok(remote) => vec![remote],
+            Err(error) => {
+                tracing::debug!(%error, "notes sync: failed to determine fetch remote");
+                return Ok(());
+            }
+        }
+    };
+    for remote in remotes {
+        if let Err(error) = fetch_authorship_notes(&repo, &remote) {
+            tracing::debug!(
+                %error,
+                %remote,
+                "notes sync: failed to fetch authorship notes after git fetch"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn apply_clone_notes_sync_side_effect(worktree: &str) -> Result<(), AutterError> {
     let repo = find_repository_in_path(worktree)?;
     if let Err(error) = fetch_authorship_notes(&repo, "origin") {
@@ -3452,6 +3504,31 @@ fn resolve_cherry_pick_source_refs(
     context: &str,
 ) -> Result<Vec<String>, AutterError> {
     let mut resolved = Vec::new();
+    // `A..B`, `A...B` and `^A B` select a set of commits, which git picks oldest
+    // first. Expand them the same way before resolving each commit.
+    if source_refs.iter().any(|r| is_cherry_pick_range_spec(r)) {
+        let mut args = vec![
+            "-C".to_string(),
+            worktree.to_string_lossy().to_string(),
+            "rev-list".to_string(),
+            "--reverse".to_string(),
+        ];
+        args.extend(source_refs.iter().cloned());
+        args.push("--".to_string());
+        let output = exec_git(&args).map_err(|err| {
+            AutterError::Generic(format!(
+                "{} failed to expand cherry-pick range {:?}: {}",
+                context, source_refs, err
+            ))
+        })?;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let oid = line.trim();
+            if is_valid_oid(oid) && !is_zero_oid(oid) {
+                resolved.push(oid.to_string());
+            }
+        }
+        return Ok(resolved);
+    }
     let repo = find_repository_in_path(worktree.to_string_lossy().as_ref())?;
     for src in source_refs {
         if is_valid_oid(src) && !is_zero_oid(src) {
@@ -3473,6 +3550,86 @@ fn resolve_cherry_pick_source_refs(
         }
     }
     Ok(resolved)
+}
+
+/// True for a cherry-pick argument that names a set of commits rather than one
+/// commit: `A..B`, `A...B` or a negated `^A`.
+fn is_cherry_pick_range_spec(arg: &str) -> bool {
+    arg.contains("..") || arg.starts_with('^')
+}
+
+/// True when `git cherry-pick` was told not to commit (`-n` / `--no-commit`).
+fn cherry_pick_is_no_commit(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "-n" || arg == "--no-commit")
+}
+
+/// Git dir of the worktree (per-worktree, so linked worktrees each get their
+/// own), found without spawning git. Used for small state files that must
+/// outlive the daemon.
+fn absolute_git_dir_for_worktree(worktree: &Path) -> Option<PathBuf> {
+    crate::git::repo_state::git_dir_for_worktree(worktree)
+}
+
+/// File that holds the source refs of a cherry-pick that stopped on a conflict,
+/// so `--continue` after a daemon restart still knows what was picked.
+fn pending_cherry_pick_sources_path(worktree: &Path) -> Option<PathBuf> {
+    absolute_git_dir_for_worktree(worktree)
+        .map(|dir| dir.join("ai").join("pending_cherry_pick_sources.json"))
+}
+
+fn write_pending_cherry_pick_sources_file(worktree: &Path, sources: &[String]) {
+    let Some(path) = pending_cherry_pick_sources_path(worktree) else {
+        return;
+    };
+    if sources.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_vec(sources) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(&path, bytes) {
+                tracing::debug!(
+                    %err,
+                    path = %path.display(),
+                    "failed to persist pending cherry-pick sources"
+                );
+            }
+        }
+        Err(err) => tracing::debug!(%err, "failed to serialize pending cherry-pick sources"),
+    }
+}
+
+fn read_pending_cherry_pick_sources_file(worktree: &Path) -> Vec<String> {
+    pending_cherry_pick_sources_path(worktree)
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// True while git's multi-commit sequencer still has picks left to apply.
+fn cherry_pick_sequencer_in_progress(worktree: &Path) -> bool {
+    absolute_git_dir_for_worktree(worktree)
+        .is_some_and(|dir| dir.join("sequencer").join("todo").exists())
+}
+
+/// True when HEAD's last reflog entry was written by a plain `git commit` that
+/// concluded a conflicted cherry-pick (git records it as `commit (cherry-pick)`).
+fn head_reflog_is_cherry_pick_commit(worktree: &Path) -> bool {
+    let args = vec![
+        "-C".to_string(),
+        worktree.to_string_lossy().to_string(),
+        "reflog".to_string(),
+        "-1".to_string(),
+        "--format=%gs".to_string(),
+        "HEAD".to_string(),
+    ];
+    exec_git(&args)
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .is_some_and(|subject| subject.starts_with("commit (cherry-pick)"))
 }
 
 fn rebase_is_control_mode(cmd: &crate::daemon::domain::NormalizedCommand) -> bool {
@@ -6486,12 +6643,32 @@ impl ActorDaemonCoordinator {
                 AutterError::Generic("pending cherry-pick sources map lock poisoned".to_string())
             })?;
         let key = Self::rewrite_worktree_key(worktree);
+        write_pending_cherry_pick_sources_file(worktree, &sources);
         if sources.is_empty() {
             map.remove(&key);
         } else {
             map.insert(key, sources);
         }
         Ok(())
+    }
+
+    /// Source refs of the cherry-pick in progress for this worktree, without
+    /// consuming them. Falls back to the copy on disk after a daemon restart.
+    fn peek_pending_cherry_pick_sources_for_worktree(
+        &self,
+        worktree: &Path,
+    ) -> Result<Vec<String>, AutterError> {
+        let map = self
+            .pending_cherry_pick_sources_by_worktree
+            .lock()
+            .map_err(|_| {
+                AutterError::Generic("pending cherry-pick sources map lock poisoned".to_string())
+            })?;
+        if let Some(sources) = map.get(&Self::rewrite_worktree_key(worktree)) {
+            return Ok(sources.clone());
+        }
+        drop(map);
+        Ok(read_pending_cherry_pick_sources_file(worktree))
     }
 
     fn take_pending_cherry_pick_sources_for_worktree(
@@ -6504,9 +6681,11 @@ impl ActorDaemonCoordinator {
             .map_err(|_| {
                 AutterError::Generic("pending cherry-pick sources map lock poisoned".to_string())
             })?;
-        Ok(map
-            .remove(&Self::rewrite_worktree_key(worktree))
-            .unwrap_or_default())
+        let in_memory = map.remove(&Self::rewrite_worktree_key(worktree));
+        drop(map);
+        // After a daemon restart the in-memory map is empty; the sources the
+        // conflicted pick started with are still on disk.
+        Ok(in_memory.unwrap_or_else(|| read_pending_cherry_pick_sources_file(worktree)))
     }
 
     fn clear_pending_cherry_pick_sources_for_worktree(
@@ -6520,6 +6699,8 @@ impl ActorDaemonCoordinator {
                 AutterError::Generic("pending cherry-pick sources map lock poisoned".to_string())
             })?;
         map.remove(&Self::rewrite_worktree_key(worktree));
+        drop(map);
+        write_pending_cherry_pick_sources_file(worktree, &[]);
         Ok(())
     }
 
@@ -6852,6 +7033,106 @@ impl ActorDaemonCoordinator {
         )))
     }
 
+    /// A conflicted cherry-pick can be finished with a plain `git commit` instead
+    /// of `git cherry-pick --continue`. Git then never reports a completed
+    /// cherry-pick, so the picked commits would keep only what the working log
+    /// saw (nothing from the source). When that commit concluded the whole pick
+    /// (no sequencer work left), map it back to its sources like `--continue` does.
+    fn cherry_pick_concluded_by_plain_commit(
+        &self,
+        cmd: &crate::daemon::domain::NormalizedCommand,
+        new_head: &str,
+    ) -> Result<Option<CherryPickCompleteEvent>, AutterError> {
+        if cmd.primary_command.as_deref() != Some("commit") || cmd.exit_code != 0 {
+            return Ok(None);
+        }
+        let Some(worktree) = cmd.worktree.as_ref() else {
+            return Ok(None);
+        };
+        let pending = self.peek_pending_cherry_pick_sources_for_worktree(worktree)?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        if !head_reflog_is_cherry_pick_commit(worktree) {
+            return Ok(None);
+        }
+        if cherry_pick_sequencer_in_progress(worktree) {
+            // More picks follow; `--continue` will map the whole chain.
+            return Ok(None);
+        }
+        let sources = self.take_pending_cherry_pick_sources_for_worktree(worktree)?;
+        let mapped = strict_cherry_pick_mappings_from_command(
+            cmd,
+            new_head,
+            sources,
+            "cherry_pick_plain_commit",
+        );
+        self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
+        let (original_head, source_commits, new_commits) = match mapped {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                tracing::debug!(%error, "plain commit did not map to cherry-pick sources");
+                return Ok(None);
+            }
+        };
+        Ok(Some(CherryPickCompleteEvent::new(
+            original_head,
+            new_head.to_string(),
+            source_commits,
+            new_commits,
+        )))
+    }
+
+    /// `git cherry-pick -n` applies the picked changes without committing. Treat
+    /// it like `merge --squash` so the next commit inherits the source commits'
+    /// attribution instead of recording the picked lines as untracked.
+    fn synthesize_cherry_pick_no_commit_squash_event(
+        cmd: &crate::daemon::domain::NormalizedCommand,
+    ) -> Result<Option<MergeSquashEvent>, AutterError> {
+        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("cherry-pick") {
+            return Ok(None);
+        }
+        if !cherry_pick_is_no_commit(&cmd.invoked_args) {
+            return Ok(None);
+        }
+        let Some(worktree) = cmd.worktree.as_deref() else {
+            return Ok(None);
+        };
+        let source_refs = cherry_pick_source_refs_from_command(cmd);
+        if source_refs.is_empty() {
+            return Ok(None);
+        }
+        let sources =
+            resolve_cherry_pick_source_refs(&source_refs, worktree, "cherry_pick_no_commit")?;
+        let Some(source_head) = sources.last().cloned() else {
+            return Ok(None);
+        };
+        let Some(base_head) = cmd
+            .pre_repo
+            .as_ref()
+            .and_then(|repo| repo.head.clone())
+            .or_else(|| cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()))
+            .filter(|value| is_valid_oid(value) && !is_zero_oid(value))
+        else {
+            return Ok(None);
+        };
+        let base_branch = cmd
+            .pre_repo
+            .as_ref()
+            .and_then(|repo| repo.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string());
+        Ok(Some(
+            MergeSquashEvent::new(
+                source_refs.join(" "),
+                source_head,
+                base_branch,
+                base_head,
+                HashMap::new(),
+            )
+            .with_preserved_working_log(),
+        ))
+    }
+
     fn rewrite_events_from_semantic_events(
         &self,
         cmd: &crate::daemon::domain::NormalizedCommand,
@@ -6866,7 +7147,10 @@ impl ActorDaemonCoordinator {
         }) {
             None
         } else {
-            Self::synthesize_merge_squash_event_from_command(cmd)?
+            match Self::synthesize_merge_squash_event_from_command(cmd)? {
+                Some(event) => Some(event),
+                None => Self::synthesize_cherry_pick_no_commit_squash_event(cmd)?,
+            }
         };
         for event in events {
             match event {
@@ -6880,6 +7164,11 @@ impl ActorDaemonCoordinator {
                         out.push(RewriteLogEvent::merge_squash(merge_squash));
                     }
                     out.push(RewriteLogEvent::commit(base.clone(), new_head.clone()));
+                    if let Some(cherry_pick) =
+                        self.cherry_pick_concluded_by_plain_commit(cmd, new_head)?
+                    {
+                        out.push(RewriteLogEvent::cherry_pick_complete(cherry_pick));
+                    }
                 }
                 crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head } => {
                     if old_head.is_empty()
@@ -7105,14 +7394,20 @@ impl ActorDaemonCoordinator {
                             "cherry-pick complete event missing valid new head".to_string(),
                         ));
                     }
-                    let pending_sources = cmd
-                        .worktree
-                        .as_ref()
-                        .and_then(|worktree| {
-                            self.take_pending_cherry_pick_sources_for_worktree(worktree)
-                                .ok()
-                        })
-                        .unwrap_or_default();
+                    // A pick that names its commits on the command line uses those;
+                    // only `--continue` / `--skip` fall back to the sources saved when
+                    // the pick stopped (which may be on disk after a daemon restart).
+                    let pending_sources = if cherry_pick_source_refs_from_command(cmd).is_empty() {
+                        cmd.worktree
+                            .as_ref()
+                            .and_then(|worktree| {
+                                self.take_pending_cherry_pick_sources_for_worktree(worktree)
+                                    .ok()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let (resolved_original_head, source_commits, new_commits) =
                         strict_cherry_pick_mappings_from_command(
                             cmd,
@@ -7566,6 +7861,14 @@ impl ActorDaemonCoordinator {
                 }
             }
         }
+        // `cherry-pick --quit` ends the pick without a completion or abort event;
+        // forget its sources so a later unrelated commit is not mapped to them.
+        if cmd.primary_command.as_deref() == Some("cherry-pick")
+            && cmd.invoked_args.iter().any(|arg| arg == "--quit")
+            && let Some(worktree) = cmd.worktree.as_ref()
+        {
+            self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
+        }
         if cmd.exit_code != 0 {
             if cmd.primary_command.as_deref() == Some("rebase") {
                 let worktree = cmd.worktree.as_ref().ok_or_else(|| {
@@ -7601,11 +7904,19 @@ impl ActorDaemonCoordinator {
                         cmd.root_sid
                     ))
                 })?;
-                if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
+                if cmd
+                    .invoked_args
+                    .iter()
+                    .any(|arg| arg == "--abort" || arg == "--quit")
+                {
                     self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
                 } else if cmd.exit_code != 0 {
                     let source_refs = cherry_pick_source_refs_from_command(cmd);
-                    self.set_pending_cherry_pick_sources_for_worktree(worktree, source_refs)?;
+                    // `--continue` / `--skip` that stop on the next conflict carry no
+                    // source refs of their own; keep the ones the pick started with.
+                    if !source_refs.is_empty() {
+                        self.set_pending_cherry_pick_sources_for_worktree(worktree, source_refs)?;
+                    }
                 }
             }
             // Fix #957: `checkout/switch --merge` exits with code 1 when it produces
@@ -7662,6 +7973,13 @@ impl ActorDaemonCoordinator {
                     }
                     crate::daemon::domain::SemanticEvent::PullCompleted { .. } => {
                         let _ = apply_pull_notes_sync_side_effect(
+                            &worktree,
+                            cmd.invoked_command.as_deref(),
+                            &cmd.invoked_args,
+                        );
+                    }
+                    crate::daemon::domain::SemanticEvent::FetchCompleted { .. } => {
+                        let _ = apply_fetch_notes_sync_side_effect(
                             &worktree,
                             cmd.invoked_command.as_deref(),
                             &cmd.invoked_args,
