@@ -160,7 +160,13 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         "background service",
         crate::diagnostics::ensure_daemon_ready_for_self_checks(),
     );
-    let daemon_ok = daemon_check.status != DoctorStatus::Failed;
+    // Skipped means the service is intentionally not running (before
+    // onboarding), so there is nothing to send a git event to.
+    let daemon_check_skipped = daemon_check.status == DoctorStatus::Skipped;
+    let daemon_ok = !matches!(
+        daemon_check.status,
+        DoctorStatus::Failed | DoctorStatus::Skipped
+    );
     reporter.add(daemon_check);
 
     // Separately: do real git trace2 events reach the service? A failure here
@@ -176,7 +182,11 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         reporter.add(skipped_check(
             SECTION_SERVICE,
             "trace2 ingestion",
-            "skipped -- fix the background service check first",
+            if daemon_check_skipped {
+                "skipped -- the background service starts after `autter onboard`"
+            } else {
+                "skipped -- fix the background service check first"
+            },
         ));
     }
 

@@ -86,8 +86,8 @@ pub fn run_device_login_with(login_ui: LoginUi) -> Result<LoginOutcome, String> 
         let ctx = crate::api::client::ApiContext::new(None);
         if ctx.auth_token.is_some() {
             crate::auth::notice::clear_sync_auth_blocked();
-            eprintln!("Stored credentials still work. Resuming cloud sync.");
-            resume_cloud_sync_after_login(false);
+            eprintln!("Stored credentials still work.");
+            resume_cloud_sync_after_login(false, login_ui.decline);
             return Ok(LoginOutcome::LoggedIn);
         }
         eprintln!("Stored credentials could not authenticate. Starting a new sign-in...\n");
@@ -162,7 +162,7 @@ pub fn run_device_login_with(login_ui: LoginUi) -> Result<LoginOutcome, String> 
         caps.paint("1;32", &format!("{ok} CLI authorization successful."))
     );
     print_login_identity(&creds.access_token);
-    resume_cloud_sync_after_login(false);
+    resume_cloud_sync_after_login(false, login_ui.decline);
 
     Ok(LoginOutcome::LoggedIn)
 }
@@ -267,7 +267,7 @@ fn finish_interactive(
         &format!("Signed in as {}", identity_summary(&creds.access_token)),
         login_ui.counter,
     );
-    resume_cloud_sync_after_login(true);
+    resume_cloud_sync_after_login(true, login_ui.decline);
     Ok(LoginOutcome::LoggedIn)
 }
 
@@ -330,7 +330,7 @@ pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
 
     eprintln!("Successfully logged in with a Personal Access Token.");
     print_login_identity(&creds.access_token);
-    resume_cloud_sync_after_login(false);
+    resume_cloud_sync_after_login(false, Decline::Cancel);
     Ok(LoginOutcome::LoggedIn)
 }
 
@@ -382,10 +382,13 @@ fn print_login_identity(access_token: &str) {
 /// any in-memory sync backoff. Skipped in test harnesses, which manage their
 /// own daemon lifecycle. Best-effort: a failed restart must not fail login.
 /// `on_rail` prints the notes under an interactive flow's rail.
-fn resume_cloud_sync_after_login(on_rail: bool) {
-    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
-        return;
-    }
+///
+/// Signing in never turns cloud sync on by itself. Outside connected mode
+/// (see [`crate::config::Config::platform_sync_enabled`]) nothing uploads, so
+/// say so instead of promising an upload, and leave the service alone.
+/// `decline` tells standalone `autter login` (`Cancel`) apart from onboarding
+/// (`ContinueLocally`), which picks the mode itself right after sign-in.
+fn resume_cloud_sync_after_login(on_rail: bool, decline: Decline) {
     let say = |text: &str| {
         if on_rail {
             rail::print_note(text);
@@ -393,6 +396,20 @@ fn resume_cloud_sync_after_login(on_rail: bool) {
             eprintln!("  {text}");
         }
     };
+
+    if !crate::config::platform_sync_enabled_now() {
+        // Inside onboarding, `setup_connected` switches to connected mode right
+        // after this returns, and onboarding restarts the service itself.
+        if decline == Decline::Cancel {
+            say("Cloud upload is off: signing in does not upload anything.");
+            say("To sync this machine with your org, run `autter onboard --connect`.");
+        }
+        return;
+    }
+
+    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+        return;
+    }
 
     let pending = crate::auth::notice::pending_sync_counts();
     if pending.total() > 0 {

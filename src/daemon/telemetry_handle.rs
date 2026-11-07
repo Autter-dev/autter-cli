@@ -114,6 +114,14 @@ pub enum DaemonTelemetryInitResult {
 ///
 /// Returns the result indicating success, failure, or skip.
 pub fn init_daemon_telemetry_handle() -> DaemonTelemetryInitResult {
+    init_daemon_telemetry_handle_with(true)
+}
+
+/// Like [`init_daemon_telemetry_handle`], but with `allow_spawn = false` it
+/// only connects to a daemon that is already running and returns `Skipped`
+/// otherwise. Plain `autter` commands use this before onboarding, so looking
+/// at `status` or `doctor` never starts background collection on its own.
+pub fn init_daemon_telemetry_handle_with(allow_spawn: bool) -> DaemonTelemetryInitResult {
     // Don't initialize if we're inside the daemon process itself
     if crate::daemon::daemon_process_active() {
         let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));
@@ -124,6 +132,8 @@ pub fn init_daemon_telemetry_handle() -> DaemonTelemetryInitResult {
     // (i.e., wrapper-daemon mode where the test harness manages the daemon).
     #[cfg(any(test, feature = "test-support"))]
     {
+        // Test builds never spawn a daemon, so there is nothing to gate.
+        let _ = allow_spawn;
         let socket_path = std::env::var("AUTTER_DAEMON_CONTROL_SOCKET")
             .ok()
             .filter(|p| !p.trim().is_empty())
@@ -158,13 +168,22 @@ pub fn init_daemon_telemetry_handle() -> DaemonTelemetryInitResult {
     #[cfg(not(any(test, feature = "test-support")))]
     {
         // Try to ensure daemon is running and connect
-        let config = match crate::commands::daemon::ensure_daemon_running(
-            DAEMON_TELEMETRY_CONNECT_TIMEOUT,
-        ) {
-            Ok(config) => config,
-            Err(e) => {
-                let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));
-                return DaemonTelemetryInitResult::Failed(e);
+        let config = if allow_spawn {
+            match crate::commands::daemon::ensure_daemon_running(DAEMON_TELEMETRY_CONNECT_TIMEOUT)
+            {
+                Ok(config) => config,
+                Err(e) => {
+                    let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));
+                    return DaemonTelemetryInitResult::Failed(e);
+                }
+            }
+        } else {
+            match crate::daemon::DaemonConfig::from_env_or_default_paths() {
+                Ok(config) if crate::commands::daemon::daemon_is_up(&config) => config,
+                _ => {
+                    let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));
+                    return DaemonTelemetryInitResult::Skipped;
+                }
             }
         };
 

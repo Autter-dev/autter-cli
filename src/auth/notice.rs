@@ -267,9 +267,10 @@ pub enum CloudSyncAttention {
     DaemonNotRunning,
 }
 
+/// Whether cloud upload is on. Same predicate the uploaders check, so the
+/// status line can never say "off" while data is being sent.
 fn cloud_sync_enabled() -> bool {
-    let cfg = crate::config::Config::fresh();
-    cfg.platform_sync_enabled() && cfg.notes_backend_kind().uses_http()
+    crate::config::platform_sync_enabled_now()
 }
 
 fn background_service_running() -> bool {
@@ -322,7 +323,8 @@ pub struct PendingSyncCountsJson {
 /// Machine-readable cloud-sync health for status commands.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CloudSyncStatusReport {
-    /// Whether the configured notes backend uploads to autter cloud.
+    /// Whether this machine uploads to autter cloud (connected mode). Matches
+    /// what every uploader checks: when false, nothing is sent.
     pub enabled: bool,
     pub daemon_running: bool,
     /// Overall state: healthy, draining a backlog, or blocked.

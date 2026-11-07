@@ -33,12 +33,13 @@ fn log_path() -> Option<std::path::PathBuf> {
 
 fn is_enabled() -> bool {
     // Reads the persisted choice directly so it reflects edits made outside this
-    // process. Telemetry is on unless explicitly set to "off".
-    config::load_file_config_public()
-        .ok()
-        .and_then(|c| c.telemetry_oss)
-        .as_deref()
-        != Some("off")
+    // process. Telemetry is off until explicitly set to "on".
+    config::telemetry_oss_opted_in(
+        config::load_file_config_public()
+            .ok()
+            .and_then(|c| c.telemetry_oss)
+            .as_deref(),
+    )
 }
 
 fn print_status() {

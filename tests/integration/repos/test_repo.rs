@@ -32,6 +32,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Patch a test config into connected mode, the state `autter onboard
+/// --connect` writes: prompts are shared (`prompt_storage = "default"`) and
+/// the notes backend syncs to the platform. Both are required for any upload
+/// (see `Config::platform_sync_enabled`). `Both` keeps writing local git notes
+/// so attribution assertions still read them.
+#[allow(dead_code)]
+pub fn connected_mode(patch: &mut ConfigPatch) {
+    patch.prompt_storage = Some("default".to_string());
+    patch.notes_backend = Some(autter::config::NotesBackendConfig {
+        kind: autter::config::NotesBackendKind::Both,
+        backend_url: None,
+    });
+}
+
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]

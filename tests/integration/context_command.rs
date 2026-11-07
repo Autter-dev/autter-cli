@@ -4,7 +4,7 @@
 //! past the sharing policy stops at "Sign in", which makes the connected run
 //! the control.
 
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{TestRepo, connected_mode};
 
 fn repo_with_remote() -> TestRepo {
     let repo = TestRepo::new();
@@ -42,7 +42,7 @@ fn context_sends_nothing_in_local_mode() {
 fn context_sends_nothing_for_an_excluded_repository() {
     let mut repo = repo_with_remote();
     repo.patch_autter_config(|patch| {
-        patch.prompt_storage = Some("default".to_string());
+        connected_mode(patch);
         patch.exclude_prompts_in_repositories = Some(vec!["https://github.com/acme/*".to_string()]);
     });
     let output = command_error(&repo, &["context", "add retries to the webhook"]);
@@ -52,7 +52,7 @@ fn context_sends_nothing_for_an_excluded_repository() {
 #[test]
 fn context_in_connected_mode_needs_a_login() {
     let mut repo = repo_with_remote();
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     let output = command_error(
         &repo,
         &["context", "add retries", "--path", "src/http/retry.rs"],
@@ -81,7 +81,7 @@ fn context_rejects_bad_usage_before_anything_else() {
 #[test]
 fn context_paths_must_be_inside_the_repository() {
     let mut repo = repo_with_remote();
-    repo.patch_autter_config(|patch| patch.prompt_storage = Some("default".to_string()));
+    repo.patch_autter_config(connected_mode);
     let output = command_error(&repo, &["context", "fix it", "--path", "../outside.rs"]);
     assert!(output.contains("outside this repository"), "{output}");
 }
