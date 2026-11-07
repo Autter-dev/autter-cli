@@ -1061,6 +1061,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
         repo_root: PathBuf::from("/tmp"),
         effective_worktree_wm: None,
         per_file_wm: HashMap::new(),
+        started_at_ns: None,
     };
 
     let mut post_entries = HashMap::new();
@@ -1096,6 +1097,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
         repo_root: PathBuf::from("/tmp"),
         effective_worktree_wm: None,
         per_file_wm: HashMap::new(),
+        started_at_ns: None,
     };
 
     let result = diff(&pre, &post);

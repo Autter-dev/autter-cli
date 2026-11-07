@@ -52,6 +52,25 @@ std::thread_local! {
     static TEST_WALK_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_HOOK_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_DAEMON_SOCKET: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    static TEST_MTIME_GRACE_SECS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Return the mtime grace window in nanoseconds, honouring any test-time
+/// thread-local override (tests default to 0; production uses 2s).
+fn effective_mtime_grace_ns() -> u128 {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(v) = TEST_MTIME_GRACE_SECS.with(|c| c.get()) {
+        return (v as u128) * 1_000_000_000;
+    }
+    MTIME_GRACE_WINDOW_NS
+}
+
+/// Override the mtime grace window for the current thread, so tests can
+/// reproduce the production 2s window. Cleared by
+/// `reset_timeout_overrides_for_test()`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_mtime_grace_secs_for_test(secs: u64) {
+    TEST_MTIME_GRACE_SECS.with(|c| c.set(Some(secs)));
 }
 
 /// Return the walk timeout, honouring any test-time thread-local override.
@@ -100,6 +119,7 @@ pub fn set_daemon_socket_for_test(path: std::path::PathBuf) {
 pub fn reset_timeout_overrides_for_test() {
     TEST_WALK_TIMEOUT_MS.with(|c| c.set(None));
     TEST_HOOK_TIMEOUT_MS.with(|c| c.set(None));
+    TEST_MTIME_GRACE_SECS.with(|c| c.set(None));
 }
 
 /// Resolve the daemon control socket path, preferring the thread-local test
@@ -238,6 +258,14 @@ pub struct StatSnapshot {
     /// Used for Tier-1 stale detection in `find_stale_files`.
     #[serde(default)]
     pub per_file_wm: HashMap<String, u128>,
+    /// Wall-clock time (ns since the epoch) when this snapshot's walk began.
+    /// The post-snapshot of a bash call keeps every file modified since the
+    /// pre-snapshot began, even one a watermark covers: otherwise a file a
+    /// bash command changed within the grace window of its watermark (e.g.
+    /// `echo >>` right after an Edit tool call on the same file) would be
+    /// missing from both snapshots and its edit would never be attributed.
+    #[serde(default)]
+    pub started_at_ns: Option<u128>,
 }
 
 /// Result of diffing two snapshots.
@@ -459,9 +487,9 @@ fn is_wm_covered(
     posix_key: &str,
 ) -> bool {
     if let Some(&file_wm) = per_file_wm.get(posix_key) {
-        return mtime_ns <= file_wm + MTIME_GRACE_WINDOW_NS;
+        return mtime_ns <= file_wm + effective_mtime_grace_ns();
     }
-    effective_wm.is_some_and(|ewm| mtime_ns <= ewm + MTIME_GRACE_WINDOW_NS)
+    effective_wm.is_some_and(|ewm| mtime_ns <= ewm + effective_mtime_grace_ns())
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +557,27 @@ pub fn snapshot(
     tool_use_id: &str,
     wm: Option<&DaemonWatermarks>,
 ) -> Result<StatSnapshot, AutterError> {
+    snapshot_with_recent(repo_root, session_id, tool_use_id, wm, None)
+}
+
+/// Like [`snapshot`], but also keeps every file whose mtime is at or after
+/// `recent_since_ns` (minus the grace window), even when a watermark covers
+/// it. Bash pre-snapshots pass their own start time and post-snapshots pass
+/// the pre-snapshot's, so a file modified during the bash call is always in
+/// the post-snapshot, and a file modified shortly before the call is in both
+/// snapshots with the same stat (so it is not reported as changed).
+pub fn snapshot_with_recent(
+    repo_root: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+    wm: Option<&DaemonWatermarks>,
+    recent_since_ns: Option<u128>,
+) -> Result<StatSnapshot, AutterError> {
     let start = Instant::now();
+    let started_at_ns = system_time_to_nanos(SystemTime::now());
+    let grace_ns = effective_mtime_grace_ns();
+    let is_recent =
+        |mtime_ns: u128| recent_since_ns.is_some_and(|since| mtime_ns + grace_ns >= since);
     let invocation_key = format!("{}:{}", session_id, tool_use_id);
 
     // Compute the effective worktree-level watermark:
@@ -646,7 +694,9 @@ pub fn snapshot(
                 let stat = StatEntry::from_metadata(&meta);
                 let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
                 let posix_key = normalize_to_posix(&normalized.to_string_lossy());
-                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
+                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key)
+                    || is_recent(mtime_ns)
+                {
                     entries.insert(normalized, stat);
                     if entries.len() > MAX_TRACKED_FILES {
                         tracing::debug!(
@@ -679,6 +729,7 @@ pub fn snapshot(
         repo_root: repo_root.to_path_buf(),
         effective_worktree_wm,
         per_file_wm,
+        started_at_ns: Some(started_at_ns),
     })
 }
 
@@ -905,13 +956,128 @@ fn signal_daemon_bash_session_end(session_id: &str, tool_use_id: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// On-disk pre-snapshot store
+// ---------------------------------------------------------------------------
+//
+// The daemon keeps bash pre-snapshots in memory, so a pre-snapshot used to be
+// lost whenever the daemon was not running at PreToolUse time (never started,
+// crashed, stopped before onboarding) or restarted before PostToolUse. The
+// post-hook then had nothing to diff against and the shell edit was committed
+// as untracked. Every pre-snapshot is now also written under
+// `<git dir>/ai/bash_snapshots/`, and the post-hook falls back to it.
+
+/// Directory name under `<git dir>/ai/` holding bash pre-snapshots.
+const BASH_SNAPSHOT_DIR: &str = "bash_snapshots";
+
+/// Pre-snapshots older than this are swept when a new one is written (a
+/// PostToolUse that never fired, e.g. the agent was killed mid-command).
+const BASH_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Resolve the git dir without spawning git when possible: `<root>/.git` is
+/// either the git dir itself or, in a linked worktree, a `gitdir:` file.
+fn git_dir_fast(repo_root: &Path) -> Option<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if dot_git.is_file()
+        && let Ok(contents) = fs::read_to_string(&dot_git)
+        && let Some(rest) = contents.lines().next().and_then(|l| l.strip_prefix("gitdir:"))
+    {
+        let p = PathBuf::from(rest.trim());
+        return Some(if p.is_absolute() { p } else { repo_root.join(p) });
+    }
+    get_git_dir(repo_root).ok()
+}
+
+fn persisted_snapshot_path(repo_root: &Path, session_id: &str, tool_use_id: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let git_dir = git_dir_fast(repo_root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(tool_use_id.as_bytes());
+    let name: String = hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    Some(
+        git_dir
+            .join("ai")
+            .join(BASH_SNAPSHOT_DIR)
+            .join(format!("{}.json", name)),
+    )
+}
+
+fn sweep_stale_persisted_snapshots(dir: &Path) {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in read_dir.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > BASH_SNAPSHOT_MAX_AGE);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Write the pre-snapshot to disk so the post-hook can diff against it even
+/// when the daemon is down or restarts in between.
+fn persist_pre_snapshot(
+    repo_root: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+    snap: &StatSnapshot,
+) -> Result<(), AutterError> {
+    let path = persisted_snapshot_path(repo_root, session_id, tool_use_id)
+        .ok_or_else(|| AutterError::Generic("could not resolve git dir".into()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| AutterError::Generic("snapshot path has no parent".into()))?;
+    fs::create_dir_all(dir)?;
+    sweep_stale_persisted_snapshots(dir);
+    let json = serde_json::to_vec(snap)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the on-disk pre-snapshot for this bash call, if any.
+fn load_persisted_pre_snapshot(
+    repo_root: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+) -> Option<StatSnapshot> {
+    let path = persisted_snapshot_path(repo_root, session_id, tool_use_id)?;
+    let bytes = fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn remove_persisted_pre_snapshot(repo_root: &Path, session_id: &str, tool_use_id: &str) {
+    if let Some(path) = persisted_snapshot_path(repo_root, session_id, tool_use_id) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pre/post hook orchestration
 // ---------------------------------------------------------------------------
 
 /// Handle the pre-tool-use hook with full agent context.
 ///
-/// Takes a filesystem snapshot and sends it to the daemon via `BashSessionStart`.
-/// The daemon stores the snapshot in memory for retrieval at post-hook time.
+/// Takes a filesystem snapshot, writes it to disk, and sends it to the daemon
+/// via `BashSessionStart`. The post-hook reads it back from the daemon, or
+/// from disk when the daemon was unavailable or restarted. Only fails when the
+/// snapshot could be stored neither on disk nor in the daemon.
 pub fn handle_bash_pre_tool_use_with_context(
     repo_root: &Path,
     session_id: &str,
@@ -927,7 +1093,11 @@ pub fn handle_bash_pre_tool_use_with_context(
             worktree: Some(ts),
         })
     });
-    let snap = snapshot(repo_root, session_id, tool_use_id, wm.as_ref())?;
+    // Keep recently modified files even when a watermark covers them, so the
+    // post-snapshot (which keeps everything modified since this moment) does
+    // not report them as created when bash left them untouched.
+    let now_ns = system_time_to_nanos(SystemTime::now());
+    let snap = snapshot_with_recent(repo_root, session_id, tool_use_id, wm.as_ref(), Some(now_ns))?;
 
     // When watermarks are unavailable (no daemon + no .git/index), the snapshot
     // contains every non-ignored file in the repo. Using that as dirty_paths
@@ -943,29 +1113,49 @@ pub fn handle_bash_pre_tool_use_with_context(
         snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
     };
 
-    let socket = effective_daemon_socket().ok_or_else(|| {
-        AutterError::Generic("no daemon socket available for BashSessionStart".into())
-    })?;
-
-    let request = ControlRequest::BashSessionStart {
-        repo_work_dir: repo_working_dir,
-        session_id: session_id.to_string(),
-        tool_use_id: tool_use_id.to_string(),
-        agent_id: agent_id.clone(),
-        metadata: agent_metadata.cloned().unwrap_or_default(),
-        stat_snapshot: Box::new(snap),
+    let persisted = match persist_pre_snapshot(repo_root, session_id, tool_use_id, &snap) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("bash_tool: could not write pre-snapshot to disk: {}", e);
+            false
+        }
     };
 
-    send_control_request(&socket, &request)?;
+    let sent_to_daemon = match effective_daemon_socket() {
+        Some(socket) if socket.exists() => {
+            let request = ControlRequest::BashSessionStart {
+                repo_work_dir: repo_working_dir,
+                session_id: session_id.to_string(),
+                tool_use_id: tool_use_id.to_string(),
+                agent_id: agent_id.clone(),
+                metadata: agent_metadata.cloned().unwrap_or_default(),
+                stat_snapshot: Box::new(snap),
+            };
+            match send_control_request(&socket, &request) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!("bash_tool: BashSessionStart failed: {}", e);
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+
+    if !persisted && !sent_to_daemon {
+        return Err(AutterError::Generic(
+            "bash pre-snapshot could not be stored on disk or in the daemon".into(),
+        ));
+    }
 
     Ok(BashPreHookResult { dirty_paths })
 }
 
 /// Handle the post-tool-use hook for a bash tool invocation.
 ///
-/// Queries the daemon for the pre-snapshot (stored during `BashSessionStart`),
-/// takes a post-snapshot, diffs them, signals `BashSessionEnd`, and returns
-/// the list of changed files.
+/// Reads the pre-snapshot (from the daemon, else from disk), takes a
+/// post-snapshot, diffs them, signals `BashSessionEnd`, removes the on-disk
+/// copy, and returns the list of changed files.
 pub fn handle_bash_post_tool_use(
     repo_root: &Path,
     session_id: &str,
@@ -975,6 +1165,11 @@ pub fn handle_bash_post_tool_use(
 
     let hook_start = Instant::now();
     let hook_timeout = Duration::from_millis(effective_hook_timeout_ms());
+
+    let finish = || {
+        signal_daemon_bash_session_end(session_id, tool_use_id);
+        remove_persisted_pre_snapshot(repo_root, session_id, tool_use_id);
+    };
 
     macro_rules! hook_timeout_fallback {
         ($label:expr) => {{
@@ -993,14 +1188,15 @@ pub fn handle_bash_post_tool_use(
                     "hook_timeout_ms": hook_timeout.as_millis(),
                 })),
             );
-            signal_daemon_bash_session_end(session_id, tool_use_id);
+            finish();
             return Ok(BashPostHookResult {
                 action: BashCheckpointAction::HookTimeout,
             });
         }};
     }
 
-    let pre_snapshot = query_daemon_bash_snapshot(session_id, tool_use_id);
+    let pre_snapshot = query_daemon_bash_snapshot(session_id, tool_use_id)
+        .or_else(|| load_persisted_pre_snapshot(repo_root, session_id, tool_use_id));
 
     match pre_snapshot {
         Some(pre) => {
@@ -1017,7 +1213,13 @@ pub fn handle_bash_post_tool_use(
                 } else {
                     None
                 };
-            let result = match snapshot(repo_root, session_id, tool_use_id, post_wm.as_ref()) {
+            let result = match snapshot_with_recent(
+                repo_root,
+                session_id,
+                tool_use_id,
+                post_wm.as_ref(),
+                pre.started_at_ns,
+            ) {
                 Ok(post) => {
                     let diff_result = diff(&pre, &post);
 
@@ -1049,16 +1251,16 @@ pub fn handle_bash_post_tool_use(
                 }
             };
 
-            signal_daemon_bash_session_end(session_id, tool_use_id);
+            finish();
 
             result
         }
         None => {
             tracing::debug!(
-                "Pre-snapshot not found in daemon for {}; returning MissingPreSnapshot",
+                "Pre-snapshot not found in daemon or on disk for {}; returning MissingPreSnapshot",
                 invocation_key
             );
-            signal_daemon_bash_session_end(session_id, tool_use_id);
+            finish();
             Ok(BashPostHookResult {
                 action: BashCheckpointAction::MissingPreSnapshot,
             })
@@ -1133,6 +1335,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            started_at_ns: None,
         };
         let post = StatSnapshot {
             entries: HashMap::new(),
@@ -1141,6 +1344,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            started_at_ns: None,
         };
 
         let result = diff(&pre, &post);
@@ -1156,6 +1360,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            started_at_ns: None,
         };
 
         let mut post_entries = HashMap::new();
@@ -1178,6 +1383,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            started_at_ns: None,
         };
 
         let result = diff(&pre, &post);
@@ -1224,6 +1430,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            started_at_ns: None,
         };
 
         let post = StatSnapshot {
@@ -1233,6 +1440,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            started_at_ns: None,
         };
 
         let result = diff(&pre, &post);

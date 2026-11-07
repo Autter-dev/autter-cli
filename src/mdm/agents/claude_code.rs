@@ -29,6 +29,91 @@ pub const CLAUDE_MEMORY_HOOKS: [(&str, Option<&str>); 3] = [
 ];
 const CLAUDE_MEMORY_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "PostToolUse"];
 
+/// Whether Claude Code's hooks run autter for its Bash tool, so edits Claude
+/// makes with shell commands (`echo >>`, `sed -i`, formatters) are captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeShellCapture {
+    /// No Claude Code settings, or no autter checkpoint hook in them.
+    NotInstalled,
+    /// autter runs on both PreToolUse and PostToolUse for the Bash tool.
+    Captured,
+    /// autter hooks exist, but these events' matchers exclude Bash (e.g. an
+    /// install from before the catch-all matcher: `Write|Edit|MultiEdit`).
+    NotCaptured { missing_events: Vec<&'static str> },
+}
+
+/// Does a Claude Code hook `matcher` select the `Bash` tool? An empty or
+/// `*` matcher selects every tool; otherwise it is a regex over the tool name.
+fn matcher_selects_bash(matcher: Option<&str>) -> bool {
+    let Some(m) = matcher.map(str::trim) else {
+        return true;
+    };
+    if m.is_empty() || m == "*" {
+        return true;
+    }
+    if m.split('|').any(|alt| alt.trim() == "Bash") {
+        return true;
+    }
+    regex::Regex::new(&format!("^(?:{})$", m))
+        .map(|re| re.is_match("Bash"))
+        .unwrap_or(false)
+}
+
+/// Shell-capture status of a parsed Claude Code settings value.
+pub fn claude_shell_capture_from_settings(settings: &Value) -> ClaudeShellCapture {
+    let mut any_autter = false;
+    let mut missing_events = Vec::new();
+    for event in ["PreToolUse", "PostToolUse"] {
+        let blocks = settings
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut covered = false;
+        for block in &blocks {
+            let has_autter = block
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_autter_checkpoint_command)
+                    })
+                });
+            if has_autter {
+                any_autter = true;
+                if matcher_selects_bash(block.get("matcher").and_then(|m| m.as_str())) {
+                    covered = true;
+                }
+            }
+        }
+        if !covered {
+            missing_events.push(event);
+        }
+    }
+    if !any_autter {
+        ClaudeShellCapture::NotInstalled
+    } else if missing_events.is_empty() {
+        ClaudeShellCapture::Captured
+    } else {
+        ClaudeShellCapture::NotCaptured { missing_events }
+    }
+}
+
+/// Shell-capture status of the primary Claude Code settings file.
+pub fn claude_shell_capture_status() -> ClaudeShellCapture {
+    let path = claude_config_dir().join("settings.json");
+    let settings = fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok());
+    match settings {
+        Some(v) => claude_shell_capture_from_settings(&v),
+        None => ClaudeShellCapture::NotInstalled,
+    }
+}
+
 pub struct ClaudeCodeInstaller;
 
 impl ClaudeCodeInstaller {
@@ -1564,5 +1649,53 @@ mod tests {
         let hooks = content.get("hooks").expect("hooks key should exist");
         assert!(hooks.get("PreToolUse").is_some());
         assert!(hooks.get("PostToolUse").is_some());
+    }
+}
+
+#[cfg(test)]
+mod shell_capture_tests {
+    use super::*;
+
+    fn settings(matcher: &str) -> Value {
+        let cmd = "/usr/local/bin/autter checkpoint claude --hook-input stdin";
+        json!({"hooks": {
+            "PreToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": cmd}]}],
+            "PostToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": cmd}]}]
+        }})
+    }
+
+    #[test]
+    fn catch_all_matcher_captures_shell_edits() {
+        assert_eq!(
+            claude_shell_capture_from_settings(&settings("*")),
+            ClaudeShellCapture::Captured
+        );
+    }
+
+    #[test]
+    fn explicit_bash_matcher_captures_shell_edits() {
+        assert_eq!(
+            claude_shell_capture_from_settings(&settings("Write|Edit|MultiEdit|Bash")),
+            ClaudeShellCapture::Captured
+        );
+    }
+
+    #[test]
+    fn old_file_edit_matcher_does_not_capture_shell_edits() {
+        assert_eq!(
+            claude_shell_capture_from_settings(&settings("Write|Edit|MultiEdit")),
+            ClaudeShellCapture::NotCaptured {
+                missing_events: vec!["PreToolUse", "PostToolUse"]
+            }
+        );
+    }
+
+    #[test]
+    fn no_autter_hooks_is_not_installed() {
+        let v = json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "prettier --write"}]}]}});
+        assert_eq!(
+            claude_shell_capture_from_settings(&v),
+            ClaudeShellCapture::NotInstalled
+        );
     }
 }

@@ -11,7 +11,8 @@ use crate::repos::test_repo::TestRepo;
 use autter::authorship::working_log::AgentId;
 use autter::commands::checkpoint_agent::bash_tool::{
     BashCheckpointAction, BashPostHookResult, diff, git_status_fallback, handle_bash_post_tool_use,
-    handle_bash_pre_tool_use_with_context, set_daemon_socket_for_test, snapshot,
+    handle_bash_pre_tool_use_with_context, reset_timeout_overrides_for_test,
+    set_daemon_socket_for_test, set_mtime_grace_secs_for_test, snapshot,
 };
 use std::fs;
 use std::process::Command;
@@ -1610,4 +1611,93 @@ exit 1
     // The stat-diff should detect the modification
     let post_action = post_hook(&root, "hookfail-sess", "hookfail-t1");
     assert_checkpoint_contains(&post_action, "broken.py");
+}
+
+// ---------------------------------------------------------------------------
+// Pre-snapshot survives without the daemon; production mtime grace window
+// ---------------------------------------------------------------------------
+
+/// Point the hooks at a socket that does not exist, as when the background
+/// service is not running (never started, crashed, or not yet allowed to
+/// start before onboarding).
+fn without_daemon(repo: &TestRepo) -> std::path::PathBuf {
+    set_daemon_socket_for_test(repo.path().join("no-daemon.sock"));
+    repo.canonical_path()
+}
+
+#[test]
+fn test_bash_edit_captured_when_daemon_is_not_running() {
+    let repo = TestRepo::new();
+    add_and_commit(&repo, "notes.md", "line one\n", "initial");
+    let root = without_daemon(&repo);
+
+    // Used to fail with "no daemon socket", losing the pre-snapshot, so the
+    // post-hook returned MissingPreSnapshot and the edit went untracked.
+    pre_hook(&root, "sess-nodaemon", "tool-1");
+    run_bash(&repo, "sh", &["-c", "echo 'line two' >> notes.md"]);
+    let result = post_hook(&root, "sess-nodaemon", "tool-1");
+
+    assert_checkpoint_contains(&result, "notes.md");
+}
+
+#[test]
+fn test_bash_pre_snapshot_file_is_removed_after_post_hook() {
+    let repo = TestRepo::new();
+    add_and_commit(&repo, "a.txt", "a\n", "initial");
+    let root = without_daemon(&repo);
+
+    pre_hook(&root, "sess-cleanup", "tool-1");
+    let snapshot_dir = root.join(".git").join("ai").join("bash_snapshots");
+    assert_eq!(
+        fs::read_dir(&snapshot_dir).map(|d| d.count()).unwrap_or(0),
+        1,
+        "pre-hook should store one pre-snapshot on disk"
+    );
+    run_bash(&repo, "sh", &["-c", "echo b >> a.txt"]);
+    let _ = post_hook(&root, "sess-cleanup", "tool-1");
+    assert_eq!(
+        fs::read_dir(&snapshot_dir).map(|d| d.count()).unwrap_or(0),
+        0,
+        "post-hook should remove the stored pre-snapshot"
+    );
+}
+
+#[test]
+fn test_bash_edit_within_grace_window_of_watermark_is_captured() {
+    let repo = TestRepo::new();
+    // The commit writes .git/index, whose mtime becomes the worktree
+    // watermark when the daemon has none.
+    add_and_commit(&repo, "fast.txt", "first\n", "initial");
+    let root = without_daemon(&repo);
+    set_mtime_grace_secs_for_test(2);
+
+    // The shell edit lands well inside the 2s grace window after the
+    // watermark, so the file is "covered" in both snapshots. It used to be
+    // missing from both and the edit was never attributed.
+    pre_hook(&root, "sess-grace", "tool-1");
+    run_bash(&repo, "sh", &["-c", "echo second >> fast.txt"]);
+    let result = post_hook(&root, "sess-grace", "tool-1");
+    reset_timeout_overrides_for_test();
+
+    assert_checkpoint_contains(&result, "fast.txt");
+}
+
+#[test]
+fn test_bash_recent_human_edit_untouched_by_bash_is_not_reported() {
+    let repo = TestRepo::new();
+    add_and_commit(&repo, "human.txt", "h\n", "initial human");
+    add_and_commit(&repo, "agent.txt", "a\n", "initial agent");
+    let root = without_daemon(&repo);
+    set_mtime_grace_secs_for_test(2);
+
+    // A human edit right before the bash call (inside the grace window) must
+    // not be reported as changed by the bash call.
+    write_file(&repo, "human.txt", "h\nhuman edit\n");
+    pre_hook(&root, "sess-recent", "tool-1");
+    run_bash(&repo, "sh", &["-c", "echo agent >> agent.txt"]);
+    let result = post_hook(&root, "sess-recent", "tool-1");
+    reset_timeout_overrides_for_test();
+
+    assert_checkpoint_contains(&result, "agent.txt");
+    assert_checkpoint_excludes(&result, "human.txt");
 }

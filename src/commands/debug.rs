@@ -485,6 +485,7 @@ fn collect_agent_capture_info() -> Vec<String> {
             .to_string(),
     );
     lines.push("  - GitHub Copilot CLI: captured via ~/.copilot/hooks/autter.json.".to_string());
+    lines.push(shell_capture_boundary_line());
     lines.push(
         "  - VS Code inline/tab completions: experimental and OFF by default (VS Code setting `autter.experiments.aiTabTracking`)."
             .to_string(),
@@ -498,6 +499,26 @@ fn collect_agent_capture_info() -> Vec<String> {
             .to_string(),
     );
     lines
+}
+
+/// Capture-boundary line for edits an agent makes through its shell tool
+/// (`echo >> f`, `sed -i`, formatters), with Claude Code's live hook status.
+fn shell_capture_boundary_line() -> String {
+    use crate::mdm::agents::{ClaudeShellCapture, claude_shell_capture_status};
+    let claude = match claude_shell_capture_status() {
+        ClaudeShellCapture::Captured => {
+            "Claude Code: captured (autter hooks run on the Bash tool)".to_string()
+        }
+        ClaudeShellCapture::NotCaptured { missing_events } => format!(
+            "Claude Code: NOT captured, the {} hook matcher excludes the Bash tool, so shell edits are committed as untracked; run `autter install-hooks`",
+            missing_events.join("/")
+        ),
+        ClaudeShellCapture::NotInstalled => "Claude Code: no autter hooks installed".to_string(),
+    };
+    format!(
+        "  - Shell-tool edits (agent runs `echo >>`, `sed -i`, a formatter): {}. Changed files are found by comparing file metadata before and after each shell call, for agents whose hooks fire on their shell tool. Not captured: gitignored files, calls whose scan exceeds 1.5s or finds more than 50,000 recently changed files, and anything else editing the same file during the call (it is attributed to the agent).",
+        claude
+    )
 }
 
 /// Outcome of walking the VS Code native-hooks chain, shared between the

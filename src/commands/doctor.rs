@@ -642,6 +642,10 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
         }
     }
 
+    if let Some(check) = claude_shell_capture_check() {
+        checks.push(check);
+    }
+
     // Agents autter has no preset for: their edits land as untracked and
     // blame credits the user. A warning, not a failure -- nothing is broken,
     // but attribution for that tool is missing.
@@ -682,6 +686,37 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
     }
 
     checks
+}
+
+/// Claude Code shell-tool capture: hooks installed by older autter versions
+/// matched only `Write|Edit|MultiEdit`, so edits Claude made with shell
+/// commands were committed as untracked with nothing flagging it.
+fn claude_shell_capture_check() -> Option<DoctorCheck> {
+    use crate::mdm::agents::{ClaudeShellCapture, claude_shell_capture_status};
+    match claude_shell_capture_status() {
+        ClaudeShellCapture::NotInstalled => None,
+        ClaudeShellCapture::Captured => Some(DoctorCheck {
+            section: SECTION_AGENTS,
+            name: "Claude Code shell edits".to_string(),
+            status: DoctorStatus::Passed,
+            summary: "captured (autter hooks run on the Bash tool)".to_string(),
+            details: Vec::new(),
+            remediation: None,
+        }),
+        ClaudeShellCapture::NotCaptured { missing_events } => Some(DoctorCheck {
+            section: SECTION_AGENTS,
+            name: "Claude Code shell edits".to_string(),
+            status: DoctorStatus::Warning,
+            summary: "NOT captured -- edits Claude makes with shell commands are committed as untracked".to_string(),
+            details: vec![format!(
+                "the {} hook matcher in Claude Code settings excludes the Bash tool",
+                missing_events.join("/")
+            )],
+            remediation: Some(
+                "run `autter install-hooks`, then restart Claude Code".to_string(),
+            ),
+        }),
+    }
 }
 
 /// The VS Code >= 1.109.3 native-hooks chain: on those builds the autter

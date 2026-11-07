@@ -17,7 +17,7 @@ mod windsurf;
 
 pub use amp::AmpInstaller;
 pub use antigravity::AntigravityInstaller;
-pub use claude_code::ClaudeCodeInstaller;
+pub use claude_code::{ClaudeCodeInstaller, ClaudeShellCapture, claude_shell_capture_status};
 pub use codex::CodexInstaller;
 pub use cursor::CursorInstaller;
 pub use droid::DroidInstaller;
