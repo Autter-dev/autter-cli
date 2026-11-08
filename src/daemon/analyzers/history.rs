@@ -102,6 +102,12 @@ impl CommandAnalyzer for HistoryAnalyzer {
                             .and_then(|repo| repo.head.clone())
                             .unwrap_or_default(),
                     });
+                } else if args.iter().any(|arg| arg == "-n" || arg == "--no-commit") {
+                    // `-n` applies the picked changes without committing, so
+                    // there is no new commit to map. The daemon carries the
+                    // sources into the next commit instead. A stale ref state
+                    // would otherwise make head_change report a bogus span
+                    // here, and mapping it fails.
                 } else if let Some((old_head, new_head)) = head_change(cmd, state.refs) {
                     events.push(SemanticEvent::CherryPickComplete {
                         original_head: old_head,
@@ -997,6 +1003,36 @@ mod tests {
                 } if original_head == "a" && new_head == "d"
             )),
             "expected cherry-pick span event, got {:?}",
+            result.events
+        );
+    }
+
+    #[test]
+    fn cherry_pick_no_commit_emits_no_complete_event() {
+        let analyzer = HistoryAnalyzer;
+        let mut cmd = command("cherry-pick", &["git", "cherry-pick", "-n", "abc123"]);
+        cmd.ref_changes.clear();
+        cmd.pre_repo = Some(crate::daemon::domain::RepoContext {
+            head: Some("main-head".to_string()),
+            branch: Some("main".to_string()),
+            detached: false,
+        });
+        cmd.post_repo = cmd.pre_repo.clone();
+        // The daemon's ref state still points at the branch checked out before.
+        let refs = std::collections::HashMap::from([
+            ("HEAD".to_string(), "feature-head".to_string()),
+            ("refs/heads/main".to_string(), "older-main".to_string()),
+        ]);
+
+        let result = analyzer
+            .analyze(&cmd, AnalysisView { refs: &refs })
+            .unwrap();
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::CherryPickComplete { .. })),
+            "cherry-pick -n creates no commit, got {:?}",
             result.events
         );
     }
