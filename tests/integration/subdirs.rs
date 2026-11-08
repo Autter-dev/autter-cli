@@ -656,7 +656,7 @@ crate::subdir_test_variants! {
     file = repo.filename("test.txt");
     file.assert_lines_and_blame(crate::lines![
         "line 1".human(),
-        "line 2".ai(),
+        "line 2".human(),
         "// AI addition".ai(),
     ]);
     }
@@ -914,7 +914,7 @@ crate::subdir_test_variants! {
 
         file = repo.filename("test.txt");
         file.assert_lines_and_blame(crate::lines![
-            "base content".ai(),
+            "base content".human(),
             "// AI feature".ai(),
         ]);
     }
@@ -992,7 +992,7 @@ crate::subdir_test_variants! {
 
         // File should now match second commit
         file = repo.filename("test.txt");
-        file.assert_lines_and_blame(crate::lines!["v1".ai(), "v2".ai()]);
+        file.assert_lines_and_blame(crate::lines!["v1".human(), "v2".ai()]);
     }
 }
 
@@ -1082,7 +1082,7 @@ crate::subdir_test_variants! {
             .expect("Cherry-pick should succeed");
 
         // Verify final file state - hooks should have preserved AI authorship
-        file.assert_lines_and_blame(crate::lines!["Initial content".ai(), "AI feature line".ai(),]);
+        file.assert_lines_and_blame(crate::lines!["Initial content".human(), "AI feature line".ai(),]);
     }
 }
 
@@ -1318,7 +1318,7 @@ crate::subdir_test_variants! {
 
         // Verify final file state - hooks should have preserved AI authorship
         file.assert_lines_and_blame(crate::lines![
-            "fn main() {".ai(),
+            "fn main() {".human(),
             "    println!(\"Starting\");".ai(),
             "    // TODO: Add error handling".ai(),
             "}".human(),
@@ -1528,7 +1528,7 @@ crate::subdir_test_variants! {
         file.assert_lines_and_blame(crate::lines![
             "line 1".human(),
             "line 2".human(),
-            "line 3".ai(),
+            "line 3".human(),
             "// AI appended line 1".ai(),
             "// AI appended line 2".ai()
         ]);
@@ -1635,7 +1635,7 @@ crate::subdir_test_variants! {
             "MAIN LINE 2".human(),
             "Base line 1".human(),
             "Base line 2".human(),
-            "Base line 3".ai(),
+            "Base line 3".human(),
             "FEATURE LINE 1".ai(),
             "FEATURE LINE 2".ai(),
         ]);

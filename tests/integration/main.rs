@@ -62,6 +62,7 @@ mod doctor;
 mod droid;
 mod e2big_post_filter;
 mod e2e_user_scenarios;
+mod eof_newline_attribution;
 mod event_timestamp_extraction;
 mod fast_reader;
 mod fetch_notes;

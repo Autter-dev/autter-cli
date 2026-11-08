@@ -150,6 +150,13 @@ pub fn post_commit_with_final_state(
     // No-hooks background agents (Devin, Codex Cloud, etc.) may not fire checkpoints
     // for all edits. Attribute any committed lines that have no existing attestation
     // ("holes") to the detected agent, preserving explicit attributions.
+    // A last line that only gained a trailing newline keeps its earlier attribution.
+    crate::authorship::eof_newline_carryover::carry_over_last_line_attributions(
+        repo,
+        &mut authorship_log,
+        &parent_sha,
+        &commit_sha,
+    );
     let background_agent = crate::authorship::background_agent::detect_in(agent_env);
     crate::authorship::background_agent::fill_unattributed_commit_lines(
         repo,

@@ -508,6 +508,37 @@ fn powershell_single_quote_literal(value: &OsStr) -> String {
     format!("'{}'", value.to_string_lossy().replace('\'', "''"))
 }
 
+/// Start the background service from a clean environment, whatever shell runs
+/// `autter bg restart` or `autter doctor`.
+fn sanitize_daemon_child_env(child: &mut Command) {
+    // The daemon is repository-agnostic; variables like GIT_DIR override the -C
+    // flag and cause repository resolution failures.
+    for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
+        child.env_remove(var);
+    }
+    // AUTTER controls debug routing in the binary (AUTTER=git → handle_git). A
+    // daemon that inherits this would route "bg run" to the git proxy instead of
+    // starting as a daemon.
+    child.env_remove("AUTTER");
+    // Cloud-agent markers describe the shell, not the machine. Attribution reads
+    // them per command (trace2), so the long-lived service must not carry a copy.
+    for var in daemon_agent_env_vars_to_remove(std::env::vars().map(|(name, _)| name)) {
+        child.env_remove(var);
+    }
+}
+
+/// Agent-detection variables (except HOSTNAME, which identifies the machine) plus
+/// any `CLOUD_AGENT_*` marker present in `names`.
+fn daemon_agent_env_vars_to_remove(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut vars: Vec<String> = crate::authorship::background_agent::DETECTION_ENV_VARS
+        .iter()
+        .filter(|name| **name != "HOSTNAME")
+        .map(|name| name.to_string())
+        .collect();
+    vars.extend(names.filter(|name| name.starts_with("CLOUD_AGENT_")));
+    vars
+}
+
 #[cfg(any(windows, not(any(test, feature = "test-support"))))]
 fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
     spawn_autter_bg_detached(config, "run")
@@ -559,11 +590,7 @@ fn spawn_autter_bg_detached(config: &DaemonConfig, subcommand: &str) -> Result<(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Remove git environment variables that must not leak into the daemon.
-        for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
-            child.env_remove(var);
-        }
-        child.env_remove("AUTTER");
+        sanitize_daemon_child_env(&mut child);
 
         let preferred_flags =
             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
@@ -596,16 +623,7 @@ fn spawn_autter_bg_detached(config: &DaemonConfig, subcommand: &str) -> Result<(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Remove git environment variables that must not leak into the daemon.
-        // The daemon is repository-agnostic; variables like GIT_DIR override
-        // the -C flag and cause repository resolution failures.
-        for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
-            child.env_remove(var);
-        }
-        // AUTTER controls debug routing in the binary (AUTTER=git → handle_git).
-        // A daemon that inherits this would route "bg run" to the git proxy instead
-        // of starting as a daemon.
-        child.env_remove("AUTTER");
+        sanitize_daemon_child_env(&mut child);
         child.spawn().map(|_| ()).map_err(|e| e.to_string())
     }
 }
@@ -624,10 +642,7 @@ fn spawn_daemon_run_with_piped_stderr(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
-        child.env_remove(var);
-    }
-    child.env_remove("AUTTER");
+    sanitize_daemon_child_env(&mut child);
     child.spawn().map_err(|e| e.to_string())
 }
 
@@ -1041,6 +1056,26 @@ fn print_help() {
 #[cfg(test)]
 mod health_tests {
     use super::*;
+
+    #[test]
+    fn daemon_spawn_drops_agent_markers_but_keeps_hostname() {
+        let vars = daemon_agent_env_vars_to_remove(
+            ["PATH", "CLOUD_AGENT_SESSION", "HOME"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert!(vars.iter().any(|v| v == "AUTTER_CLOUD_AGENT"));
+        assert!(
+            vars.iter()
+                .any(|v| v == "CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+        );
+        assert!(vars.iter().any(|v| v == "CLOUD_AGENT_SESSION"));
+        assert!(
+            !vars
+                .iter()
+                .any(|v| v == "HOSTNAME" || v == "PATH" || v == "HOME")
+        );
+    }
 
     #[test]
     fn classify_daemon_health_covers_every_state() {

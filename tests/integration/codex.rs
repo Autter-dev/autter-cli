@@ -534,7 +534,7 @@ fn test_codex_file_edit_then_bash_pretooluse_does_not_steal_ai_commit_attributio
         .expect("Codex status commit should succeed");
 
     readme.assert_lines_and_blame(crate::lines![
-        "Project README".ai(),
+        "Project README".human(),
         "Updated by live Codex proof".ai(),
     ]);
 }
@@ -599,7 +599,7 @@ fn test_codex_file_edit_then_camel_case_bash_pretooluse_does_not_steal_ai_commit
         .expect("Codex status camel commit should succeed");
 
     readme.assert_lines_and_blame(crate::lines![
-        "Project README".ai(),
+        "Project README".human(),
         "Updated by live Codex proof camel".ai(),
     ]);
 }
@@ -689,7 +689,7 @@ fn test_codex_read_only_bash_post_tool_use_before_edit_does_not_steal_commit_att
         .expect("commit should succeed");
 
     readme.assert_lines_and_blame(crate::lines![
-        "Project README".ai(),
+        "Project README".human(),
         "Updated after read-only bash".ai(),
     ]);
 }
@@ -752,7 +752,7 @@ fn test_codex_commit_inside_bash_inflight_repeated_append_keeps_file_ai_standard
         .expect("Codex append commit should succeed");
 
     readme.assert_lines_and_blame(crate::lines![
-        "Project README".ai(),
+        "Project README".human(),
         "Updated by Codex".ai(),
     ]);
 
@@ -808,7 +808,7 @@ fn test_codex_commit_inside_bash_inflight_repeated_append_keeps_file_ai_standard
         .expect("second Codex append commit should succeed");
 
     readme.assert_lines_and_blame(crate::lines![
-        "Project README".ai(),
+        "Project README".human(),
         "Updated by Codex".ai(),
         "Updated again by Codex".ai(),
     ]);

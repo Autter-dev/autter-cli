@@ -66,7 +66,7 @@ fn test_reset_soft_reconstructs_working_log() {
     file = repo.filename("test.txt");
     file.assert_lines_and_blame(crate::lines![
         "line 1".human(),
-        "line 2".ai(),
+        "line 2".human(),
         "// AI addition".ai(),
     ]);
 }
@@ -290,7 +290,7 @@ fn test_reset_forward_is_noop() {
 
     // File should now match second commit
     file = repo.filename("test.txt");
-    file.assert_lines_and_blame(crate::lines!["v1".ai(), "v2".ai()]);
+    file.assert_lines_and_blame(crate::lines!["v1".human(), "v2".ai()]);
 }
 
 /// Test git reset with AI and human mixed changes: should preserve all authorship
@@ -361,7 +361,7 @@ fn test_reset_merge() {
     );
 
     file = repo.filename("test.txt");
-    file.assert_lines_and_blame(crate::lines!["base".ai(), "// AI line".ai()]);
+    file.assert_lines_and_blame(crate::lines!["base".human(), "// AI line".ai()]);
 }
 
 /// Test git reset with new files added in unwound commit: should preserve AI authorship

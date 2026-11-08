@@ -303,7 +303,7 @@ pub async fn delete_user(Path(id): Path<u32>) -> Json<()> {
         "pub async fn get_user(Path(id): Path<u32>) -> Result<Json<User>, StatusCode> {".human(),
         "    let user = fetch_user_from_db(id).await?;".human(),
         "    Ok(Json(user))".human(),
-        "}".ai(),  // Line 6: git attributes closing brace to AI due to AI adding next function
+        "}".human(), // human-written; it only gained a trailing newline when the AI appended below it
         "".ai(),
         "pub async fn create_user(Json(payload): Json<CreateUser>) -> Result<Json<User>, StatusCode> {".human(),
         "    if payload.username.is_empty() {".human(),
@@ -311,7 +311,7 @@ pub async fn delete_user(Path(id): Path<u32>) -> Json<()> {
         "    }".human(),
         "    let user = insert_user_to_db(payload).await?;".human(),
         "    Ok(Json(user))".human(),
-        "}".ai(),  // Line 14: git attributes closing brace to AI
+        "}".human(), // human-written; it only gained a trailing newline when the AI appended below it
         "".ai(),
         "pub async fn update_user(Path(id): Path<u32>, Json(payload): Json<UpdateUser>) -> Json<User> {".ai(),
         "    let user = update_user_in_db(id, payload).await;".ai(),
@@ -1063,7 +1063,7 @@ export function errorHandlerMiddleware(err, req, res, next) {
         "  const timestamp = new Date().toISOString();".human(),
         "  console.log(`[${timestamp}] ${req.method} ${req.path}`);".human(),
         "  next();".human(),
-        "}".ai(), // Line 5: git attributes closing brace to AI
+        "}".human(), // human-written; it only gained a trailing newline when the AI appended below it
         "".ai(),
         "export function authMiddleware(req, res, next) {".ai(),
         "  const token = req.headers['authorization'];".ai(),
@@ -1071,7 +1071,7 @@ export function errorHandlerMiddleware(err, req, res, next) {
         "    return res.status(401).json({ error: 'Unauthorized' });".ai(),
         "  }".ai(),
         "  next();".ai(),
-        "}".ai(), // Line 13: git attributes closing brace to AI
+        "}".human(), // human-written; it only gained a trailing newline when the AI appended below it
         "".ai(),
         "const rateLimitStore = new Map();".ai(),
         "".ai(),
@@ -1612,7 +1612,7 @@ pub fn get_user_by_email(email: &str) -> Option<User> {
         "".human(),
         "pub fn get_user(id: i32) -> Option<User> {".human(),
         "    None".human(),
-        "}".ai(), // Line 5: git attributes closing brace to AI (next function added by AI)
+        "}".human(), // human-written; it only gained a trailing newline when the AI appended below it
         "".ai(),
         "pub fn get_user_by_email(email: &str) -> Option<User> {".ai(),
         "    if !email.contains('@') {".human(),

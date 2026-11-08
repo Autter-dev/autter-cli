@@ -138,7 +138,8 @@ fn test_github_copilot_human_then_ai_checkpoint() {
     // Verify attribution
     file.assert_lines_and_blame(crate::lines![
         "const x = 1;".human(),
-        "const y = 2;".ai(), // Reattributed to AI after subsequent AI checkpoint
+        // Human-written; it only gains a trailing newline when the AI appends below it.
+        "const y = 2;".human(),
         "const z = 3;".ai(), // AI from mock_ai checkpoint
     ]);
 }

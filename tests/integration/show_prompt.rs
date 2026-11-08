@@ -134,9 +134,17 @@ fn show_prompt_with_offset_skips_occurrences() {
     file.set_contents(crate::lines!["Base".human(), "AI line 1".ai()]);
     let first_commit = repo.stage_all_and_commit("First commit").unwrap();
 
-    // Second AI session with new AI content so we get another prompt occurrence
+    // Second AI session appends below "AI line 1", which had no trailing newline.
+    // That line gains a "\n", so git reports it as changed in the second commit
+    // and its note carries the first session's attribution for it: the first
+    // session now occurs in both commits.
     file.insert_at(2, crate::lines!["AI line 2".ai()]);
-    repo.stage_all_and_commit("Second commit").unwrap();
+    let second_commit = repo.stage_all_and_commit("Second commit").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "Base".human(),
+        "AI line 1".ai(),
+        "AI line 2".ai(),
+    ]);
 
     // Use a session ID from the first commit (mock_ai now produces sessions)
     let sessions_first = &first_commit.authorship_log.metadata.sessions;
@@ -144,26 +152,39 @@ fn show_prompt_with_offset_skips_occurrences() {
         .iter()
         .next()
         .expect("expected at least one session in first commit");
+    assert!(
+        second_commit
+            .authorship_log
+            .metadata
+            .sessions
+            .contains_key(prompt_id),
+        "the carried line keeps the first session's attribution"
+    );
 
-    // Default (no offset) and explicit offset 0 should both succeed and point to the same commit
-    let default_output = repo
-        .autter(&["show-prompt", prompt_id])
-        .expect("show-prompt without offset should succeed");
-    let default_json: serde_json::Value = serde_json::from_str(default_output.trim()).unwrap();
+    let commit_for = |offset: Option<&str>| {
+        let mut args = vec!["show-prompt", prompt_id.as_str()];
+        if let Some(offset) = offset {
+            args.extend(["--offset", offset]);
+        }
+        let output = repo
+            .autter(&args)
+            .unwrap_or_else(|e| panic!("show-prompt {args:?} should succeed: {e}"));
+        let json: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        json["commit"].as_str().unwrap().to_string()
+    };
 
-    let offset0_output = repo
-        .autter(&["show-prompt", prompt_id, "--offset", "0"])
-        .expect("show-prompt with offset 0 should succeed");
-    let offset0_json: serde_json::Value = serde_json::from_str(offset0_output.trim()).unwrap();
-
-    assert_eq!(default_json["commit"], offset0_json["commit"]);
+    // Default (no offset) and explicit offset 0 both point to the latest occurrence;
+    // offset 1 skips back to the first commit.
+    assert_eq!(commit_for(None), second_commit.commit_sha);
+    assert_eq!(commit_for(Some("0")), second_commit.commit_sha);
+    assert_eq!(commit_for(Some("1")), first_commit.commit_sha);
 
     // Offset that is too large should return a clear error
     let err = repo
-        .autter(&["show-prompt", prompt_id, "--offset", "1"])
-        .expect_err("show-prompt with offset 1 should fail when only one occurrence exists");
+        .autter(&["show-prompt", prompt_id, "--offset", "2"])
+        .expect_err("show-prompt with offset 2 should fail when only two occurrences exist");
     assert!(
-        err.contains("found 1 time(s), but offset 1 requested"),
+        err.contains("found 2 time(s), but offset 2 requested"),
         "unexpected error message: {}",
         err
     );

@@ -15,7 +15,7 @@ fn test_chinese_simple_additions() {
     file.assert_lines_and_blame(crate::lines![
         "第一行".human(),
         "第二行".human(),
-        "第三行".ai(),
+        "第三行".human(),
         "新增一行".ai(),
         "新增二行".ai(),
     ]);

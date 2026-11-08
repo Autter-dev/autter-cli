@@ -354,33 +354,13 @@ fn configure_daemon_trace2(dry_run: bool) -> Result<bool, AutterError> {
     // shell rather than from the daemon's own (frozen) environment. Names the user
     // already lists are kept.
     let existing_env_vars = global_git_config_values(git_cmd, TRACE2_ENV_VARS_KEY);
-    let merged_env_vars = merge_trace2_env_vars(
-        &existing_env_vars,
-        &crate::authorship::background_agent::trace2_env_vars_value(),
-    );
+    let merged_env_vars =
+        crate::authorship::background_agent::merge_trace2_env_vars(&existing_env_vars);
     if existing_env_vars != [merged_env_vars.clone()] {
         replace_global_git_config_value(git_cmd, TRACE2_ENV_VARS_KEY, &merged_env_vars)?;
         changed = true;
     }
     Ok(changed)
-}
-
-/// Union of the comma-separated names in `existing` values and `required`, keeping
-/// the user's names first and in order.
-fn merge_trace2_env_vars(existing: &[String], required: &str) -> String {
-    let mut names: Vec<&str> = Vec::new();
-    for name in existing
-        .iter()
-        .flat_map(|value| value.split(','))
-        .chain(required.split(','))
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    names.join(",")
 }
 
 /// Every value of a global git config key (empty when unset or unreadable).

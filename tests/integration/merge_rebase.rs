@@ -41,7 +41,7 @@ fn test_blame_after_merge_with_ai_contributions() {
         "MAIN LINE 2".human(),
         "Base line 1".human(),
         "Base line 2".human(),
-        "Base line 3".ai(),
+        "Base line 3".human(),
         "FEATURE LINE 1".ai(),
         "FEATURE LINE 2".ai(),
     ]);
@@ -326,13 +326,12 @@ fn test_merge_conflict_ai_resolution_outside_session() {
     repo.stage_all_and_commit("merge resolved by AI").unwrap();
 
     // "class App:" was never in the conflict — it was identical on both branches → human.
-    // The AI resolved the conflict by writing the entire resolution, so both lines that
-    // were part of the contested region ("    def feature(): pass" and "    def main(): pass")
-    // are attributed to the AI that produced the resolution.
+    // "    def feature(): pass" is the line the AI introduced. "    def main(): pass" is
+    // HEAD's line unchanged (it only gained a trailing newline), so it stays human.
     file.assert_lines_and_blame(crate::lines![
         "class App:".human(),
         "    def feature(): pass".ai(),
-        "    def main(): pass".ai(),
+        "    def main(): pass".human(),
     ]);
 }
 

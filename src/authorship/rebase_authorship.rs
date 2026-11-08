@@ -3531,6 +3531,13 @@ pub fn rewrite_authorship_after_commit_amend_with_snapshot(
     authorship_log.metadata.base_commit_sha = amended_commit.to_string();
 
     // Fill unattributed lines with bg agent attribution (same as post_commit path)
+    // A last line that only gained a trailing newline keeps its earlier attribution.
+    crate::authorship::eof_newline_carryover::carry_over_last_line_attributions(
+        repo,
+        &mut authorship_log,
+        &parent_sha,
+        amended_commit,
+    );
     let background_agent = crate::authorship::background_agent::detect_in(agent_env);
     crate::authorship::background_agent::fill_unattributed_commit_lines(
         repo,

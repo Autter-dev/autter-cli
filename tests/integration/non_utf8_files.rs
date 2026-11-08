@@ -638,7 +638,7 @@ fn test_line_attribution_multi_commit_with_non_utf8_neighbor() {
 
     file.assert_lines_and_blame(crate::lines![
         "const x = 1;".human(),
-        "const y = 2;".ai(),
+        "const y = 2;".human(),
         "const ai_z = compute();".ai(),
         "const ai_w = transform();".ai(),
     ]);
@@ -668,9 +668,9 @@ fn test_line_attribution_interleaved_ai_human_with_non_utf8() {
     repo.stage_all_and_commit("Interleaved additions").unwrap();
 
     file.assert_lines_and_blame(crate::lines![
-        "fn main() {".ai(),
+        "fn main() {".human(),
         "    let a = ai_gen();".ai(),
-        "    let b = human_wrote();".ai(),
+        "    let b = human_wrote();".human(),
         "    let c = ai_gen_2();".ai(),
     ]);
 }

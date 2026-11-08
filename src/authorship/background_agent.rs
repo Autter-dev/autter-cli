@@ -41,6 +41,25 @@ pub fn trace2_env_vars_value() -> String {
         .join(",")
 }
 
+/// The `trace2.envVars` value to write: every name already in `existing` (the user's
+/// own, kept first and in order) plus any of ours that are missing.
+pub fn merge_trace2_env_vars(existing: &[String]) -> String {
+    let required = trace2_env_vars_value();
+    let mut names: Vec<&str> = Vec::new();
+    for name in existing
+        .iter()
+        .flat_map(|value| value.split(','))
+        .chain(required.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(",")
+}
+
 /// A snapshot of the detection variables seen by one git command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentEnv(BTreeMap<String, String>);
@@ -354,6 +373,14 @@ mod tests {
             detect_in(&env(&[("AUTTER_CLOUD_AGENT", "true")])),
             BackgroundAgent::None
         );
+    }
+
+    #[test]
+    fn merge_trace2_env_vars_keeps_user_names_and_adds_ours() {
+        assert_eq!(merge_trace2_env_vars(&[]), trace2_env_vars_value());
+        let merged = merge_trace2_env_vars(&["MY_VAR, CURSOR_AGENT".to_string()]);
+        assert!(merged.starts_with("MY_VAR,CURSOR_AGENT,AUTTER_WRAPPER_INVOCATION_ID"));
+        assert_eq!(merge_trace2_env_vars(&[merged.clone()]), merged);
     }
 
     #[test]

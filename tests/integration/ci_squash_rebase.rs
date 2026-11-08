@@ -69,7 +69,7 @@ fn test_ci_squash_merge_basic() {
     // Verify AI authorship is preserved in the merge commit
     file.assert_lines_and_blame(crate::lines![
         "// Original code".human(),
-        "function original() {}".ai(),
+        "function original() {}".human(),
         "// AI added function".ai(),
         "function aiFeature() {".ai(),
         "  return 'ai code';".ai(),
@@ -145,13 +145,13 @@ fn test_ci_squash_merge_multiple_files() {
 
     // Verify AI authorship is preserved in both files
     file1.assert_lines_and_blame(crate::lines![
-        "// File 1 original".ai(),
+        "// File 1 original".human(),
         "// AI code in file1".ai(),
         "const feature1 = 'ai';".ai()
     ]);
 
     file2.assert_lines_and_blame(crate::lines![
-        "// File 2 original".ai(),
+        "// File 2 original".human(),
         "// AI code in file2".ai(),
         "const feature2 = 'ai';".ai()
     ]);
@@ -237,7 +237,7 @@ fn test_ci_squash_merge_mixed_content() {
     file.assert_lines_and_blame(crate::lines![
         "// Base code".human(),
         "const base = 1;".human(),
-        "// Human comment".ai(),
+        "// Human comment".human(),
         "// AI generated function".ai(),
         "function aiHelper() {".ai(),
         "  return true;".ai(),
@@ -1443,7 +1443,7 @@ fn test_ci_squash_merge_basic_standard_human() {
     // Verify AI authorship is preserved in the merge commit
     file.assert_lines_and_blame(crate::lines![
         "// Original code".unattributed_human(),
-        "function original() {}".ai(),
+        "function original() {}".human(),
         "// AI added function".ai(),
         "function aiFeature() {".ai(),
         "  return 'ai code';".ai(),
@@ -1524,7 +1524,7 @@ fn test_ci_squash_merge_mixed_content_standard_human() {
     file.assert_lines_and_blame(crate::lines![
         "// Base code".unattributed_human(),
         "const base = 1;".unattributed_human(),
-        "// Human comment".ai(),
+        "// Human comment".human(),
         "// AI generated function".ai(),
         "function aiHelper() {".ai(),
         "  return true;".ai(),

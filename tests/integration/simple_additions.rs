@@ -27,7 +27,7 @@ fn run_simple_additions_with_diff_settings(settings: &[(&str, &str)]) {
 
     file.assert_lines_and_blame(crate::lines![
         "Base line 1".human(),
-        "Base line 2".ai(),
+        "Base line 2".human(),
         "NEW LINEs From Claude!".ai(),
         "Hello".ai(),
         "World".ai(),
@@ -63,7 +63,7 @@ fn test_simple_additions_with_base_commit() {
 
     file.assert_lines_and_blame(crate::lines![
         "Base line 1".human(),
-        "Base line 2".ai(),
+        "Base line 2".human(),
         "NEW LINEs From Claude!".ai(),
         "Hello".ai(),
         "World".ai(),
@@ -148,7 +148,7 @@ fn test_simple_additions_on_top_of_ai_contributions() {
     file.assert_lines_and_blame(crate::lines![
         "Line 1".human(),
         "Line 2".human(),
-        "Line 3".ai(),
+        "Line 3".human(),
         "HUMAN EDITED AI LINE".human(),
         "AI Line 2".ai(),
     ]);
@@ -199,9 +199,9 @@ fn test_ai_human_interleaved_line_attribution() {
     repo.stage_all_and_commit("Interleaved commit").unwrap();
 
     file.assert_lines_and_blame(crate::lines![
-        "Base line".ai(),
+        "Base line".human(),
         "AI Line 1".ai(),
-        "Human Line 1".ai(),
+        "Human Line 1".human(),
         "AI Line 2".ai(),
     ]);
 }
@@ -264,7 +264,7 @@ fn test_multiple_ai_checkpoints_with_human_deletions() {
     // places it in the same 1→N hunk as the AI insertions.
     file.assert_lines_and_blame(crate::lines![
         "Base".human(),
-        "Base2".ai(),
+        "Base2".human(),
         "AI2 Line 1".ai(),
         "AI2 Line 2".ai(),
     ]);
@@ -308,7 +308,7 @@ fn test_complex_mixed_additions_and_deletions() {
         "Line 7".human(),
         "Line 8".human(),
         "Line 9".human(),
-        "Line 10".ai(),
+        "Line 10".human(),
         "END LINE 1".ai(),
         "END LINE 2".ai(),
     ]);
@@ -414,7 +414,7 @@ fn test_human_stages_some_ai_lines() {
     file.assert_committed_lines(crate::lines![
         "line1".human(),
         "line2".human(),
-        "line3".ai(),
+        "line3".human(),
         "ai_line4".ai(),
         "ai_line5".ai(),
         "ai_line6".ai(),
@@ -454,7 +454,7 @@ fn test_multiple_ai_sessions_with_partial_staging() {
     file.assert_committed_lines(crate::lines![
         "line1".human(),
         "line2".human(),
-        "line3".ai(),
+        "line3".human(),
         "ai1_line1".ai(),
         "ai1_line2".ai(),
         // ai1_line3 is ai, but it's not considered committed, because adding the subsequent uncommitted lines also added a newline char to this line
@@ -569,7 +569,7 @@ fn test_unstaged_changes_not_committed() {
     file.assert_committed_lines(crate::lines![
         "line1".human(),
         "line2".human(),
-        "line3".ai(),
+        "line3".human(),
         "ai_line4".ai(),
         // line 5 is ai, but it's not considered committed, because adding line 6+ also added a newline char to line 5
     ]);
@@ -1050,7 +1050,7 @@ fn test_mock_ai_with_pathspecs() {
     // file1 should have AI attribution for the new line
     file1.assert_lines_and_blame(crate::lines![
         "File1 Line 1".human(),
-        "File1 Line 2".ai(),
+        "File1 Line 2".human(),
         "File1 AI Line".ai(),
     ]);
 
@@ -1101,7 +1101,7 @@ fn test_with_duplicate_lines() {
     file.assert_lines_and_blame(crate::lines![
         "pub fn format_string(s: &str) -> String {".human(),
         "    s.to_uppercase()".human(),
-        "}".ai(), // This is the attribution for the AI closing brace. Not natural, but this is how git works!
+        "}".human(), // human-written; it only gained a trailing newline when the AI appended below it
         "pub fn reverse_string(s: &str) -> String {".ai(),
         "    s.chars().rev().collect()".ai(),
         "}".human(), // Is human, because of how git diffs work!

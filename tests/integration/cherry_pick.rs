@@ -32,7 +32,7 @@ fn test_single_commit_cherry_pick() {
 
     // Verify final file state - hooks should have preserved AI authorship
     file.assert_lines_and_blame(crate::lines![
-        "Initial content".ai(),
+        "Initial content".human(),
         "AI feature line".ai(),
     ]);
 
@@ -42,9 +42,11 @@ fn test_single_commit_cherry_pick() {
         stats.git_diff_added_lines, 2,
         "Should add 1 AI line (+ newline)"
     );
-    assert_eq!(stats.ai_additions, 2, "2 AI lines added");
-    assert_eq!(stats.ai_accepted, 2, "2 AI lines accepted");
-    assert_eq!(stats.human_additions, 0, "0 human lines added");
+    // "Initial content" had no trailing newline, so git counts it as re-added here;
+    // it keeps its human attribution and only the appended line is AI.
+    assert_eq!(stats.ai_additions, 1, "1 AI line added");
+    assert_eq!(stats.ai_accepted, 1, "1 AI line accepted");
+    assert_eq!(stats.human_additions, 1, "the re-added human line");
 
     // Verify prompt records have correct stats
     let head_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
@@ -440,7 +442,7 @@ fn test_cherry_pick_multiple_ai_sessions() {
 
     // Verify final file state - hooks should have preserved AI authorship
     file.assert_lines_and_blame(crate::lines![
-        "fn main() {".ai(),
+        "fn main() {".human(),
         "    println!(\"Starting\");".ai(),
         "    // TODO: Add error handling".ai(),
         "}".human(),
@@ -506,7 +508,7 @@ fn test_cherry_pick_identical_trees() {
     repo.git(&["cherry-pick", &feature_commit]).unwrap();
 
     // Verify final file state - hooks should have preserved AI authorship
-    file.assert_lines_and_blame(crate::lines!["Line 1".ai(), "AI line".ai(),]);
+    file.assert_lines_and_blame(crate::lines!["Line 1".human(), "AI line".ai(),]);
 }
 
 /// Test cherry-pick where some commits become empty (already applied)
@@ -632,7 +634,7 @@ fn test_cherry_pick_preserves_custom_attributes_from_config() {
 
     // Also verify the AI attribution itself survived
     file.assert_lines_and_blame(crate::lines![
-        "Initial content".ai(),
+        "Initial content".human(),
         "AI feature line".ai()
     ]);
 }
@@ -680,12 +682,12 @@ fn test_cherry_pick_bad_args_dont_corrupt_subsequent_attribution() {
     repo.git(&["cherry-pick", &sha1]).unwrap();
     // Single-commit cherry-pick: the source commit's note covers all file content,
     // so all lines (including "base line") end up AI-attributed after the copy.
-    file.assert_lines_and_blame(crate::lines!["base line".ai(), "AI line 1".ai(),]);
+    file.assert_lines_and_blame(crate::lines!["base line".human(), "AI line 1".ai(),]);
 
     // Cherry-pick sha2 as well — state must still be clean.
     repo.git(&["cherry-pick", &sha2]).unwrap();
     file.assert_lines_and_blame(crate::lines![
-        "base line".ai(),
+        "base line".human(),
         "AI line 1".ai(),
         "AI line 2".ai(),
     ]);
@@ -809,7 +811,7 @@ fn test_cherry_pick_from_remote_without_prefetched_notes() {
 
     // Single-commit cherry-pick: the source note covers all file content, so both lines
     // end up AI-attributed after the note is copied to the cherry-picked commit.
-    target_file.assert_lines_and_blame(crate::lines!["base".ai(), "AI line".ai(),]);
+    target_file.assert_lines_and_blame(crate::lines!["base".human(), "AI line".ai(),]);
 }
 
 crate::reuse_tests_in_worktree!(

@@ -19,6 +19,7 @@ const SELF_CHECK_CONTENT_AI: &str = "Untracked line\nKnown human line\nAI line\n
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "10";
+const TRACE2_ENV_VARS_KEY: &str = "trace2.envVars";
 const SELF_CHECK_TRACE_ENV_REMOVE: &[&str] = &[
     "GIT_TRACE2_PARENT_SID",
     "GIT_TRACE2_PARENT_NAME",
@@ -1668,6 +1669,46 @@ pub fn repair_stale_trace2_config(git_program: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// When git's trace2 events already go to this machine's autter service, make sure
+/// `trace2.envVars` also lists the background-agent detection variables, so the
+/// service judges each commit by the shell that made it. Installs from before
+/// per-commit detection lack them; this repairs them in place. Returns a note
+/// when something changed.
+pub fn repair_trace2_agent_env_vars(git_program: &str) -> Option<String> {
+    let expected = crate::daemon::DaemonConfig::from_env_or_default_paths()
+        .ok()?
+        .trace2_event_target();
+    let mut commands = Vec::new();
+    let targets =
+        read_global_git_config_values(&mut commands, git_program, TRACE2_EVENT_TARGET_KEY).ok()?;
+    if !targets.iter().any(|t| t == &expected) {
+        return None;
+    }
+    let existing =
+        read_global_git_config_values(&mut commands, git_program, TRACE2_ENV_VARS_KEY).ok()?;
+    let merged = crate::authorship::background_agent::merge_trace2_env_vars(&existing);
+    if existing == [merged.clone()] {
+        return None;
+    }
+    let ok = std::process::Command::new(git_program)
+        .args([
+            "config",
+            "--global",
+            "--replace-all",
+            TRACE2_ENV_VARS_KEY,
+            &merged,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    ok.then(|| {
+        format!(
+            "repaired: {TRACE2_ENV_VARS_KEY} now reports cloud-agent variables for each command, so a commit is only credited to an agent when it was made inside one"
+        )
+    })
 }
 
 /// True when every configured trace2 event target is an autter target, but

@@ -106,7 +106,7 @@ fn test_amend_add_lines_at_bottom() {
         "line 2".human(),
         "line 3".human(),
         "line 4".human(),
-        "line 5".ai(),
+        "line 5".human(),
         "// AI appended line 1".ai(),
         "// AI appended line 2".ai()
     ]);
@@ -348,7 +348,7 @@ fn test_amend_with_partially_staged_ai_file() {
     // diff places it in the same 1→N hunk as the AI additions (force_split applies).
     file.assert_lines_and_blame(crate::lines![
         "// Initial line".human(),
-        "// Human end".ai(),
+        "// Human end".human(),
         "// AI line 1".ai(),
         "// AI line 2".ai(),
         "// AI line 3".ai(),
@@ -400,7 +400,7 @@ fn test_amend_with_partially_staged_mixed_content() {
         "human line 2".human(),
         "// AI addition 1".ai(),
         "// AI addition 2".ai(),
-        "human end".ai(),
+        "human end".human(),
     ]);
 }
 
@@ -455,7 +455,7 @@ fn test_amend_with_unstaged_middle_section() {
     // the same 1→N hunk as the AI additions (force_split applies).
     file.assert_lines_and_blame(crate::lines![
         "// File header".human(),
-        "// File footer".ai(),
+        "// File footer".human(),
         "// AI section 1 line 1".ai(),
         "// AI section 1 line 2".ai(),
         "// AI section 2 line 1".ai(),

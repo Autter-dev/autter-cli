@@ -564,6 +564,45 @@ impl AttributionTracker {
         ts: u128,
         is_ai_checkpoint: bool,
     ) -> Result<Vec<Attribution>, AutterError> {
+        // The diff compares whole lines including their line ending, so a last line
+        // without a trailing newline ("a") never equals the same line once something is
+        // appended below it ("a\n"). That made an append look like a rewrite of the line
+        // above, and AI checkpoints then claimed that line. Diff as if both sides ended
+        // with a newline, then trim back to the real content.
+        let old_needs_newline = !old_content.is_empty() && !old_content.ends_with('\n');
+        let new_needs_newline = !new_content.is_empty() && !new_content.ends_with('\n');
+        if old_needs_newline || new_needs_newline {
+            let old_terminated = if old_needs_newline {
+                format!("{old_content}\n")
+            } else {
+                old_content.to_string()
+            };
+            let new_terminated = if new_needs_newline {
+                format!("{new_content}\n")
+            } else {
+                new_content.to_string()
+            };
+            let attributions = self.update_attributions_for_checkpoint(
+                &old_terminated,
+                &new_terminated,
+                old_attributions,
+                current_author,
+                ts,
+                is_ai_checkpoint,
+            )?;
+            let len = new_content.len();
+            let trimmed = attributions
+                .into_iter()
+                .filter_map(|mut attr| {
+                    let was_marker = attr.start == attr.end;
+                    attr.start = attr.start.min(len);
+                    attr.end = attr.end.min(len);
+                    (was_marker || attr.start < attr.end).then_some(attr)
+                })
+                .collect();
+            return Ok(self.merge_attributions(trimmed));
+        }
+
         // Cursor-based scans in transform_attributions assume sorted ranges.
         // Normalize once at the boundary so callers can pass ranges in any order.
         let sorted_old_storage = (!is_attribution_list_sorted(old_attributions))
@@ -2053,6 +2092,17 @@ fn find_dominant_author_for_line_candidates(
     full_content: &str,
     is_ai_checkpoint: bool,
 ) -> (String, Option<String>) {
+    // Where this line's own line ending ("\n" or "\r\n") starts.
+    let line_text = &full_content[line_start..line_end];
+    let terminator_len = if line_text.ends_with("\r\n") {
+        2
+    } else if line_text.ends_with('\n') {
+        1
+    } else {
+        0
+    };
+    let terminator_start = line_end - terminator_len;
+
     let mut candidate_attrs: Vec<&Attribution> = Vec::new();
     for &attr_idx in candidate_indices {
         let attribution = &attributions[attr_idx];
@@ -2063,6 +2113,17 @@ fn find_dominant_author_for_line_candidates(
         // Get the substring of the content on this line that is covered by the attribution
         let slice_start = std::cmp::max(line_start, attribution.start);
         let slice_end = std::cmp::min(line_end, attribution.end);
+
+        // An edit that only adds or changes the line ending of a line with content does
+        // not author that line. This happens when someone appends below a last line
+        // that had no trailing newline: the "\n" they insert lands on the line above.
+        if !is_line_empty
+            && terminator_len > 0
+            && slice_start < slice_end
+            && slice_start >= terminator_start
+        {
+            continue;
+        }
         let mut has_non_whitespace = false;
         if slice_start < slice_end {
             let safe_start = if full_content.is_char_boundary(slice_start) {
@@ -2619,6 +2680,59 @@ mod tests {
             .expect("AI block missing");
         assert_eq!(ai_block.start_line, 2);
         assert_eq!(ai_block.end_line, 17);
+    }
+
+    #[test]
+    fn ai_append_below_unterminated_last_line_keeps_that_line() {
+        let tracker = AttributionTracker::new();
+        let human_attrs = vec![Attribution::new(0, 10, "h_human".into(), TEST_TS)];
+
+        for new in ["human line\nai line", "human line\nai line\n"] {
+            let updated = tracker
+                .update_attributions_for_checkpoint(
+                    "human line",
+                    new,
+                    &human_attrs,
+                    "ai",
+                    TEST_TS + 1,
+                    true,
+                )
+                .unwrap();
+            assert_range_owned_by(&updated, 0, 10, "h_human");
+            assert!(
+                updated.iter().all(|a| a.end <= new.len()),
+                "attributions must stay inside the content: {updated:?}"
+            );
+
+            let line_attrs = attributions_to_line_attributions_for_checkpoint(&updated, new, true);
+            assert_eq!(
+                line_attrs
+                    .iter()
+                    .filter(|la| la.author_id == "ai")
+                    .map(|la| (la.start_line, la.end_line))
+                    .collect::<Vec<_>>(),
+                vec![(2, 2)],
+                "only the appended line is AI for {new:?}: {line_attrs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_that_only_adds_a_line_ending_does_not_author_the_line() {
+        // The AI owns just the "\n" that ends line 1, plus line 2.
+        let content = "human line\nai line";
+        let attrs = vec![
+            Attribution::new(0, 10, "human".into(), TEST_TS),
+            Attribution::new(10, 18, "ai".into(), TEST_TS + 1),
+        ];
+        let line_attrs = attributions_to_line_attributions_for_checkpoint(&attrs, content, true);
+        assert_eq!(
+            line_attrs
+                .iter()
+                .map(|la| (la.start_line, la.end_line, la.author_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, 2, "ai")]
+        );
     }
 
     // ====================================================================

@@ -603,7 +603,7 @@ fn test_cross_repo_cwd_blame_shows_correct_attribution() {
     let mut file = repo_target.filename("existing.txt");
     file.assert_lines_and_blame(vec![
         "Human line 1".human(),
-        "Human line 2".ai(),
+        "Human line 2".human(),
         "AI appended line 1".ai(),
         "AI appended line 2".ai(),
     ]);
@@ -655,11 +655,11 @@ fn test_parent_cwd_blame_correct_across_repos() {
 
     // Verify blame in repo_a
     let mut blamed_a = repo_a.filename("code.txt");
-    blamed_a.assert_lines_and_blame(vec!["Human A1".human(), "Human A2".ai(), "AI A3".ai()]);
+    blamed_a.assert_lines_and_blame(vec!["Human A1".human(), "Human A2".human(), "AI A3".ai()]);
 
     // Verify blame in repo_b
     let mut blamed_b = repo_b.filename("code.txt");
-    blamed_b.assert_lines_and_blame(vec!["Human B1".ai(), "AI B2".ai(), "AI B3".ai()]);
+    blamed_b.assert_lines_and_blame(vec!["Human B1".human(), "AI B2".ai(), "AI B3".ai()]);
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -1053,7 +1053,7 @@ fn test_nested_subrepo_blame_attribution_mock_ai() {
     let mut file = subrepo.filename("code.txt");
     file.assert_lines_and_blame(vec![
         "Human line 1".human(),
-        "Human line 2".ai(),
+        "Human line 2".human(),
         "AI appended 1".ai(),
         "AI appended 2".ai(),
     ]);

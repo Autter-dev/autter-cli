@@ -146,6 +146,9 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     // before any check that sends a git event through it. Missing or foreign
     // config is only reported: that needs `autter install --system`.
     let trace2_repair = crate::diagnostics::repair_stale_trace2_config(&git_cmd);
+    // Older installs don't report cloud-agent variables per command; add them so
+    // agent attribution never depends on the service's own environment.
+    let agent_env_repair = crate::diagnostics::repair_trace2_agent_env_vars(&git_cmd);
 
     // Setup: git binary/version, config file parse, repository eligibility.
     reporter.begin(SECTION_SETUP, "checking git");
@@ -230,7 +233,7 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
             name,
             crate::diagnostics::check_trace2_global_config(target),
         );
-        if let Some(repair) = &trace2_repair {
+        for repair in [&agent_env_repair, &trace2_repair].into_iter().flatten() {
             check.details.insert(0, repair.clone());
         }
         if check.status == DoctorStatus::Failed {
