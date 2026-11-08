@@ -2524,14 +2524,22 @@ mod tests {
         }
     }
 
+    /// Transcripts upload only in connected mode (dede3cd made cloud sync opt
+    /// in). The repository-filter tests below start from a connected config so
+    /// they test the filters, not the opt-in.
+    fn connected(mut config: Config) -> Config {
+        config.notes_backend.kind = NotesBackendKind::Both;
+        config
+    }
+
     #[test]
     fn test_transcript_upload_checks_all_repository_remotes() {
-        let config = create_test_config_with_include_prompts(
+        let config = connected(create_test_config_with_include_prompts(
             vec![],
             vec!["https://github.com/private/*".into()],
             "default",
             None,
-        );
+        ));
         let public = vec![("origin".into(), "https://github.com/public/repo".into())];
         assert!(config.should_upload_transcript_with_remotes(Some(&public)));
         let mut multiple = public;
@@ -2544,12 +2552,12 @@ mod tests {
     fn test_transcript_upload_honors_include_fallback_and_local_mode() {
         let work = vec![("origin".into(), "https://github.com/work/repo".into())];
         let other = vec![("origin".into(), "https://github.com/personal/repo".into())];
-        let mut config = create_test_config_with_include_prompts(
+        let mut config = connected(create_test_config_with_include_prompts(
             vec!["https://github.com/work/*".into()],
             vec![],
             "default",
             Some("local"),
-        );
+        ));
         assert!(config.should_upload_transcript_with_remotes(Some(&work)));
         assert!(!config.should_upload_transcript_with_remotes(Some(&other)));
         assert!(!config.should_upload_transcript_with_remotes(None));
@@ -2562,20 +2570,30 @@ mod tests {
     fn test_transcript_upload_honors_capture_filters() {
         let allowed = vec![("origin".into(), "https://github.com/allowed/repo".into())];
         let private = vec![("origin".into(), "https://github.com/private/repo".into())];
-        let config = create_test_config(vec!["https://github.com/allowed/*".into()], vec![]);
+        let config = connected(create_test_config(
+            vec!["https://github.com/allowed/*".into()],
+            vec![],
+        ));
         assert!(config.should_upload_transcript_with_remotes(Some(&allowed)));
         assert!(!config.should_upload_transcript_with_remotes(Some(&private)));
         assert!(!config.should_upload_transcript_with_remotes(None));
-        let config = create_test_config(vec![], vec!["https://github.com/private/*".into()]);
+        let config = connected(create_test_config(
+            vec![],
+            vec!["https://github.com/private/*".into()],
+        ));
         assert!(!config.should_upload_transcript_with_remotes(Some(&private)));
     }
 
     #[test]
     fn test_transcript_upload_unknown_context_without_restrictions() {
-        let config = create_test_config(vec![], vec![]);
+        let config = connected(create_test_config(vec![], vec![]));
         assert!(config.should_upload_transcript_with_remotes(None));
-        let excluded =
-            create_test_config_with_include_prompts(vec![], vec!["*".into()], "default", None);
+        let excluded = connected(create_test_config_with_include_prompts(
+            vec![],
+            vec!["*".into()],
+            "default",
+            None,
+        ));
         assert!(!excluded.should_upload_transcript_with_remotes(Some(&vec![])));
         assert!(!excluded.should_upload_transcript_with_remotes(None));
     }
