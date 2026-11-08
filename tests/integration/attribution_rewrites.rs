@@ -37,15 +37,15 @@ fn cherry_pick_range_maps_each_commit_to_its_source() {
     let range_start = head_sha(&repo);
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&file_path, "Base line\nAI one\n").unwrap();
     repo.autter(&["checkpoint", "human", "range.txt"]).unwrap();
+    fs::write(&file_path, "Base line\nAI one\n").unwrap();
     repo.autter(&["checkpoint", "mock_ai", "range.txt"])
         .unwrap();
     repo.stage_all_and_commit("AI one").unwrap();
     file.assert_committed_lines(lines!["Base line".unattributed_human(), "AI one".ai()]);
 
-    fs::write(&file_path, "Base line\nAI one\nAI two\n").unwrap();
     repo.autter(&["checkpoint", "human", "range.txt"]).unwrap();
+    fs::write(&file_path, "Base line\nAI one\nAI two\n").unwrap();
     repo.autter(&["checkpoint", "mock_ai", "range.txt"])
         .unwrap();
     repo.stage_all_and_commit("AI two").unwrap();
@@ -99,9 +99,9 @@ fn cherry_pick_no_commit_then_plain_commit_keeps_ai_attribution() {
     let main_branch = repo.current_branch();
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&file_path, "Base line\nAI picked line\n").unwrap();
     repo.autter(&["checkpoint", "human", "nocommit.txt"])
         .unwrap();
+    fs::write(&file_path, "Base line\nAI picked line\n").unwrap();
     repo.autter(&["checkpoint", "mock_ai", "nocommit.txt"])
         .unwrap();
     repo.stage_all_and_commit("AI change").unwrap();
@@ -140,9 +140,10 @@ fn cherry_pick_no_commit_onto_uncommitted_ai_work_keeps_both() {
     let main_branch = repo.current_branch();
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&picked_path, "Picked base\nAI picked line\n").unwrap();
     repo.autter(&["checkpoint", "human", "picked.txt"]).unwrap();
-    repo.autter(&["checkpoint", "mock_ai", "picked.txt"]).unwrap();
+    fs::write(&picked_path, "Picked base\nAI picked line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "picked.txt"])
+        .unwrap();
     repo.stage_all_and_commit("AI change to pick").unwrap();
     picked.assert_committed_lines(lines![
         "Picked base".unattributed_human(),
@@ -154,8 +155,8 @@ fn cherry_pick_no_commit_onto_uncommitted_ai_work_keeps_both() {
     picked.assert_committed_lines(lines!["Picked base".unattributed_human()]);
 
     // Uncommitted AI work in another file, left unstaged.
-    fs::write(&live_path, "Live base\nLive AI line\n").unwrap();
     repo.autter(&["checkpoint", "human", "live.txt"]).unwrap();
+    fs::write(&live_path, "Live base\nLive AI line\n").unwrap();
     repo.autter(&["checkpoint", "mock_ai", "live.txt"]).unwrap();
 
     repo.git(&["cherry-pick", "-n", &source]).unwrap();
@@ -167,7 +168,10 @@ fn cherry_pick_no_commit_onto_uncommitted_ai_work_keeps_both() {
         "Picked base".unattributed_human(),
         "AI picked line".ai(),
     ]);
-    live.assert_committed_lines(lines!["Live base".unattributed_human(), "Live AI line".ai()]);
+    live.assert_committed_lines(lines![
+        "Live base".unattributed_human(),
+        "Live AI line".ai()
+    ]);
 }
 
 #[test]
@@ -186,9 +190,10 @@ fn cherry_pick_no_commit_onto_staged_ai_work_in_same_file_keeps_both() {
     let main_branch = repo.current_branch();
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&file_path, "Line 1\nLine 2\nLine 3\nPicked AI line\n").unwrap();
     repo.autter(&["checkpoint", "human", "shared.txt"]).unwrap();
-    repo.autter(&["checkpoint", "mock_ai", "shared.txt"]).unwrap();
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\nPicked AI line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "shared.txt"])
+        .unwrap();
     repo.stage_all_and_commit("AI change to pick").unwrap();
     file.assert_committed_lines(lines![
         "Line 1".unattributed_human(),
@@ -207,9 +212,10 @@ fn cherry_pick_no_commit_onto_staged_ai_work_in_same_file_keeps_both() {
 
     // Uncommitted AI work in the same file. `cherry-pick -n` merges against
     // the index, so the live work is staged first.
-    fs::write(&file_path, "Live AI line\nLine 1\nLine 2\nLine 3\n").unwrap();
     repo.autter(&["checkpoint", "human", "shared.txt"]).unwrap();
-    repo.autter(&["checkpoint", "mock_ai", "shared.txt"]).unwrap();
+    fs::write(&file_path, "Live AI line\nLine 1\nLine 2\nLine 3\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "shared.txt"])
+        .unwrap();
     repo.git(&["add", "shared.txt"]).unwrap();
 
     repo.git(&["cherry-pick", "-n", &source]).unwrap();
@@ -255,8 +261,8 @@ fn set_up_conflicted_cherry_pick(repo: &TestRepo, name: &str) -> (std::path::Pat
     let main_branch = repo.current_branch();
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&file_path, "Line 1\nAI version\nLine 3\n").unwrap();
     repo.autter(&["checkpoint", "human", name]).unwrap();
+    fs::write(&file_path, "Line 1\nAI version\nLine 3\n").unwrap();
     repo.autter(&["checkpoint", "mock_ai", name]).unwrap();
     repo.stage_all_and_commit("AI change").unwrap();
     file.assert_committed_lines(lines![
@@ -388,9 +394,9 @@ fn rebase_onto_renamed_file_moves_attribution_to_new_path() {
 
     // Feature branch: the AI edits the file under its old name.
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&old_path, "Base line 1\nBase line 2\nAI added line\n").unwrap();
     repo.autter(&["checkpoint", "human", "old_name.txt"])
         .unwrap();
+    fs::write(&old_path, "Base line 1\nBase line 2\nAI added line\n").unwrap();
     repo.autter(&["checkpoint", "mock_ai", "old_name.txt"])
         .unwrap();
     repo.stage_all_and_commit("AI edit").unwrap();
@@ -442,9 +448,10 @@ fn rebase_of_commits_that_rename_the_file_keeps_ai_attribution() {
 
     // Feature branch: the AI edits the file, then a later commit renames it.
     repo.git(&["checkout", "-b", "feature"]).unwrap();
-    fs::write(&old_path, "Base line 1\nBase line 2\nAI added line\n").unwrap();
     repo.autter(&["checkpoint", "human", "before.txt"]).unwrap();
-    repo.autter(&["checkpoint", "mock_ai", "before.txt"]).unwrap();
+    fs::write(&old_path, "Base line 1\nBase line 2\nAI added line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "before.txt"])
+        .unwrap();
     repo.stage_all_and_commit("AI edit").unwrap();
     old_file.assert_committed_lines(lines![
         "Base line 1".unattributed_human(),
@@ -476,7 +483,10 @@ fn rebase_of_commits_that_rename_the_file_keeps_ai_attribution() {
     repo.git(&["rebase", &main_branch]).unwrap();
     repo.sync_daemon();
 
-    assert!(!old_path.exists(), "the rebased rename should remove before.txt");
+    assert!(
+        !old_path.exists(),
+        "the rebased rename should remove before.txt"
+    );
     new_file.assert_committed_lines(lines![
         "Main header".unattributed_human(),
         "Base line 1".unattributed_human(),
