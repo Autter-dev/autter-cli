@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 844
 expression: human_only_output
 ---
-"you  ████████████████████████████████████████ ai\n     100%                                   0%\n"
+"human ████████████████████████████████████████ AI\n      75 human (100%) · 0 AI (0%) · 75 added, 10 deleted\n"

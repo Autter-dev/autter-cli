@@ -1,0 +1,14 @@
+---
+source: src/commands/coverage.rs
+assertion_line: 387
+expression: render_coverage(&report)
+---
+Attribution coverage: last 50 commits from HEAD
+     5  recorded (3 with AI lines, 2 with no AI activity)
+     1  pending, the background service is still writing them
+     1  predate Autter in this repository
+     1  merges without a record (they add no lines of their own)
+     1  missing a record:
+          e4f5a6b  alice@example.com  made by someone else; their record is not here
+Remote (origin): 2 recorded commit(s) here are not on origin as of the last fetch; `git push` shares them.
+Next: `autter fetch-notes`

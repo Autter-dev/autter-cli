@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 816
 expression: mixed_output
 ---
-"you  █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai\n     33%                                  67%\n"
+"human █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ AI\n      50 human (33%) · 100 AI (67%) · 80 added, 15 deleted\n"

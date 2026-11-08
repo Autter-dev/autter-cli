@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 858
 expression: minimal_human_output
 ---
-"you  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai\n     2%                                   98%\n"
+"human ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ AI\n      2 human (2%) · 100 AI (98%) · 102 added, 0 deleted\n"

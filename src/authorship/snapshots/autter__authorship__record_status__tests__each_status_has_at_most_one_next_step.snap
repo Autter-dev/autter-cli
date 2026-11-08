@@ -1,0 +1,20 @@
+---
+source: src/authorship/record_status.rs
+assertion_line: 522
+expression: "rendered.join(\"---\\n\")"
+---
+Pending: the background service is still writing this commit's record (2 pending).
+Next: run the command again in a few seconds, or add --wait
+---
+This commit predates Autter in this repository (first recorded commit: 2026-01-01).
+---
+No commit in this repository has an Autter record yet. Commits made from now on get one.
+---
+Capture failed: checkpoints were recorded for this commit, but the background service did not write its record.
+Next: `autter doctor`
+---
+No Autter record for this commit. Someone else made it; their record may not be fetched, or they don't use Autter.
+Next: `autter fetch-notes`
+---
+No Autter record for this commit: it was made while Autter was not recording (service stopped, or another clone or machine).
+Next: `autter doctor`

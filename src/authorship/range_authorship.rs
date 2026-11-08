@@ -12,7 +12,6 @@ use crate::git::notes_api::{
     CommitAuthorship, filter_commits_with_notes as get_commits_with_notes_from_list,
 };
 use crate::git::repository::{CommitRange, InternalGitProfile, Repository, exec_git_with_profile};
-use std::io::IsTerminal;
 
 /// The git empty tree hash - represents an empty repository state
 /// This is the hash of the empty tree object that git uses internally
@@ -426,7 +425,7 @@ fn calculate_range_stats_direct(
         git_diff_added_lines,
         git_diff_deleted_lines,
         diff_ai_stats.total_ai_accepted,
-        0,
+        diff_ai_stats.total_known_human,
         &diff_ai_stats.per_tool_model,
     );
 
@@ -434,45 +433,44 @@ fn calculate_range_stats_direct(
 }
 
 pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
-    println!("\n");
+    print!("{}", render_range_authorship_stats(stats));
+}
 
-    // If there's no AI authorship in the range, show the special message
-    if stats.authorship_stats.commits_with_authorship == 0 {
-        println!("Committers are not using autter");
-        return;
-    }
+/// Text for `autter stats <a>..<b>`. Printed whether or not stdout is a
+/// terminal, so piped output matches what a person sees.
+pub fn render_range_authorship_stats(stats: &RangeAuthorshipStats) -> String {
+    use crate::authorship::labels::{AI_SHARE_MEANING, LineCategory};
+    use crate::authorship::stats::write_stats_to_terminal_with;
 
-    // Use existing stats terminal output
-    use crate::authorship::stats::write_stats_to_terminal;
+    let data = &stats.authorship_stats;
+    let none_recorded = data.commits_with_authorship == 0;
+    let unattributed = if none_recorded {
+        LineCategory::Unknown
+    } else {
+        LineCategory::Untracked
+    };
+    let mut out = write_stats_to_terminal_with(&stats.range_stats, false, unattributed);
 
-    // Only print stats if we're in an interactive terminal
-    let is_interactive = std::io::stdout().is_terminal();
-    write_stats_to_terminal(&stats.range_stats, is_interactive);
-
-    // Check if all individual commits have authorship logs (for optional breakdown)
-    let all_have_authorship =
-        stats.authorship_stats.commits_with_authorship == stats.authorship_stats.total_commits;
-
-    // If not all commits have authorship logs, show the breakdown
-    if !all_have_authorship {
-        let commits_without =
-            stats.authorship_stats.total_commits - stats.authorship_stats.commits_with_authorship;
+    if none_recorded {
+        out.push_str("No commit in this range has an Autter record.\n");
+    } else if data.commits_with_authorship < data.total_commits {
+        let commits_without = data.total_commits - data.commits_with_authorship;
         let commit_word = if commits_without == 1 {
-            "commit"
+            "commit has"
         } else {
-            "commits"
+            "commits have"
         };
-        println!(
-            "  {} {} without Authorship Logs",
-            commits_without, commit_word
-        );
-
-        // Show each commit without authorship
-        for (sha, author) in &stats
-            .authorship_stats
-            .commits_without_authorship_with_authors
-        {
-            println!("    {} {}", &sha[0..7], author);
+        out.push_str(&format!(
+            "{commits_without} of {} {commit_word} no Autter record (their lines count as untracked):\n",
+            data.total_commits
+        ));
+        for (sha, author) in &data.commits_without_authorship_with_authors {
+            out.push_str(&format!("  {} {}\n", &sha[..sha.len().min(7)], author));
         }
     }
+    if stats.range_stats.ai_additions > 0 {
+        out.push_str(AI_SHARE_MEANING);
+        out.push('\n');
+    }
+    out
 }

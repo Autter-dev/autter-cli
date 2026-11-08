@@ -16,8 +16,8 @@ fn log_default_shows_stats_without_raw_note() {
 
     assert!(output.contains("feat: add ai line"), "output:\n{}", output);
     assert!(output.contains("Autter stats:"), "output:\n{}", output);
-    assert!(output.contains("you"), "output:\n{}", output);
-    assert!(output.contains("ai"), "output:\n{}", output);
+    assert!(output.contains("human "), "output:\n{}", output);
+    assert!(output.contains("1 AI (100%)"), "output:\n{}", output);
     assert!(
         !output.contains("schema_version"),
         "raw note data should be hidden by default:\n{}",

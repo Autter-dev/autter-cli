@@ -167,6 +167,13 @@ pub fn post_commit_with_final_state(
         &human_author,
     );
 
+    // The prompt/session metrics above were computed from checkpoint-time
+    // working-tree attributions, which include lines that were never
+    // committed (unstaged, in other files, or deleted by hand afterwards).
+    // Count accepted lines from this commit's attestations instead, so the
+    // note agrees with `autter stats`.
+    recount_accepted_lines_from_attestations(&mut authorship_log);
+
     // Long-lived daemon processes should read a fresh config snapshot.
     // Always use Config::fresh() to support runtime config updates
     // (especially important for daemon mode, but also good for consistency)
@@ -386,6 +393,51 @@ pub fn post_commit_with_final_state(
         }
     }
     Ok((commit_sha.to_string(), authorship_log))
+}
+
+/// Set each prompt's and session's `accepted_lines` (and each session file's)
+/// to the lines its attestations cover in this commit.
+pub(crate) fn recount_accepted_lines_from_attestations(authorship_log: &mut AuthorshipLog) {
+    let mut accepted: HashMap<String, u32> = HashMap::new();
+    let mut accepted_by_file: HashMap<(String, String), u32> = HashMap::new();
+    for file in &authorship_log.attestations {
+        for entry in &file.entries {
+            if entry.hash.starts_with("h_") {
+                continue;
+            }
+            let key = entry.hash.split("::").next().unwrap_or(&entry.hash);
+            let lines: u32 = entry
+                .line_ranges
+                .iter()
+                .map(|range| match range {
+                    crate::authorship::authorship_log::LineRange::Single(_) => 1,
+                    crate::authorship::authorship_log::LineRange::Range(start, end) => {
+                        end.saturating_sub(*start) + 1
+                    }
+                })
+                .sum();
+            *accepted.entry(key.to_string()).or_insert(0) += lines;
+            *accepted_by_file
+                .entry((key.to_string(), file.file_path.clone()))
+                .or_insert(0) += lines;
+        }
+    }
+
+    for (prompt_id, record) in authorship_log.metadata.prompts.iter_mut() {
+        record.accepted_lines = accepted.get(prompt_id).copied().unwrap_or(0);
+    }
+    for (session_id, record) in authorship_log.metadata.sessions.iter_mut() {
+        let Some(stats) = record.stats.as_mut() else {
+            continue;
+        };
+        stats.accepted_lines = accepted.get(session_id).copied().unwrap_or(0);
+        for (file_path, file_stats) in stats.files.iter_mut() {
+            file_stats.accepted_lines = accepted_by_file
+                .get(&(session_id.clone(), file_path.clone()))
+                .copied()
+                .unwrap_or(0);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

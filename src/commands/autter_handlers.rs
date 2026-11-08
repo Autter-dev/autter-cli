@@ -1156,10 +1156,7 @@ fn handle_ai_blame(args: &[String]) {
         .to_string();
     let repo = match find_repository_in_path(&current_dir) {
         Ok(repo) => repo,
-        Err(e) => {
-            eprintln!("Failed to find repository: {}", e);
-            std::process::exit(1);
-        }
+        Err(e) => commands::exit_repository_error("blame", &e),
     };
 
     // Parse blame arguments
@@ -1270,10 +1267,7 @@ fn handle_ai_diff(args: &[String]) {
         .to_string();
     let repo = match find_repository_in_path(&current_dir) {
         Ok(repo) => repo,
-        Err(e) => {
-            eprintln!("Failed to find repository: {}", e);
-            std::process::exit(1);
-        }
+        Err(e) => commands::exit_repository_error("diff", &e),
     };
 
     if let Err(e) = commands::diff::handle_diff(&repo, args) {
@@ -1302,8 +1296,7 @@ fn handle_stats(args: &[String]) {
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
         Err(e) => {
-            eprintln!("Failed to find repository: {}", e);
-            std::process::exit(1);
+            commands::exit_repository_error("stats", &e);
         }
     };
     // Parse stats-specific arguments
@@ -1313,12 +1306,18 @@ fn handle_stats(args: &[String]) {
     let mut ignore_patterns: Vec<String> = Vec::new();
     let mut wait_secs: Option<u64> = None;
     let mut interactive = false;
+    let mut coverage = false;
+    let mut raw_spec: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-i" | "--interactive" => {
                 interactive = true;
+                i += 1;
+            }
+            "--coverage" => {
+                coverage = true;
                 i += 1;
             }
             "--ignore" => {
@@ -1365,8 +1364,9 @@ fn handle_stats(args: &[String]) {
             }
             _ => {
                 // First non-flag argument is treated as commit SHA or range
-                if commit_sha.is_none() {
+                if commit_sha.is_none() && commit_range.is_none() {
                     let arg = &args[i];
+                    raw_spec = Some(arg.clone());
                     // Check if this is a commit range (contains "..")
                     if arg.contains("..") {
                         let parts: Vec<&str> = arg.split("..").collect();
@@ -1400,6 +1400,16 @@ fn handle_stats(args: &[String]) {
                 }
             }
         }
+    }
+
+    // `--coverage`: which commits have a record, why the rest don't, and
+    // whether the records reached the remote.
+    if coverage {
+        if let Err(e) = commands::coverage::run_coverage(&repo, raw_spec.as_deref(), json_output) {
+            eprintln!("Coverage failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
     }
 
     // `-i`: browse recent commits full-screen, starting from the given commit.

@@ -423,6 +423,7 @@ mod tests {
             blame_hunks: Vec::new(),
             humans: BTreeMap::new(),
             line_prompts: HashMap::new(),
+            line_categories: HashMap::new(),
         };
         assert_eq!(
             classify(4, &analysis),

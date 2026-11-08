@@ -7,6 +7,7 @@ pub mod checkpoint_agent;
 pub mod ci_handlers;
 pub mod config;
 pub mod context;
+pub mod coverage;
 pub mod daemon;
 pub mod debug;
 pub mod diff;
@@ -65,6 +66,26 @@ pub const EXIT_RUNTIME_ERROR: i32 = 1;
 /// Usage/argument error in a user-invoked subcommand. See [`EXIT_SUCCESS`].
 pub const EXIT_USAGE_ERROR: i32 = 2;
 
+/// The error a repository-scoped command prints when it can't open the
+/// repository. Outside a repository that is one plain sentence instead of
+/// git's `rev-parse` failure.
+pub fn repository_error_message(command: &str, error: &crate::error::AutterError) -> String {
+    let text = error.to_string();
+    if text.contains("not a git repository") {
+        format!(
+            "error: `autter {command}` must be run inside a git repository (or pass -C <path>)."
+        )
+    } else {
+        format!("error: could not open the git repository: {text}")
+    }
+}
+
+/// Print [`repository_error_message`] and exit with [`EXIT_RUNTIME_ERROR`].
+pub fn exit_repository_error(command: &str, error: &crate::error::AutterError) -> ! {
+    eprintln!("{}", repository_error_message(command, error));
+    std::process::exit(EXIT_RUNTIME_ERROR);
+}
+
 /// Print a one-line stderr pointer to `autter doctor`.
 ///
 /// Reserved for error paths that usually mean a broken installation
@@ -75,4 +96,23 @@ pub fn suggest_autter_doctor() {
     eprintln!(
         "[autter] run `autter doctor` to check your setup -- each failed check includes a suggested fix"
     );
+}
+
+#[cfg(test)]
+mod repository_error_tests {
+    use super::*;
+
+    #[test]
+    fn outside_a_repository_is_one_plain_sentence() {
+        let error = crate::error::AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: not a git repository (or any of the parent directories): .git"
+                .to_string(),
+            args: vec!["rev-parse".to_string()],
+        };
+        assert_eq!(
+            repository_error_message("stats", &error),
+            "error: `autter stats` must be run inside a git repository (or pass -C <path>)."
+        );
+    }
 }

@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 913
 expression: untracked_just_above_output
 ---
-"you  ███████████████████████████████████████· ai\n     98%          untracked   2%            0%\n"
+"human ███████████████████████████████████████· AI\n      97 human (98%) · 2 untracked (2%) · 0 AI (0%) · 99 added, 0 deleted\n"
