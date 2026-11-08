@@ -39,6 +39,12 @@ jobs:
       - name: Check (lib, bins, tests, benches)
         run: cargo check --locked --all-targets
 
+      # The release builds only the binary, without the test-support feature
+      # that tests switch on. Check that build too, so code gated behind
+      # test-support can't break a release while the line above passes.
+      - name: Check (release binary, default features)
+        run: cargo check --locked --bin autter
+
   windows-installer:
     name: install.ps1 (Windows PowerShell 5.1 + pwsh)
     runs-on: blacksmith-4vcpu-windows-2025

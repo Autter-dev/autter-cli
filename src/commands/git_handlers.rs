@@ -310,7 +310,6 @@ fn handle_git_inner(args: &[String]) {
     exit_with_status(exit_status);
 }
 
-#[cfg(feature = "test-support")]
 /// The background service couldn't be reached for a git command that changes
 /// history. For a plain `git commit`, write the commit's authorship note here,
 /// from the checkpoints already on disk, the same way the service would have
@@ -386,6 +385,7 @@ fn plural_commits(count: usize) -> String {
     }
 }
 
+#[cfg(feature = "test-support")]
 pub fn resolve_alias_invocation(
     parsed_args: &ParsedGitInvocation,
     repository: &Repository,
