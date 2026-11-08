@@ -1962,7 +1962,14 @@ pub fn rewrite_authorship_after_rebase_v2(
                     total_files_diffed += 1;
                     let new_line_count = new_content.lines().count();
                     total_lines_diffed += new_line_count;
-                    let state_path = if current_file_contents.contains_key(file_path) {
+                    // A path the branch renames later has no state of its own at
+                    // original_head (its content there reads as empty), so its
+                    // state is under the final path.
+                    let has_own_state = current_attributions.contains_key(file_path)
+                        || current_file_contents
+                            .get(file_path)
+                            .is_some_and(|content| !content.is_empty());
+                    let state_path = if has_own_state {
                         file_path.as_str()
                     } else {
                         renamed_path_targets
