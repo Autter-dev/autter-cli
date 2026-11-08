@@ -4264,6 +4264,12 @@ struct FamilySequencerOrder {
     ordinal: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct QueuedFamilyEntries {
+    entries: usize,
+    checkpoints: usize,
+}
+
 #[derive(Debug, Default)]
 struct FamilySequencerState {
     next_ordinal: u64,
@@ -4607,6 +4613,31 @@ impl ActorDaemonCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// Entries waiting in this family's sequencer (git commands whose trace is
+    /// still arriving, and checkpoints queued behind them).
+    fn queued_family_entries(&self, family: &str) -> QueuedFamilyEntries {
+        let Ok(map) = self.family_sequencers_by_family.lock() else {
+            return QueuedFamilyEntries::default();
+        };
+        let Some(state) = map.get(family) else {
+            return QueuedFamilyEntries::default();
+        };
+        let mut queued = QueuedFamilyEntries::default();
+        for entry in state.entries.values() {
+            match entry {
+                FamilySequencerEntry::Canceled => {}
+                FamilySequencerEntry::Checkpoint { .. } => {
+                    queued.entries += 1;
+                    queued.checkpoints += 1;
+                }
+                FamilySequencerEntry::PendingRoot | FamilySequencerEntry::ReadyCommand(_) => {
+                    queued.entries += 1;
+                }
+            }
+        }
+        queued
     }
 
     fn inflight_family_effects(&self, family: &str) -> usize {
@@ -8368,6 +8399,7 @@ impl ActorDaemonCoordinator {
             .await?;
         let latest_seq = status.applied_seq;
         let family_key = family.0;
+        let queued = self.queued_family_entries(&family_key);
         Ok(FamilyStatus {
             family_key: family_key.clone(),
             latest_seq,
@@ -8375,6 +8407,8 @@ impl ActorDaemonCoordinator {
                 .last_error
                 .or_else(|| self.latest_side_effect_error(&family_key).ok().flatten()),
             inflight_effects: self.inflight_family_effects(&family_key),
+            queued_entries: queued.entries,
+            queued_checkpoints: queued.checkpoints,
         })
     }
 

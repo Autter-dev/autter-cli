@@ -16,6 +16,7 @@ mod amp;
 mod antigravity;
 mod attribution_rewrites;
 mod attribution_tracker_comprehensive;
+mod authorship_categories;
 mod background_agent_attribution;
 mod badge;
 mod bash_attribution;

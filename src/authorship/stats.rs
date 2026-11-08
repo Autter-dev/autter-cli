@@ -1,10 +1,13 @@
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
+use crate::authorship::labels::{AI_SHARE_MEANING, LineCategory};
+use crate::authorship::record_status::RecordStatus;
 use crate::error::AutterError;
 use crate::git::notes_api::read_authorship as get_authorship;
 use crate::git::repository::Repository;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::io::IsTerminal;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolModelHeadlineStats {
@@ -30,6 +33,15 @@ pub struct CommitStats {
     pub git_diff_added_lines: u32,
     #[serde(default)]
     pub tool_model_breakdown: BTreeMap<String, ToolModelHeadlineStats>,
+}
+
+/// `autter stats --json` output: the commit stats plus why lines may lack a
+/// record. Existing fields keep their names; `record` is added.
+#[derive(Debug, Serialize)]
+struct StatsJsonOutput<'a> {
+    #[serde(flatten)]
+    stats: &'a CommitStats,
+    record: &'a RecordStatus,
 }
 
 pub fn stats_command(
@@ -65,13 +77,46 @@ pub fn stats_command(
         refname
     );
 
+    // Right after `git commit` the background service may still be writing
+    // the note; wait for it rather than report every line as untracked.
+    let record = crate::authorship::record_status::classify_commit(
+        repo,
+        &target,
+        crate::authorship::record_status::DEFAULT_PENDING_WAIT,
+    );
+
     let stats = stats_for_commit_stats(repo, &target, ignore_patterns)?;
 
     if json {
-        let json_str = serde_json::to_string(&stats)?;
-        println!("{}", json_str);
+        let output = StatsJsonOutput {
+            stats: &stats,
+            record: &record,
+        };
+        println!("{}", serde_json::to_string(&output)?);
+        return Ok(());
+    }
+
+    let unattributed = if record.is_recorded() {
+        LineCategory::Untracked
     } else {
-        write_stats_to_terminal(&stats, true);
+        LineCategory::Unknown
+    };
+    print!(
+        "{}",
+        render_stats_output(
+            &stats,
+            crate::commands::arg_parser::use_color(),
+            unattributed,
+        )
+    );
+    print!("{}", stats_footer(&stats, &record));
+
+    let interactive = std::io::stdout().is_terminal();
+    if interactive && stats.unknown_additions > 0 && record.is_recorded() {
+        println!(
+            "{}",
+            crate::authorship::record_status::capture_boundary_line()
+        );
         if untracked_share_is_high(&stats) {
             let agents = crate::mdm::unsupported_agents::detect_unsupported_agents();
             if let Some(notice) = unsupported_agent_notice(&agents) {
@@ -81,6 +126,25 @@ pub fn stats_command(
     }
 
     Ok(())
+}
+
+/// Lines printed under `autter stats` for one commit: why lines have no
+/// record (with at most one next step) and what the AI share measures.
+fn stats_footer(stats: &CommitStats, record: &RecordStatus) -> String {
+    let mut out = String::new();
+    // A commit with no note but an agent's author email gets simulated AI
+    // attribution; don't call it unrecorded.
+    let simulated_agent_commit = !record.is_recorded() && stats.ai_additions > 0;
+    if !simulated_agent_commit
+        && let Some(explanation) = crate::authorship::record_status::explain(record, stats)
+    {
+        out.push_str(&explanation.render());
+    }
+    if stats.ai_additions > 0 {
+        out.push_str(AI_SHARE_MEANING);
+        out.push('\n');
+    }
+    out
 }
 
 /// Untracked share at or above which `autter stats` checks for AI tools that
@@ -101,74 +165,81 @@ fn unsupported_agent_notice(
     let names = agents.iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
     Some(if agents.len() == 1 {
         format!(
-            "\nNote: {}. If it wrote this code, that is why it shows as untracked. See `autter doctor`.\n",
+            "Note: {}. If it wrote this code, that is why it shows as untracked.\n",
             crate::mdm::unsupported_agents::not_captured_message(first)
         )
     } else {
         format!(
-            "\nNote: {names} detected — autter cannot capture their edits yet; they will be attributed to you. If one of them wrote this code, that is why it shows as untracked. See `autter doctor`.\n"
+            "Note: {names} detected — autter cannot capture their edits yet; they will be attributed to you. If one of them wrote this code, that is why it shows as untracked.\n"
         )
     })
 }
 
+/// Print the stats bar and counts for a commit Autter recorded. Returns the
+/// text; prints it only when `is_interactive` is set.
 pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> String {
+    write_stats_to_terminal_with(stats, is_interactive, LineCategory::Untracked)
+}
+
+/// Like [`write_stats_to_terminal`], naming lines without attestation
+/// `unattributed` ([`LineCategory::Untracked`] when the commit has a record,
+/// [`LineCategory::Unknown`] when it has none).
+pub fn write_stats_to_terminal_with(
+    stats: &CommitStats,
+    is_interactive: bool,
+    unattributed: LineCategory,
+) -> String {
     // Honor the project-wide color decision (NO_COLOR / --no-color / non-TTY).
-    render_stats_output(
+    let output = render_stats_output(
         stats,
-        is_interactive,
         crate::commands::arg_parser::use_color(),
-    )
+        unattributed,
+    );
+    if is_interactive {
+        print!("{output}");
+    }
+    output
 }
 
 /// Rendering half of [`write_stats_to_terminal`], with the color decision passed
 /// in rather than read from the environment. `use_color()` depends on stdout
 /// being a TTY, which is never true under `cargo test`, so snapshots have to
 /// drive this directly to stay stable across machines.
-fn render_stats_output(stats: &CommitStats, is_interactive: bool, colorize: bool) -> String {
+///
+/// Two lines: a bar running from human (`█`) through untracked or unknown
+/// (`·`) to AI (`░`), then each category's line count and share.
+fn render_stats_output(stats: &CommitStats, colorize: bool, unattributed: LineCategory) -> String {
     let mut output = String::new();
 
     // Set maximum bar width to 40 characters
     let bar_width: usize = 40;
+    let left = LineCategory::Human.label();
+    let right = LineCategory::Ai.label();
+    let indent = " ".repeat(left.len() + 1);
 
     // Handle deletion-only commits (no additions)
     if stats.git_diff_added_lines == 0 && stats.git_diff_deleted_lines > 0 {
-        // Show gray bar for deletion-only commit
-        let mut progress_bar = String::new();
-        progress_bar.push_str("you  ");
+        output.push_str(left);
+        output.push(' ');
         if colorize {
-            progress_bar.push_str("\x1b[90m"); // Gray color
+            output.push_str("\x1b[90m"); // Gray color
         }
-        progress_bar.push_str(&" ".repeat(bar_width)); // Gray bar
+        output.push_str(&" ".repeat(bar_width)); // Gray bar
         if colorize {
-            progress_bar.push_str("\x1b[0m"); // Reset color
+            output.push_str("\x1b[0m"); // Reset color
         }
-        progress_bar.push_str(" ai");
-
-        output.push_str(&progress_bar);
+        output.push(' ');
+        output.push_str(right);
         output.push('\n');
-        if is_interactive {
-            println!("{}", progress_bar);
-        }
-
-        // Show "(no additions)" message below the bar
-        let no_additions_msg = if colorize {
-            format!("     \x1b[90m{:^40}\x1b[0m", "(no additions)")
-        } else {
-            format!("     {:^40}", "(no additions)")
-        };
-        output.push_str(&no_additions_msg);
-        output.push('\n');
-        if is_interactive {
-            println!("{}", no_additions_msg);
-        }
-        // No percentage line or AI stats for deletion-only commits
+        output.push_str(&format!(
+            "{indent}no lines added \u{00B7} {} deleted\n",
+            stats.git_diff_deleted_lines
+        ));
         return output;
     }
 
-    // Calculate total additions: known human + unknown (untracked) + AI
+    // Calculate total additions: known human + untracked/unknown + AI
     let total_additions = stats.human_additions + stats.unknown_additions + stats.ai_additions;
-
-    // (ai_additions == ai_accepted after mixed removal, so acceptance is always 100%)
 
     // Determine whether to show the untracked segment (raw float check, before rounding)
     let untracked_pct_raw = if total_additions > 0 {
@@ -208,88 +279,62 @@ fn render_stats_output(stats: &CommitStats, is_interactive: bool, colorize: bool
         (0, remaining_width)
     };
 
-    // Build the progress bar
-    let mut progress_bar = String::new();
-    progress_bar.push_str("you  ");
-    progress_bar.push_str(&"█".repeat(final_human_bars)); // known human (attested)
-    progress_bar.push_str(&"·".repeat(final_untracked_bars)); // untracked (no attestation)
-    progress_bar.push_str(&"░".repeat(final_ai_bars)); // AI
-    progress_bar.push_str(" ai");
-
-    // Calculate percentages for display
-    let human_percentage = if total_additions > 0 {
-        ((stats.human_additions as f64 / total_additions as f64) * 100.0).round() as u32
-    } else {
-        0
-    };
-    let ai_percentage = if total_additions > 0 {
-        ((stats.ai_additions as f64 / total_additions as f64) * 100.0).round() as u32
-    } else {
-        0
-    };
-
-    // Print the stats
-    output.push_str(&progress_bar);
+    output.push_str(left);
+    output.push(' ');
+    output.push_str(&"█".repeat(final_human_bars)); // known human (attested)
+    output.push_str(&"·".repeat(final_untracked_bars)); // untracked / unknown
+    output.push_str(&"░".repeat(final_ai_bars)); // AI
+    output.push(' ');
+    output.push_str(right);
     output.push('\n');
-    if is_interactive {
-        println!("{}", progress_bar);
-    }
 
-    // Percentage line: three anchors (human / untracked / AI) when untracked is visible,
-    // two anchors (human / AI) otherwise.
-    if show_untracked {
-        let untracked_percentage = untracked_pct_raw.round() as u32;
-        // When interactive *and* the terminal supports OSC 8, wrap "untracked" in a
-        // hyperlink. Color alone is not enough — Windows ConHost with VT enabled still
-        // dumps OSC 8 as literal text. Spaces are constructed manually — not via
-        // format-width padding on the label — so invisible escape bytes do not
-        // misalign the output.
-        let untracked_label = if is_interactive
-            && colorize
-            && crate::commands::arg_parser::use_hyperlinks()
-        {
+    output.push_str(&indent);
+    output.push_str(&counts_line(stats, unattributed, colorize));
+    output.push('\n');
+
+    output
+}
+
+/// `12 human (30%) · 8 untracked (20%) · 20 AI (50%) · 40 added, 3 deleted`.
+/// Categories with no lines are left out, except AI, which always shows.
+fn counts_line(stats: &CommitStats, unattributed: LineCategory, colorize: bool) -> String {
+    let total = stats.human_additions + stats.unknown_additions + stats.ai_additions;
+    let percent = |count: u32| -> u32 {
+        if total == 0 {
+            0
+        } else {
+            ((f64::from(count) / f64::from(total)) * 100.0).round() as u32
+        }
+    };
+    let mut parts = Vec::new();
+    let mut push = |category: LineCategory, count: u32, always: bool| {
+        if count == 0 && !always {
+            return;
+        }
+        let label = if category == LineCategory::Untracked && colorize && use_hyperlinks() {
+            // OSC 8 link on terminals that render it; color alone isn't enough
+            // (Windows ConHost with VT enabled prints OSC 8 literally).
             "\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\\x1b[4muntracked\x1b[24m\x1b]8;;\x1b\\"
                 .to_string()
         } else {
-            "untracked".to_string()
+            category.label().to_string()
         };
-        let percentage_line = format!(
-            "     {:<3}{:>10}{} {:>3}%{:>10}{:>3}%",
-            format!("{}%", human_percentage),
-            "",
-            untracked_label,
-            untracked_percentage,
-            "",
-            ai_percentage
-        );
-        output.push_str(&percentage_line);
-        output.push('\n');
-        if is_interactive {
-            println!("{}", percentage_line);
-        }
-    } else {
-        let percentage_line = format!(
-            "     {:<3}{:>33}{:>3}%",
-            format!("{}%", human_percentage),
-            "",
-            ai_percentage
-        );
-        output.push_str(&percentage_line);
-        output.push('\n');
-        if is_interactive {
-            println!("{}", percentage_line);
-        }
-    }
+        parts.push(format!("{count} {label} ({}%)", percent(count)));
+    };
+    push(LineCategory::Human, stats.human_additions, false);
+    push(unattributed, stats.unknown_additions, false);
+    push(LineCategory::Ai, stats.ai_additions, true);
 
-    if stats.ai_additions == 0 && stats.human_additions == 0 && stats.unknown_additions > 0 {
-        let guidance = crate::authorship::guidance::stats_all_untracked_footer();
-        output.push_str(&guidance);
-        if is_interactive {
-            print!("{}", guidance);
-        }
-    }
+    let mut line = parts.join(" \u{00B7} ");
+    line.push_str(&format!(
+        " \u{00B7} {} added, {} deleted",
+        stats.git_diff_added_lines, stats.git_diff_deleted_lines
+    ));
+    line
+}
 
-    output
+fn use_hyperlinks() -> bool {
+    std::io::stdout().is_terminal() && crate::commands::arg_parser::use_hyperlinks()
 }
 
 #[allow(dead_code)]
@@ -767,7 +812,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let mixed_output = render_stats_output(&stats, false, true);
+        let mixed_output = render_stats_output(&stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(mixed_output);
 
         // Test with AI-only stats
@@ -781,7 +826,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let ai_only_output = render_stats_output(&ai_stats, false, true);
+        let ai_only_output = render_stats_output(&ai_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(ai_only_output);
 
         // Test with human-only stats
@@ -795,7 +840,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let human_only_output = render_stats_output(&human_stats, false, true);
+        let human_only_output = render_stats_output(&human_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(human_only_output);
 
         // Test with minimal human contribution (should get at least 2 blocks)
@@ -809,7 +854,8 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let minimal_human_output = render_stats_output(&minimal_human_stats, false, true);
+        let minimal_human_output =
+            render_stats_output(&minimal_human_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(minimal_human_output);
 
         // Test with deletion-only commit (no additions)
@@ -823,7 +869,8 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let deletion_only_output = render_stats_output(&deletion_only_stats, false, true);
+        let deletion_only_output =
+            render_stats_output(&deletion_only_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(deletion_only_output);
 
         // --- New test cases for untracked segment ---
@@ -838,7 +885,8 @@ mod tests {
             git_diff_added_lines: 1000,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let with_untracked_output = render_stats_output(&untracked_stats, false, true);
+        let with_untracked_output =
+            render_stats_output(&untracked_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(with_untracked_output);
 
         // untracked exactly at the 1% threshold — should NOT show untracked segment
@@ -851,7 +899,8 @@ mod tests {
             git_diff_added_lines: 100,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let untracked_at_threshold_output = render_stats_output(&threshold_stats, false, true);
+        let untracked_at_threshold_output =
+            render_stats_output(&threshold_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(untracked_at_threshold_output);
 
         // untracked just above 1% threshold (~2%) — should show untracked segment
@@ -864,7 +913,8 @@ mod tests {
             git_diff_added_lines: 99,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let untracked_just_above_output = render_stats_output(&above_threshold_stats, false, true);
+        let untracked_just_above_output =
+            render_stats_output(&above_threshold_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(untracked_just_above_output);
 
         // 100% untracked — entire bar is · chars
@@ -877,29 +927,72 @@ mod tests {
             git_diff_added_lines: 100,
             tool_model_breakdown: BTreeMap::new(),
         };
-        let all_untracked_output = render_stats_output(&all_untracked_stats, false, true);
+        let all_untracked_output =
+            render_stats_output(&all_untracked_stats, true, LineCategory::Untracked);
         assert_debug_snapshot!(all_untracked_output);
 
-        // OSC 8 hyperlink only when the terminal advertises hyperlink support
-        // (see use_hyperlinks). In non-TTY unit tests this stays plain "untracked".
-        let interactive_output = render_stats_output(&untracked_stats, true, true);
+        // A commit with no record names the same lines "unknown".
+        let unknown_output = render_stats_output(&all_untracked_stats, true, LineCategory::Unknown);
+        assert_debug_snapshot!(unknown_output);
+
+        // OSC 8 hyperlinks need a terminal; under `cargo test` stdout is not one.
         assert!(
-            interactive_output.contains("untracked"),
-            "Expected 'untracked' label in interactive output"
+            !render_stats_output(&untracked_stats, true, LineCategory::Untracked)
+                .contains("\x1b]8;;"),
+            "OSC 8 must not leak when stdout is not a terminal"
         );
-        if crate::commands::arg_parser::use_hyperlinks() {
-            assert!(
-                interactive_output.contains("\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\"),
-                "Expected OSC 8 hyperlink when hyperlinks are enabled, got: {:?}",
-                interactive_output
-            );
-        } else {
-            assert!(
-                !interactive_output.contains("\x1b]8;;"),
-                "OSC 8 must not leak when hyperlinks are disabled, got: {:?}",
-                interactive_output
-            );
+    }
+
+    #[test]
+    fn stats_footer_explains_without_troubleshooting() {
+        use crate::authorship::record_status::{MissingCause, RecordStatus};
+        let human_only = stats_with(0, 5, 0);
+        let footer = stats_footer(&human_only, &RecordStatus::Recorded);
+        assert_eq!(
+            footer,
+            "No AI activity detected: Autter recorded this commit, and no agent wrote its lines.\n"
+        );
+
+        let with_ai = stats_with(1, 2, 3);
+        assert_eq!(
+            stats_footer(&with_ai, &RecordStatus::Recorded),
+            format!("{AI_SHARE_MEANING}\n")
+        );
+
+        let missing = RecordStatus::Missing {
+            cause: MissingCause::NotCaptured,
+        };
+        let footer = stats_footer(&human_only, &missing);
+        assert_eq!(footer.matches("Next:").count(), 1, "{footer}");
+        assert!(!footer.contains("install-hooks"), "{footer}");
+
+        // Simulated agent-email attribution: don't call it unrecorded.
+        assert_eq!(
+            stats_footer(&stats_with(0, 0, 4), &missing),
+            format!("{AI_SHARE_MEANING}\n")
+        );
+    }
+
+    #[test]
+    fn stats_json_adds_record_without_renaming_fields() {
+        let stats = stats_with(1, 2, 3);
+        let json = serde_json::to_value(StatsJsonOutput {
+            stats: &stats,
+            record: &RecordStatus::Recorded,
+        })
+        .unwrap();
+        for field in [
+            "human_additions",
+            "unknown_additions",
+            "ai_additions",
+            "ai_accepted",
+            "git_diff_deleted_lines",
+            "git_diff_added_lines",
+            "tool_model_breakdown",
+        ] {
+            assert!(json.get(field).is_some(), "missing {field}: {json}");
         }
+        assert_eq!(json["record"], serde_json::json!({"status": "recorded"}));
     }
 
     #[test]

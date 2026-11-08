@@ -115,6 +115,20 @@ pub struct FamilyStatus {
     /// not send this field, so it reads as 0.
     #[serde(default)]
     pub inflight_effects: usize,
+    /// Git commands and checkpoints received for this family but not yet
+    /// applied. Older daemons do not send this field, so it reads as 0.
+    #[serde(default)]
+    pub queued_entries: usize,
+    /// Of `queued_entries`, how many are checkpoints.
+    #[serde(default)]
+    pub queued_checkpoints: usize,
+}
+
+impl FamilyStatus {
+    /// Work the service has accepted for this repository and not finished.
+    pub fn pending_work(&self) -> usize {
+        self.inflight_effects.saturating_add(self.queued_entries)
+    }
 }
 
 /// A telemetry envelope sent from client to daemon.

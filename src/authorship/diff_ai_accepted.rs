@@ -8,6 +8,8 @@ use crate::git::repository::Repository;
 #[derive(Debug, Default)]
 pub struct DiffAiAcceptedStats {
     pub total_ai_accepted: u32,
+    /// Added lines attested as typed by a person (known human).
+    pub total_known_human: u32,
     pub per_tool_model: BTreeMap<String, u32>,
     pub per_prompt: BTreeMap<String, u32>,
 }
@@ -65,6 +67,10 @@ pub fn diff_ai_accepted_stats(
 
         for line in &lines {
             if let Some(author_hash) = line_authors.get(line)
+                && author_hash.starts_with("h_")
+            {
+                stats.total_known_human += 1;
+            } else if let Some(author_hash) = line_authors.get(line)
                 && prompt_records.contains_key(author_hash)
             {
                 stats.total_ai_accepted += 1;
@@ -181,6 +187,7 @@ mod tests {
     fn test_diff_ai_accepted_stats_debug() {
         let stats = DiffAiAcceptedStats {
             total_ai_accepted: 10,
+            total_known_human: 0,
             per_tool_model: BTreeMap::new(),
             per_prompt: BTreeMap::new(),
         };

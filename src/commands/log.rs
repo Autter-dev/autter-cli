@@ -1,7 +1,9 @@
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::ignore::effective_ignore_patterns;
+use crate::authorship::labels::LineCategory;
+use crate::authorship::record_status::{DEFAULT_PENDING_WAIT, RecordClassifier, RecordStatus};
 use crate::authorship::stats::{
-    stats_for_commit_stats_with_parent_and_authorship, write_stats_to_terminal,
+    stats_for_commit_stats_with_parent_and_authorship, write_stats_to_terminal_with,
 };
 use crate::config::Config;
 use crate::error::AutterError;
@@ -16,11 +18,12 @@ use crossterm::{
         enable_raw_mode,
     },
 };
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LOG_BATCH_SIZE: usize = 24;
 const GIT_LOG_FIELD_COUNT: usize = 8;
@@ -225,8 +228,10 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
     }
 
     let repository_global_args = repository_global_args(&global_args);
-    let repo =
-        crate::git::repository::find_repository(&repository_global_args).map_err(LogError::Git)?;
+    let repo = match crate::git::repository::find_repository(&repository_global_args) {
+        Ok(repo) => repo,
+        Err(e) => crate::commands::exit_repository_error("log", &e),
+    };
     let use_pager = should_use_pager(&global_args);
     let renderer = LogRenderer::new(repo, parsed)?;
 
@@ -383,18 +388,24 @@ struct LogRenderer {
     stream: CommitStream,
     ignore_patterns: Vec<String>,
     eof: bool,
+    classifier: RecordClassifier,
+    head_sha: Option<String>,
 }
 
 impl LogRenderer {
     fn new(repo: Repository, options: ParsedLogArgs) -> Result<Self, LogError> {
         let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
         let stream = CommitStream::spawn(&repo, &options.git_log_args, options.show_decorations)?;
+        let classifier = RecordClassifier::new(&repo);
+        let head_sha = repo.head().and_then(|head| head.target()).ok();
         Ok(Self {
             repo,
             options,
             stream,
             ignore_patterns,
             eof: false,
+            classifier,
+            head_sha,
         })
     }
 
@@ -419,7 +430,32 @@ impl LogRenderer {
         }
 
         let shas: Vec<String> = commits.iter().map(|commit| commit.sha.clone()).collect();
-        let notes = crate::git::notes_api::read_notes_batch(&self.repo, &shas)?;
+        let mut notes = crate::git::notes_api::read_notes_batch(&self.repo, &shas)?;
+
+        // Say why a commit has no record. For HEAD, the background service may
+        // still be writing it: wait for it once instead of showing every line
+        // as untracked.
+        let mut records: HashMap<String, RecordStatus> = HashMap::new();
+        for commit in &commits {
+            if notes.contains_key(&commit.sha) {
+                continue;
+            }
+            let is_head = self.head_sha.as_deref() == Some(commit.sha.as_str());
+            let wait = if is_head {
+                self.head_sha = None;
+                DEFAULT_PENDING_WAIT
+            } else {
+                Duration::ZERO
+            };
+            let status = self.classifier.classify(&commit.sha, wait);
+            if status.is_recorded()
+                && let Some(note) = crate::git::notes_api::read_note(&self.repo, &commit.sha)
+            {
+                notes.insert(commit.sha.clone(), note);
+                continue;
+            }
+            records.insert(commit.sha.clone(), status);
+        }
 
         Ok(commits
             .iter()
@@ -429,6 +465,7 @@ impl LogRenderer {
                     &self.repo,
                     commit,
                     note,
+                    records.get(&commit.sha),
                     &self.options,
                     &self.ignore_patterns,
                 )
@@ -568,6 +605,7 @@ fn render_commit(
     repo: &Repository,
     commit: &CommitRecord,
     raw_note: Option<&str>,
+    missing_record: Option<&RecordStatus>,
     options: &ParsedLogArgs,
     ignore_patterns: &[String],
 ) -> String {
@@ -634,15 +672,28 @@ fn render_commit(
     }
 
     out.push_str("    Autter stats:\n");
+    let unattributed = if missing_record.is_some() {
+        LineCategory::Unknown
+    } else {
+        LineCategory::Untracked
+    };
     match render_stats(
         repo,
         &commit.sha,
         &commit.parents,
         authorship_log.as_ref(),
         ignore_patterns,
+        unattributed,
     ) {
         Ok(stats) => append_indented_block(&mut out, &stats, 6),
         Err(message) => append_indented_line(&mut out, &message, 6),
+    }
+    if let Some(record) = missing_record {
+        append_indented_line(
+            &mut out,
+            &format!("no Autter record: {}", record.short_reason()),
+            6,
+        );
     }
 
     if options.show_raw_notes {
@@ -664,6 +715,7 @@ fn render_stats(
     parents: &[String],
     authorship_log: Option<&AuthorshipLog>,
     ignore_patterns: &[String],
+    unattributed: LineCategory,
 ) -> Result<String, String> {
     if parents.len() > 1 {
         return Err("stats skipped for merge commit".to_string());
@@ -695,7 +747,7 @@ fn render_stats(
         authorship_log,
     )
     .map_err(|e| format!("stats unavailable: {}", e))?;
-    Ok(write_stats_to_terminal(&stats, false))
+    Ok(write_stats_to_terminal_with(&stats, false, unattributed))
 }
 
 fn append_indented_line(out: &mut String, line: &str, spaces: usize) {

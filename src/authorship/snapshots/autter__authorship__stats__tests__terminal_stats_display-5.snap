@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 872
 expression: deletion_only_output
 ---
-"you  \u{1b}[90m                                        \u{1b}[0m ai\n     \u{1b}[90m             (no additions)             \u{1b}[0m\n"
+"human \u{1b}[90m                                        \u{1b}[0m AI\n      no lines added · 25 deleted\n"

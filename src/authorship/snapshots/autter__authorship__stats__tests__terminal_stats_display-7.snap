@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 900
 expression: untracked_at_threshold_output
 ---
-"you  ███████████████████░░░░░░░░░░░░░░░░░░░░░ ai\n     49%                                  50%\n"
+"human ███████████████████░░░░░░░░░░░░░░░░░░░░░ AI\n      49 human (49%) · 1 untracked (1%) · 50 AI (50%) · 100 added, 0 deleted\n"
