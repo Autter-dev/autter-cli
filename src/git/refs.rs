@@ -819,13 +819,15 @@ pub fn grep_ai_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, Au
         }
     }
 
-    // If we have multiple results, sort by commit date (newest first)
+    // Newest first. Commit dates have one-second resolution, so commits made in
+    // the same second (a rebase, a script) tie and git orders them arbitrarily;
+    // within a tie a descendant goes before its ancestor, so "latest" and
+    // `show-prompt --offset` follow history.
     if shas.len() > 1 {
         let sha_vec: Vec<String> = shas.into_iter().collect();
         let mut args = repo.global_args_for_exec();
         args.push("log".to_string());
-        args.push("--format=%H".to_string());
-        args.push("--date-order".to_string());
+        args.push("--format=%H %ct".to_string());
         args.push("--no-walk".to_string());
         for sha in &sha_vec {
             args.push(sha.clone());
@@ -835,10 +837,48 @@ pub fn grep_ai_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, Au
         let stdout = String::from_utf8(output.stdout)
             .map_err(|_| AutterError::Generic("Failed to parse git log output".to_string()))?;
 
-        Ok(stdout.lines().map(|s| s.to_string()).collect())
+        let mut dated: Vec<(String, i64)> = stdout
+            .lines()
+            .filter_map(|line| {
+                let (sha, time) = line.split_once(' ')?;
+                Some((sha.to_string(), time.trim().parse().ok()?))
+            })
+            .collect();
+        dated.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut start = 0;
+        while start < dated.len() {
+            let mut end = start + 1;
+            while end < dated.len() && dated[end].1 == dated[start].1 {
+                end += 1;
+            }
+            order_descendants_first(repo, &mut dated[start..end]);
+            start = end;
+        }
+        Ok(dated.into_iter().map(|(sha, _)| sha).collect())
     } else {
         Ok(shas.into_iter().collect())
     }
+}
+
+/// Reorder commits that share a commit time so each one comes before its
+/// ancestors.
+fn order_descendants_first(repo: &Repository, tied: &mut [(String, i64)]) {
+    for i in 1..tied.len() {
+        let mut j = i;
+        while j > 0 && is_ancestor(repo, &tied[j - 1].0, &tied[j].0) {
+            tied.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
+fn is_ancestor(repo: &Repository, ancestor: &str, descendant: &str) -> bool {
+    let mut args = repo.global_args_for_exec();
+    args.push("merge-base".to_string());
+    args.push("--is-ancestor".to_string());
+    args.push(ancestor.to_string());
+    args.push(descendant.to_string());
+    exec_git(&args).is_ok()
 }
 
 #[cfg(test)]

@@ -132,16 +132,27 @@ fn show_prompt_with_offset_skips_occurrences() {
     let repo = TestRepo::new();
     let mut file = repo.filename("test.txt");
 
+    // Both commits get the same timestamp: commits made within one second
+    // (a rebase, a script) must still be ordered by history, not arbitrarily.
+    let same_second = [
+        ("GIT_AUTHOR_DATE", "2030-01-01T00:00:00Z"),
+        ("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z"),
+    ];
+
     // First AI session
     file.set_contents(crate::lines!["Base".human(), "AI line 1".ai()]);
-    let first_commit = repo.stage_all_and_commit("First commit").unwrap();
+    let first_commit = repo
+        .stage_all_and_commit_with_env("First commit", &same_second)
+        .unwrap();
 
     // Second AI session appends below "AI line 1", which had no trailing newline.
     // That line gains a "\n", so git reports it as changed in the second commit
     // and its note carries the first session's attribution for it: the first
     // session now occurs in both commits.
     file.insert_at(2, crate::lines!["AI line 2".ai()]);
-    let second_commit = repo.stage_all_and_commit("Second commit").unwrap();
+    let second_commit = repo
+        .stage_all_and_commit_with_env("Second commit", &same_second)
+        .unwrap();
     file.assert_committed_lines(crate::lines![
         "Base".human(),
         "AI line 1".ai(),
