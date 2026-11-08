@@ -4,8 +4,8 @@ name: CI
 # workflow was the repo's only build check, so uncompilable merges could land
 # on main unnoticed — v1.6.8 alone shipped three separate "repair main" fixes.
 #
-# Deliberately just `cargo check`: fast enough to gate every PR, and it
-# compiles the lib, bins, tests, and benches without running anything.
+# `cargo check` compiles the lib, bins, tests, and benches without running
+# anything; the `test` job runs the lib tests and a core integration subset.
 #
 # Plus one Windows job for install.ps1, which users run as `irm <url> | iex`
 # under Windows PowerShell 5.1 or PowerShell 7 (issues #9 and #11).
@@ -44,6 +44,43 @@ jobs:
       # test-support can't break a release while the line above passes.
       - name: Check (release binary, default features)
         run: cargo check --locked --bin autter
+
+  # Runs tests, not just `cargo check`. Most CLI fixes between 3.1.0 and
+  # 3.2.2 merged without their tests running, and nine attribution tests,
+  # six lib tests and a crash that killed the whole integration binary
+  # went unnoticed. This runs the lib tests plus the integration groups
+  # that guard attribution through history rewrites and the
+  # install/uninstall/--help safety checks.
+  test:
+    name: tests (lib + core integration)
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 40
+    env:
+      AUTTER_TEST_GIT_MODE: daemon
+      AUTTER_TEST_SHARED_DAEMON_POOL_SIZE: "4"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Git identity for test repos
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+
+      - name: Lib tests
+        run: cargo test --locked --lib -- --test-threads 4
+
+      - name: Integration tests (rewrites, cherry-pick, rebase, install, --help)
+        run: >
+          cargo test --locked --test integration --
+          attribution_rewrites:: cherry_pick:: rebase:: install_hooks
+          help_flag_safety:: --test-threads 4
 
   windows-installer:
     name: install.ps1 (Windows PowerShell 5.1 + pwsh)
