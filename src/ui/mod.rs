@@ -24,9 +24,12 @@ pub use header::Header;
 pub use prompt::{SelectItem, multiselect, secret, select};
 pub use theme::{TermCaps, caps};
 
-/// Whether prompts can be shown: both stdin and stderr must be terminals.
+/// Whether prompts can be shown: both stdin and stderr must be terminals, and
+/// this must not be a CI run (`CI=true`).
 pub fn is_interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+        && !crate::commands::output::ci_mode()
 }
 
 #[cfg(test)]

@@ -3,8 +3,10 @@ use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::labels::LineCategory;
 use crate::authorship::record_status::{DEFAULT_PENDING_WAIT, RecordClassifier, RecordStatus};
 use crate::authorship::stats::{
-    stats_for_commit_stats_with_parent_and_authorship, write_stats_to_terminal_with,
+    CommitStatsReport, stats_for_commit_stats_with_parent_and_authorship,
+    write_stats_to_terminal_with,
 };
+use crate::commands::output::{self, ErrorKind};
 use crate::config::Config;
 use crate::error::AutterError;
 use crate::git::repository::Repository;
@@ -18,6 +20,7 @@ use crossterm::{
         enable_raw_mode,
     },
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -168,6 +171,7 @@ fn extract_git_global_args(args: &[String]) -> (Vec<String>, Vec<String>) {
 struct ParsedLogArgs {
     git_log_args: Vec<String>,
     plain: bool,
+    json: bool,
     show_raw_notes: bool,
     oneline: bool,
     show_decorations: bool,
@@ -179,6 +183,7 @@ impl Default for ParsedLogArgs {
         Self {
             git_log_args: Vec::new(),
             plain: false,
+            json: false,
             show_raw_notes: false,
             oneline: false,
             show_decorations: true,
@@ -199,6 +204,12 @@ pub fn handle_log(args: &[String]) -> ExitStatus {
         Err(LogError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
             status_from_code(0)
         }
+        Err(LogError::Usage(message)) => {
+            output::fail(ErrorKind::Usage, format!("autter log: {}", message))
+        }
+        Err(error) if crate::commands::arg_parser::json() => {
+            output::fail(ErrorKind::Runtime, format!("autter log: {}", error))
+        }
         Err(error) => {
             eprintln!("autter log: {}", error);
             status_from_code(1)
@@ -208,11 +219,45 @@ pub fn handle_log(args: &[String]) -> ExitStatus {
 
 fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
     let (global_args, log_args) = extract_git_global_args(args);
-    let parsed = parse_log_args(&log_args).map_err(LogError::Message)?;
+    // Record `--json` before any argument error, so that error is JSON too.
+    if !contains_plain_flag(&log_args)
+        && log_args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--json")
+    {
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                json: true,
+                ..Default::default()
+            },
+        );
+    }
+    let parsed = parse_log_args(&log_args).map_err(LogError::Usage)?;
 
     if parsed.help {
         print_log_help();
         return Ok(status_from_code(0));
+    }
+
+    if parsed.json || crate::commands::arg_parser::json() {
+        if parsed.plain {
+            return Err(LogError::Usage(
+                "--json and --plain cannot be combined".to_string(),
+            ));
+        }
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                json: true,
+                ..Default::default()
+            },
+        );
+        let repo =
+            match crate::git::repository::find_repository(&repository_global_args(&global_args)) {
+                Ok(repo) => repo,
+                Err(e) => crate::commands::exit_repository_error("log", &e),
+            };
+        return run_json_log(repo, parsed);
     }
 
     if parsed.plain {
@@ -299,6 +344,11 @@ fn parse_log_args(args: &[String]) -> Result<ParsedLogArgs, String> {
             continue;
         }
 
+        if arg == "--json" {
+            parsed.json = true;
+            continue;
+        }
+
         if plain_requested {
             passthrough.push(arg.clone());
             continue;
@@ -374,12 +424,108 @@ fn print_log_help() {
     println!("  --raw, --notes    Include raw authorship note data after the stats");
     println!("  --show-notes      Alias for --notes");
     println!("  --plain           Run git log --notes=ai directly (git_notes backend only)");
+    println!("  --json            One JSON document: every commit with its authorship stats");
     println!("  --oneline         Compact commit header");
     println!("  --no-decorate     Hide ref decorations");
     println!("  --no-pager        Stream output instead of opening the pager");
     println!();
     println!("Common git log filters such as -n, --max-count, --author, --grep,");
     println!("--since, --until, revisions, and pathspecs are passed through to git.");
+}
+
+/// `autter log --json`: every commit git lists, in git's order. `stats` has
+/// the same fields as `autter stats --json` (without `schema_version`); it is
+/// null for merge commits and commits too large to compute here, with the
+/// reason in `stats_skipped`.
+#[derive(Serialize)]
+struct LogReport {
+    commits: Vec<LogCommit>,
+}
+
+#[derive(Serialize)]
+struct LogCommit {
+    commit: String,
+    parents: Vec<String>,
+    author: LogAuthor,
+    date: String,
+    subject: String,
+    body: String,
+    refs: Vec<String>,
+    note_present: bool,
+    stats: Option<CommitStatsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats_skipped: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LogAuthor {
+    name: String,
+    email: String,
+}
+
+fn run_json_log(repo: Repository, options: ParsedLogArgs) -> Result<ExitStatus, LogError> {
+    let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
+    let mut stream = CommitStream::spawn(&repo, &options.git_log_args, true)?;
+    let mut records = Vec::new();
+    while let Some(commit) = stream.next_commit()? {
+        records.push(commit);
+    }
+    let shas: Vec<String> = records.iter().map(|commit| commit.sha.clone()).collect();
+    let notes = if shas.is_empty() {
+        Default::default()
+    } else {
+        crate::git::notes_api::read_notes_batch(&repo, &shas)?
+    };
+
+    let commits = records
+        .into_iter()
+        .map(|commit| {
+            let raw_note = notes.get(&commit.sha).map(String::as_str);
+            let authorship_log =
+                raw_note.and_then(|note| AuthorshipLog::deserialize_from_string(note).ok());
+            let (stats, stats_skipped) = match commit_stats(
+                &repo,
+                &commit.sha,
+                &commit.parents,
+                authorship_log.as_ref(),
+                &ignore_patterns,
+            ) {
+                Ok(stats) => (
+                    Some(CommitStatsReport::new(
+                        commit.sha.clone(),
+                        stats,
+                        authorship_log.is_some(),
+                    )),
+                    None,
+                ),
+                Err(reason) => (None, Some(reason)),
+            };
+            LogCommit {
+                note_present: raw_note.is_some_and(|note| !note.trim().is_empty()),
+                refs: commit
+                    .decorations
+                    .split(", ")
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                author: LogAuthor {
+                    name: commit.author_name,
+                    email: commit.author_email,
+                },
+                date: commit.author_date,
+                subject: commit.subject,
+                body: commit.body.trim_end_matches('\n').to_string(),
+                parents: commit.parents,
+                commit: commit.sha,
+                stats,
+                stats_skipped,
+            }
+        })
+        .collect();
+
+    output::print_json(&LogReport { commits });
+    Ok(status_from_code(0))
 }
 
 struct LogRenderer {
@@ -717,6 +863,18 @@ fn render_stats(
     ignore_patterns: &[String],
     unattributed: LineCategory,
 ) -> Result<String, String> {
+    let stats = commit_stats(repo, commit_sha, parents, authorship_log, ignore_patterns)?;
+    Ok(write_stats_to_terminal_with(&stats, false, unattributed))
+}
+
+/// A commit's stats for `autter log`, or why they were skipped.
+fn commit_stats(
+    repo: &Repository,
+    commit_sha: &str,
+    parents: &[String],
+    authorship_log: Option<&AuthorshipLog>,
+    ignore_patterns: &[String],
+) -> Result<crate::authorship::stats::CommitStats, String> {
     if parents.len() > 1 {
         return Err("stats skipped for merge commit".to_string());
     }
@@ -739,15 +897,14 @@ fn render_stats(
         ));
     }
 
-    let stats = stats_for_commit_stats_with_parent_and_authorship(
+    stats_for_commit_stats_with_parent_and_authorship(
         repo,
         commit_sha,
         parents.first().map(String::as_str),
         ignore_patterns,
         authorship_log,
     )
-    .map_err(|e| format!("stats unavailable: {}", e))?;
-    Ok(write_stats_to_terminal_with(&stats, false, unattributed))
+    .map_err(|e| format!("stats unavailable: {}", e))
 }
 
 fn append_indented_line(out: &mut String, line: &str, spaces: usize) {
@@ -1139,6 +1296,8 @@ impl Drop for TerminalGuard {
 #[derive(Debug)]
 enum LogError {
     Git(AutterError),
+    /// Bad flags: exit 2.
+    Usage(String),
     Io(io::Error),
     Message(String),
 }
@@ -1147,6 +1306,7 @@ impl std::fmt::Display for LogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LogError::Git(error) => write!(f, "{}", error),
+            LogError::Usage(message) => write!(f, "{}", message),
             LogError::Io(error) => write!(f, "{}", error),
             LogError::Message(message) => write!(f, "{}", message),
         }

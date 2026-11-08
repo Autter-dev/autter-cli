@@ -75,6 +75,9 @@ struct DoctorOutput {
     checks: Vec<DoctorCheck>,
     summary: DoctorSummary,
     ok: bool,
+    /// No check that capture depends on failed (background service, trace2,
+    /// end-to-end checkpoint, agent hooks). `--strict` exits 4 when false.
+    capture_ok: bool,
     /// The one command to run next: the first failed check's remediation, or
     /// the first warning when nothing failed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,10 +92,10 @@ struct DoctorOptions {
 pub fn handle_doctor(args: &[String]) {
     let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
         Ok(pp) => pp,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
+        Err(e) => crate::commands::output::fail(
+            crate::commands::output::ErrorKind::Usage,
+            format!("error: {}", e),
+        ),
     };
     if pp.flags.help {
         arg_parser::print_command_help("doctor");
@@ -109,16 +112,61 @@ pub fn handle_doctor(args: &[String]) {
                 return;
             }
             unknown => {
-                eprintln!("error: unknown doctor argument: {}", unknown);
                 arg_parser::print_command_help("doctor");
-                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                crate::commands::output::fail(
+                    crate::commands::output::ErrorKind::Usage,
+                    format!("error: unknown doctor argument: {}", unknown),
+                );
             }
         }
     }
 
     let output = run_doctor(&options);
-    if output.summary.failed > 0 {
-        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    if let Some((kind, _)) = doctor_failure(&output, crate::commands::output::strict()) {
+        std::process::exit(kind.exit_code());
+    }
+}
+
+/// Sections whose failures mean authorship is not being captured.
+const CAPTURE_SECTIONS: &[&str] = &[SECTION_SERVICE, SECTION_TRACE2, SECTION_E2E, SECTION_AGENTS];
+
+fn capture_ok(checks: &[DoctorCheck]) -> bool {
+    !checks
+        .iter()
+        .any(|c| c.status == DoctorStatus::Failed && CAPTURE_SECTIONS.contains(&c.section))
+}
+
+/// How a doctor run fails, if it does. Any failed check exits 1; with
+/// `--strict`, a failed capture check exits 4 instead.
+fn doctor_failure(
+    output: &DoctorOutput,
+    strict: bool,
+) -> Option<(crate::commands::output::ErrorKind, String)> {
+    use crate::commands::output::ErrorKind;
+    if output.summary.failed == 0 {
+        return None;
+    }
+    let first_failed = output
+        .checks
+        .iter()
+        .find(|c| {
+            c.status == DoctorStatus::Failed
+                && (!strict || output.capture_ok || CAPTURE_SECTIONS.contains(&c.section))
+        })
+        .map(|c| format!("{}: {}", c.name, c.summary))
+        .unwrap_or_default();
+    let failed = output.summary.failed;
+    let checks = if failed == 1 { "check" } else { "checks" };
+    if strict && !output.capture_ok {
+        Some((
+            ErrorKind::CaptureBroken,
+            format!("capture is broken (--strict): {first_failed}"),
+        ))
+    } else {
+        Some((
+            ErrorKind::CheckFailed,
+            format!("{failed} doctor {checks} failed: {first_failed}"),
+        ))
     }
 }
 
@@ -1689,16 +1737,20 @@ impl Reporter {
         }
         let summary = summarize(&self.checks);
         let next_step = next_step_from_checks(&self.checks);
+        let capture_ok = capture_ok(&self.checks);
         let output = DoctorOutput {
             autter_version: version_string(),
             checks: self.checks,
             summary,
             ok: summary.failed == 0,
+            capture_ok,
             next_step,
         };
 
         if self.json {
-            match serde_json::to_string(&output) {
+            let error = doctor_failure(&output, crate::commands::output::strict())
+                .map(|(kind, message)| crate::commands::output::ErrorBody::new(kind, message));
+            match crate::commands::output::document(Some(&output), error.as_ref()) {
                 Ok(serialized) => println!("{}", serialized),
                 Err(err) => {
                     eprintln!("Error: failed to serialize doctor report: {}", err);
@@ -1892,14 +1944,22 @@ mod tests {
         let next_step = next_step_from_checks(&checks);
         let output = DoctorOutput {
             autter_version: "test".to_string(),
+            capture_ok: capture_ok(&checks),
             checks,
             summary,
             ok: summary.failed == 0,
             next_step,
         };
         let value: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
+            serde_json::from_str(&crate::commands::output::document(Some(&output), None).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["schema_version"],
+            crate::commands::output::SCHEMA_VERSION
+        );
         assert!(!value["ok"].as_bool().unwrap());
+        // The failed check is in Setup, which capture does not depend on.
+        assert!(value["capture_ok"].as_bool().unwrap());
         assert_eq!(value["summary"]["passed"], 1);
         assert_eq!(value["summary"]["failed"], 1);
         assert_eq!(value["checks"][0]["status"], "passed");
@@ -1908,6 +1968,50 @@ mod tests {
         assert_eq!(value["next_step"], "do the thing");
         // Passed checks with no remediation omit the key entirely.
         assert!(value["checks"][0].get("remediation").is_none());
+    }
+
+    fn output_for(checks: Vec<DoctorCheck>) -> DoctorOutput {
+        let summary = summarize(&checks);
+        DoctorOutput {
+            autter_version: "test".to_string(),
+            capture_ok: capture_ok(&checks),
+            next_step: next_step_from_checks(&checks),
+            ok: summary.failed == 0,
+            summary,
+            checks,
+        }
+    }
+
+    #[test]
+    fn strict_exits_4_only_when_a_capture_check_fails() {
+        use crate::commands::output::ErrorKind;
+
+        let all_passed = output_for(vec![make_check(DoctorStatus::Passed)]);
+        assert!(doctor_failure(&all_passed, true).is_none());
+        assert!(doctor_failure(&all_passed, false).is_none());
+
+        // A setup failure is a failed check (1) with or without --strict.
+        let setup_failed = output_for(vec![make_check(DoctorStatus::Failed)]);
+        assert_eq!(
+            doctor_failure(&setup_failed, true).unwrap().0,
+            ErrorKind::CheckFailed
+        );
+
+        // A trace2 failure is a failed check by default and broken capture
+        // (4) under --strict.
+        let mut trace2 = make_check(DoctorStatus::Failed);
+        trace2.section = SECTION_TRACE2;
+        trace2.name = "trace2 config".to_string();
+        let capture_failed = output_for(vec![make_check(DoctorStatus::Failed), trace2]);
+        assert!(!capture_failed.capture_ok);
+        assert_eq!(
+            doctor_failure(&capture_failed, false).unwrap().0,
+            ErrorKind::CheckFailed
+        );
+        let (kind, message) = doctor_failure(&capture_failed, true).unwrap();
+        assert_eq!(kind, ErrorKind::CaptureBroken);
+        assert_eq!(kind.exit_code(), 4);
+        assert!(message.contains("trace2 config"), "{message}");
     }
 
     #[test]

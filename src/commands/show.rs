@@ -6,32 +6,160 @@ use crate::git::notes_api::{
     CommitAuthorship, filter_commits_with_notes as get_commits_with_notes_from_list,
 };
 use crate::git::repository::{CommitRange, Repository};
+use serde::Serialize;
 use std::time::Duration;
 
 pub fn handle_show(args: &[String]) {
-    // A revision never starts with `-`: an option here is a typo, not a ref.
-    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
-        crate::commands::arg_parser::exit_unknown_option("show", flag);
+    use crate::commands::output::{self, ErrorKind};
+
+    // Record `--json` before reporting any bad argument, so that error is JSON too.
+    if args.iter().any(|arg| arg == "--json") {
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                json: true,
+                ..Default::default()
+            },
+        );
+    }
+    let mut revisions = Vec::new();
+    for arg in args {
+        if arg == "--json" {
+            continue;
+        } else if arg.starts_with('-') {
+            // A revision never starts with `-`: an option here is a typo, not a ref.
+            crate::commands::arg_parser::exit_unknown_option("show", arg);
+        } else {
+            revisions.push(arg.clone());
+        }
     }
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
         Err(e) => crate::commands::exit_repository_error("show", &e),
     };
 
-    if args.is_empty() {
+    if revisions.is_empty() {
         crate::commands::usage_hints::eprint_missing_show_args(&repo);
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        output::fail(ErrorKind::Usage, "show requires a revision or range");
     }
 
-    if args.len() > 1 {
-        eprintln!("Error: show accepts exactly one revision or range");
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+    if revisions.len() > 1 {
+        output::fail(
+            ErrorKind::Usage,
+            "Error: show accepts exactly one revision or range",
+        );
     }
 
-    if let Err(e) = show_authorship(&repo, &args[0]) {
-        eprintln!("Failed to show authorship: {}", e);
-        std::process::exit(1);
+    let result = if crate::commands::arg_parser::json() {
+        show_authorship_json(&repo, &revisions[0])
+    } else {
+        show_authorship(&repo, &revisions[0])
+    };
+    if let Err(e) = result {
+        let kind = match e {
+            AutterError::GitCliError { .. } => ErrorKind::RevisionNotFound,
+            _ => ErrorKind::Runtime,
+        };
+        output::fail(kind, format!("Failed to show authorship: {}", e));
     }
+}
+
+/// `autter show <rev|range> --json`: one entry per commit, newest first as
+/// git lists them. `authorship` is null when the commit has no note.
+#[derive(Serialize)]
+struct ShowReport {
+    commits: Vec<ShowCommit>,
+}
+
+#[derive(Serialize)]
+struct ShowCommit {
+    commit: String,
+    note_present: bool,
+    authorship: Option<ShowAuthorship>,
+}
+
+#[derive(Serialize)]
+struct ShowAuthorship {
+    /// Per file, the attested line ranges. `kind` is `ai` for an AI session
+    /// or prompt and `human` for a known human (`h_` hashes); lines with no
+    /// entry are untracked.
+    attestations: Vec<ShowFileAttestation>,
+    /// The note's metadata section as stored (prompts, humans, sessions).
+    metadata: crate::authorship::authorship_log_serialization::AuthorshipMetadata,
+}
+
+#[derive(Serialize)]
+struct ShowFileAttestation {
+    file: String,
+    entries: Vec<ShowAttestationEntry>,
+}
+
+#[derive(Serialize)]
+struct ShowAttestationEntry {
+    hash: String,
+    kind: &'static str,
+    /// Inclusive `[start, end]` line ranges.
+    lines: Vec<[u32; 2]>,
+}
+
+fn show_authorship_json(repo: &Repository, spec: &str) -> Result<(), AutterError> {
+    use crate::authorship::authorship_log::LineRange;
+
+    let commits = resolve_commits(repo, spec)?;
+    let entries = if commits.is_empty() {
+        Vec::new()
+    } else {
+        get_commits_with_notes_from_list(repo, &commits)?
+    };
+    let commits = entries
+        .into_iter()
+        .map(|entry| match entry {
+            CommitAuthorship::Log {
+                sha,
+                authorship_log,
+                ..
+            } => ShowCommit {
+                commit: sha,
+                note_present: true,
+                authorship: Some(ShowAuthorship {
+                    attestations: authorship_log
+                        .attestations
+                        .iter()
+                        .map(|file| ShowFileAttestation {
+                            file: file.file_path.clone(),
+                            entries: file
+                                .entries
+                                .iter()
+                                .map(|entry| ShowAttestationEntry {
+                                    hash: entry.hash.clone(),
+                                    kind: if entry.hash.starts_with("h_") {
+                                        "human"
+                                    } else {
+                                        "ai"
+                                    },
+                                    lines: entry
+                                        .line_ranges
+                                        .iter()
+                                        .map(|range| match range {
+                                            LineRange::Single(line) => [*line, *line],
+                                            LineRange::Range(start, end) => [*start, *end],
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    metadata: authorship_log.metadata,
+                }),
+            },
+            CommitAuthorship::NoLog { sha, .. } => ShowCommit {
+                commit: sha,
+                note_present: false,
+                authorship: None,
+            },
+        })
+        .collect();
+    crate::commands::output::print_json(&ShowReport { commits });
+    Ok(())
 }
 
 fn show_authorship(repo: &Repository, spec: &str) -> Result<(), AutterError> {

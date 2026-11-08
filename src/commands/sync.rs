@@ -182,18 +182,20 @@ pub fn purge_sync_queues() -> Result<String, AutterError> {
 }
 
 fn print_status(args: &[String]) {
+    use crate::commands::output::{self, ErrorKind};
+
     let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
         Ok(pp) => pp,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         print_help();
         return;
     }
     arg_parser::merge_global_flags(&pp.flags);
+    if let Some(arg) = pp.rest.first() {
+        arg_parser::exit_unknown_option("sync status", arg);
+    }
 
     let report = collect_cloud_sync_status();
     let ok = !report.enabled
@@ -208,16 +210,23 @@ fn print_status(args: &[String]) {
             not_connected: crate::upload_hold::unconnected_counts().into(),
             ok,
         };
-        println!(
-            "{}",
-            serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
-        );
+        if !ok {
+            output::fail_with(
+                ErrorKind::SyncUnhealthy,
+                format!(
+                    "cloud sync needs attention: {}",
+                    crate::auth::notice::format_sync_report(&output.cloud_sync)
+                ),
+                Some(&output),
+            );
+        }
+        output::print_json(&output);
     } else {
         print_human_status(&report);
     }
 
     if !ok {
-        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+        std::process::exit(ErrorKind::SyncUnhealthy.exit_code());
     }
 }
 

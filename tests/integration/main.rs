@@ -93,6 +93,7 @@ mod internal_spawn_safety;
 mod issue_1204_multi_agent;
 mod jetbrains_download;
 mod jetbrains_ide_types;
+mod json_contract;
 mod local_mode_privacy;
 mod log;
 mod memory_command;

@@ -1,0 +1,53 @@
+---
+source: tests/integration/json_contract.rs
+expression: shape_text(&document)
+---
+{
+  "authorship_stats": {
+    "authors_committing_authorship": [
+      "string"
+    ],
+    "authors_not_committing_authorship": [],
+    "commits_with_authorship": "integer",
+    "commits_without_authorship": [],
+    "commits_without_authorship_with_authors": [],
+    "total_commits": "integer"
+  },
+  "capture": {
+    "note_present": "boolean",
+    "status": "string"
+  },
+  "lines": {
+    "added": "integer",
+    "ai": "integer",
+    "deleted": "integer",
+    "human": "integer",
+    "unknown": "integer",
+    "untracked": "integer"
+  },
+  "percent": {
+    "ai": "number",
+    "human": "number",
+    "unknown": "number",
+    "untracked": "number"
+  },
+  "range": {
+    "end": "string",
+    "start": "string"
+  },
+  "range_stats": {
+    "ai_accepted": "integer",
+    "ai_additions": "integer",
+    "git_diff_added_lines": "integer",
+    "git_diff_deleted_lines": "integer",
+    "human_additions": "integer",
+    "tool_model_breakdown": {
+      "<key>": {
+        "ai_accepted": "integer",
+        "ai_additions": "integer"
+      }
+    },
+    "unknown_additions": "integer"
+  },
+  "schema_version": "integer"
+}

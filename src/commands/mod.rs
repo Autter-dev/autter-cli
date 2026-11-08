@@ -32,6 +32,7 @@ pub mod memory_skills;
 pub mod notes_backfill;
 pub mod notes_migrate;
 pub mod onboard;
+pub mod output;
 pub mod personal_dashboard;
 pub mod show;
 pub mod show_prompt;
@@ -53,7 +54,12 @@ pub mod wrapped;
 /// * [`EXIT_RUNTIME_ERROR`] (`1`) — a runtime/IO/lookup error (e.g. repository
 ///   not found, a git invocation failed, serialization failed).
 /// * [`EXIT_USAGE_ERROR`] (`2`) — the caller misused the command (missing or
-///   unknown subcommand, missing required argument, unparseable flag value).
+///   unknown subcommand, missing required argument, unparseable flag value,
+///   or a reporting command run outside a git repository).
+/// * [`EXIT_NOTHING_CAPTURED`] (`3`) — only with `--strict`: `stats`/`status`
+///   found nothing captured.
+/// * [`EXIT_CAPTURE_BROKEN`] (`4`) — only with `--strict`: `doctor` found
+///   capture broken.
 ///
 /// This policy intentionally does NOT apply to the git proxy/hook path or to
 /// the `checkpoint` command. Those run *inside* the user's `git` invocation or
@@ -63,8 +69,13 @@ pub mod wrapped;
 pub const EXIT_SUCCESS: i32 = 0;
 /// Runtime/IO error in a user-invoked subcommand. See [`EXIT_SUCCESS`].
 pub const EXIT_RUNTIME_ERROR: i32 = 1;
-/// Usage/argument error in a user-invoked subcommand. See [`EXIT_SUCCESS`].
+/// Usage/argument error in a user-invoked subcommand (bad flags, or a
+/// reporting command run outside a repository). See [`EXIT_SUCCESS`].
 pub const EXIT_USAGE_ERROR: i32 = 2;
+/// `--strict`: capture is broken (`doctor`). See [`output`].
+pub use output::EXIT_CAPTURE_BROKEN;
+/// `--strict`: nothing was captured. See [`output`] for the full contract.
+pub use output::EXIT_NOTHING_CAPTURED;
 
 /// The error a repository-scoped command prints when it can't open the
 /// repository. Outside a repository that is one plain sentence instead of
@@ -80,10 +91,14 @@ pub fn repository_error_message(command: &str, error: &crate::error::AutterError
     }
 }
 
-/// Print [`repository_error_message`] and exit with [`EXIT_RUNTIME_ERROR`].
+/// Print [`repository_error_message`] and exit: [`EXIT_USAGE_ERROR`]
+/// (`not_a_repository`) outside a git repository, [`EXIT_RUNTIME_ERROR`]
+/// otherwise. Under `--json` the error is also printed as a JSON document.
 pub fn exit_repository_error(command: &str, error: &crate::error::AutterError) -> ! {
-    eprintln!("{}", repository_error_message(command, error));
-    std::process::exit(EXIT_RUNTIME_ERROR);
+    output::fail(
+        output::repository_error_kind(error),
+        repository_error_message(command, error),
+    )
 }
 
 /// Print a one-line stderr pointer to `autter doctor`.

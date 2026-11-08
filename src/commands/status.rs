@@ -1,9 +1,12 @@
 use crate::authorship::ignore::{
     IgnoreMatcher, build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
-use crate::authorship::stats::{CommitStats, stats_from_authorship_log, write_stats_to_terminal};
+use crate::authorship::stats::{
+    CaptureStatus, CommitStats, StatsSummary, stats_from_authorship_log, write_stats_to_terminal,
+};
 use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::authorship::working_log::CheckpointKind;
+use crate::commands::output::{self, ErrorKind};
 use crate::error::AutterError;
 use crate::git::find_repository;
 use crate::git::repo_storage::InitialAttributions;
@@ -23,9 +26,15 @@ struct CheckpointInfo {
     is_human: bool,
 }
 
+/// `autter status --json`. `lines`/`percent`/`capture` describe the
+/// uncommitted changes in the files checkpoints touched (with no checkpoints:
+/// every change to a tracked file, all Unknown).
 #[derive(Serialize)]
 struct StatusOutput {
+    head: String,
     stats: CommitStats,
+    #[serde(flatten)]
+    summary: StatsSummary,
     checkpoints: Vec<CheckpointInfo>,
     /// Checkpoints the background service has received but not yet written.
     pending_checkpoints: usize,
@@ -37,28 +46,32 @@ pub fn handle_status(args: &[String]) {
 
     let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         arg_parser::print_command_help("status");
         return;
     }
     arg_parser::merge_global_flags(&pp.flags);
-
-    if let Err(e) = run_status(arg_parser::json()) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    if let Some(arg) = pp.rest.first() {
+        arg_parser::exit_unknown_option("status", arg);
     }
-}
 
-fn run_status(json: bool) -> Result<(), AutterError> {
     let repo = match find_repository(&[]) {
         Ok(repo) => repo,
         Err(e) => crate::commands::exit_repository_error("status", &e),
     };
+    match run_status(&repo, arg_parser::json(), output::strict()) {
+        Ok(()) => {}
+        Err(e) => output::fail(ErrorKind::Runtime, format!("Error: {}", e)),
+    }
+}
+
+/// The `--strict` failure for `status`.
+const STATUS_NOTHING_CAPTURED: &str = "nothing captured: there are uncommitted changes, and no added line is attributed to AI or a known human (--strict). Run `autter doctor` to check capture.";
+
+fn run_status(repo: &Repository, json: bool, strict: bool) -> Result<(), AutterError> {
+    let repo = repo.clone();
     let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
     let ignore_matcher = build_ignore_matcher(&ignore_patterns);
 
@@ -82,15 +95,33 @@ fn run_status(json: bool) -> Result<(), AutterError> {
     let has_initial = !initial_attributions.files.is_empty();
 
     if !has_checkpoints && !has_initial {
+        // Nothing was checkpointed: every uncommitted change to a tracked file
+        // is Unknown. Only the line counts are needed, for --json and --strict.
+        let (added, deleted) = if json || strict {
+            get_working_dir_diff_stats(&repo, None, &ignore_matcher)?
+        } else {
+            (0, 0)
+        };
+        let stats = stats_from_authorship_log(None, added, deleted, 0, 0, &BTreeMap::new());
+        let summary = StatsSummary::from_stats(&stats, false);
+        let nothing_captured = strict && summary.capture.status == CaptureStatus::NothingCaptured;
         if json {
-            let output = StatusOutput {
-                stats: CommitStats::default(),
+            let report = StatusOutput {
+                head: head_sha.clone(),
+                stats,
+                summary,
                 checkpoints: vec![],
                 pending_checkpoints,
                 cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
             };
-            let json_str = serde_json::to_string(&output)?;
-            println!("{}", json_str);
+            if nothing_captured {
+                output::fail_with(
+                    ErrorKind::NothingCaptured,
+                    STATUS_NOTHING_CAPTURED,
+                    Some(&report),
+                );
+            }
+            output::print_json(&report);
         } else if !crate::commands::arg_parser::quiet() {
             eprint!("{}", no_checkpoints_message(&head_sha, pending_checkpoints));
             if pending_checkpoints == 0 && std::io::stderr().is_terminal() {
@@ -105,6 +136,9 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             && let Some(line) = crate::auth::notice::format_cloud_sync_status_line()
         {
             eprintln!("{line}");
+        }
+        if nothing_captured {
+            output::fail(ErrorKind::NothingCaptured, STATUS_NOTHING_CAPTURED);
         }
         return Ok(());
     }
@@ -175,20 +209,33 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         known_human,
         &BTreeMap::new(),
     );
+    let summary = StatsSummary::from_stats(&stats, true);
+    let nothing_captured = strict && summary.capture.status == CaptureStatus::NothingCaptured;
 
     if json {
-        let output = StatusOutput {
+        let report = StatusOutput {
+            head: head_sha.clone(),
             stats,
+            summary,
             checkpoints: checkpoint_infos,
             pending_checkpoints,
             cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
         };
-        let json_str = serde_json::to_string(&output)?;
-        println!("{}", json_str);
+        if nothing_captured {
+            output::fail_with(
+                ErrorKind::NothingCaptured,
+                STATUS_NOTHING_CAPTURED,
+                Some(&report),
+            );
+        }
+        output::print_json(&report);
         return Ok(());
     }
 
     if crate::commands::arg_parser::quiet() {
+        if nothing_captured {
+            output::fail(ErrorKind::NothingCaptured, STATUS_NOTHING_CAPTURED);
+        }
         return Ok(());
     }
     write_stats_to_terminal(&stats, true);
@@ -225,6 +272,9 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         }
     }
 
+    if nothing_captured {
+        output::fail(ErrorKind::NothingCaptured, STATUS_NOTHING_CAPTURED);
+    }
     Ok(())
 }
 

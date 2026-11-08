@@ -1,0 +1,38 @@
+---
+source: tests/integration/json_contract.rs
+expression: shape_text(&document)
+---
+{
+  "capture": {
+    "note_present": "boolean",
+    "status": "string"
+  },
+  "checkpoints": [],
+  "cloud_sync": "<cloud_sync>",
+  "head": "string",
+  "lines": {
+    "added": "integer",
+    "ai": "integer",
+    "deleted": "integer",
+    "human": "integer",
+    "unknown": "integer",
+    "untracked": "integer"
+  },
+  "pending_checkpoints": "integer",
+  "percent": {
+    "ai": "number",
+    "human": "number",
+    "unknown": "number",
+    "untracked": "number"
+  },
+  "schema_version": "integer",
+  "stats": {
+    "ai_accepted": "integer",
+    "ai_additions": "integer",
+    "git_diff_added_lines": "integer",
+    "git_diff_deleted_lines": "integer",
+    "human_additions": "integer",
+    "tool_model_breakdown": {},
+    "unknown_additions": "integer"
+  }
+}

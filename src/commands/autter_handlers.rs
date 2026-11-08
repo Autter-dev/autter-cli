@@ -1,7 +1,7 @@
 use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
-use crate::authorship::stats::stats_command;
+use crate::authorship::stats::{CaptureStatus, commit_stats_report, print_commit_stats_report};
 use crate::commands;
 use crate::config;
 use crate::daemon::ControlRequest;
@@ -1184,22 +1184,21 @@ fn handle_ai_blame(args: &[String]) {
     // LeadingOnly + no -C recognition: blame forwards git-style flags (e.g. `-C`
     // means copy detection here). Any leading `-C <path>` was already consumed
     // at the top level in handle_autter.
+    use crate::commands::output::{self, ErrorKind};
     let pp = match commands::arg_parser::pre_parse(
         args,
         commands::arg_parser::ScanMode::LeadingOnly,
         false,
     ) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         commands::arg_parser::print_command_help("blame");
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
+    merge_trailing_json_flag(&pp.rest);
     // `-i`/`--interactive` is autter's own (git blame has no `-i`), so it is
     // taken out before the git-compatible flags are parsed.
     let interactive = pp
@@ -1222,11 +1221,9 @@ fn handle_ai_blame(args: &[String]) {
         if let Ok(repo) = find_repository_in_path(&current_dir) {
             commands::usage_hints::eprint_missing_blame_args(&repo);
         } else {
-            eprintln!("Error: blame requires a file argument");
-            eprintln!();
             eprintln!("Usage: autter blame <file>");
         }
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        output::fail(ErrorKind::Usage, "Error: blame requires a file argument");
     }
 
     // Find the git repository from current directory
@@ -1242,10 +1239,10 @@ fn handle_ai_blame(args: &[String]) {
     // Parse blame arguments
     let (file_path, mut options) = match commands::blame::parse_blame_args(args) {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Failed to parse blame arguments: {}", e);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
+        Err(e) => output::fail(
+            ErrorKind::Usage,
+            format!("Failed to parse blame arguments: {}", e),
+        ),
     };
     // Honor a global `--json` supplied before the file positional (stripped by
     // the shared pre-parser) as well as blame's own trailing `--json`.
@@ -1291,8 +1288,10 @@ fn handle_ai_blame(args: &[String]) {
     if is_interactive && options.incremental {
         // For incremental mode in interactive terminal, we need special handling
         // This would typically involve a pager like less
-        eprintln!("Error: incremental mode is not supported in interactive terminal");
-        std::process::exit(1);
+        output::fail(
+            ErrorKind::Usage,
+            "Error: incremental mode is not supported in interactive terminal",
+        );
     }
 
     let file_path = if !std::path::Path::new(&file_path).is_absolute() {
@@ -1308,8 +1307,7 @@ fn handle_ai_blame(args: &[String]) {
     if interactive {
         if commands::interactive::available() && !options.json {
             if let Err(e) = commands::interactive::blame::run(&repo, &file_path, &options) {
-                eprintln!("Blame failed: {}", e);
-                std::process::exit(1);
+                output::fail(ErrorKind::Runtime, format!("Blame failed: {}", e));
             }
             return;
         }
@@ -1317,28 +1315,26 @@ fn handle_ai_blame(args: &[String]) {
     }
 
     if let Err(e) = repo.blame(&file_path, &options) {
-        eprintln!("Blame failed: {}", e);
-        std::process::exit(1);
+        output::fail(ErrorKind::Runtime, format!("Blame failed: {}", e));
     }
 }
 
 fn handle_ai_diff(args: &[String]) {
+    use crate::commands::output::{self, ErrorKind};
     let pp = match commands::arg_parser::pre_parse(
         args,
         commands::arg_parser::ScanMode::LeadingOnly,
         false,
     ) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         commands::arg_parser::print_command_help("diff");
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
+    merge_trailing_json_flag(&pp.rest);
     let args = &pp.rest;
 
     let current_dir = env::current_dir()
@@ -1351,19 +1347,33 @@ fn handle_ai_diff(args: &[String]) {
     };
 
     if let Err(e) = commands::diff::handle_diff(&repo, args) {
-        eprintln!("Diff failed: {}", e);
-        std::process::exit(1);
+        output::fail(ErrorKind::Runtime, format!("Diff failed: {}", e));
+    }
+}
+
+/// `blame` and `diff` parse their own trailing `--json` (after the file or
+/// revision, where the shared pre-parser stops). Record it globally as well,
+/// so their errors are JSON too.
+fn merge_trailing_json_flag(rest: &[String]) {
+    if rest
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--json")
+    {
+        commands::arg_parser::merge_global_flags(&commands::arg_parser::GlobalFlags {
+            json: true,
+            ..Default::default()
+        });
     }
 }
 
 fn handle_stats(args: &[String]) {
+    use crate::commands::output::{self, ErrorKind};
+
     let pp =
         match commands::arg_parser::pre_parse(args, commands::arg_parser::ScanMode::Full, false) {
             Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                std::process::exit(2);
-            }
+            Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
         };
     if pp.flags.help {
         commands::arg_parser::print_command_help("stats");
@@ -1375,12 +1385,11 @@ fn handle_stats(args: &[String]) {
     // Find the git repository
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
-        Err(e) => {
-            commands::exit_repository_error("stats", &e);
-        }
+        Err(e) => commands::exit_repository_error("stats", &e),
     };
     // Parse stats-specific arguments
     let json_output = commands::arg_parser::json();
+    let strict = output::strict();
     let mut commit_sha = None;
     let mut commit_range: Option<CommitRange> = None;
     let mut ignore_patterns: Vec<String> = Vec::new();
@@ -1423,8 +1432,10 @@ fn handle_stats(args: &[String]) {
                     i += 1;
                 }
                 if !found_pattern {
-                    eprintln!("--ignore requires at least one pattern argument");
-                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                    output::fail(
+                        ErrorKind::Usage,
+                        "--ignore requires at least one pattern argument",
+                    );
                 }
             }
             "--wait" => {
@@ -1435,10 +1446,10 @@ fn handle_stats(args: &[String]) {
                 let raw = &flag["--wait=".len()..];
                 match raw.parse::<u64>() {
                     Ok(secs) => wait_secs = Some(secs.max(1)),
-                    Err(_) => {
-                        eprintln!("--wait expects a positive number of seconds");
-                        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-                    }
+                    Err(_) => output::fail(
+                        ErrorKind::Usage,
+                        "--wait expects a positive number of seconds",
+                    ),
                 }
                 i += 1;
             }
@@ -1461,22 +1472,29 @@ fn handle_stats(args: &[String]) {
                                 Ok(range) => {
                                     commit_range = Some(range);
                                 }
-                                Err(e) => {
-                                    eprintln!("Failed to create commit range: {}", e);
-                                    std::process::exit(1);
-                                }
+                                Err(e) => output::fail(
+                                    ErrorKind::RevisionNotFound,
+                                    format!("Failed to create commit range: {}", e),
+                                ),
                             }
                         } else {
-                            eprintln!("Invalid commit range format. Expected: <commit>..<commit>");
-                            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                            output::fail(
+                                ErrorKind::Usage,
+                                "Invalid commit range format. Expected: <commit>..<commit>",
+                            );
                         }
+                    } else if arg.starts_with('-') {
+                        // A revision never starts with `-`: this is a mistyped flag.
+                        commands::arg_parser::exit_unknown_option("stats", arg);
                     } else {
                         commit_sha = Some(normalize_head_rev(arg));
                     }
                     i += 1;
                 } else {
-                    eprintln!("Unknown stats argument: {}", args[i]);
-                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                    output::fail(
+                        ErrorKind::Usage,
+                        format!("Unknown stats argument: {}", args[i]),
+                    );
                 }
             }
         }
@@ -1486,8 +1504,7 @@ fn handle_stats(args: &[String]) {
     // whether the records reached the remote.
     if coverage {
         if let Err(e) = commands::coverage::run_coverage(&repo, raw_spec.as_deref(), json_output) {
-            eprintln!("Coverage failed: {}", e);
-            std::process::exit(1);
+            output::fail(ErrorKind::Runtime, format!("Coverage failed: {}", e));
         }
         return;
     }
@@ -1496,8 +1513,7 @@ fn handle_stats(args: &[String]) {
     if interactive {
         if commands::interactive::available() && !json_output {
             if let Err(e) = commands::interactive::stats::run(&repo, commit_sha.as_deref()) {
-                eprintln!("{}", e);
-                std::process::exit(1);
+                output::fail(ErrorKind::Runtime, e.to_string());
             }
             return;
         }
@@ -1508,19 +1524,29 @@ fn handle_stats(args: &[String]) {
 
     // Handle commit range if detected
     if let Some(range) = commit_range {
+        let (start, end) = (range.start_oid.clone(), range.end_oid.clone());
         match range_authorship::range_authorship(range, false, &effective_patterns, None) {
             Ok(stats) => {
+                let report = range_authorship::RangeStatsReport::new(start, end, stats);
+                let status = report.summary.capture.status;
                 if json_output {
-                    let json_str = serde_json::to_string(&stats).unwrap();
-                    println!("{}", json_str);
+                    if strict && status == CaptureStatus::NothingCaptured {
+                        output::fail_with(
+                            ErrorKind::NothingCaptured,
+                            nothing_captured_message("this range"),
+                            Some(&report),
+                        );
+                    }
+                    output::print_json(&report);
                 } else {
-                    range_authorship::print_range_authorship_stats(&stats);
+                    range_authorship::print_range_authorship_stats(&report.stats);
                 }
+                exit_if_nothing_captured(strict, status, "this range");
             }
-            Err(e) => {
-                eprintln!("Range authorship failed: {}", e);
-                std::process::exit(1);
-            }
+            Err(e) => output::fail(
+                ErrorKind::Runtime,
+                format!("Range authorship failed: {}", e),
+            ),
         }
         return;
     }
@@ -1529,17 +1555,14 @@ fn handle_stats(args: &[String]) {
         let sha = match commit_sha.as_deref() {
             Some(s) => match repo.revparse_single(s) {
                 Ok(obj) => obj.id(),
-                Err(e) => {
-                    eprintln!("Failed to resolve commit: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => output::fail(
+                    ErrorKind::RevisionNotFound,
+                    format!("Failed to resolve commit: {e}"),
+                ),
             },
             None => match repo.head().and_then(|h| h.target()) {
                 Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to resolve HEAD: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => output::fail(ErrorKind::Runtime, format!("Failed to resolve HEAD: {e}")),
             },
         };
         let timeout = std::time::Duration::from_secs(secs);
@@ -1554,46 +1577,66 @@ fn handle_stats(args: &[String]) {
             std::thread::sleep(poll);
         }
         if !found {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "pending": true,
-                        "commit": sha,
-                        "waited_secs": secs,
-                        "error": "authorship note not ready"
-                    })
-                );
-            } else {
-                eprintln!(
+            #[derive(Serialize)]
+            struct Pending<'a> {
+                pending: bool,
+                commit: &'a str,
+                waited_secs: u64,
+            }
+            output::fail_with(
+                ErrorKind::NotePending,
+                format!(
                     "pending: authorship note for {} not ready after {}s (daemon still processing?)",
                     &sha[..std::cmp::min(8, sha.len())],
                     secs
-                );
-            }
-            std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+                ),
+                Some(&Pending {
+                    pending: true,
+                    commit: &sha,
+                    waited_secs: secs,
+                }),
+            );
         }
     }
 
-    if let Err(e) = stats_command(
-        &repo,
-        commit_sha.as_deref(),
-        json_output,
-        &effective_patterns,
-    ) {
-        match e {
-            crate::error::AutterError::Generic(msg) if msg.starts_with("No commit found:") => {
-                eprintln!("{}", msg);
-            }
-            _ => {
-                eprintln!("Stats failed: {}", e);
-            }
+    let report = match commit_stats_report(&repo, commit_sha.as_deref(), &effective_patterns) {
+        Ok(report) => report,
+        Err(crate::error::AutterError::Generic(msg)) if msg.starts_with("No commit found:") => {
+            output::fail(ErrorKind::RevisionNotFound, msg)
         }
-        std::process::exit(1);
+        Err(e) => output::fail(ErrorKind::Runtime, format!("Stats failed: {}", e)),
+    };
+    let status = report.summary.capture.status;
+    if json_output && strict && status == CaptureStatus::NothingCaptured {
+        output::fail_with(
+            ErrorKind::NothingCaptured,
+            nothing_captured_message("this commit"),
+            Some(&report),
+        );
+    }
+    print_commit_stats_report(&report, json_output);
+    exit_if_nothing_captured(strict, status, "this commit");
+}
+
+/// The `--strict` failure message for `stats`.
+fn nothing_captured_message(what: &str) -> String {
+    format!(
+        "nothing captured: no added line in {what} is attributed to AI or a known human (--strict). Run `autter doctor` to check capture."
+    )
+}
+
+/// `--strict` without `--json`: the human output is already printed; exit 3
+/// when nothing was captured.
+fn exit_if_nothing_captured(strict: bool, status: CaptureStatus, what: &str) {
+    if strict && status == CaptureStatus::NothingCaptured {
+        crate::commands::output::fail(
+            crate::commands::output::ErrorKind::NothingCaptured,
+            nothing_captured_message(what),
+        );
     }
 }
 
-/// Normalise a revision token that the user may have typed with a lowercase
+// Normalise a revision token that the user may have typed with a lowercase
 /// "head" prefix.  On case-insensitive file systems (macOS) git accepts both
 /// "head" and "HEAD", but in a linked worktree "head" can resolve to the
 /// *main* repository's HEAD file rather than the worktree's own HEAD, so the

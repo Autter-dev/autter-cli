@@ -16,16 +16,36 @@ pub fn handle_whoami(args: &[String]) {
         std::process::exit(0);
     }
 
-    if !args.is_empty() {
-        eprintln!("Error: unknown whoami argument(s): {}", args.join(" "));
+    if args.iter().any(|arg| arg == "--json") {
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                json: true,
+                ..Default::default()
+            },
+        );
+    }
+    let rest: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "--json")
+        .collect();
+    if !rest.is_empty() {
         print_help();
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        crate::commands::output::fail(
+            crate::commands::output::ErrorKind::Usage,
+            format!("Error: unknown whoami argument(s): {}", rest.join(" ")),
+        );
     }
 
     // Use Config::fresh() to support runtime config updates (daemon mode)
     let api_base_url = config::Config::fresh().api_base_url().to_string();
     let auth = collect_auth_status();
     let api_ctx = ApiContext::new(None);
+
+    if crate::commands::arg_parser::json() {
+        print_json_report(&auth, &api_base_url, api_ctx.api_key.as_deref());
+        return;
+    }
 
     // A person at a terminal gets a card; anything reading stdout keeps the
     // `Key: value` lines below.
@@ -335,12 +355,103 @@ fn mask_api_key(key: &str) -> String {
     format!("{}...{}", prefix, suffix)
 }
 
+/// `autter whoami --json`. `signed_in` is true when a login or an API key
+/// lets this machine talk to Autter; when false the document carries an
+/// `error` (`not_signed_in`) and the command exits 1.
+#[derive(serde::Serialize)]
+struct WhoamiReport {
+    signed_in: bool,
+    /// logged_in, logged_out, sync_blocked, refresh_expired, login_refused
+    /// or error.
+    auth_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_detail: Option<String>,
+    api_base_url: String,
+    credential_backend: String,
+    api_key: Option<String>,
+    access_token_expires_at: Option<i64>,
+    refresh_token_expires_at: Option<i64>,
+    user: WhoamiUser,
+    personal_org_id: Option<String>,
+    orgs: Vec<WhoamiOrg>,
+    cloud_sync: crate::auth::notice::CloudSyncStatusReport,
+}
+
+#[derive(serde::Serialize)]
+struct WhoamiUser {
+    id: Option<String>,
+    email: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct WhoamiOrg {
+    id: Option<String>,
+    slug: Option<String>,
+    name: Option<String>,
+    role: Option<String>,
+}
+
+fn auth_state_code(state: &AuthState) -> (&'static str, Option<String>) {
+    match state {
+        AuthState::LoggedOut => ("logged_out", None),
+        AuthState::LoggedIn => ("logged_in", None),
+        AuthState::SyncBlocked => ("sync_blocked", None),
+        AuthState::RefreshExpired => ("refresh_expired", None),
+        AuthState::LoginRefused(reason) => ("login_refused", Some(reason.clone())),
+        AuthState::Error(err) => ("error", Some(err.clone())),
+    }
+}
+
+fn print_json_report(auth: &AuthStatus, api_base_url: &str, api_key: Option<&str>) {
+    let (auth_state, auth_detail) = auth_state_code(&auth.state);
+    let signed_in = matches!(auth.state, AuthState::LoggedIn) || api_key.is_some();
+    let report = WhoamiReport {
+        signed_in,
+        auth_state,
+        auth_detail,
+        api_base_url: api_base_url.to_string(),
+        credential_backend: auth.backend.clone(),
+        api_key: api_key.map(mask_api_key),
+        access_token_expires_at: auth.access_token_expires_at,
+        refresh_token_expires_at: auth.refresh_token_expires_at,
+        user: WhoamiUser {
+            id: auth.user_id.clone(),
+            email: auth.email.clone(),
+            name: auth.name.clone(),
+        },
+        personal_org_id: auth.personal_org_id.clone(),
+        orgs: auth
+            .orgs
+            .iter()
+            .map(|org| WhoamiOrg {
+                id: org.org_id.clone(),
+                slug: org.org_slug.clone(),
+                name: org.org_name.clone(),
+                role: org.role.clone(),
+            })
+            .collect(),
+        cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
+    };
+    if !signed_in {
+        crate::commands::output::fail_with(
+            crate::commands::output::ErrorKind::NotSignedIn,
+            format!("not signed in ({auth_state}): run `autter login`"),
+            Some(&report),
+        );
+    }
+    crate::commands::output::print_json(&report);
+}
+
 fn print_help() {
     eprintln!("autter whoami - Show current auth state and identity");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  autter whoami");
+    eprintln!("  autter whoami [--json]");
     eprintln!("  autter whoami --help");
+    eprintln!();
+    eprintln!("  --json   One JSON document: signed_in, auth_state, user, orgs, cloud_sync.");
+    eprintln!("           Exits 1 when not signed in (error code not_signed_in).");
 }
 
 #[cfg(test)]

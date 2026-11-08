@@ -178,6 +178,7 @@ Want a closer look?
 - [CI Actions](https://autter.dev/docs/guides/ci-workflows) — preserve attribution through Rebase and Merge and Squash and Merge.
 - [How Autter Works](https://autter.dev/docs/cli/how-autter-works)
 - [Stats command](https://autter.dev/docs/cli/commit-stats) — aggregate % AI stats across commits.
+- [Scripting and CI](docs/scripting.md) — `--json` output, exit codes, `--strict`, and a GitHub Actions example.
 - [AI Blame](https://autter.dev/docs/cli/ai-blame)
 - [Config](https://autter.dev/docs/cli/configuration)
 - [Add support for an agent in Autter](https://autter.dev/docs/guides/add-your-agent)
@@ -194,6 +195,24 @@ autter stats <start_sha>..<end_sha> --json
 
 It computes % AI code, AI lines generated vs committed, acceptance rates, and human overrides, broken down by tool and model. More in the [stats command reference](https://autter.dev/docs/cli/reference#stats).
 
+### Scripting and CI
+
+Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `whoami`, `doctor`, `sync status`) takes `--json` and prints exactly one JSON document on stdout, with a `schema_version` and, on failure, an `error` object. Fields are only ever added. With `--strict` (or `AUTTER_STRICT=1`), `stats` and `status` fail when nothing was captured and `doctor` fails when capture is broken:
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Runtime error |
+| 2 | Usage error (bad flags, outside a repository) |
+| 3 | Nothing captured (`stats`, `status`; only with `--strict`) |
+| 4 | Capture is broken (`doctor`; only with `--strict`) |
+
+```bash
+autter stats "$BASE..$HEAD" --json --strict | jq '.percent.ai'
+```
+
+In CI (`CI=true`) or when output is not a terminal, autter prints no color, prompts or spinners. See [Scripting and CI](docs/scripting.md) for the JSON Schema, error codes and a GitHub Actions workflow that fails a pull request when nothing was captured or the AI share is too high.
+
 For a year at a glance, `autter wrapped` draws a screenshot-ready card of your AI-assisted coding in the repository: AI share by month, top agent and model, most-prompted file, longest prompt, streak and busiest weekday. `--json` prints the same numbers, and `--share` publishes the card as a page with a share image. Prompt text never leaves the machine unless you pass `--include-prompt-text`.
 
 <details>
@@ -201,7 +220,10 @@ For a year at a glance, `autter wrapped` draws a screenshot-ready card of your A
 
 ```json
 {
+  "schema_version": 1,
+  "commit": "3f2a9c1e…",
   "human_additions": 28,
+  "unknown_additions": 0,
   "ai_additions": 76,
   "ai_accepted": 47,
   "git_diff_deleted_lines": 34,
@@ -211,7 +233,10 @@ For a year at a glance, `autter wrapped` draws a screenshot-ready card of your A
       "ai_additions": 76,
       "ai_accepted": 47
     }
-  }
+  },
+  "lines": { "added": 104, "deleted": 34, "ai": 76, "human": 28, "untracked": 0, "unknown": 0 },
+  "percent": { "ai": 73.1, "human": 26.9, "untracked": 0.0, "unknown": 0.0 },
+  "capture": { "status": "captured", "note_present": true }
 }
 ```
 

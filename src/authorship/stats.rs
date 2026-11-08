@@ -35,21 +35,25 @@ pub struct CommitStats {
     pub tool_model_breakdown: BTreeMap<String, ToolModelHeadlineStats>,
 }
 
-/// `autter stats --json` output: the commit stats plus why lines may lack a
-/// record. Existing fields keep their names; `record` is added.
-#[derive(Debug, Serialize)]
-struct StatsJsonOutput<'a> {
-    #[serde(flatten)]
-    stats: &'a CommitStats,
-    record: &'a RecordStatus,
-}
-
 pub fn stats_command(
     repo: &Repository,
     commit_sha: Option<&str>,
     json: bool,
     ignore_patterns: &[String],
 ) -> Result<(), AutterError> {
+    let report = commit_stats_report(repo, commit_sha, ignore_patterns)?;
+    print_commit_stats_report(&report, json);
+    Ok(())
+}
+
+/// The `autter stats` report for one commit: the raw [`CommitStats`] plus the
+/// line breakdown, percentages and capture status that `--json` and
+/// `--strict` use.
+pub fn commit_stats_report(
+    repo: &Repository,
+    commit_sha: Option<&str>,
+    ignore_patterns: &[String],
+) -> Result<CommitStatsReport, AutterError> {
     let (target, refname) = if let Some(sha) = commit_sha {
         // Validate that the commit exists using revparse_single
         match repo.revparse_single(sha) {
@@ -86,15 +90,20 @@ pub fn stats_command(
     );
 
     let stats = stats_for_commit_stats(repo, &target, ignore_patterns)?;
+    Ok(CommitStatsReport::with_record(target, stats, record))
+}
 
+/// Print a commit's stats: the JSON document with `--json`, the bar otherwise.
+pub fn print_commit_stats_report(report: &CommitStatsReport, json: bool) {
     if json {
-        let output = StatsJsonOutput {
-            stats: &stats,
-            record: &record,
-        };
-        println!("{}", serde_json::to_string(&output)?);
-        return Ok(());
+        crate::commands::output::print_json(report);
+        return;
     }
+    let stats = &report.stats;
+    let Some(record) = report.record.as_ref() else {
+        write_stats_to_terminal(stats, true);
+        return;
+    };
 
     let unattributed = if record.is_recorded() {
         LineCategory::Untracked
@@ -104,12 +113,12 @@ pub fn stats_command(
     print!(
         "{}",
         render_stats_output(
-            &stats,
+            stats,
             crate::commands::arg_parser::use_color(),
             unattributed,
         )
     );
-    print!("{}", stats_footer(&stats, &record));
+    print!("{}", stats_footer(stats, record));
 
     if stats.unknown_additions > 0 && record.is_recorded() {
         // Probing every agent installer is slow, so only on a terminal.
@@ -121,15 +130,145 @@ pub fn stats_command(
         }
         // The unsupported-agent notice is cheap and explains the untracked
         // share, so it is printed in piped output too, as before.
-        if untracked_share_is_high(&stats) {
+        if untracked_share_is_high(stats) {
             let agents = crate::mdm::unsupported_agents::detect_unsupported_agents();
             if let Some(notice) = unsupported_agent_notice(&agents) {
                 print!("{notice}");
             }
         }
     }
+}
 
-    Ok(())
+/// Added lines under the labels `stats` and `blame` show: AI, Human (a known
+/// human typed it), Untracked (the commit has an authorship note, but nothing
+/// attested these lines) and Unknown (no authorship note at all, so autter
+/// has no data). Every added line is in exactly one of the four.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct LineBreakdown {
+    pub added: u32,
+    pub deleted: u32,
+    pub ai: u32,
+    pub human: u32,
+    pub untracked: u32,
+    pub unknown: u32,
+}
+
+/// Each label's share of the added lines, in percent with one decimal.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct PercentBreakdown {
+    pub ai: f64,
+    pub human: f64,
+    pub untracked: f64,
+    pub unknown: f64,
+}
+
+/// Whether autter captured anything for what a command looked at.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStatus {
+    /// At least one added line is attributed to AI or a known human.
+    Captured,
+    /// Lines were added, and none of them is attributed: `--strict` exits 3.
+    NothingCaptured,
+    /// Nothing was added, so there was nothing to capture.
+    NoAdditions,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub status: CaptureStatus,
+    /// The commit has an authorship note (for `status`: checkpoints exist
+    /// since the last commit).
+    pub note_present: bool,
+}
+
+/// The fields every stats-shaped `--json` document shares.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct StatsSummary {
+    pub lines: LineBreakdown,
+    pub percent: PercentBreakdown,
+    pub capture: CaptureSummary,
+}
+
+impl StatsSummary {
+    /// `note_present` decides whether unattributed lines are Untracked (there
+    /// is data, it just doesn't cover them) or Unknown (there is no data).
+    pub fn from_stats(stats: &CommitStats, note_present: bool) -> Self {
+        let unattributed = stats.unknown_additions;
+        let (untracked, unknown) = if note_present {
+            (unattributed, 0)
+        } else {
+            (0, unattributed)
+        };
+        let lines = LineBreakdown {
+            added: stats.ai_additions + stats.human_additions + unattributed,
+            deleted: stats.git_diff_deleted_lines,
+            ai: stats.ai_additions,
+            human: stats.human_additions,
+            untracked,
+            unknown,
+        };
+        let pct = |n| crate::commands::output::percent(n, lines.added);
+        let status = if lines.added == 0 {
+            CaptureStatus::NoAdditions
+        } else if lines.ai + lines.human == 0 {
+            CaptureStatus::NothingCaptured
+        } else {
+            CaptureStatus::Captured
+        };
+        Self {
+            lines,
+            percent: PercentBreakdown {
+                ai: pct(lines.ai),
+                human: pct(lines.human),
+                untracked: pct(lines.untracked),
+                unknown: pct(lines.unknown),
+            },
+            capture: CaptureSummary {
+                status,
+                note_present,
+            },
+        }
+    }
+}
+
+/// `autter stats <commit> --json`: the commit, the original [`CommitStats`]
+/// fields (kept for existing readers) and the [`StatsSummary`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitStatsReport {
+    pub commit: String,
+    #[serde(flatten)]
+    pub stats: CommitStats,
+    /// Why lines may lack a record (`autter stats` only; `log` leaves it out).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<RecordStatus>,
+    #[serde(flatten)]
+    pub summary: StatsSummary,
+}
+
+impl CommitStatsReport {
+    pub fn new(commit: String, stats: CommitStats, note_present: bool) -> Self {
+        let summary = StatsSummary::from_stats(&stats, note_present);
+        Self {
+            commit,
+            stats,
+            record: None,
+            summary,
+        }
+    }
+
+    /// The report for `autter stats`: unattributed lines are Untracked when
+    /// the commit is recorded and Unknown when it is not, as the terminal
+    /// view labels them.
+    pub fn with_record(commit: String, stats: CommitStats, record: RecordStatus) -> Self {
+        let summary = StatsSummary::from_stats(&stats, record.is_recorded());
+        Self {
+            commit,
+            stats,
+            record: Some(record),
+            summary,
+        }
+    }
 }
 
 /// Lines printed under `autter stats` for one commit: why lines have no
@@ -980,10 +1119,11 @@ mod tests {
     #[test]
     fn stats_json_adds_record_without_renaming_fields() {
         let stats = stats_with(1, 2, 3);
-        let json = serde_json::to_value(StatsJsonOutput {
-            stats: &stats,
-            record: &RecordStatus::Recorded,
-        })
+        let json = serde_json::to_value(CommitStatsReport::with_record(
+            "abc".to_string(),
+            stats,
+            RecordStatus::Recorded,
+        ))
         .unwrap();
         for field in [
             "human_additions",

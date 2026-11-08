@@ -1064,8 +1064,12 @@ fn print_cached_notice(cache: &UpdateCache) {
         return;
     }
 
-    if !std::io::stdout().is_terminal() {
-        // Don't print the version check notice if stdout is not a terminal/interactive shell
+    if !std::io::stdout().is_terminal()
+        || crate::commands::output::ci_mode()
+        || crate::commands::arg_parser::json()
+    {
+        // Don't print the version check notice if stdout is not a terminal/interactive
+        // shell, in CI, or when the output is for a program (--json).
         return;
     }
 

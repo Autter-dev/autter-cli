@@ -58,7 +58,7 @@ pub struct RemoteNotes {
 pub fn run_coverage(repo: &Repository, spec: Option<&str>, json: bool) -> Result<(), AutterError> {
     let report = coverage_report(repo, spec)?;
     if json {
-        println!("{}", serde_json::to_string(&report)?);
+        crate::commands::output::print_json(&report);
     } else {
         print!("{}", render_coverage(&report));
     }

@@ -1,0 +1,27 @@
+---
+source: tests/integration/json_contract.rs
+expression: shape_text(&document)
+---
+{
+  "access_token_expires_at": "null",
+  "api_base_url": "string",
+  "api_key": "null",
+  "auth_state": "string",
+  "cloud_sync": "<cloud_sync>",
+  "credential_backend": "string",
+  "error": {
+    "code": "string",
+    "exit_code": "integer",
+    "message": "string"
+  },
+  "orgs": [],
+  "personal_org_id": "null",
+  "refresh_token_expires_at": "null",
+  "schema_version": "integer",
+  "signed_in": "boolean",
+  "user": {
+    "email": "null",
+    "id": "null",
+    "name": "null"
+  }
+}

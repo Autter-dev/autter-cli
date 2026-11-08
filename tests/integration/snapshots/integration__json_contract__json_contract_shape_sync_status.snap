@@ -1,0 +1,16 @@
+---
+source: tests/integration/json_contract.rs
+expression: shape_text(&document)
+---
+{
+  "cloud_sync": "<cloud_sync>",
+  "not_connected": {
+    "commit_summaries": "integer",
+    "file_changes": "integer",
+    "notes": "integer",
+    "total": "integer",
+    "transcripts": "integer"
+  },
+  "ok": "boolean",
+  "schema_version": "integer"
+}

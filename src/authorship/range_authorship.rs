@@ -6,7 +6,9 @@ use serde::Serialize;
 
 use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
-use crate::authorship::stats::{CommitStats, stats_for_commit_stats, stats_from_authorship_log};
+use crate::authorship::stats::{
+    CommitStats, StatsSummary, stats_for_commit_stats, stats_from_authorship_log,
+};
 use crate::error::AutterError;
 use crate::git::notes_api::{
     CommitAuthorship, filter_commits_with_notes as get_commits_with_notes_from_list,
@@ -38,6 +40,39 @@ pub struct RangeAuthorshipStatsData {
     pub authors_not_committing_authorship: HashSet<String>,
     pub commits_without_authorship: Vec<String>,
     pub commits_without_authorship_with_authors: Vec<(String, String)>, // (sha, git_author)
+}
+
+/// `autter stats <a>..<b> --json`: the range, the original
+/// [`RangeAuthorshipStats`] fields (kept for existing readers) and the
+/// [`StatsSummary`] of the range's added lines.
+///
+/// Unattributed lines count as Untracked when any commit in the range has an
+/// authorship note and as Unknown when none has.
+#[derive(Debug, Clone, Serialize)]
+pub struct RangeStatsReport {
+    pub range: RangeEnds,
+    #[serde(flatten)]
+    pub stats: RangeAuthorshipStats,
+    #[serde(flatten)]
+    pub summary: StatsSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RangeEnds {
+    pub start: String,
+    pub end: String,
+}
+
+impl RangeStatsReport {
+    pub fn new(start: String, end: String, stats: RangeAuthorshipStats) -> Self {
+        let note_present = stats.authorship_stats.commits_with_authorship > 0;
+        let summary = StatsSummary::from_stats(&stats.range_stats, note_present);
+        Self {
+            range: RangeEnds { start, end },
+            stats,
+            summary,
+        }
+    }
 }
 
 pub fn range_authorship(

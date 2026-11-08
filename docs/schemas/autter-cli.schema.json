@@ -1,0 +1,557 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autter.dev/schemas/autter-cli.schema.json",
+  "title": "autter CLI --json output",
+  "description": "Every reporting command prints exactly one JSON document on stdout with --json. Each document has schema_version (currently 1); fields are only ever added. A failed command still prints one document, with an `error` object, and exits non-zero. Each command's document is one entry of $defs: stats, stats_range, status, log, show, blame, diff, whoami, doctor, sync_status. A document that failed before the command produced anything is an `error_only` document.",
+  "$defs": {
+    "schema_version": {
+      "description": "Version of this contract. Bumped only for a change that breaks a reader.",
+      "type": "integer",
+      "const": 1
+    },
+    "error": {
+      "description": "Present only when the command failed. The process exit code is also in exit_code.",
+      "type": "object",
+      "required": ["code", "message", "exit_code"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "usage_error",
+            "not_a_repository",
+            "revision_not_found",
+            "note_pending",
+            "not_signed_in",
+            "sync_unhealthy",
+            "check_failed",
+            "nothing_captured",
+            "capture_broken",
+            "runtime_error"
+          ]
+        },
+        "message": { "type": "string" },
+        "exit_code": { "type": "integer", "enum": [1, 2, 3, 4] }
+      }
+    },
+    "error_only": {
+      "description": "A command that failed before it produced a report (bad flags, outside a repository, a revision that does not resolve).",
+      "type": "object",
+      "required": ["schema_version", "error"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "lines": {
+      "description": "Added lines by label. ai + human + untracked + unknown = added. Untracked: the commit has an authorship note that does not attest the line. Unknown: there is no authorship note (no data).",
+      "type": "object",
+      "required": ["added", "deleted", "ai", "human", "untracked", "unknown"],
+      "properties": {
+        "added": { "type": "integer" },
+        "deleted": { "type": "integer" },
+        "ai": { "type": "integer" },
+        "human": { "type": "integer" },
+        "untracked": { "type": "integer" },
+        "unknown": { "type": "integer" }
+      }
+    },
+    "percent": {
+      "description": "Each label's share of the added lines, in percent with one decimal (0 when nothing was added).",
+      "type": "object",
+      "required": ["ai", "human", "untracked", "unknown"],
+      "properties": {
+        "ai": { "type": "number" },
+        "human": { "type": "number" },
+        "untracked": { "type": "number" },
+        "unknown": { "type": "number" }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "required": ["status", "note_present"],
+      "properties": {
+        "status": {
+          "description": "captured: at least one added line is AI or known human. nothing_captured: lines were added and none is (--strict exits 3). no_additions: nothing to capture.",
+          "type": "string",
+          "enum": ["captured", "nothing_captured", "no_additions"]
+        },
+        "note_present": {
+          "description": "The commit has an authorship note (range: any commit has one; status: checkpoints exist since the last commit).",
+          "type": "boolean"
+        }
+      }
+    },
+    "tool_model_breakdown": {
+      "description": "AI lines per `tool::model`.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["ai_additions", "ai_accepted"],
+        "properties": {
+          "ai_additions": { "type": "integer" },
+          "ai_accepted": { "type": "integer" }
+        }
+      }
+    },
+    "commit_stats": {
+      "description": "The original `autter stats --json` fields, kept for existing readers. unknown_additions = lines.untracked + lines.unknown.",
+      "type": "object",
+      "required": [
+        "human_additions",
+        "unknown_additions",
+        "ai_additions",
+        "ai_accepted",
+        "git_diff_deleted_lines",
+        "git_diff_added_lines",
+        "tool_model_breakdown"
+      ],
+      "properties": {
+        "human_additions": { "type": "integer" },
+        "unknown_additions": { "type": "integer" },
+        "ai_additions": { "type": "integer" },
+        "ai_accepted": { "type": "integer" },
+        "git_diff_deleted_lines": { "type": "integer" },
+        "git_diff_added_lines": { "type": "integer" },
+        "tool_model_breakdown": { "$ref": "#/$defs/tool_model_breakdown" }
+      }
+    },
+    "commit_stats_report": {
+      "description": "One commit's stats: commit_stats fields plus lines, percent and capture.",
+      "allOf": [{ "$ref": "#/$defs/commit_stats" }],
+      "type": "object",
+      "required": ["commit", "lines", "percent", "capture"],
+      "properties": {
+        "commit": { "type": "string" },
+        "lines": { "$ref": "#/$defs/lines" },
+        "percent": { "$ref": "#/$defs/percent" },
+        "capture": { "$ref": "#/$defs/capture" }
+      }
+    },
+    "stats": {
+      "description": "autter stats [<commit>] --json",
+      "allOf": [{ "$ref": "#/$defs/commit_stats_report" }],
+      "type": "object",
+      "required": ["schema_version"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "record": {
+          "description": "Whether the commit has an Autter record and, if not, why (recorded, pending, predates_autter, …).",
+          "type": "object",
+          "required": ["status"],
+          "properties": { "status": { "type": "string" } }
+        },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "stats_range": {
+      "description": "autter stats <a>..<b> --json",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "range",
+        "authorship_stats",
+        "range_stats",
+        "lines",
+        "percent",
+        "capture"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "range": {
+          "type": "object",
+          "required": ["start", "end"],
+          "properties": {
+            "start": { "type": "string" },
+            "end": { "type": "string" }
+          }
+        },
+        "authorship_stats": {
+          "type": "object",
+          "required": ["total_commits", "commits_with_authorship", "commits_without_authorship"],
+          "properties": {
+            "total_commits": { "type": "integer" },
+            "commits_with_authorship": { "type": "integer" },
+            "authors_committing_authorship": { "type": "array", "items": { "type": "string" } },
+            "authors_not_committing_authorship": { "type": "array", "items": { "type": "string" } },
+            "commits_without_authorship": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "range_stats": { "$ref": "#/$defs/commit_stats" },
+        "lines": { "$ref": "#/$defs/lines" },
+        "percent": { "$ref": "#/$defs/percent" },
+        "capture": { "$ref": "#/$defs/capture" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "cloud_sync": {
+      "type": "object",
+      "required": ["enabled", "daemon_running", "state", "pending", "held"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "daemon_running": { "type": "boolean" },
+        "state": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "healthy",
+            "draining",
+            "auth_blocked",
+            "upload_failing",
+            "daemon_not_running",
+            "status_unavailable"
+          ]
+        },
+        "pending": { "type": "object" },
+        "held": { "type": "object" },
+        "queue_status_available": { "type": "boolean" },
+        "auth_blocked_recently": { "type": "boolean" },
+        "upload_stalled_recently": { "type": "boolean" },
+        "last_metrics_upload_at": { "type": ["integer", "null"] },
+        "organization_slug": { "type": ["string", "null"] },
+        "dashboard_url": { "type": ["string", "null"] },
+        "remediation": { "type": "string" }
+      }
+    },
+    "status": {
+      "description": "autter status --json: uncommitted changes in the files checkpoints touched (with no checkpoints, every change to a tracked file, all unknown).",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "head",
+        "stats",
+        "lines",
+        "percent",
+        "capture",
+        "checkpoints",
+        "cloud_sync"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "head": { "type": "string" },
+        "stats": { "$ref": "#/$defs/commit_stats" },
+        "lines": { "$ref": "#/$defs/lines" },
+        "percent": { "$ref": "#/$defs/percent" },
+        "capture": { "$ref": "#/$defs/capture" },
+        "checkpoints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["time_ago", "additions", "deletions", "tool_model", "is_human"],
+            "properties": {
+              "time_ago": { "type": "string" },
+              "additions": { "type": "integer" },
+              "deletions": { "type": "integer" },
+              "tool_model": { "type": "string" },
+              "is_human": { "type": "boolean" }
+            }
+          }
+        },
+        "cloud_sync": { "$ref": "#/$defs/cloud_sync" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "log": {
+      "description": "autter log [git log filters] --json: every commit git lists, in git's order.",
+      "type": "object",
+      "required": ["schema_version", "commits"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "commits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "commit",
+              "parents",
+              "author",
+              "date",
+              "subject",
+              "body",
+              "refs",
+              "note_present",
+              "stats"
+            ],
+            "properties": {
+              "commit": { "type": "string" },
+              "parents": { "type": "array", "items": { "type": "string" } },
+              "author": {
+                "type": "object",
+                "required": ["name", "email"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "email": { "type": "string" }
+                }
+              },
+              "date": { "description": "Author date, ISO 8601.", "type": "string" },
+              "subject": { "type": "string" },
+              "body": { "type": "string" },
+              "refs": { "type": "array", "items": { "type": "string" } },
+              "note_present": { "type": "boolean" },
+              "stats": {
+                "description": "Same fields as `autter stats --json` without schema_version; null for merge commits and commits too large to compute here (see stats_skipped).",
+                "anyOf": [{ "$ref": "#/$defs/commit_stats_report" }, { "type": "null" }]
+              },
+              "stats_skipped": { "type": "string" }
+            }
+          }
+        },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "show": {
+      "description": "autter show <rev|range> --json",
+      "type": "object",
+      "required": ["schema_version", "commits"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "commits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["commit", "note_present", "authorship"],
+            "properties": {
+              "commit": { "type": "string" },
+              "note_present": { "type": "boolean" },
+              "authorship": {
+                "anyOf": [
+                  { "type": "null" },
+                  {
+                    "type": "object",
+                    "required": ["attestations", "metadata"],
+                    "properties": {
+                      "attestations": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "required": ["file", "entries"],
+                          "properties": {
+                            "file": { "type": "string" },
+                            "entries": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "required": ["hash", "kind", "lines"],
+                                "properties": {
+                                  "hash": { "type": "string" },
+                                  "kind": { "type": "string", "enum": ["ai", "human"] },
+                                  "lines": {
+                                    "description": "Inclusive [start, end] ranges.",
+                                    "type": "array",
+                                    "items": { "type": "array", "items": { "type": "integer" } }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "metadata": {
+                        "description": "The note's metadata section as stored.",
+                        "type": "object",
+                        "required": ["schema_version", "base_commit_sha", "prompts"],
+                        "properties": {
+                          "schema_version": {
+                            "description": "Version of the authorship note format (e.g. authorship/3.0.0), not of this contract.",
+                            "type": "string"
+                          },
+                          "base_commit_sha": { "type": "string" },
+                          "prompts": { "type": "object" }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "blame": {
+      "description": "autter blame <file> --json (pretty-printed): AI line ranges mapped to the prompt that wrote them.",
+      "type": "object",
+      "required": ["schema_version", "lines", "prompts", "metadata"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "lines": {
+          "description": "\"<line>\" or \"<start>-<end>\" -> prompt id.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "prompts": { "type": "object", "additionalProperties": { "type": "object" } },
+        "metadata": {
+          "type": "object",
+          "required": ["is_logged_in", "current_user"],
+          "properties": {
+            "is_logged_in": { "type": "boolean" },
+            "current_user": { "type": ["string", "null"] }
+          }
+        },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "diff": {
+      "description": "autter diff <commit|range> --json",
+      "type": "object",
+      "required": ["schema_version", "files", "prompts", "hunks", "commits"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "files": { "type": "object", "additionalProperties": { "type": "object" } },
+        "prompts": { "type": "object", "additionalProperties": { "type": "object" } },
+        "sessions": { "type": "object", "additionalProperties": { "type": "object" } },
+        "humans": { "type": "object", "additionalProperties": { "type": "object" } },
+        "hunks": { "type": "array", "items": { "type": "object" } },
+        "commits": { "type": "object", "additionalProperties": { "type": "object" } },
+        "commit_stats": {
+          "description": "Only with --include-stats on a single commit.",
+          "type": "object",
+          "required": [
+            "ai_lines_added",
+            "human_lines_added",
+            "unknown_lines_added",
+            "git_lines_added",
+            "git_lines_deleted",
+            "tool_model_breakdown"
+          ],
+          "properties": {
+            "ai_lines_added": { "type": "integer" },
+            "human_lines_added": { "type": "integer" },
+            "unknown_lines_added": { "type": "integer" },
+            "git_lines_added": { "type": "integer" },
+            "git_lines_deleted": { "type": "integer" },
+            "tool_model_breakdown": { "type": "object" }
+          }
+        },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "whoami": {
+      "description": "autter whoami --json. When signed_in is false the document has an error (not_signed_in) and the command exits 1.",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "signed_in",
+        "auth_state",
+        "api_base_url",
+        "credential_backend",
+        "api_key",
+        "access_token_expires_at",
+        "refresh_token_expires_at",
+        "user",
+        "personal_org_id",
+        "orgs",
+        "cloud_sync"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "signed_in": { "type": "boolean" },
+        "auth_state": {
+          "type": "string",
+          "enum": [
+            "logged_in",
+            "logged_out",
+            "sync_blocked",
+            "refresh_expired",
+            "login_refused",
+            "error"
+          ]
+        },
+        "auth_detail": { "type": "string" },
+        "api_base_url": { "type": "string" },
+        "credential_backend": { "type": "string" },
+        "api_key": { "description": "Masked.", "type": ["string", "null"] },
+        "access_token_expires_at": { "type": ["integer", "null"] },
+        "refresh_token_expires_at": { "type": ["integer", "null"] },
+        "user": {
+          "type": "object",
+          "required": ["id", "email", "name"],
+          "properties": {
+            "id": { "type": ["string", "null"] },
+            "email": { "type": ["string", "null"] },
+            "name": { "type": ["string", "null"] }
+          }
+        },
+        "personal_org_id": { "type": ["string", "null"] },
+        "orgs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "slug", "name", "role"],
+            "properties": {
+              "id": { "type": ["string", "null"] },
+              "slug": { "type": ["string", "null"] },
+              "name": { "type": ["string", "null"] },
+              "role": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "cloud_sync": { "$ref": "#/$defs/cloud_sync" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "doctor": {
+      "description": "autter doctor --json. Exits 1 when any check fails; with --strict, 4 when capture_ok is false.",
+      "type": "object",
+      "required": ["schema_version", "autter_version", "checks", "summary", "ok", "capture_ok"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "autter_version": { "type": "string" },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["section", "name", "status", "summary"],
+            "properties": {
+              "section": { "type": "string" },
+              "name": { "type": "string" },
+              "status": { "type": "string", "enum": ["passed", "warning", "failed", "skipped"] },
+              "summary": { "type": "string" },
+              "details": { "type": "array", "items": { "type": "string" } },
+              "remediation": { "type": "string" }
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "required": ["passed", "warnings", "failed", "skipped"],
+          "properties": {
+            "passed": { "type": "integer" },
+            "warnings": { "type": "integer" },
+            "failed": { "type": "integer" },
+            "skipped": { "type": "integer" }
+          }
+        },
+        "ok": { "description": "No check failed.", "type": "boolean" },
+        "capture_ok": {
+          "description": "No check capture depends on failed (background service, trace2, end-to-end checkpoint, agent hooks).",
+          "type": "boolean"
+        },
+        "next_step": { "type": "string" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "sync_status": {
+      "description": "autter sync status --json. Exits 1 (sync_unhealthy) when ok is false.",
+      "type": "object",
+      "required": ["schema_version", "cloud_sync", "not_connected", "ok"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "cloud_sync": { "$ref": "#/$defs/cloud_sync" },
+        "not_connected": {
+          "type": "object",
+          "required": ["notes", "commit_summaries", "transcripts", "file_changes", "total"],
+          "properties": {
+            "notes": { "type": "integer" },
+            "commit_summaries": { "type": "integer" },
+            "transcripts": { "type": "integer" },
+            "file_changes": { "type": "integer" },
+            "total": { "type": "integer" }
+          }
+        },
+        "ok": { "type": "boolean" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    }
+  }
+}

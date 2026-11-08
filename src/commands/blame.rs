@@ -1528,7 +1528,7 @@ fn output_json_format(
         },
     };
 
-    let json_str = serde_json::to_string_pretty(&output)
+    let json_str = crate::commands::output::document_pretty(&output)
         .map_err(|e| AutterError::Generic(format!("Failed to serialize JSON output: {}", e)))?;
 
     println!("{}", json_str);
