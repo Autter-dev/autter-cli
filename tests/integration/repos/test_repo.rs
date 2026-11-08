@@ -208,6 +208,42 @@ fn assign_daemon_to_test_job(pid: u32) {
 #[cfg(not(windows))]
 fn assign_daemon_to_test_job(_pid: u32) {}
 
+/// Stop a long-lived daemon child from keeping other tests' pipes open.
+///
+/// On macOS, std makes a pipe with `pipe()` and sets close-on-exec in a second
+/// call. A daemon forked by another test thread between those two calls
+/// inherits both ends and holds them for the whole run, so the test reading
+/// that pipe never sees EOF and hangs. In the child, after fork and before
+/// exec, mark every descriptor above stderr close-on-exec so exec drops any
+/// such strays. Only `fcntl` runs in the child, which is async-signal-safe.
+#[cfg(unix)]
+fn drop_stray_fds_on_exec(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let fd_limit: libc::c_int = if open_max > 0 {
+        open_max.min(65_536) as libc::c_int
+    } else {
+        4096
+    };
+    // SAFETY: the closure only calls fcntl, which is async-signal-safe, and
+    // allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in 3..fd_limit {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn drop_stray_fds_on_exec(_command: &mut Command) {}
+
 impl DaemonProcess {
     fn control_socket_path_for_home(test_home: &Path) -> PathBuf {
         DaemonConfig::from_home(test_home).control_socket_path
@@ -261,6 +297,7 @@ impl DaemonProcess {
             .env("AUTTER_DAEMON_HOME", test_home)
             .env("AUTTER_DAEMON_CONTROL_SOCKET", &control_socket_path)
             .env("AUTTER_DAEMON_TRACE_SOCKET", &trace_socket_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(
                 stderr_log
@@ -271,6 +308,7 @@ impl DaemonProcess {
             command.env(key, value);
         }
         configure_test_home_env(&mut command, test_home);
+        drop_stray_fds_on_exec(&mut command);
 
         let mut child = command
             .spawn()
