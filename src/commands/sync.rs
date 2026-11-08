@@ -241,7 +241,7 @@ fn print_human_status(report: &crate::auth::notice::CloudSyncStatusReport) {
         println!("Pending uploads: unavailable");
     } else if report.pending.total > 0 {
         println!("Pending uploads:");
-        print_pending_line("  telemetry events", report.pending.metrics);
+        print_pending_line("  usage-metrics events", report.pending.metrics);
         print_pending_line("  authorship notes", report.pending.notes);
         print_pending_line("  commit summaries", report.pending.commit_summaries);
         print_pending_line("  transcripts", report.pending.transcripts);

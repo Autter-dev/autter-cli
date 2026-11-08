@@ -330,7 +330,8 @@ pub fn describe_http_failure(operation: &str, status: u16, body: &str) -> String
         _ => None,
     };
     let trimmed = body.trim();
-    let looks_like_page = trimmed.starts_with('<') || trimmed.to_ascii_lowercase().contains("<html");
+    let looks_like_page =
+        trimmed.starts_with('<') || trimmed.to_ascii_lowercase().contains("<html");
     let detail = if trimmed.is_empty() || looks_like_page {
         String::new()
     } else {
@@ -384,7 +385,9 @@ fn resolve_org_for_repo(
 /// two cases apart.
 pub fn resolve_org_for_repo_cached(repo_url: &str) -> Option<String> {
     let token = try_load_auth_token().ok();
-    resolve_org_for_repo(repo_url, token.as_deref()).ok().flatten()
+    resolve_org_for_repo(repo_url, token.as_deref())
+        .ok()
+        .flatten()
 }
 
 /// Where one repo's data may be uploaded.
@@ -425,8 +428,8 @@ pub fn route_for_repo_at(repo_url: Option<&str>, base_url: Option<String>) -> Re
         Ok(None) => return RepoRoute::NotConnected,
         Err(err) => return RepoRoute::Unavailable(err),
     };
-    let login_org = crate::auth::identity::extract_identity_from_access_token(&login_token)
-        .active_org_id;
+    let login_org =
+        crate::auth::identity::extract_identity_from_access_token(&login_token).active_org_id;
     if login_org.as_deref() == Some(org.as_str()) {
         return RepoRoute::Upload(default);
     }
@@ -743,6 +746,22 @@ impl ApiContext {
         endpoint: &str,
         body: &T,
     ) -> Result<http::Response, AutterError> {
+        match self.post_json_classified(endpoint, body)? {
+            Ok(response) => Ok(response),
+            Err(failure) => Err(AutterError::Generic(format!(
+                "HTTP request failed: {}",
+                failure.message
+            ))),
+        }
+    }
+
+    /// POST JSON, keeping a transport failure (no HTTP response at all)
+    /// separate from request-building errors, and saying whether it timed out.
+    pub fn post_json_classified<T: serde::Serialize>(
+        &self,
+        endpoint: &str,
+        body: &T,
+    ) -> Result<Result<http::Response, http::TransportFailure>, AutterError> {
         let url = self.build_url(endpoint)?;
         let body_json = serde_json::to_string(body).map_err(AutterError::JsonError)?;
 
@@ -759,8 +778,7 @@ impl ApiContext {
             request = request.set("Authorization", &format!("Bearer {}", token));
         }
 
-        http::send_with_body(request, &body_json)
-            .map_err(|e| AutterError::Generic(format!("HTTP request failed: {}", e)))
+        Ok(http::send_with_body_classified(request, &body_json))
     }
 
     /// Make a GET request

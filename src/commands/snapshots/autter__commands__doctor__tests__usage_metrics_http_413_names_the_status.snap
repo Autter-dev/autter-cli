@@ -1,0 +1,10 @@
+---
+source: src/commands/doctor.rs
+expression: render_check(&check)
+---
+[warning] usage metrics upload: usage metrics are not uploading: POST /worker/metrics/upload — HTTP 413: {"error":"metrics batch too large: send at most 1000 events"}
+  fix: nothing to restart; autter retries automatically in smaller batches (next: 321 events)
+  643 events queued, 1200 uploaded, 1 failed attempt
+  last error: POST /worker/metrics/upload: HTTP 413: {"error":"metrics batch too large: send at most 1000 events"}; 1 failed attempt (batch of 643 events), last at 2025-11-08T08:00:00+00:00
+  next retry: 2025-11-08T08:00:05+00:00 with 321 events
+  attribution is not affected: authorship notes upload through their own queue

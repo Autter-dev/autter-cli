@@ -327,6 +327,8 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
     reporter.add(check_org_data_plane());
     reporter.begin(SECTION_ACCOUNT, "checking the upload queue");
     reporter.add(check_sync_queue());
+    reporter.begin(SECTION_ACCOUNT, "checking usage metrics upload");
+    reporter.add(check_usage_metrics());
 
     reporter.finish()
 }
@@ -1330,8 +1332,10 @@ fn check_sync_queue() -> DoctorCheck {
         };
     }
 
-    let pending = crate::auth::notice::pending_sync_counts();
-    let mut details = vec![pending.summary()];
+    // Usage metrics have their own check (`check_usage_metrics`): a metrics
+    // backlog says nothing about whether attribution reaches the dashboard.
+    let pending = crate::auth::notice::pending_sync_counts().attribution_only();
+    let mut details = vec![pending.attribution_summary()];
     let held = crate::upload_hold::held_counts();
     if held.total() > 0 {
         details.push(format!(
@@ -1380,7 +1384,7 @@ fn check_sync_queue() -> DoctorCheck {
             section: SECTION_ACCOUNT,
             name,
             status: DoctorStatus::Passed,
-            summary: "all local cloud-sync queues are empty".to_string(),
+            summary: "all local attribution upload queues are empty".to_string(),
             details,
             remediation: None,
         };
@@ -1408,6 +1412,96 @@ fn check_sync_queue() -> DoctorCheck {
                     .to_string(),
             ),
         }
+    }
+}
+
+fn check_usage_metrics() -> DoctorCheck {
+    let sync_enabled = Config::fresh().platform_sync_enabled();
+    let queued = crate::auth::notice::pending_sync_counts().metrics;
+    let status = crate::metrics::sync_state::UsageMetricsStatus::current(queued);
+    usage_metrics_check(&status, sync_enabled)
+}
+
+/// The usage-metrics verdict. Metrics are product telemetry, not attribution:
+/// a failing metrics upload is a warning that names the endpoint and the
+/// error, and never says attribution is broken or asks for a restart (the
+/// queue is durable and the daemon already retries, in smaller batches when
+/// the server is too slow).
+fn usage_metrics_check(
+    status: &crate::metrics::sync_state::UsageMetricsStatus,
+    sync_enabled: bool,
+) -> DoctorCheck {
+    use crate::metrics::sync_state::{advice, describe_failure};
+    let name = "usage metrics upload".to_string();
+    let counts = format!(
+        "{} events queued, {} uploaded, {}{}",
+        status.queued,
+        status.uploaded,
+        crate::metrics::sync_state::failed_attempts_text(status.failed_attempts),
+        if status.dropped > 0 {
+            format!(", {} dropped as unacceptable", status.dropped)
+        } else {
+            String::new()
+        }
+    );
+
+    if !sync_enabled {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Passed,
+            summary: "local mode — usage metrics are not uploaded".to_string(),
+            details: Vec::new(),
+            remediation: None,
+        };
+    }
+
+    if let Some(failure) = status.last_failure.as_ref().filter(|_| status.failing) {
+        let mut details = vec![counts, format!("last error: {}", describe_failure(failure))];
+        if let Some(next) = status.next_retry_at {
+            details.push(format!(
+                "next retry: {} with {} events",
+                format_unix_timestamp(next),
+                status.batch_size
+            ));
+        } else {
+            details.push(format!(
+                "next retry: on the next background tick, with {} events",
+                status.batch_size
+            ));
+        }
+        details.push(
+            "attribution is not affected: authorship notes upload through their own queue"
+                .to_string(),
+        );
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: format!(
+                "usage metrics are not uploading: POST {} — {}",
+                failure.endpoint, failure.error
+            ),
+            details,
+            remediation: Some(advice(failure, status.batch_size)),
+        };
+    }
+
+    let summary = if status.queued > 0 {
+        format!(
+            "{} usage-metrics events queued; uploading in batches of {}",
+            status.queued, status.batch_size
+        )
+    } else {
+        "no usage metrics waiting".to_string()
+    };
+    DoctorCheck {
+        section: SECTION_ACCOUNT,
+        name,
+        status: DoctorStatus::Passed,
+        summary,
+        details: vec![counts],
+        remediation: None,
     }
 }
 
@@ -1834,6 +1928,102 @@ mod tests {
 
         let check = local_mode_sync_check("durable sync queue".to_string(), false, Vec::new());
         assert_eq!(check.status, DoctorStatus::Passed);
+    }
+
+    /// Plain-text form of a check as `autter doctor` prints it.
+    fn render_check(check: &DoctorCheck) -> String {
+        let status = serde_json::to_value(check.status).unwrap();
+        let mut out = format!(
+            "[{}] {}: {}\n",
+            status.as_str().unwrap(),
+            check.name,
+            check.summary
+        );
+        if let Some(fix) = &check.remediation {
+            out.push_str(&format!("  fix: {fix}\n"));
+        }
+        for detail in &check.details {
+            out.push_str(&format!("  {detail}\n"));
+        }
+        out
+    }
+
+    /// Usage-metrics status with `queued` events after `failures` in a row,
+    /// starting from a full 1,000-event batch, at a fixed clock.
+    fn metrics_status_after(
+        failures: &[crate::api::metrics::MetricsUploadFailure],
+        queued: i64,
+    ) -> crate::metrics::sync_state::UsageMetricsStatus {
+        use crate::metrics::sync_state::{MetricsSyncState, UsageMetricsStatus};
+        let mut state = MetricsSyncState {
+            uploaded_total: 1_200,
+            ..MetricsSyncState::default()
+        };
+        let now = 1_762_588_800; // 2025-11-08T08:00:00Z
+        for failure in failures {
+            let size = (queued as usize).min(state.batch_limit());
+            state.record_failure(now, failure, size);
+        }
+        UsageMetricsStatus::from_state(&state, queued, now)
+    }
+
+    #[test]
+    fn usage_metrics_timeout_names_the_endpoint_and_is_only_a_warning() {
+        let timeout = crate::api::metrics::MetricsUploadFailure::Timeout {
+            after_secs: Some(30),
+        };
+        let check = usage_metrics_check(
+            &metrics_status_after(&[timeout.clone(), timeout], 643),
+            true,
+        );
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(check.summary.contains("/worker/metrics/upload"));
+        assert!(check.summary.contains("timeout after 30s"));
+        let fix = check.remediation.as_deref().unwrap();
+        assert!(!fix.contains("bg restart"), "{fix}");
+        insta::assert_snapshot!(render_check(&check));
+    }
+
+    #[test]
+    fn usage_metrics_http_413_names_the_status() {
+        let failure = crate::api::metrics::MetricsUploadFailure::Http {
+            status: 413,
+            body: "{\"error\":\"metrics batch too large: send at most 1000 events\"}".to_string(),
+        };
+        let check = usage_metrics_check(&metrics_status_after(&[failure], 643), true);
+        assert_eq!(check.status, DoctorStatus::Warning);
+        insta::assert_snapshot!(render_check(&check));
+    }
+
+    #[test]
+    fn usage_metrics_healthy_and_draining_pass() {
+        let check = usage_metrics_check(&metrics_status_after(&[], 0), true);
+        assert_eq!(check.status, DoctorStatus::Passed);
+        insta::assert_snapshot!("usage_metrics_healthy", render_check(&check));
+
+        let check = usage_metrics_check(&metrics_status_after(&[], 120), true);
+        assert_eq!(check.status, DoctorStatus::Passed);
+        insta::assert_snapshot!("usage_metrics_draining", render_check(&check));
+    }
+
+    #[test]
+    fn usage_metrics_failure_with_an_empty_queue_is_not_failing() {
+        // A purge or drain leaves no events; an old error is not news.
+        let timeout = crate::api::metrics::MetricsUploadFailure::Timeout {
+            after_secs: Some(30),
+        };
+        let check = usage_metrics_check(&metrics_status_after(&[timeout], 0), true);
+        assert_eq!(check.status, DoctorStatus::Passed);
+    }
+
+    #[test]
+    fn usage_metrics_in_local_mode_pass() {
+        let timeout = crate::api::metrics::MetricsUploadFailure::Timeout {
+            after_secs: Some(30),
+        };
+        let check = usage_metrics_check(&metrics_status_after(&[timeout], 643), false);
+        assert_eq!(check.status, DoctorStatus::Passed);
+        insta::assert_snapshot!(render_check(&check));
     }
 
     #[test]

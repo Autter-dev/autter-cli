@@ -9,6 +9,7 @@ pub mod attrs;
 pub mod db;
 pub mod events;
 pub mod pos_encoded;
+pub mod sync_state;
 pub mod types;
 
 // Re-export all public types for external crates

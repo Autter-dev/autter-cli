@@ -9,6 +9,116 @@ use serde::{Deserialize, Serialize};
 /// Retry delay in seconds: single retry after 60s
 const RETRY_DELAYS_SECS: [u64; 1] = [60];
 
+/// The endpoint usage metrics are written to. Named in `autter doctor` and
+/// `autter sync status` when uploads fail.
+pub const METRICS_UPLOAD_ENDPOINT: &str = "/worker/metrics/upload";
+
+/// Why a metrics upload got no usable answer. Each kind says whether retrying
+/// can help and whether a smaller batch might.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricsUploadFailure {
+    /// No response within the client timeout. The server may still be
+    /// working, or a proxy may have cut a long request; a smaller batch
+    /// finishes sooner.
+    Timeout { after_secs: Option<u64> },
+    /// The server answered with a non-200 status.
+    Http { status: u16, body: String },
+    /// No response for another reason (DNS, refused connection, TLS, reset).
+    Network { message: String },
+    /// A 200 whose body was not the expected JSON.
+    InvalidResponse { message: String },
+    /// A 200 that accepted none of the events, for a reason a later retry
+    /// may fix (validation verdicts are dropped, not reported this way).
+    NotAccepted { count: usize, error: String },
+}
+
+/// What a failure kind means for the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsFailureKind {
+    Timeout,
+    /// HTTP 413, 504 and other "too big or too slow" answers.
+    TooLarge,
+    /// HTTP 401/403: the login is not accepted. Retrying waits for a new login.
+    Auth,
+    /// HTTP 4xx other than the above: the request itself is wrong.
+    Rejected,
+    /// HTTP 5xx (other than 504): the server failed.
+    Server,
+    Network,
+    InvalidResponse,
+}
+
+impl MetricsUploadFailure {
+    pub fn kind(&self) -> MetricsFailureKind {
+        match self {
+            Self::Timeout { .. } => MetricsFailureKind::Timeout,
+            Self::Http { status, .. } => match *status {
+                413 | 504 => MetricsFailureKind::TooLarge,
+                401 | 403 => MetricsFailureKind::Auth,
+                400..=499 => MetricsFailureKind::Rejected,
+                _ => MetricsFailureKind::Server,
+            },
+            Self::Network { .. } => MetricsFailureKind::Network,
+            Self::InvalidResponse { .. } => MetricsFailureKind::InvalidResponse,
+            Self::NotAccepted { .. } => MetricsFailureKind::Rejected,
+        }
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// A smaller batch could succeed where this one failed.
+    pub fn should_split(&self) -> bool {
+        matches!(
+            self.kind(),
+            MetricsFailureKind::Timeout | MetricsFailureKind::TooLarge
+        )
+    }
+
+    /// Short description for `autter doctor` and `autter sync status`, e.g.
+    /// "timeout after 30s" or "HTTP 413: request entity too large".
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Timeout {
+                after_secs: Some(secs),
+            } => format!("timeout after {secs}s (no response)"),
+            Self::Timeout { after_secs: None } => "timeout (no response)".to_string(),
+            Self::Http { status, body } => {
+                let body: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+                let body: String = body.chars().take(160).collect();
+                if body.is_empty() {
+                    format!("HTTP {status}")
+                } else {
+                    format!("HTTP {status}: {body}")
+                }
+            }
+            Self::Network { message } => format!("network error: {message}"),
+            Self::InvalidResponse { message } => format!("unreadable response: {message}"),
+            Self::NotAccepted { count, error } if error.is_empty() => {
+                format!("server accepted none of {count} events")
+            }
+            Self::NotAccepted { count, error } => {
+                format!("server accepted none of {count} events: {error}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MetricsUploadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "POST {METRICS_UPLOAD_ENDPOINT} failed: {}",
+            self.summary()
+        )
+    }
+}
+
 /// Error for a single event in the batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsUploadError {
@@ -80,10 +190,6 @@ pub fn upload_metrics_with_retry(
                     );
                 }
                 if !response.errors.is_empty() {
-                    crate::auth::notice::record_upload_failure(
-                        "metrics",
-                        &format!("{} metric records were not accepted", response.errors.len()),
-                    );
                     return Err(AutterError::Generic(format!(
                         "{} metric records were not accepted; upload is incomplete",
                         response.errors.len(),
@@ -121,19 +227,50 @@ impl ApiClient {
         &self,
         batch: &MetricsBatch,
     ) -> Result<MetricsUploadResponse, AutterError> {
-        let response = self.context().post_json("/worker/metrics/upload", batch)?;
+        self.upload_metrics_classified(batch)
+            .map_err(|failure| AutterError::Generic(failure.to_string()))
+    }
+
+    /// [`Self::upload_metrics`], with the failure classified (timeout, HTTP
+    /// status, network, unreadable answer) so the caller can decide whether to
+    /// retry, retry smaller, or wait.
+    pub fn upload_metrics_classified(
+        &self,
+        batch: &MetricsBatch,
+    ) -> Result<MetricsUploadResponse, MetricsUploadFailure> {
+        let response = match self
+            .context()
+            .post_json_classified(METRICS_UPLOAD_ENDPOINT, batch)
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(transport)) if transport.timed_out => {
+                return Err(MetricsUploadFailure::Timeout {
+                    after_secs: self.context().timeout_secs,
+                });
+            }
+            Ok(Err(transport)) => {
+                return Err(MetricsUploadFailure::Network {
+                    message: transport.message,
+                });
+            }
+            Err(error) => {
+                return Err(MetricsUploadFailure::Network {
+                    message: error.to_string(),
+                });
+            }
+        };
         let status_code = response.status_code;
-        let body = response
-            .as_str()
-            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+        let body = String::from_utf8_lossy(response.as_bytes()).into_owned();
         if status_code != 200 {
-            return Err(AutterError::Generic(format!(
-                "Metrics upload failed with status {}: {}",
-                status_code, body
-            )));
+            return Err(MetricsUploadFailure::Http {
+                status: status_code,
+                body,
+            });
         }
         let response: MetricsUploadResponse =
-            serde_json::from_str(body).map_err(AutterError::JsonError)?;
+            serde_json::from_str(&body).map_err(|error| MetricsUploadFailure::InvalidResponse {
+                message: error.to_string(),
+            })?;
         let failed = response
             .errors
             .iter()
@@ -174,6 +311,145 @@ mod tests {
 
         let successful = response.successful_indices(5);
         assert_eq!(successful, vec![0, 2, 4]);
+    }
+
+    fn http(status: u16) -> MetricsUploadFailure {
+        MetricsUploadFailure::Http {
+            status,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn failures_are_classified_by_what_a_retry_can_fix() {
+        use MetricsFailureKind::*;
+        for (failure, kind, split) in [
+            (
+                MetricsUploadFailure::Timeout {
+                    after_secs: Some(30),
+                },
+                Timeout,
+                true,
+            ),
+            (http(413), TooLarge, true),
+            (http(504), TooLarge, true),
+            (http(401), Auth, false),
+            (http(403), Auth, false),
+            (http(400), Rejected, false),
+            (http(500), Server, false),
+            (http(502), Server, false),
+            (
+                MetricsUploadFailure::Network {
+                    message: "connection refused".to_string(),
+                },
+                Network,
+                false,
+            ),
+            (
+                MetricsUploadFailure::InvalidResponse {
+                    message: "expected value".to_string(),
+                },
+                InvalidResponse,
+                false,
+            ),
+        ] {
+            assert_eq!(failure.kind(), kind, "{failure:?}");
+            assert_eq!(failure.should_split(), split, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn failure_text_names_the_endpoint_and_the_error() {
+        let timeout = MetricsUploadFailure::Timeout {
+            after_secs: Some(30),
+        };
+        assert_eq!(
+            timeout.to_string(),
+            "POST /worker/metrics/upload failed: timeout after 30s (no response)"
+        );
+        let too_large = MetricsUploadFailure::Http {
+            status: 413,
+            body: "{\"error\":\n  \"too many events\"}".to_string(),
+        };
+        assert_eq!(
+            too_large.summary(),
+            "HTTP 413: {\"error\": \"too many events\"}"
+        );
+        assert_eq!(http(502).summary(), "HTTP 502");
+        // A huge HTML error page is cut short.
+        let html = MetricsUploadFailure::Http {
+            status: 502,
+            body: "<html>".repeat(200),
+        };
+        assert!(html.summary().len() < 200);
+    }
+
+    /// A socket that accepts the request and never answers, then (when
+    /// `status` is set) one that answers with that status.
+    fn stub(status: Option<u16>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                let mut buffer = [0u8; 4096];
+                while matches!(stream.read(&mut buffer), Ok(read) if read > 0) {}
+                match status {
+                    Some(status) => {
+                        let body = "{\"error\":\"too large\"}";
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 {status} Nope\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_secs(4)),
+                }
+            }
+        });
+        base_url
+    }
+
+    fn client(base_url: String) -> ApiClient {
+        ApiClient::new(crate::api::ApiContext::without_auth(Some(base_url)).with_timeout(1))
+    }
+
+    #[test]
+    fn a_server_that_never_answers_is_a_timeout() {
+        let failure = client(stub(None))
+            .upload_metrics_classified(&MetricsBatch::new(Vec::new()))
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            MetricsUploadFailure::Timeout {
+                after_secs: Some(1)
+            }
+        );
+    }
+
+    #[test]
+    fn an_http_error_keeps_its_status_and_body() {
+        let failure = client(stub(Some(413)))
+            .upload_metrics_classified(&MetricsBatch::new(Vec::new()))
+            .unwrap_err();
+        assert_eq!(failure.http_status(), Some(413));
+        assert_eq!(failure.summary(), "HTTP 413: {\"error\":\"too large\"}");
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_network_error_not_a_timeout() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let failure = client(format!("http://127.0.0.1:{port}"))
+            .upload_metrics_classified(&MetricsBatch::new(Vec::new()))
+            .unwrap_err();
+        assert_eq!(failure.kind(), MetricsFailureKind::Network, "{failure:?}");
     }
 
     #[test]

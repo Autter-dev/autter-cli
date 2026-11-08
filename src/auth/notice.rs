@@ -133,7 +133,14 @@ fn upload_failure_path() -> PathBuf {
 
 /// Record that a durable-queue upload failed for a reason other than missing
 /// auth (network error, rejected batch, org database unreachable, etc.).
+///
+/// Usage metrics do not go through here: their failures live in
+/// [`crate::metrics::sync_state`] and are reported as "usage metrics", since a
+/// metrics problem says nothing about whether attribution reaches autter.
 pub fn record_upload_failure(queue: &str, detail: &str) {
+    if queue == "metrics" {
+        return;
+    }
     let detail: String = detail.trim().chars().take(300).collect();
     let failure = UploadFailure {
         at: unix_now(),
@@ -152,9 +159,6 @@ pub fn record_upload_failure(queue: &str, detail: &str) {
         let _ = std::fs::write(&path, content);
     }
     record_sync_upload_stalled();
-    if queue == "metrics" {
-        record_metrics_upload_stalled();
-    }
 }
 
 /// Drop the recorded failure when that same queue uploads successfully.
@@ -168,11 +172,13 @@ pub fn clear_upload_failure_for(queue: &str) {
     clear_upload_failures();
 }
 
-/// Drop every upload-failure stamp, including the legacy timestamp files.
+/// Drop every upload-failure stamp, including the legacy timestamp files and
+/// the usage-metrics failure state.
 pub fn clear_upload_failures() {
     let _ = std::fs::remove_file(upload_failure_path());
     clear_sync_upload_stalled();
     clear_metrics_upload_stalled();
+    crate::metrics::sync_state::MetricsSyncState::reset();
 }
 
 fn read_upload_failure() -> Option<UploadFailure> {
@@ -180,24 +186,30 @@ fn read_upload_failure() -> Option<UploadFailure> {
     serde_json::from_slice(&content).ok()
 }
 
-/// The fresh upload failure, if the background service recorded one.
+/// The fresh attribution-sync upload failure (notes, commit summaries,
+/// transcripts, file changes), if the background service recorded one.
+/// Usage-metrics failures are reported separately
+/// ([`crate::metrics::sync_state::UsageMetricsStatus`]); a metrics record
+/// left by an older version is ignored here.
 pub fn current_upload_failure() -> Option<UploadFailure> {
-    if let Some(failure) = read_upload_failure()
-        && unix_now() - failure.at < SYNC_BLOCKED_FRESH_SECS
-    {
-        return Some(failure);
+    match read_upload_failure() {
+        Some(failure) if failure.queue == "metrics" => return None,
+        Some(failure) if unix_now() - failure.at < SYNC_BLOCKED_FRESH_SECS => {
+            return Some(failure);
+        }
+        _ => {}
     }
+    // Legacy stamp: older versions wrote a bare timestamp for every queue,
+    // and a separate one for metrics. When the newest is the metrics one, it
+    // was a metrics failure.
     let metrics_at = stamp_time(&metrics_upload_stalled_stamp_path());
-    let generic_at = stamp_time(&sync_upload_stalled_stamp_path());
-    let (queue, at) = match (metrics_at, generic_at) {
-        (Some(metrics), Some(generic)) if metrics >= generic => ("metrics", metrics),
-        (Some(metrics), None) => ("metrics", metrics),
-        (_, Some(generic)) => ("upload", generic),
-        (None, None) => return None,
-    };
+    let at = stamp_time(&sync_upload_stalled_stamp_path())?;
+    if metrics_at.is_some_and(|metrics| metrics >= at) {
+        return None;
+    }
     (unix_now() - at < SYNC_BLOCKED_FRESH_SECS).then(|| UploadFailure {
         at,
-        queue: queue.to_string(),
+        queue: "upload".to_string(),
         detail: "the background upload failed; no error was recorded".to_string(),
     })
 }
@@ -225,14 +237,6 @@ pub fn clear_sync_upload_stalled() {
 
 fn metrics_upload_stalled_stamp_path() -> PathBuf {
     sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at")
-}
-
-fn record_metrics_upload_stalled() {
-    let stamp = sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at");
-    if let Some(parent) = stamp.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(stamp, unix_now().to_string());
 }
 
 fn clear_metrics_upload_stalled() {
@@ -347,6 +351,9 @@ pub struct CloudSyncStatusReport {
     /// Which queue failed, and the error the worker recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_failure: Option<UploadFailure>,
+    /// Usage metrics (telemetry events), reported apart from attribution: a
+    /// failing metrics upload does not make cloud sync "failing".
+    pub usage_metrics: crate::metrics::sync_state::UsageMetricsStatus,
     pub last_metrics_upload_at: Option<i64>,
     pub organization_slug: Option<String>,
     pub dashboard_url: Option<String>,
@@ -439,6 +446,7 @@ pub fn collect_cloud_sync_status() -> CloudSyncStatusReport {
         auth_blocked_recently,
         upload_stalled_recently,
         upload_failure,
+        usage_metrics: crate::metrics::sync_state::UsageMetricsStatus::current(pending.metrics),
         last_metrics_upload_at,
         organization_slug,
         dashboard_url,
@@ -519,6 +527,19 @@ impl PendingSyncCounts {
         format!(
             "{} telemetry events, {} authorship notes, {} commit summaries, {} transcripts, {} file-change records",
             self.metrics, self.notes, self.commit_summaries, self.transcripts, self.file_changes
+        )
+    }
+
+    /// The same counts without usage metrics, which are reported on their own.
+    pub fn attribution_only(self) -> Self {
+        Self { metrics: 0, ..self }
+    }
+
+    /// [`Self::summary`] without the usage-metrics count.
+    pub fn attribution_summary(self) -> String {
+        format!(
+            "{} authorship notes, {} commit summaries, {} transcripts, {} file-change records",
+            self.notes, self.commit_summaries, self.transcripts, self.file_changes
         )
     }
 }
@@ -757,6 +778,15 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
         ));
     }
     if report.enabled {
+        if report.usage_metrics.queued > 0 || report.usage_metrics.failing {
+            summary.push('\n');
+            summary.push_str(&report.usage_metrics.summary_line());
+            if report.usage_metrics.failing {
+                summary.push_str(
+                    "\nUsage metrics are separate from attribution; this does not stop authorship notes from uploading.",
+                );
+            }
+        }
         if let Some(uploaded_at) = report.last_metrics_upload_at {
             summary.push_str(&format!(
                 "\nLast metrics batch received: {}",
@@ -787,6 +817,11 @@ mod tests {
             auth_blocked_recently: false,
             upload_stalled_recently: false,
             upload_failure: None,
+            usage_metrics: crate::metrics::sync_state::UsageMetricsStatus::from_state(
+                &crate::metrics::sync_state::MetricsSyncState::default(),
+                0,
+                0,
+            ),
             last_metrics_upload_at: None,
             organization_slug: None,
             dashboard_url: None,
@@ -820,13 +855,49 @@ mod tests {
         let mut report = status_report(CloudSyncState::UploadFailing);
         report.upload_failure = Some(UploadFailure {
             at: 1,
-            queue: "metrics".to_string(),
+            queue: "notes".to_string(),
             detail: "batch not fully accepted (2 rejected)".to_string(),
         });
         let summary = format_sync_report(&report);
         assert!(summary.contains("autter doctor"));
-        assert!(summary.contains("Failing queue: metrics"));
+        assert!(summary.contains("Failing queue: notes"));
         assert!(summary.contains("batch not fully accepted (2 rejected)"));
+    }
+
+    #[test]
+    fn failing_usage_metrics_show_counts_and_the_last_error_without_failing_sync() {
+        use crate::metrics::sync_state::{MetricsSyncState, UsageMetricsStatus};
+        let mut state = MetricsSyncState {
+            uploaded_total: 1_200,
+            ..MetricsSyncState::default()
+        };
+        state.record_failure(
+            1_762_588_800,
+            &crate::api::metrics::MetricsUploadFailure::Timeout {
+                after_secs: Some(30),
+            },
+            643,
+        );
+        let mut report = status_report(CloudSyncState::Draining);
+        report.pending.metrics = 643;
+        report.pending.total = 643;
+        report.usage_metrics = UsageMetricsStatus::from_state(&state, 643, 1_762_588_800);
+        let summary = format_sync_report(&report);
+        assert!(summary.contains("upload pending"), "{summary}");
+        assert!(!summary.contains("upload failed"), "{summary}");
+        assert!(
+            summary.contains("Usage metrics: 643 queued, 1200 uploaded, 1 failed attempt"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(
+                "Last metrics error: POST /worker/metrics/upload: timeout after 30s (no response)"
+            ),
+            "{summary}"
+        );
+        assert!(summary.contains("next: 321 events"), "{summary}");
+        assert!(!summary.contains("bg restart"), "{summary}");
+        assert!(summary.contains("separate from attribution"), "{summary}");
     }
 
     #[test]

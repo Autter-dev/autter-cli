@@ -1,0 +1,10 @@
+---
+source: src/commands/doctor.rs
+expression: render_check(&check)
+---
+[warning] usage metrics upload: usage metrics are not uploading: POST /worker/metrics/upload — timeout after 30s (no response)
+  fix: nothing to restart; autter retries automatically in smaller batches (next: 160 events). If it keeps timing out, check that your network or proxy lets requests to the autter API run for 30 seconds
+  643 events queued, 1200 uploaded, 2 failed attempts
+  last error: POST /worker/metrics/upload: timeout after 30s (no response); 2 failed attempts in a row (batch of 321 events), last at 2025-11-08T08:00:00+00:00
+  next retry: 2025-11-08T08:00:10+00:00 with 160 events
+  attribution is not affected: authorship notes upload through their own queue

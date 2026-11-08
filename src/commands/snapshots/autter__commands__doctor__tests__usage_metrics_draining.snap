@@ -1,0 +1,6 @@
+---
+source: src/commands/doctor.rs
+expression: render_check(&check)
+---
+[passed] usage metrics upload: 120 usage-metrics events queued; uploading in batches of 1000
+  120 events queued, 1200 uploaded, 0 failed attempts

@@ -103,6 +103,18 @@ impl MetricsDatabase {
         Ok(())
     }
 
+    /// Open (or create) a queue database at `path`, for tests that need a
+    /// real queue without touching the global one.
+    #[cfg(test)]
+    pub(crate) fn open_at(path: &std::path::Path) -> Result<Self, AutterError> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let mut db = Self { conn };
+        db.initialize_schema()?;
+        db.ensure_held_table()?;
+        Ok(db)
+    }
+
     /// Get database path: ~/.autter/internal/metrics-db
     fn database_path() -> Result<PathBuf, AutterError> {
         // Allow test override via environment variable
