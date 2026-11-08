@@ -1130,6 +1130,16 @@ mod tests {
             // Provide a fake API key so `has_api_key()` returns true and the
             // auth guard in `warm_cache_for_remote` does not short-circuit.
             std::env::set_var("AUTTER_API_KEY", "warm-cache-test-key");
+            // Connected mode regardless of this machine's ~/.autter/config.json,
+            // which Config::fresh() would otherwise read.
+            std::env::set_var(
+                "AUTTER_TEST_CONFIG_PATCH",
+                serde_json::json!({
+                    "prompt_storage": "default",
+                    "notes_backend": { "kind": "http", "backend_url": server_url },
+                })
+                .to_string(),
+            );
         }
 
         // Execute.
@@ -1174,6 +1184,7 @@ mod tests {
         // Cleanup.
         unsafe {
             std::env::remove_var("AUTTER_API_KEY");
+            std::env::remove_var("AUTTER_TEST_CONFIG_PATCH");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }
     }
@@ -1269,6 +1280,16 @@ mod tests {
         unsafe {
             std::env::set_var("AUTTER_NOTES_BACKEND_URL", &server_url);
             std::env::set_var("AUTTER_API_KEY", "skip-test-key");
+            // Connected mode regardless of this machine's ~/.autter/config.json,
+            // which Config::fresh() would otherwise read.
+            std::env::set_var(
+                "AUTTER_TEST_CONFIG_PATCH",
+                serde_json::json!({
+                    "prompt_storage": "default",
+                    "notes_backend": { "kind": "http", "backend_url": server_url },
+                })
+                .to_string(),
+            );
         }
 
         let result = warm_cache_for_remote(repo.autter_repo(), "origin");
@@ -1300,6 +1321,7 @@ mod tests {
         // Cleanup.
         unsafe {
             std::env::remove_var("AUTTER_API_KEY");
+            std::env::remove_var("AUTTER_TEST_CONFIG_PATCH");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }
     }
