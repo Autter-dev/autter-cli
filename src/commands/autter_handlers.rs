@@ -424,10 +424,15 @@ fn print_help() {
 /// policy that governs the *other* (user-facing) subcommands.
 fn handle_checkpoint(args: &[String]) {
     // Exit-code policy for `autter checkpoint`:
-    //   * Operational / hook conditions (a valid invocation that has nothing to
-    //     do, or hits a transient/environmental failure) exit 0 -- this command
-    //     is invoked by AI agent pre/post-edit hooks and must NEVER break the
-    //     agent's edit flow.
+    //   * Hook invocations (agent presets, IDE extensions, anything passing
+    //     `--hook-input`; see `checkpoint_runs_in_hook`) exit 0 on operational
+    //     failures -- the agent's edit flow must NEVER break -- and say why on
+    //     stderr.
+    //   * Direct runs (`autter checkpoint`, `human`, `mock_ai`,
+    //     `mock_known_human` typed by a person or a script) exit non-zero when
+    //     the checkpoint can't be captured: not in a repository, the background
+    //     service unreachable, or git not set up to report the commit. A script
+    //     must be able to tell "recorded" from "lost".
     //   * Usage / argument errors (the caller invoked the command incorrectly:
     //     missing flag value, unknown preset) exit non-zero, so scripts, CI, and
     //     integration code can detect that they're calling it wrong.
@@ -533,6 +538,12 @@ fn handle_checkpoint(args: &[String]) {
         (args[0].as_str(), &args[1..])
     };
 
+    let hook_mode = checkpoint_runs_in_hook(
+        preset_name,
+        hook_input.is_some(),
+        env_flag_set("AUTTER_CHECKPOINT_HOOK"),
+    );
+
     let effective_hook_input =
         hook_input.unwrap_or_else(|| synthesize_hook_input_from_cli_args(preset_name, file_args));
 
@@ -558,8 +569,16 @@ fn handle_checkpoint(args: &[String]) {
                 ),
                 Some(&message),
             );
-            eprintln!("{} preset error: {}", preset_name, e);
-            std::process::exit(0);
+            let fix = if message.contains("No git repository found") {
+                "run it inside a git repository, or pass files that are in one"
+            } else {
+                "check the file paths, then run `autter doctor`"
+            };
+            exit_checkpoint_not_captured(
+                hook_mode,
+                &format!("{} preset error: {}", preset_name, e),
+                fix,
+            );
         }
     };
 
@@ -573,14 +592,26 @@ fn handle_checkpoint(args: &[String]) {
     }
 
     if requests.is_empty() {
+        // Nothing changed is a valid no-op. Outside any repository, though, a
+        // direct run silently did nothing: say so.
+        if !hook_mode && !cwd_is_in_git_repository() {
+            exit_checkpoint_not_captured(
+                false,
+                "not in a git repository, so nothing was checkpointed",
+                "run `autter checkpoint` inside a git repository, or pass files that are in one",
+            );
+        }
         std::process::exit(0);
     }
 
     for request in &requests {
         for file in &request.files {
             if !file.path.is_absolute() {
-                eprintln!("Error: file path must be absolute: {}", file.path.display());
-                std::process::exit(0);
+                exit_checkpoint_not_captured(
+                    hook_mode,
+                    &format!("file path must be absolute: {}", file.path.display()),
+                    "pass absolute paths, or paths relative to the current directory",
+                );
             }
         }
     }
@@ -651,8 +682,11 @@ fn handle_checkpoint(args: &[String]) {
     let config = match daemon_config {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Background worker unavailable: {}", e);
-            std::process::exit(0);
+            exit_checkpoint_not_captured(
+                hook_mode,
+                &format!("Background worker unavailable: {}", e),
+                "check that your home directory is set and writable, then run `autter doctor`",
+            );
         }
     };
 
@@ -706,8 +740,14 @@ fn handle_checkpoint(args: &[String]) {
                         crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome::Error,
                         Some(&format!("background service unavailable: {}", e)),
                     );
-                    eprintln!("Background worker unavailable, checkpoint dropped: {}", e);
-                    std::process::exit(0);
+                    exit_checkpoint_not_captured(
+                        hook_mode,
+                        &format!("Background worker unavailable, checkpoint dropped: {}", e),
+                        &format!(
+                            "run `{}`, then `autter doctor`",
+                            crate::commands::daemon::RESTART_COMMAND
+                        ),
+                    );
                 }
             }
         }
@@ -723,8 +763,17 @@ fn handle_checkpoint(args: &[String]) {
                 crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome::Error,
                 Some(&format!("could not reach the background service: {}", e)),
             );
-            eprintln!("Failed to send checkpoint to background worker: {}", e);
-            std::process::exit(0);
+            exit_checkpoint_not_captured(
+                hook_mode,
+                &format!(
+                    "Failed to send checkpoint to background worker, checkpoint dropped: {}",
+                    e
+                ),
+                &format!(
+                    "run `{}`, then `autter doctor`",
+                    crate::commands::daemon::RESTART_COMMAND
+                ),
+            );
         }
         if is_activity {
             activity_count += 1;
@@ -743,11 +792,29 @@ fn handle_checkpoint(args: &[String]) {
         }
     }
 
-    if std::env::var_os("AUTTER_TEST_DB_PATH").is_some() {
+    let in_test_harness = std::env::var_os("AUTTER_TEST_DB_PATH").is_some();
+    if in_test_harness {
         println!("checkpoint_requests={}", sent_count);
         println!("session_activity_requests={}", activity_count);
-    } else if sent_count > 0 {
+    } else if sent_count > 0 && hook_mode {
         warn_if_commits_cannot_be_captured();
+    }
+
+    // A direct run gets an honest exit code: the checkpoint is recorded, but if
+    // git can't report the commit to autter, the commit won't be attributed.
+    // Test harnesses wire trace2 per command, so they opt in explicitly.
+    if sent_count > 0
+        && !hook_mode
+        && (!in_test_harness || env_flag_set("AUTTER_TEST_ENFORCE_CAPTURE_CHECK"))
+        && let Some(reason) = commit_capture_problem()
+    {
+        exit_checkpoint_not_captured(
+            false,
+            &format!(
+                "this checkpoint was recorded, but git isn't set up to report commits to autter ({reason}), so the next commit won't be attributed"
+            ),
+            "run `autter install --system`, then `autter doctor`",
+        );
     }
 
     if perf {
@@ -756,6 +823,58 @@ fn handle_checkpoint(args: &[String]) {
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
+}
+
+/// Presets a person or script runs by hand. Every other preset is invoked by an
+/// agent hook or an editor extension.
+const DIRECT_CHECKPOINT_PRESETS: &[&str] = &["human", "mock_ai", "mock_known_human"];
+
+/// Whether this checkpoint was invoked by an agent hook or editor extension,
+/// where a non-zero exit can block or alarm the agent.
+///
+/// Decided by preset, not only by `--hook-input`: older Gemini/Droid installs,
+/// the amp plugin and the IDE extensions (`known_human --editor ...`) call
+/// checkpoint without `--hook-input`, and every agent preset exists only for
+/// hooks. A manual preset counts as a hook when it carries a hook payload, or
+/// when the caller sets `AUTTER_CHECKPOINT_HOOK=1`.
+fn checkpoint_runs_in_hook(preset: &str, has_hook_input: bool, hook_env: bool) -> bool {
+    !DIRECT_CHECKPOINT_PRESETS.contains(&preset) || has_hook_input || hook_env
+}
+
+fn env_flag_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// End a checkpoint that could not be captured. Hooks exit 0 so the agent's
+/// edit flow never breaks (the reason still goes to stderr); direct runs exit
+/// non-zero with the one command that fixes it.
+fn exit_checkpoint_not_captured(hook_mode: bool, message: &str, fix: &str) -> ! {
+    if hook_mode {
+        eprintln!("{message}");
+        std::process::exit(0);
+    }
+    eprintln!("error: {message}");
+    eprintln!("Fix: {fix}");
+    std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+}
+
+fn cwd_is_in_git_repository() -> bool {
+    std::env::current_dir().is_ok_and(|cwd| {
+        crate::git::repository::discover_repository_in_path_no_git_exec(&cwd).is_ok()
+    })
+}
+
+/// Why a commit made now would not reach the background service, or `None`
+/// when it would: git's global trace2 config points at the service, or this
+/// environment routes trace2 events itself (`GIT_TRACE2_EVENT`).
+fn commit_capture_problem() -> Option<String> {
+    if std::env::var_os("GIT_TRACE2_EVENT").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let git_cmd = crate::config::Config::get().git_cmd().to_string();
+    let target = crate::diagnostics::GitDiagnosticTarget::new("git", git_cmd);
+    let check = crate::diagnostics::check_trace2_global_config(&target);
+    (check.status == crate::diagnostics::DiagnosticStatus::Failed).then_some(check.summary)
 }
 
 /// A checkpoint only becomes attribution when the commit is observed, and that
@@ -1586,4 +1705,26 @@ fn exit_with_log_status(status: std::process::ExitStatus) -> ! {
         }
     }
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod checkpoint_exit_policy_tests {
+    use super::checkpoint_runs_in_hook;
+
+    #[test]
+    fn agent_presets_and_editor_extensions_are_hooks() {
+        for preset in ["claude", "codex", "cursor", "gemini", "amp", "known_human"] {
+            assert!(checkpoint_runs_in_hook(preset, false, false), "{preset}");
+            assert!(checkpoint_runs_in_hook(preset, true, false), "{preset}");
+        }
+    }
+
+    #[test]
+    fn manual_presets_are_direct_unless_they_carry_a_hook_payload() {
+        for preset in ["human", "mock_ai", "mock_known_human"] {
+            assert!(!checkpoint_runs_in_hook(preset, false, false), "{preset}");
+            assert!(checkpoint_runs_in_hook(preset, true, false), "{preset}");
+            assert!(checkpoint_runs_in_hook(preset, false, true), "{preset}");
+        }
+    }
 }

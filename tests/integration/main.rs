@@ -30,6 +30,7 @@ mod blame_why;
 mod broken_pipe;
 mod checkout_switch;
 mod checkpoint_debug_log;
+mod checkpoint_exit_codes;
 mod checkpoint_explicit_paths;
 mod checkpoint_perf;
 mod checkpoint_size;
