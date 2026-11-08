@@ -605,8 +605,12 @@ pub fn merge_working_log_after_squash_from_final_state(
 
     if checkpoints_changed {
         working_log.write_all_checkpoints(&checkpoints)?;
+        // Picked lines merged into a checkpoint entry point at the source
+        // commits' sessions, whose records only INITIAL holds.
+        working_log.write_initial_keeping_records(initial)?;
+    } else {
+        working_log.write_initial(initial)?;
     }
-    working_log.write_initial(initial)?;
 
     Ok(())
 }

@@ -686,13 +686,36 @@ impl PersistedWorkingLog {
 
     /// Write a fully-formed INITIAL state, preserving any persisted blob references.
     pub fn write_initial(&self, initial: InitialAttributions) -> Result<(), AutterError> {
+        self.write_initial_inner(initial, false)
+    }
+
+    /// Like [`Self::write_initial`], but keeps INITIAL when it has prompt,
+    /// session or human records and no file attributions. Used when a
+    /// checkpoint entry carries attribution whose records only INITIAL holds
+    /// (lines picked by `cherry-pick -n` into a file with live AI work);
+    /// dropping INITIAL would leave those lines pointing at unknown sessions.
+    pub fn write_initial_keeping_records(
+        &self,
+        initial: InitialAttributions,
+    ) -> Result<(), AutterError> {
+        self.write_initial_inner(initial, true)
+    }
+
+    fn write_initial_inner(
+        &self,
+        initial: InitialAttributions,
+        keep_records_without_files: bool,
+    ) -> Result<(), AutterError> {
         let filtered_files: HashMap<String, Vec<LineAttribution>> = initial
             .files
             .into_iter()
             .filter(|(_, attrs)| !attrs.is_empty())
             .collect();
 
-        if filtered_files.is_empty() {
+        let has_records = !initial.prompts.is_empty()
+            || !initial.sessions.is_empty()
+            || !initial.humans.is_empty();
+        if filtered_files.is_empty() && !(keep_records_without_files && has_records) {
             if self.initial_file.exists() {
                 fs::remove_file(&self.initial_file)?;
             }
