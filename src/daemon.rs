@@ -8692,8 +8692,11 @@ fn control_listener_loop_actor(
                 })
                 .is_err()
             {
+                // Usually a transient resource limit on a busy machine. The
+                // connection is dropped and the client retries; stopping the
+                // listener would take the whole daemon down instead.
                 tracing::error!("control listener: failed to spawn handler thread");
-                break;
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
         Ok(())
@@ -8911,8 +8914,11 @@ fn trace_listener_loop_actor(
                 })
                 .is_err()
             {
+                // Usually a transient resource limit on a busy machine. The
+                // connection is dropped and the client retries; stopping the
+                // listener would take the whole daemon down instead.
                 tracing::error!("trace listener: failed to spawn handler thread");
-                break;
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
         Ok(())
@@ -9194,6 +9200,53 @@ fn daemon_min_uptime_for_self_restart() -> u64 {
         .unwrap_or(DAEMON_MIN_UPTIME_FOR_SELF_RESTART_SECS)
 }
 
+/// Consecutive failed probes of socket files that are still on disk before the
+/// daemon treats its listener as hung. A busy machine can fill a listener's
+/// accept backlog for a moment, and a single refused connect then would make a
+/// healthy daemon restart itself, dropping work in flight.
+const DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketHealthVerdict {
+    Healthy,
+    /// A probe failed but both socket files exist: likely a busy listener.
+    Retry,
+    Unhealthy,
+}
+
+/// Decide what one round of socket probes means. A missing socket file is
+/// final at once; a failed connect to a file that exists only counts once it
+/// has failed [`DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART`] times in a row.
+fn socket_health_verdict(
+    probes_ok: bool,
+    socket_file_missing: bool,
+    consecutive_failures: &mut u32,
+) -> SocketHealthVerdict {
+    if probes_ok {
+        *consecutive_failures = 0;
+        return SocketHealthVerdict::Healthy;
+    }
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    if socket_file_missing || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
+        SocketHealthVerdict::Unhealthy
+    } else {
+        SocketHealthVerdict::Retry
+    }
+}
+
+fn socket_file_missing(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Named pipes have no file on disk to check.
+        let _ = path;
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        !path.exists()
+    }
+}
+
 /// Background loop that verifies the daemon's sockets are reachable by
 /// actually connecting to them.  A successful connect proves the socket file
 /// exists, points to this daemon's listener, and that the listener thread is
@@ -9213,6 +9266,7 @@ fn daemon_socket_health_check_loop(
 ) {
     let started = std::time::Instant::now();
     let interval = daemon_socket_health_check_interval().max(1);
+    let mut consecutive_probe_failures = 0u32;
     tracing::info!(
         interval,
         control = %control_socket_path.display(),
@@ -9243,7 +9297,20 @@ fn daemon_socket_health_check_loop(
         let trace_ok =
             local_socket_connects_with_timeout(&trace_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
 
-        if control_ok.is_err() || trace_ok.is_err() {
+        let verdict = socket_health_verdict(
+            control_ok.is_ok() && trace_ok.is_ok(),
+            socket_file_missing(&control_socket_path) || socket_file_missing(&trace_socket_path),
+            &mut consecutive_probe_failures,
+        );
+        if verdict == SocketHealthVerdict::Retry {
+            tracing::warn!(
+                control = %control_ok.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()),
+                trace = %trace_ok.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()),
+                consecutive_probe_failures,
+                "socket health probe failed; sockets still on disk, checking again before restarting"
+            );
+        }
+        if verdict == SocketHealthVerdict::Unhealthy {
             let uptime = started.elapsed();
             let min_uptime = std::time::Duration::from_secs(daemon_min_uptime_for_self_restart());
 
@@ -9854,6 +9921,44 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn socket_health_tolerates_brief_probe_failures_on_existing_sockets() {
+        let mut failures = 0;
+        assert_eq!(
+            socket_health_verdict(false, false, &mut failures),
+            SocketHealthVerdict::Retry
+        );
+        assert_eq!(
+            socket_health_verdict(false, false, &mut failures),
+            SocketHealthVerdict::Retry
+        );
+        // A good probe resets the count.
+        assert_eq!(
+            socket_health_verdict(true, false, &mut failures),
+            SocketHealthVerdict::Healthy
+        );
+        assert_eq!(failures, 0);
+        for _ in 1..DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
+            assert_eq!(
+                socket_health_verdict(false, false, &mut failures),
+                SocketHealthVerdict::Retry
+            );
+        }
+        assert_eq!(
+            socket_health_verdict(false, false, &mut failures),
+            SocketHealthVerdict::Unhealthy
+        );
+    }
+
+    #[test]
+    fn socket_health_fails_at_once_when_a_socket_file_is_gone() {
+        let mut failures = 0;
+        assert_eq!(
+            socket_health_verdict(false, true, &mut failures),
+            SocketHealthVerdict::Unhealthy
+        );
+    }
 
     #[test]
     fn missing_working_dir_error_detects_exit_128_enoent() {
