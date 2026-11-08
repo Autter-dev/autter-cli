@@ -146,10 +146,10 @@ In local-only mode:
 
 Choosing a mode does not change system configuration by itself. In a terminal, onboarding asks before it installs IDE/agent hooks, writes global git trace2 settings, or starts the background service. In scripts, add `--yes` to consent to those changes up front (for example `autter onboard --local --yes`); without it a non-interactive run leaves them off, and you can apply them later with `autter install --system`.
 
-Open source error and exception telemetry is enabled by default. If you want Autter to send no telemetry at all, turn it off:
+Anonymous usage and error telemetry is off until you opt in. Onboarding asks once, in both local and connected mode, and never includes code or prompts. Everything sent is mirrored to `~/.autter/internal/telemetry.log`. Change your answer at any time:
 
 ```bash
-autter config set telemetry_oss off
+autter telemetry off
 ```
 
 You can connect later without reinstalling:

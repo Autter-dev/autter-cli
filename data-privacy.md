@@ -24,7 +24,7 @@ AI attribution data is written to git notes and is readable by anyone with repo 
 
 ### Telemetry
 
-- **Error & exception telemetry** — shared by default with Autter. You can disable it or redirect it to your own endpoint. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options).
+- **Error & exception telemetry** — off until you opt in during `autter onboard` (or with `autter telemetry on`), in local and connected mode alike. It never includes code or prompts. You can turn it off or redirect it to your own endpoint. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options).
 
 ---
 
@@ -54,7 +54,7 @@ Teams and Enterprise deployments store additional data in the team instance:
 - **SCM PR data** from GitHub, Bitbucket, and GitLab
   - PR metadata: description, opener, reviewer, status
   - PR diffs — processed for computing % AI code, but not stored
-- **Error & exception telemetry** — shared by default with Autter, unless disabled or redirected to your own endpoint. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options).
+- **Error & exception telemetry** — off until you opt in; you can turn it off or redirect it to your own endpoint at any time. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options).
 
 For more information, see our [Trust Center](https://trust.autter.dev).
 

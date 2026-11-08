@@ -395,7 +395,7 @@ fn prompt_mode_choice(counter: Option<&str>, logged_in: bool) -> bool {
             connected_hint,
         ),
         SelectItem::new(
-            "Local only — everything stays on this machine",
+            "Local only — your code and prompts stay on this machine",
             "No account needed. Switch anytime with `autter onboard --connect`.",
         ),
     ];
@@ -499,7 +499,7 @@ fn setup_local(cfg: &mut config::FileConfig, announce: bool) {
     });
 
     if announce {
-        rail::print_step("Local mode \u{00B7} everything stays on this machine", None);
+        rail::print_step("Local mode \u{00B7} your code and prompts stay on this machine", None);
     }
     rail::print_note(
         "Attribution, blame and stats run on this machine, in git notes (refs/notes/ai).\n\

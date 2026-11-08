@@ -96,7 +96,7 @@ fn render(view: &HomeView, caps: &TermCaps) -> String {
             "Not set up yet \u{00B7} run {}",
             caps.paint("36", "autter onboard")
         ),
-        Mode::Local => "Local mode \u{00B7} nothing leaves this machine".to_string(),
+        Mode::Local => "Local mode \u{00B7} your code and prompts stay on this machine".to_string(),
         Mode::Connected { account } => format!("Connected \u{00B7} {account}"),
         Mode::SignedOut => format!(
             "Connected mode, signed out \u{00B7} run {}",
