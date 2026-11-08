@@ -232,7 +232,19 @@ fe2c4c8 (claude         2025-12-02 19:25:13 -0500  138)     // Resolve commits t
 fe2c4c8 (claude         2025-12-02 19:25:13 -0500  139)     let (from_commit, to_commit) = match spec {
 fe2c4c8 (claude         2025-12-02 19:25:13 -0500  140)         DiffSpec::TwoCommit(start, end) => {
 
+Prompts behind the AI lines:
+  s_3f9a2c1d  claude  claude-opus-4-5  lines 138-140
+Details: autter show-prompt s_3f9a2c1d  |  autter blame --why src/log_fmt/authorship_log.rs:138
 ```
+
+### From a line to the prompt that wrote it
+
+1. **`autter blame <file>`** shows who wrote each line. On a terminal it ends with a legend of the prompts behind the AI lines: a short reference (`s_3f9a2c1d`), the agent, the model and the lines. `--show-prompt` puts the reference on every AI line, and prints the legend even when piped.
+2. **`autter blame --why <file>:<line>`** explains one line: agent, model, the prompt reference, the agent's own session ID, the commit, and the prompt transcript, or why there is none.
+3. **`autter show-prompt <ref>`** prints the full prompt record as JSON: agent, model, session, line counts, the commit whose note holds it, and the transcript. It takes the short reference, a full session ID (`s_` + 14 hex), an older 16-hex prompt hash, any unique prefix of 4+ hex characters, or the agent's own session ID. `autter show-prompt --help` lists where each ID appears.
+4. **`git show <commit>`** is the change itself.
+
+Transcripts are read from this machine first, then from the Autter platform when you are connected and signed in. When one can't be shown, `--why` and `show-prompt` (in `transcript.reason`) say why: none was recorded, it stayed on the machine that made the commit (local mode), or you need to sign in. Notes made on other machines arrive with `autter fetch-notes`. The web app has no page per prompt or session yet, so there is no link to one.
 
 <img align="right" width="350" alt="Autter VS Code extension showing color-coded AI blame in the gutter" src="https://github.com/user-attachments/assets/94e332e7-5d96-4e5c-8757-63ac0e2f88e0" />
 

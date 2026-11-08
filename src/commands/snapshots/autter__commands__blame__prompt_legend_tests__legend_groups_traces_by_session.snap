@@ -1,0 +1,9 @@
+---
+source: src/commands/blame.rs
+expression: legend
+---
+
+Prompts behind the AI lines:
+  s_3f9a2c1d  claude  claude-opus-4-5     lines 3-5, 9
+  s_0b12ce44  codex   model not recorded  line 12
+Details: autter show-prompt s_3f9a2c1d  |  autter blame --why src/lib.rs:3

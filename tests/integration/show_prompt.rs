@@ -1,5 +1,7 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use regex::Regex;
+use std::fs;
 
 // Local helper mirroring the CLI arg vector used by main
 fn args(list: &[&str]) -> Vec<String> {
@@ -190,6 +192,200 @@ fn show_prompt_with_offset_skips_occurrences() {
     );
 }
 
+/// One committed AI line (line 2) under a known-human line, so blame has a
+/// prompt to point at.
+fn repo_with_ai_line() -> TestRepo {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("f.txt");
+    fs::write(&file_path, "human line 1\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "f.txt"])
+        .unwrap();
+    fs::write(&file_path, "human line 1\nAI made this\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "f.txt"]).unwrap();
+    repo.stage_all_and_commit("init").unwrap();
+    let mut file = repo.filename("f.txt");
+    file.assert_committed_lines(crate::lines!["human line 1".human(), "AI made this".ai()]);
+    repo
+}
+
+/// The only session ID in HEAD's authorship note.
+fn head_session_id(repo: &TestRepo) -> String {
+    let note = repo
+        .read_authorship_note(&repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string())
+        .expect("HEAD has an authorship note");
+    let log =
+        autter::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(
+            &note,
+        )
+        .expect("note parses");
+    let mut ids: Vec<&String> = log.metadata.sessions.keys().collect();
+    assert_eq!(ids.len(), 1, "expected one session, got {ids:?}");
+    ids.pop().unwrap().clone()
+}
+
+/// Replace IDs, SHAs and dates that change from run to run.
+fn redact(text: &str) -> String {
+    let sessions = Regex::new(r"s_[0-9a-f]{4,14}").unwrap();
+    let shas = Regex::new(r"\b[0-9a-f]{7,40}\b").unwrap();
+    let dates = Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}").unwrap();
+    let text = sessions.replace_all(text, "s_<id>");
+    let text = shas.replace_all(&text, "<sha>");
+    dates.replace_all(&text, "<date>").to_string()
+}
+
+fn json(output: &str) -> serde_json::Value {
+    serde_json::from_str(output.trim()).unwrap_or_else(|e| panic!("not JSON ({e}): {output}"))
+}
+
+#[test]
+fn blame_legend_shows_prompt_reference_on_a_terminal() {
+    let repo = repo_with_ai_line();
+    let session = head_session_id(&repo);
+    let short = format!("s_{}", &session[2..10]);
+
+    let output = repo
+        .autter_with_env(&["blame", "f.txt"], &[("AUTTER_TEST_FORCE_TTY", "1")])
+        .unwrap();
+    assert!(
+        output.contains(&short),
+        "legend should show {short}, got:\n{output}"
+    );
+    insta::assert_snapshot!(redact(&output));
+}
+
+#[test]
+fn piped_blame_has_no_legend() {
+    let repo = repo_with_ai_line();
+    let output = repo.autter(&["blame", "f.txt"]).unwrap();
+    assert!(
+        !output.contains("Prompts behind the AI lines"),
+        "piped blame must stay one line per source line, got:\n{output}"
+    );
+    assert_eq!(output.lines().count(), 2, "got:\n{output}");
+}
+
+#[test]
+fn show_prompt_flag_puts_reference_on_ai_lines() {
+    let repo = repo_with_ai_line();
+    let session = head_session_id(&repo);
+    let short = format!("s_{}", &session[2..10]);
+
+    let output = repo.autter(&["blame", "--show-prompt", "f.txt"]).unwrap();
+    assert!(
+        output.contains(&format!("mock_ai [{short}]")),
+        "AI line should carry its reference, got:\n{output}"
+    );
+    assert!(
+        output.contains("Prompts behind the AI lines"),
+        "--show-prompt should print the legend even when piped, got:\n{output}"
+    );
+}
+
+#[test]
+fn show_prompt_resolves_the_short_reference_from_blame() {
+    let repo = repo_with_ai_line();
+    let session = head_session_id(&repo);
+    let short = format!("s_{}", &session[2..10]);
+
+    let output = repo.autter(&["show-prompt", &short]).unwrap();
+    let value = json(&output);
+    assert_eq!(value["prompt_id"].as_str(), Some(session.as_str()));
+    assert_eq!(value["query"].as_str(), Some(short.as_str()));
+    assert_eq!(
+        value["prompt"]["agent_id"]["tool"].as_str(),
+        Some("mock_ai")
+    );
+    assert_eq!(
+        value["commit"].as_str(),
+        Some(repo.git(&["rev-parse", "HEAD"]).unwrap().trim())
+    );
+    // mock_ai records no transcript; the output says so instead of omitting it.
+    assert_eq!(value["transcript"]["status"].as_str(), Some("not_recorded"));
+    assert!(value["transcript"]["reason"].as_str().is_some());
+
+    // The bracketed form `--show-prompt` prints, and the --commit path, work too.
+    let bracketed = json(
+        &repo
+            .autter(&["show-prompt", &format!("[{short}]")])
+            .unwrap(),
+    );
+    assert_eq!(bracketed["prompt_id"].as_str(), Some(session.as_str()));
+    let in_commit = json(
+        &repo
+            .autter(&["show-prompt", &short, "--commit", "HEAD"])
+            .unwrap(),
+    );
+    assert_eq!(in_commit["prompt_id"].as_str(), Some(session.as_str()));
+}
+
+#[test]
+fn show_prompt_resolves_the_agent_session_id() {
+    let repo = repo_with_ai_line();
+    let session = head_session_id(&repo);
+    let full = json(&repo.autter(&["show-prompt", &session]).unwrap());
+    let agent_session = full["prompt"]["agent_id"]["id"]
+        .as_str()
+        .expect("agent session id")
+        .to_string();
+
+    let value = json(&repo.autter(&["show-prompt", &agent_session]).unwrap());
+    assert_eq!(value["prompt_id"].as_str(), Some(session.as_str()));
+}
+
+#[test]
+fn why_reference_resolves_in_show_prompt() {
+    let repo = repo_with_ai_line();
+    let session = head_session_id(&repo);
+
+    let why = repo.autter(&["blame", "--why", "f.txt:2"]).unwrap();
+    let reference = why
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("prompt:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("--why should print a prompt reference:\n{why}"))
+        .to_string();
+    assert!(
+        why.contains(&format!("autter show-prompt {reference}")),
+        "{why}"
+    );
+    assert!(
+        why.contains("commit:"),
+        "--why should name the commit:\n{why}"
+    );
+    assert!(
+        why.contains("No transcript was saved"),
+        "--why should say why there is no transcript:\n{why}"
+    );
+    insta::assert_snapshot!(redact(&why));
+
+    let value = json(&repo.autter(&["show-prompt", &reference]).unwrap());
+    assert_eq!(value["prompt_id"].as_str(), Some(session.as_str()));
+}
+
+#[test]
+fn show_prompt_help_explains_the_id() {
+    let repo = TestRepo::new();
+    let long = repo.autter(&["show-prompt", "--help"]).unwrap();
+    let short = repo.autter(&["show-prompt", "-h"]).unwrap();
+    assert_eq!(long, short);
+    assert!(!long.contains("Unknown option"), "{long}");
+    insta::assert_snapshot!(long);
+}
+
+#[test]
+fn show_prompt_unknown_id_says_where_ids_come_from() {
+    let repo = repo_with_ai_line();
+    let err = repo
+        .autter(&["show-prompt", "s_00000000"])
+        .expect_err("unknown ID should fail");
+    assert!(
+        err.contains("Prompt not found in history: s_00000000"),
+        "{err}"
+    );
+    assert!(err.contains("autter blame --why"), "{err}");
+    assert!(err.contains("autter fetch-notes"), "{err}");
+}
+
 crate::reuse_tests_in_worktree!(
     parse_args_requires_prompt_id,
     parse_args_parses_basic_id,
@@ -203,4 +399,12 @@ crate::reuse_tests_in_worktree!(
     parse_args_rejects_unknown_flag,
     show_prompt_returns_latest_prompt_by_default,
     show_prompt_with_offset_skips_occurrences,
+    blame_legend_shows_prompt_reference_on_a_terminal,
+    piped_blame_has_no_legend,
+    show_prompt_flag_puts_reference_on_ai_lines,
+    show_prompt_resolves_the_short_reference_from_blame,
+    show_prompt_resolves_the_agent_session_id,
+    why_reference_resolves_in_show_prompt,
+    show_prompt_help_explains_the_id,
+    show_prompt_unknown_id_says_where_ids_come_from,
 );

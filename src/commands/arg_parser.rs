@@ -322,6 +322,14 @@ autter blame <file>
   Git blame with an AI authorship overlay. Accepts git blame arguments
   (-L, -C, --porcelain, etc.).
 
+  On a terminal, the output ends with a legend of the prompts behind its AI
+  lines: a short reference (s_3f9a2c1d), the agent and model, and the lines.
+  Pass that reference to `autter show-prompt` for the full record.
+
+  --why <file>:<line>   Explain one line: agent, model, prompt reference,
+                        session, commit and transcript
+  --open                With --why: open the line's issue, PR or prompt URL
+  --show-prompt         Show the prompt reference on every AI line
   --json                Output in JSON format
   -i, --interactive     Browse the file full-screen: AI, human and untracked
                         lines, and the prompt behind each AI change",
@@ -458,15 +466,42 @@ autter show <rev|range>
     HelpEntry {
         name: "show-prompt",
         aliases: &[],
-        summary: "Display a prompt record by its ID",
+        summary: "Show the prompt and session behind AI lines, by prompt ID",
         body: "\
-autter show-prompt <id>
+autter show-prompt <id> [--commit <rev> | --offset <n>]
 
-  Display a prompt record by its ID.
+  Print, as JSON, the prompt record behind AI-written lines: the agent, the
+  model, the agent's own session ID, the human who ran it, line counts, the
+  commit whose authorship note holds it, and the transcript when one can be
+  read. When there is no transcript, `transcript.reason` says why.
 
-  --commit <rev>   Look in a specific commit only
-  --offset <n>     Skip n occurrences (0 = most recent, mutually exclusive
-                   with --commit)",
+  Where to find the ID:
+    autter blame <file>               on a terminal, blame ends with a legend
+                                      of the prompts behind its AI lines
+    autter blame --show-prompt <file> the same reference on every AI line
+    autter blame --why <file>:<line>  the prompt behind one line
+    autter show <commit>              the raw note (prompts and sessions)
+    autter log --notes                the raw notes in history
+
+  The ID can be:
+    s_3f9a2c1d                 a short reference from blame (any unique
+                               prefix of 4+ hex characters works)
+    s_3f9a2c1d4e5f60           a full session ID
+    s_3f9a2c1d4e5f60::t_...    a line's attestation key (same session)
+    0123456789abcdef           a prompt hash from older notes
+    <agent session id>         the agent's own ID, e.g. a Claude Code session
+
+  From a line to its change: blame shows the commit and the prompt
+  reference; --why and show-prompt add the agent, model, session and
+  transcript; `git show <commit>` is the change itself.
+
+  Transcripts are read from this machine first, then from Autter when you
+  are connected and signed in. Secrets are redacted before a transcript is
+  stored. Notes made on other machines arrive with `autter fetch-notes`.
+
+  --commit <rev>   Look in that commit's note only
+  --offset <n>     Skip n occurrences, newest first (0 = most recent);
+                   cannot be combined with --commit",
     },
     HelpEntry {
         name: "config",

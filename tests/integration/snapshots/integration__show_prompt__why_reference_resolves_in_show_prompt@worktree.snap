@@ -1,0 +1,19 @@
+---
+source: tests/integration/show_prompt.rs
+expression: redact(&why)
+---
+f.txt:2
+  AI made this
+
+Produced by AI
+  agent:    mock_ai
+  model:    mock_ai/unknown-model
+  human:    Test User <test@example.com>
+  prompt:   s_<id>  (full ID s_<id>)
+  session:  ai-thread-<sha>  (the agent's own session ID)
+  commit:   <sha>
+
+Full record: autter show-prompt s_<id>
+The change:  git show <sha>
+
+No transcript was saved for this prompt. The agent reported no transcript file, the file was gone when the commit was made, or prompt storage for this repository keeps transcripts out.

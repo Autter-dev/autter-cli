@@ -1,0 +1,13 @@
+---
+source: src/authorship/prompt_utils.rs
+expression: "not_found_message(\"s_deadbeef\", false)"
+---
+Prompt not found in history: s_deadbeef
+No authorship note on this machine has a prompt or session with that ID.
+
+Where to find a prompt ID:
+  autter blame <file>               legend of the prompts behind AI lines
+  autter blame --why <file>:<line>  the prompt behind one line
+  autter show <commit>              the raw note, prompts and sessions included
+
+Notes made on other machines arrive with `autter fetch-notes`.

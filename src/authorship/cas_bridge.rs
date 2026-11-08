@@ -261,10 +261,28 @@ pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, 
         return Ok(Some(messages));
     }
 
+    match fetch_cas_messages_from_platform(hash)? {
+        PlatformFetch::Found(messages) => Ok(Some(messages)),
+        PlatformFetch::LocalMode | PlatformFetch::SignedOut | PlatformFetch::Missing => Ok(None),
+    }
+}
+
+/// Outcome of asking the platform for a transcript.
+enum PlatformFetch {
+    Found(Vec<Message>),
+    /// Local mode: the platform is never contacted.
+    LocalMode,
+    /// Connected mode, but no login or API key.
+    SignedOut,
+    /// The platform has no copy this user can read.
+    Missing,
+}
+
+fn fetch_cas_messages_from_platform(hash: &str) -> Result<PlatformFetch, AutterError> {
     let cfg = config::Config::fresh();
     // Local mode does not contact the platform at all.
     if !cfg.platform_sync_enabled() {
-        return Ok(None);
+        return Ok(PlatformFetch::LocalMode);
     }
     let dataplane_url = if cfg.notes_backend_kind().uses_http() {
         cfg.notes_backend_url().map(|s| s.to_string())
@@ -273,7 +291,7 @@ pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, 
     };
     let client = ApiClient::new(ApiContext::new(dataplane_url));
     if !client.is_logged_in() && !client.has_api_key() {
-        return Ok(None);
+        return Ok(PlatformFetch::SignedOut);
     }
 
     let response = client.read_ca_prompt_store(&[hash])?;
@@ -289,11 +307,104 @@ pub fn resolve_cas_messages(messages_url: &str) -> Result<Option<Vec<Message>>, 
             {
                 let _ = db_lock.set_cas_cache(hash, &messages_json);
             }
-            return Ok(Some(messages));
+            return Ok(PlatformFetch::Found(messages));
         }
     }
 
-    Ok(None)
+    Ok(PlatformFetch::Missing)
+}
+
+/// Where a prompt's transcript is, or why it cannot be shown.
+#[derive(Debug)]
+pub enum TranscriptLookup {
+    /// Resolved from this machine or from Autter.
+    Found(Vec<Message>),
+    /// The note points at a transcript outside Autter.
+    External(String),
+    /// The note records no transcript for this prompt.
+    NotRecorded,
+    /// Not on this machine, and local mode never fetches from Autter.
+    NotLocalLocalMode,
+    /// Not on this machine; connected mode, but not signed in.
+    NotLocalSignedOut,
+    /// Not on this machine, and Autter returned no copy this user can read.
+    NotOnPlatform,
+    /// Not on this machine, and fetching from Autter failed.
+    FetchFailed(String),
+}
+
+impl TranscriptLookup {
+    /// Short machine-readable status for JSON output.
+    pub fn status(&self) -> &'static str {
+        match self {
+            TranscriptLookup::Found(_) => "found",
+            TranscriptLookup::External(_) => "external",
+            TranscriptLookup::NotRecorded => "not_recorded",
+            TranscriptLookup::NotLocalLocalMode => "not_on_this_machine",
+            TranscriptLookup::NotLocalSignedOut => "not_on_this_machine_signed_out",
+            TranscriptLookup::NotOnPlatform => "not_on_platform",
+            TranscriptLookup::FetchFailed(_) => "fetch_failed",
+        }
+    }
+
+    /// Plain explanation when there is no transcript to print.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            TranscriptLookup::Found(_) => None,
+            TranscriptLookup::External(url) => {
+                Some(format!("The transcript is stored outside Autter: {url}"))
+            }
+            TranscriptLookup::NotRecorded => Some(
+                "No transcript was saved for this prompt. The agent reported no transcript \
+                 file, the file was gone when the commit was made, or prompt storage for \
+                 this repository keeps transcripts out."
+                    .to_string(),
+            ),
+            TranscriptLookup::NotLocalLocalMode => Some(
+                "The transcript is not on this machine; it stays where the commit was made. \
+                 Local mode never fetches transcripts from Autter."
+                    .to_string(),
+            ),
+            TranscriptLookup::NotLocalSignedOut => Some(
+                "The transcript is not on this machine. Run `autter login` to fetch it \
+                 from Autter."
+                    .to_string(),
+            ),
+            TranscriptLookup::NotOnPlatform => Some(
+                "The transcript is not on this machine, and Autter has no copy you can read. \
+                 It may still be uploading from the machine that made the commit, or that \
+                 machine keeps prompts local."
+                    .to_string(),
+            ),
+            TranscriptLookup::FetchFailed(e) => Some(format!(
+                "The transcript is not on this machine, and fetching it from Autter failed: {e}"
+            )),
+        }
+    }
+}
+
+/// Look up a prompt's transcript and say why when it cannot be shown.
+/// Checks this machine first, then Autter in connected mode.
+pub fn lookup_transcript(messages_url: Option<&str>) -> TranscriptLookup {
+    let Some(url) = messages_url.filter(|u| !u.is_empty()) else {
+        return TranscriptLookup::NotRecorded;
+    };
+    let Some(hash) = url.strip_prefix("cas:") else {
+        return TranscriptLookup::External(url.to_string());
+    };
+    if hash.is_empty() {
+        return TranscriptLookup::NotRecorded;
+    }
+    if let Ok(Some(messages)) = resolve_cas_messages_local(url) {
+        return TranscriptLookup::Found(messages);
+    }
+    match fetch_cas_messages_from_platform(hash) {
+        Ok(PlatformFetch::Found(messages)) => TranscriptLookup::Found(messages),
+        Ok(PlatformFetch::LocalMode) => TranscriptLookup::NotLocalLocalMode,
+        Ok(PlatformFetch::SignedOut) => TranscriptLookup::NotLocalSignedOut,
+        Ok(PlatformFetch::Missing) => TranscriptLookup::NotOnPlatform,
+        Err(e) => TranscriptLookup::FetchFailed(e.to_string()),
+    }
 }
 
 fn extract_messages_from_cas_payload(payload: &str) -> Result<Vec<Message>, AutterError> {

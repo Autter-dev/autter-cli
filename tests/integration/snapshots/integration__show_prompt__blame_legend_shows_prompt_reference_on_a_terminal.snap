@@ -1,0 +1,10 @@
+---
+source: tests/integration/show_prompt.rs
+expression: redact(&output)
+---
+^<sha> (Test User <test@example.com> <date> 1) human line 1
+^<sha> (mock_ai                      <date> 2) AI made this
+
+Prompts behind the AI lines:
+  s_<id>  mock_ai  mock_ai/unknown-model  line 2
+Details: autter show-prompt s_<id>  |  autter blame --why f.txt:2

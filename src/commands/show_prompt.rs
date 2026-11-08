@@ -1,18 +1,22 @@
-use crate::authorship::cas_bridge;
-use crate::authorship::prompt_utils::find_prompt;
+use crate::authorship::cas_bridge::{self, TranscriptLookup};
+use crate::authorship::prompt_utils::resolve_prompt;
 use crate::git::find_repository;
 
 /// Handle the `show-prompt` command
 ///
 /// Usage: `autter show-prompt <prompt_id> [--commit <rev>] [--offset <n>]`
 ///
-/// Returns the prompt object from the authorship note where the given prompt ID is found.
+/// Prints, as JSON, the prompt record from the authorship note where the given
+/// prompt ID is found, with its transcript when one can be read. The ID can be
+/// a short reference from `autter blame`, a full session ID, a legacy prompt
+/// hash, or the agent's own session ID (see `prompt_utils`).
 /// By default returns from the most recent commit containing the prompt.
 pub fn handle_show_prompt(args: &[String]) {
     let parsed = match parse_args(args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {}", e);
+            eprintln!("Run `autter show-prompt --help` for where to find a prompt ID.");
             std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
     };
@@ -25,14 +29,15 @@ pub fn handle_show_prompt(args: &[String]) {
         }
     };
 
-    match find_prompt(
+    match resolve_prompt(
         &repo,
         &parsed.prompt_id,
         parsed.commit.as_deref(),
         parsed.offset,
     ) {
-        Ok((commit_sha, prompt_record)) => {
-            let mut prompt_json = serde_json::to_value(&prompt_record).unwrap_or_else(|_| {
+        Ok(resolved) => {
+            let prompt_record = &resolved.record;
+            let mut prompt_json = serde_json::to_value(prompt_record).unwrap_or_else(|_| {
                 serde_json::json!({
                     "agent_id": prompt_record.agent_id,
                     "human_author": prompt_record.human_author,
@@ -40,23 +45,42 @@ pub fn handle_show_prompt(args: &[String]) {
                 })
             });
 
-            if let Some(messages_url) = prompt_record.messages_url.as_deref()
-                && let Ok(Some(messages)) = cas_bridge::resolve_cas_messages(messages_url)
-                && let Ok(messages_json) = serde_json::to_value(&messages)
+            let lookup = cas_bridge::lookup_transcript(prompt_record.messages_url.as_deref());
+            let mut transcript = serde_json::json!({ "status": lookup.status() });
+            if let Some(reason) = lookup.reason()
+                && let Some(obj) = transcript.as_object_mut()
+            {
+                obj.insert("reason".to_string(), serde_json::Value::String(reason));
+            }
+            if let TranscriptLookup::Found(messages) = &lookup
+                && let Ok(messages_json) = serde_json::to_value(messages)
                 && let Some(obj) = prompt_json.as_object_mut()
             {
                 obj.insert("messages".to_string(), messages_json);
             }
 
-            let output = serde_json::json!({
-                "commit": commit_sha,
-                "prompt_id": parsed.prompt_id,
+            let mut output = serde_json::json!({
+                "commit": resolved.commit_sha,
+                "prompt_id": resolved.prompt_id,
                 "prompt": prompt_json,
+                "transcript": transcript,
             });
+            if resolved.prompt_id != parsed.prompt_id
+                && let Some(obj) = output.as_object_mut()
+            {
+                obj.insert(
+                    "query".to_string(),
+                    serde_json::Value::String(parsed.prompt_id.clone()),
+                );
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
             );
+        }
+        Err(crate::error::AutterError::Generic(msg)) => {
+            eprintln!("Error: {}", msg);
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("Error: {}", e);

@@ -1,0 +1,8 @@
+---
+source: src/authorship/prompt_utils.rs
+expression: err.to_string()
+---
+Generic error: Prompt ID 's_3f9a' is ambiguous. It matches:
+  s_3f9a2c1d4e5f60  claude  opus                commit abcdef01
+  s_3f9a2c1d9999aa  codex   model not recorded  commit abcdef01
+Use more characters, or the full ID.

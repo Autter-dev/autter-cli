@@ -69,6 +69,11 @@ pub struct BlameAnalysisResult {
     pub blame_hunks: Vec<BlameHunk>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub humans: BTreeMap<String, HumanRecord>,
+    /// Line number -> prompt hash (key into `prompt_records`) for AI lines,
+    /// whatever `line_authors` shows. Lets the default output name the prompt
+    /// behind each line without switching its author column to hashes.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub line_prompts: HashMap<u32, String>,
 }
 
 struct PreparedBlameRequest {
@@ -432,6 +437,7 @@ impl Repository {
             authorship_logs,
             prompt_commits,
             commits_with_notes,
+            line_prompts,
         ) = overlay_ai_authorship(self, &blame_hunks, relative_file_path, options)?;
 
         Ok((
@@ -441,6 +447,7 @@ impl Repository {
                 session_records,
                 blame_hunks,
                 humans,
+                line_prompts,
             },
             authorship_logs,
             prompt_commits,
@@ -569,8 +576,9 @@ impl Repository {
             line_authors,
             prompt_records,
             session_records: _,
-            blame_hunks: _,
+            blame_hunks,
             humans: _,
+            line_prompts,
         } = analysis;
 
         if request.options.no_output {
@@ -579,11 +587,16 @@ impl Repository {
 
         // `--why <file>:<line>`: explain a single line and return early.
         if let Some(why_line) = request.options.why_line {
+            let line_commit = blame_hunks
+                .iter()
+                .find(|h| h.range.0 <= why_line && why_line <= h.range.1)
+                .map(|h| h.commit_sha.as_str());
             output_why_format(
                 self,
                 why_line,
                 &line_authors,
                 &prompt_records,
+                line_commit,
                 &request.relative_file_path,
                 &lines,
                 &request.options,
@@ -626,6 +639,7 @@ impl Repository {
                 self,
                 &line_authors,
                 &prompt_records,
+                &line_prompts,
                 &request.relative_file_path,
                 &lines,
                 &request.line_ranges,
@@ -1106,10 +1120,12 @@ fn overlay_ai_authorship(
         Vec<AuthorshipLog>,
         HashMap<String, Vec<String>>,      // prompt_hash -> commit_shas
         std::collections::HashSet<String>, // commit SHAs with real authorship notes
+        HashMap<u32, String>,              // line -> prompt hash, for AI lines
     ),
     AutterError,
 > {
     let mut line_authors: HashMap<u32, String> = HashMap::new();
+    let mut line_prompts: HashMap<u32, String> = HashMap::new();
     let mut prompt_records: HashMap<String, PromptRecord> = HashMap::new();
     let mut session_records: HashMap<String, SessionRecord> = HashMap::new();
     let mut humans: BTreeMap<String, HumanRecord> = BTreeMap::new();
@@ -1185,6 +1201,7 @@ fn overlay_ai_authorship(
                             .entry(prompt_hash.clone())
                             .or_default()
                             .insert(hunk.commit_sha.clone());
+                        line_prompts.insert(current_line_num, prompt_hash.clone());
                         if options.use_prompt_hashes_as_names {
                             line_authors.insert(current_line_num, prompt_hash.clone());
                         } else {
@@ -1285,6 +1302,7 @@ fn overlay_ai_authorship(
 
             // Mark all lines in this hunk as AI-authored by the detected tool
             for line_num in hunk.range.0..=hunk.range.1 {
+                line_prompts.insert(line_num, prompt_hash.clone());
                 if options.use_prompt_hashes_as_names {
                     line_authors.insert(line_num, prompt_hash.clone());
                 } else {
@@ -1329,6 +1347,7 @@ fn overlay_ai_authorship(
         authorship_logs,
         prompt_commits_vec,
         commits_with_notes,
+        line_prompts,
     ))
 }
 
@@ -1740,13 +1759,15 @@ fn output_incremental_format(
 }
 
 // Takes the same display context as the sibling formatters plus the prompt
-// records it needs for `--show-prompt`; bundling them would leave this one
-// formatter shaped differently from its siblings for no gain.
+// records and line -> prompt map it needs for the prompt legend and
+// `--show-prompt`; bundling them would leave this one formatter shaped
+// differently from its siblings for no gain.
 #[allow(clippy::too_many_arguments)]
 fn output_default_format(
     repo: &Repository,
     line_authors: &HashMap<u32, String>,
     prompt_records: &HashMap<String, PromptRecord>,
+    line_prompts: &HashMap<u32, String>,
     file_path: &str,
     lines: &[&str],
     line_ranges: &[(u32, u32)],
@@ -1786,6 +1807,31 @@ fn output_default_format(
         }
     }
 
+    // Prompts behind the AI lines shown, for the legend and `--show-prompt`.
+    // Lines from commits without a note (agent detected from the commit email)
+    // have no prompt that `show-prompt` could find, so they are left out.
+    let shown_prompts: Vec<(u32, &str)> = requested_lines
+        .iter()
+        .filter_map(|line_num| {
+            let hash = line_prompts.get(line_num)?;
+            let hunk = line_to_hunk.get(line_num)?;
+            (commits_with_notes.contains(&hunk.commit_sha) && prompt_records.contains_key(hash))
+                .then_some((*line_num, hash.as_str()))
+        })
+        .collect();
+    let short_refs = crate::authorship::prompt_utils::short_prompt_refs(
+        shown_prompts.iter().map(|(_, hash)| *hash),
+    );
+    let inline_prompt_ref = |author: &str| -> Option<String> {
+        let prompt = prompt_records.get(author)?;
+        let key = crate::authorship::prompt_utils::prompt_key(author);
+        let short = short_refs
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| crate::authorship::prompt_utils::short_prompt_ref(author));
+        Some(format!("{} [{}]", prompt.agent_id.tool, short))
+    };
+
     // Calculate the maximum line number width for proper padding
     let max_line_num = lines.len() as u32;
     let line_num_width = max_line_num.to_string().len();
@@ -1798,10 +1844,10 @@ fn output_default_format(
             .unwrap_or(&hunk.original_author);
         let author_display = if options.suppress_author {
             "".to_string()
-        } else if options.show_prompt && prompt_records.contains_key(author) {
-            let prompt = &prompt_records[author];
-            let short_hash = &author[..7.min(author.len())];
-            format!("{} [{}]", prompt.agent_id.tool, short_hash)
+        } else if options.show_prompt
+            && let Some(display) = inline_prompt_ref(author)
+        {
+            display
         } else if options.show_email {
             format!("{} <{}>", author, &hunk.author_email)
         } else {
@@ -1850,10 +1896,10 @@ fn output_default_format(
             // Handle different output formats based on flags
             let author_display = if options.suppress_author {
                 "".to_string()
-            } else if options.show_prompt && prompt_records.contains_key(author) {
-                let prompt = &prompt_records[author];
-                let short_hash = &author[..7.min(author.len())];
-                format!("{} [{}]", prompt.agent_id.tool, short_hash)
+            } else if options.show_prompt
+                && let Some(display) = inline_prompt_ref(author)
+            {
+                display
             } else if options.show_email {
                 format!("{} <{}>", author, &hunk.author_email)
             } else {
@@ -1941,6 +1987,21 @@ fn output_default_format(
         output.push_str(stats);
     }
 
+    // The path from a line to its prompt: a legend of the prompts behind the
+    // AI lines, with references `show-prompt` and `blame --why` take. Shown on
+    // a terminal (and with `--show-prompt`), so piped output stays one line
+    // per source line like `git blame`.
+    let interactive =
+        io::stdout().is_terminal() || std::env::var_os("AUTTER_TEST_FORCE_TTY").is_some();
+    if (interactive || options.show_prompt) && !shown_prompts.is_empty() {
+        output.push_str(&format_prompt_legend(
+            &shown_prompts,
+            prompt_records,
+            &short_refs,
+            file_path,
+        ));
+    }
+
     // Interactive TTY only: explain git-author fallback so blame doesn't look
     // like it contradicts `autter stats` on the same commit. Keep porcelain /
     // pager-piped / scripted output byte-compatible with git blame.
@@ -1991,21 +2052,128 @@ fn output_default_format(
     Ok(())
 }
 
+/// The legend that ends default blame output: one row per prompt behind the
+/// AI lines shown, in order of first line, with the short reference that
+/// `autter show-prompt` and `autter blame --why` take.
+fn format_prompt_legend(
+    shown_prompts: &[(u32, &str)],
+    prompt_records: &HashMap<String, PromptRecord>,
+    short_refs: &HashMap<String, String>,
+    file_path: &str,
+) -> String {
+    use crate::authorship::prompt_utils::{prompt_key, short_prompt_ref};
+
+    // prompt key -> (record, lines), in order of first appearance.
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_key: HashMap<&str, (&PromptRecord, Vec<u32>)> = HashMap::new();
+    let mut sorted: Vec<(u32, &str)> = shown_prompts.to_vec();
+    sorted.sort_unstable();
+    for (line, hash) in sorted {
+        let Some(record) = prompt_records.get(hash) else {
+            continue;
+        };
+        let key = prompt_key(hash);
+        by_key
+            .entry(key)
+            .or_insert_with(|| {
+                order.push(key);
+                (record, Vec::new())
+            })
+            .1
+            .push(line);
+    }
+    if order.is_empty() {
+        return String::new();
+    }
+
+    let rows: Vec<(String, &str, &str, String)> = order
+        .iter()
+        .map(|key| {
+            let (record, lines) = &by_key[key];
+            let short = short_refs
+                .get(*key)
+                .cloned()
+                .unwrap_or_else(|| short_prompt_ref(key));
+            let model = if record.agent_id.model.is_empty() {
+                "model not recorded"
+            } else {
+                record.agent_id.model.as_str()
+            };
+            (
+                short,
+                record.agent_id.tool.as_str(),
+                model,
+                format_line_list(lines),
+            )
+        })
+        .collect();
+    let ref_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let tool_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+    let model_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("\nPrompts behind the AI lines:\n");
+    for (short, tool, model, lines) in &rows {
+        out.push_str(&format!(
+            "  {short:<ref_w$}  {tool:<tool_w$}  {model:<model_w$}  {lines}\n"
+        ));
+    }
+    let example_line = shown_prompts
+        .iter()
+        .map(|(line, _)| *line)
+        .min()
+        .unwrap_or(1);
+    out.push_str(&format!(
+        "Details: autter show-prompt {}  |  autter blame --why {file_path}:{example_line}\n",
+        rows[0].0
+    ));
+    out
+}
+
+/// `3-5, 9` style list of sorted line numbers, prefixed `line`/`lines`.
+fn format_line_list(lines: &[u32]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = lines[i];
+        let mut end = start;
+        while i + 1 < lines.len() && lines[i + 1] == end + 1 {
+            i += 1;
+            end = lines[i];
+        }
+        parts.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        });
+        i += 1;
+    }
+    let label = if lines.len() == 1 { "line" } else { "lines" };
+    format!("{label} {}", parts.join(", "))
+}
+
 /// `autter blame --why <file>:<line>`: explain who/what produced a single line.
 ///
-/// Resolves the line's prompt hash to its [`PromptRecord`], prints the agent,
-/// human author, stats, any issue/PR links from `custom_attributes`, and the
-/// resolved prompt transcript (from the local CAS cache / sync queue / cloud).
+/// Resolves the line's prompt hash to its [`PromptRecord`] and prints the path
+/// from the line to its change: the agent and model, the prompt reference that
+/// `autter show-prompt` takes, the agent's own session ID, the commit, any
+/// issue/PR links from `custom_attributes`, and the prompt transcript (from the
+/// local CAS cache / sync queue / cloud), or why the transcript is missing.
 /// With `--open`, also opens the most relevant URL in a browser.
+#[allow(clippy::too_many_arguments)]
 fn output_why_format(
     _repo: &Repository,
     why_line: u32,
     line_authors: &HashMap<u32, String>,
     prompt_records: &HashMap<String, PromptRecord>,
+    line_commit: Option<&str>,
     file_path: &str,
     lines: &[&str],
     options: &AutterBlameOptions,
 ) -> Result<(), AutterError> {
+    use crate::authorship::cas_bridge::TranscriptLookup;
+    use crate::authorship::prompt_utils::{prompt_key, short_prompt_ref};
+
     if why_line == 0 || (why_line as usize) > lines.len() {
         return Err(AutterError::Generic(format!(
             "Line {} is out of range for {} ({} lines)",
@@ -2046,16 +2214,34 @@ fn output_why_format(
     };
 
     let hash = author.expect("prompt implies author present");
+    let key = prompt_key(hash);
+    let short = short_prompt_ref(hash);
 
     println!("Produced by AI");
-    println!("  agent:  {}", prompt.agent_id.tool);
-    if !prompt.agent_id.model.is_empty() {
-        println!("  model:  {}", prompt.agent_id.model);
+    println!("  agent:    {}", prompt.agent_id.tool);
+    if prompt.agent_id.model.is_empty() {
+        println!("  model:    not recorded");
+    } else {
+        println!("  model:    {}", prompt.agent_id.model);
     }
     if let Some(human) = &prompt.human_author {
-        println!("  human:  {human}");
+        println!("  human:    {human}");
     }
-    println!("  prompt: {}", &hash[..hash.len().min(12)]);
+    println!("  prompt:   {short}  (full ID {key})");
+    if !prompt.agent_id.id.is_empty() {
+        println!(
+            "  session:  {}  (the agent's own session ID)",
+            prompt.agent_id.id
+        );
+    }
+    if let Some(commit) = line_commit {
+        println!("  commit:   {commit}");
+    }
+    println!();
+    println!("Full record: autter show-prompt {short}");
+    if let Some(commit) = line_commit {
+        println!("The change:  git show {}", &commit[..commit.len().min(12)]);
+    }
 
     // Surface issue/PR links and any other custom attributes.
     if let Some(attrs) = &prompt.custom_attributes
@@ -2072,26 +2258,21 @@ fn output_why_format(
         }
     }
 
-    // Resolve and print the prompt transcript locally.
-    if let Some(messages_url) = &prompt.messages_url {
-        match crate::authorship::cas_bridge::resolve_cas_messages(messages_url) {
-            Ok(Some(messages)) if !messages.is_empty() => {
-                println!();
-                println!("Prompt:");
-                print_why_transcript(&messages);
-            }
-            Ok(_) => {
-                println!();
-                println!("Prompt transcript is not available locally ({messages_url}).");
-            }
-            Err(e) => {
-                println!();
-                println!("Could not resolve prompt transcript: {e}");
+    // Resolve and print the prompt transcript, or say why it is missing.
+    println!();
+    match crate::authorship::cas_bridge::lookup_transcript(prompt.messages_url.as_deref()) {
+        TranscriptLookup::Found(messages) if !messages.is_empty() => {
+            println!("Prompt:");
+            print_why_transcript(&messages);
+        }
+        TranscriptLookup::Found(_) => {
+            println!("The prompt transcript is empty.");
+        }
+        other => {
+            if let Some(reason) = other.reason() {
+                println!("{reason}");
             }
         }
-    } else {
-        println!();
-        println!("No prompt transcript is associated with this line.");
     }
 
     // `--open`: open the most relevant URL in the browser.
@@ -2614,5 +2795,56 @@ mod unquote_git_path_tests {
     fn unquotes_escapes_and_octal_utf8() {
         assert_eq!(unquote_git_path("\"a\\\"b.txt\""), "a\"b.txt");
         assert_eq!(unquote_git_path("\"caf\\303\\251.txt\""), "café.txt");
+    }
+}
+
+#[cfg(test)]
+mod prompt_legend_tests {
+    use super::{format_line_list, format_prompt_legend};
+    use crate::authorship::authorship_log::PromptRecord;
+    use crate::authorship::prompt_utils::short_prompt_refs;
+    use crate::authorship::working_log::AgentId;
+    use std::collections::HashMap;
+
+    fn record(tool: &str, model: &str) -> PromptRecord {
+        PromptRecord {
+            agent_id: AgentId {
+                tool: tool.to_string(),
+                id: "agent-session".to_string(),
+                model: model.to_string(),
+            },
+            human_author: None,
+            messages_url: None,
+            total_additions: 0,
+            total_deletions: 0,
+            accepted_lines: 0,
+            overriden_lines: 0,
+            custom_attributes: None,
+        }
+    }
+
+    #[test]
+    fn line_lists_collapse_runs() {
+        assert_eq!(format_line_list(&[7]), "line 7");
+        assert_eq!(
+            format_line_list(&[3, 4, 5, 9, 11, 12]),
+            "lines 3-5, 9, 11-12"
+        );
+    }
+
+    #[test]
+    fn legend_groups_traces_by_session() {
+        let a1 = "s_3f9a2c1d4e5f60::t_aaaaaaaaaaaaaa";
+        let a2 = "s_3f9a2c1d4e5f60::t_bbbbbbbbbbbbbb";
+        let b = "s_0b12ce44aa0099::t_cccccccccccccc";
+        let mut records = HashMap::new();
+        records.insert(a1.to_string(), record("claude", "claude-opus-4-5"));
+        records.insert(a2.to_string(), record("claude", "claude-opus-4-5"));
+        records.insert(b.to_string(), record("codex", ""));
+        let shown = vec![(3, a1), (4, a1), (5, a2), (9, a1), (12, b)];
+        let refs = short_prompt_refs(shown.iter().map(|(_, h)| *h));
+
+        let legend = format_prompt_legend(&shown, &records, &refs, "src/lib.rs");
+        insta::assert_snapshot!(legend);
     }
 }
