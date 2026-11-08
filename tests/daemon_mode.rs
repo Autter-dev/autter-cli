@@ -1002,10 +1002,26 @@ fn checkpoint_fails_hard_when_daemon_startup_is_blocked() {
     let held_lock = DaemonLock::acquire(&daemon_lock_path(&repo))
         .expect("should acquire daemon lock before checkpoint invocation");
 
-    let result = repo.autter(&["checkpoint", "mock_ai", "delegate-fallback-blocked.txt"]);
+    // Since 257f8e3 a direct checkpoint (no hook payload) exits non-zero when
+    // it can't be captured, so a person or script can tell it was dropped.
+    let error = repo
+        .autter(&["checkpoint", "mock_ai", "delegate-fallback-blocked.txt"])
+        .expect_err("a direct checkpoint must fail when the service can't start");
     assert!(
-        result.is_ok(),
-        "checkpoint should exit(0) when daemon is unavailable (never block agents)"
+        error.contains("checkpoint dropped"),
+        "the failure should say the checkpoint was dropped, got:\n{error}"
+    );
+
+    // A hook run still exits 0: a non-zero exit can block or alarm the agent.
+    let hook_run = repo
+        .autter_command(&["checkpoint", "mock_ai", "delegate-fallback-blocked.txt"])
+        .env("AUTTER_CHECKPOINT_HOOK", "1")
+        .output()
+        .expect("spawn autter checkpoint");
+    assert!(
+        hook_run.status.success(),
+        "a hook checkpoint must exit 0 when the service is unavailable (never block agents):\n{}",
+        String::from_utf8_lossy(&hook_run.stderr)
     );
 
     drop(held_lock);
