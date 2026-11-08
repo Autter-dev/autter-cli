@@ -1011,6 +1011,17 @@ pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<()
 /// Shut down the running daemon and start a fresh one. Escalates to hard kill
 /// if the soft shutdown doesn't complete within GRACEFUL_SHUTDOWN_TIMEOUT.
 pub(crate) fn restart_daemon(config: &DaemonConfig) -> Result<(), String> {
+    // Test builds never start a daemon (see ensure_daemon_running), so a
+    // restart would only stop one: `autter doctor` restarting a slow service
+    // took a shared test daemon down for every later test using it.
+    #[cfg(any(test, feature = "test-support"))]
+    if daemon_is_up(config) || daemon_startup_is_blocked(config) {
+        return Err(
+            "restart skipped in a test build: the test harness owns the background service"
+                .to_string(),
+        );
+    }
+
     let was_running = daemon_is_up(config) || daemon_startup_is_blocked(config);
     if was_running {
         stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)?;
