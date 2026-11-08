@@ -28,10 +28,11 @@ use crate::utils::LockFile;
 use crate::{
     authorship::post_commit::post_commit_with_final_state,
     authorship::rebase_authorship::{
-        committed_file_snapshot_between_commits, prepare_working_log_after_squash_from_final_state,
-        reconstruct_working_log_after_reset, restore_virtual_attribution_carryover,
-        restore_working_log_carryover, rewrite_authorship_after_commit_amend_with_snapshot,
-        rewrite_authorship_if_needed,
+        committed_file_snapshot_between_commits, merge_working_log_after_squash_from_final_state,
+        prepare_working_log_after_squash_from_final_state, reconstruct_working_log_after_reset,
+        restore_virtual_attribution_carryover, restore_working_log_carryover,
+        rewrite_authorship_after_commit_amend_with_snapshot, rewrite_authorship_if_needed,
+        take_pending_no_commit_pick,
     },
     authorship::working_log::{AgentId, CheckpointKind},
     commands::checkpoint_agent::orchestrator::CheckpointRequest,
@@ -2623,13 +2624,20 @@ fn seed_merge_squash_working_log_for_commit_replay(
     author: &str,
     exact_final_state: Option<&HashMap<String, String>>,
 ) -> Result<(), AutterError> {
-    if working_log_has_tracked_state_for_base(repo, base_commit) {
+    // `cherry-pick -n` keeps the live working log, so tracked state there does
+    // not mean the picked lines are already accounted for.
+    let has_tracked_state = working_log_has_tracked_state_for_base(repo, base_commit);
+    let pending_no_commit_pick = take_pending_no_commit_pick(repo, base_commit);
+    if has_tracked_state && !pending_no_commit_pick {
         return Ok(());
     }
 
     let Some(merge_squash) = preceding_merge_squash_for_pending_commit(repo, base_commit)? else {
         return Ok(());
     };
+    if has_tracked_state && !merge_squash.preserve_working_log {
+        return Ok(());
+    }
 
     let merge_base = repo
         .merge_base(
@@ -2662,6 +2670,15 @@ fn seed_merge_squash_working_log_for_commit_replay(
         );
         return Ok(());
     };
+    if has_tracked_state {
+        return merge_working_log_after_squash_from_final_state(
+            repo,
+            &merge_squash.source_head,
+            base_commit,
+            final_state,
+            author,
+        );
+    }
     prepare_working_log_after_squash_from_final_state(
         repo,
         &merge_squash.source_head,

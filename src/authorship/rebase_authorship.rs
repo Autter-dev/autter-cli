@@ -127,6 +127,9 @@ pub fn load_rebase_note_cache(
 struct CommitTrackedDelta {
     changed_files: HashSet<String>,
     file_to_blob_oid: HashMap<String, Option<String>>,
+    /// `(old path, new path)` for tracked files this commit renamed. Only
+    /// filled when the diff ran with rename detection.
+    renames: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -171,6 +174,13 @@ pub fn rewrite_authorship_if_needed(
             );
         }
         RewriteLogEvent::MergeSquash { merge_squash } => {
+            // `cherry-pick -n` may run on a dirty tree, so its live log is kept
+            // and the next commit merges the picked attribution into it. Mark
+            // that before the head check: this service can process the pick
+            // after the user already committed.
+            if merge_squash.preserve_working_log {
+                mark_pending_no_commit_pick(repo, &merge_squash.base_head)?;
+            }
             let current_head = repo
                 .head()
                 .ok()
@@ -185,7 +195,7 @@ pub fn rewrite_authorship_if_needed(
             }
             // --squash always fails if repo is not clean
             // this clears old working logs in the event you reset, make manual changes, reset, try again
-            // (`cherry-pick -n` may run on a dirty tree, so its live log is kept.)
+            // (`cherry-pick -n` keeps its live log; see above.)
             if !merge_squash.preserve_working_log {
                 repo.storage
                     .delete_working_log_for_base_commit(&merge_squash.base_head)?;
@@ -434,6 +444,228 @@ pub fn prepare_working_log_after_squash_from_final_state(
     final_state: &HashMap<String, String>,
     _human_author: &str,
 ) -> Result<(), AutterError> {
+    let Some((initial_attributions, initial_file_contents)) =
+        squash_initial_attributions_from_final_state(
+            repo,
+            source_head_sha,
+            target_branch_head_sha,
+            final_state,
+        )?
+    else {
+        return Ok(());
+    };
+
+    let working_log = repo
+        .storage
+        .working_log_for_base_commit(target_branch_head_sha)?;
+    working_log.write_initial_attributions_with_contents(
+        initial_attributions.files,
+        initial_attributions.prompts,
+        initial_attributions.humans,
+        initial_file_contents,
+        initial_attributions.sessions,
+    )?;
+
+    Ok(())
+}
+
+/// Marker left in a working log by `git cherry-pick -n`. That pick keeps the
+/// live working log, so the commit that follows has to merge the picked
+/// attribution into it instead of skipping because tracked state exists.
+const PENDING_NO_COMMIT_PICK_MARKER: &str = "pending_no_commit_pick";
+
+pub fn mark_pending_no_commit_pick(
+    repo: &Repository,
+    base_commit: &str,
+) -> Result<(), AutterError> {
+    let working_log = repo.storage.working_log_for_base_commit(base_commit)?;
+    std::fs::write(working_log.dir.join(PENDING_NO_COMMIT_PICK_MARKER), b"")?;
+    Ok(())
+}
+
+/// Removes the `cherry-pick -n` marker for `base_commit` and says whether it
+/// was there.
+pub fn take_pending_no_commit_pick(repo: &Repository, base_commit: &str) -> bool {
+    if !repo.storage.has_working_log(base_commit) {
+        return false;
+    }
+    let marker = repo
+        .storage
+        .working_logs
+        .join(base_commit)
+        .join(PENDING_NO_COMMIT_PICK_MARKER);
+    std::fs::remove_file(marker).is_ok()
+}
+
+/// Like [`prepare_working_log_after_squash_from_final_state`], but keeps what
+/// the working log already tracks. Used after `git cherry-pick -n` on a tree
+/// with uncommitted AI work: the picked lines get the source commits'
+/// attribution and the live lines keep theirs.
+///
+/// When the commit is built, the newest checkpoint entry with attribution data
+/// for a file replaces INITIAL for that file, so picked lines are merged into
+/// that entry when there is one, and into INITIAL otherwise.
+pub fn merge_working_log_after_squash_from_final_state(
+    repo: &Repository,
+    source_head_sha: &str,
+    target_branch_head_sha: &str,
+    final_state: &HashMap<String, String>,
+    _human_author: &str,
+) -> Result<(), AutterError> {
+    use crate::authorship::attribution_tracker::{
+        attributions_to_line_attributions, line_attributions_to_attributions,
+    };
+
+    let Some((picked, picked_contents)) = squash_initial_attributions_from_final_state(
+        repo,
+        source_head_sha,
+        target_branch_head_sha,
+        final_state,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let working_log = repo
+        .storage
+        .working_log_for_base_commit(target_branch_head_sha)?;
+    let mut initial = working_log.read_initial_attributions();
+    let mut checkpoints = working_log.read_all_checkpoints().unwrap_or_default();
+    let mut checkpoints_changed = false;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    for (file_path, picked_attrs) in &picked.files {
+        let Some(final_content) = picked_contents
+            .get(file_path)
+            .or_else(|| final_state.get(file_path))
+        else {
+            continue;
+        };
+
+        let live_entry = checkpoints
+            .iter_mut()
+            .rev()
+            .flat_map(|checkpoint| checkpoint.entries.iter_mut())
+            .find(|entry| {
+                entry.file == *file_path
+                    && !(entry.line_attributions.is_empty() && entry.attributions.is_empty())
+            });
+        if let Some(entry) = live_entry {
+            // Without the entry's content there is no safe way to line its
+            // attribution up with the committed file; leave it as it is.
+            let Ok(live_content) = working_log.get_file_version(&entry.blob_sha) else {
+                continue;
+            };
+            let live_attrs = if entry.line_attributions.is_empty() {
+                attributions_to_line_attributions(&entry.attributions, &live_content)
+            } else {
+                entry.line_attributions.clone()
+            };
+            let carried =
+                diff_based_line_attribution_transfer(&live_content, final_content, &live_attrs);
+            let merged = merge_line_attributions_preferring_first(&carried, picked_attrs);
+            entry.attributions = line_attributions_to_attributions(&merged, final_content, now_ms);
+            entry.line_attributions = merged;
+            entry.blob_sha = working_log.persist_file_version(final_content)?;
+            checkpoints_changed = true;
+            continue;
+        }
+
+        let existing = initial.files.get(file_path).cloned().unwrap_or_default();
+        let carried = if existing.is_empty() {
+            existing
+        } else {
+            match working_log.stored_initial_file_content_from(&initial, file_path) {
+                Some(content) => {
+                    diff_based_line_attribution_transfer(&content, final_content, &existing)
+                }
+                None => existing,
+            }
+        };
+        let merged = merge_line_attributions_preferring_first(&carried, picked_attrs);
+        initial.files.insert(file_path.clone(), merged);
+        initial.file_blobs.insert(
+            file_path.clone(),
+            working_log.persist_file_version(final_content)?,
+        );
+    }
+
+    for (prompt_id, record) in picked.prompts {
+        initial.prompts.entry(prompt_id).or_insert(record);
+    }
+    for (hash, record) in picked.humans {
+        initial.humans.entry(hash).or_insert(record);
+    }
+    for (session_id, record) in picked.sessions {
+        initial.sessions.entry(session_id).or_insert(record);
+    }
+
+    if checkpoints_changed {
+        working_log.write_all_checkpoints(&checkpoints)?;
+    }
+    working_log.write_initial(initial)?;
+
+    Ok(())
+}
+
+/// Merges two line attribution lists for the same content. Lines covered by
+/// `primary` keep its author; `secondary` only fills lines `primary` leaves
+/// empty.
+fn merge_line_attributions_preferring_first(
+    primary: &[crate::authorship::attribution_tracker::LineAttribution],
+    secondary: &[crate::authorship::attribution_tracker::LineAttribution],
+) -> Vec<crate::authorship::attribution_tracker::LineAttribution> {
+    use crate::authorship::attribution_tracker::LineAttribution;
+
+    let mut author_by_line: BTreeMap<u32, &str> = BTreeMap::new();
+    for attr in secondary {
+        for line in attr.start_line..=attr.end_line {
+            author_by_line.insert(line, attr.author_id.as_str());
+        }
+    }
+    for attr in primary {
+        for line in attr.start_line..=attr.end_line {
+            author_by_line.insert(line, attr.author_id.as_str());
+        }
+    }
+
+    let mut merged: Vec<LineAttribution> = Vec::new();
+    for (line, author_id) in author_by_line {
+        if let Some(last) = merged.last_mut()
+            && last.end_line + 1 == line
+            && last.author_id == author_id
+        {
+            last.end_line = line;
+            continue;
+        }
+        merged.push(LineAttribution {
+            start_line: line,
+            end_line: line,
+            author_id: author_id.to_string(),
+            overrode: None,
+        });
+    }
+    merged
+}
+
+/// INITIAL-style attributions plus the file contents they describe.
+type SquashInitialState = (
+    crate::git::repo_storage::InitialAttributions,
+    HashMap<String, String>,
+);
+
+/// The attribution a squash (or `cherry-pick -n`) brings in, computed against
+/// the exact committed contents. Returns the INITIAL-style attributions and the
+/// file contents they describe, or `None` when there is nothing to attribute.
+fn squash_initial_attributions_from_final_state(
+    repo: &Repository,
+    source_head_sha: &str,
+    target_branch_head_sha: &str,
+    final_state: &HashMap<String, String>,
+) -> Result<Option<SquashInitialState>, AutterError> {
     use crate::authorship::virtual_attribution::{
         VirtualAttributions, merge_attributions_favoring_first,
     };
@@ -448,7 +680,7 @@ pub fn prepare_working_log_after_squash_from_final_state(
 
     let changed_files = repo.diff_changed_files(source_head_sha, target_branch_head_sha)?;
     if changed_files.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let repo_clone = repo.clone();
@@ -486,23 +718,13 @@ pub fn prepare_working_log_after_squash_from_final_state(
 
     let merged_va = merge_attributions_favoring_first(target_va, source_va, squash_files)?;
     let initial_attributions = merged_va.to_initial_working_log_only();
-
-    if !initial_attributions.files.is_empty() {
-        let working_log = repo
-            .storage
-            .working_log_for_base_commit(target_branch_head_sha)?;
-        let initial_file_contents =
-            merged_va.snapshot_contents_for_files(initial_attributions.files.keys());
-        working_log.write_initial_attributions_with_contents(
-            initial_attributions.files,
-            initial_attributions.prompts,
-            initial_attributions.humans,
-            initial_file_contents,
-            initial_attributions.sessions,
-        )?;
+    if initial_attributions.files.is_empty() {
+        return Ok(None);
     }
+    let initial_file_contents =
+        merged_va.snapshot_contents_for_files(initial_attributions.files.keys());
 
-    Ok(())
+    Ok(Some((initial_attributions, initial_file_contents)))
 }
 
 /// Restore carried-over uncommitted authorship after an async head/base transition.
@@ -775,6 +997,7 @@ fn try_reconstruct_attributions_from_notes_cached(
     _is_squash_rebase: bool,
     note_cache: &RebaseNoteCache,
     original_hunks: &HunksByCommitAndFile,
+    renames_by_commit: &HashMap<String, Vec<(String, String)>>,
 ) -> Option<(
     HashMap<
         String,
@@ -837,6 +1060,16 @@ fn try_reconstruct_attributions_from_notes_cached(
         .collect();
 
     for commit in &all_commits_ordered {
+        // Step 0: A file this commit renamed keeps its attribution under the new
+        // path. The commit's hunks for it are relative to the old content.
+        if let Some(renames) = renames_by_commit.get(*commit) {
+            for (old_path, new_path) in renames {
+                if let Some(attrs) = file_attrs.remove(old_path) {
+                    file_attrs.insert(new_path.clone(), attrs);
+                }
+            }
+        }
+
         // Step 1: Apply this commit's hunks to shift existing attributions.
         if let Some(file_hunks) = original_hunks.get(*commit) {
             for (file_path, hunks) in file_hunks {
@@ -1270,8 +1503,38 @@ pub fn rewrite_authorship_after_rebase_v2(
         Vec::with_capacity(commits_to_process.len() + original_commits_for_processing.len());
     combined_commits.extend(commits_to_process.iter().cloned());
     combined_commits.extend(original_commits_for_processing.iter().cloned());
-    let (combined_diff_tree_result, combined_hunks) =
-        run_diff_tree_with_hunks(repo, &combined_commits, &pathspecs_lookup, &pathspecs)?;
+    let (mut combined_diff_tree_result, mut combined_hunks) =
+        run_diff_tree_with_hunks(repo, &combined_commits, &pathspecs_lookup, &pathspecs, false)?;
+
+    // A tracked file that disappears in one of these commits may have been
+    // renamed there. Track the paths it was renamed to and diff again with
+    // rename detection, so attribution follows the file instead of being
+    // dropped with the old path.
+    if combined_diff_tree_result.removes_a_tracked_file() {
+        let renamed_to = renamed_paths_within_commits(repo, &combined_commits, &pathspecs);
+        if !renamed_to.is_empty() {
+            pathspecs.extend(renamed_to);
+            let pathspecs_lookup: HashSet<&str> = pathspecs.iter().map(String::as_str).collect();
+            (combined_diff_tree_result, combined_hunks) = run_diff_tree_with_hunks(
+                repo,
+                &combined_commits,
+                &pathspecs_lookup,
+                &pathspecs,
+                true,
+            )?;
+        }
+    }
+
+    // Renames made by the commits themselves, by commit, plus where each
+    // renamed path ends up. A path renamed later in the branch has no state of
+    // its own at original_head, so it reads the state of its final path.
+    let renames_by_commit: HashMap<String, Vec<(String, String)>> = combined_diff_tree_result
+        .commit_deltas
+        .iter()
+        .filter(|(_, delta)| !delta.renames.is_empty())
+        .map(|(sha, delta)| (sha.clone(), delta.renames.clone()))
+        .collect();
+    let renamed_path_targets = final_paths_for_renames(renames_by_commit.values().flatten());
 
     // Partition diff-tree results: only new commits need DiffTreeResult metadata
     let new_commit_deltas: Vec<_> = combined_diff_tree_result
@@ -1338,6 +1601,7 @@ pub fn rewrite_authorship_after_rebase_v2(
             force_process_existing_notes,
             &note_cache,
             &original_hunks_by_commit,
+            &renames_by_commit,
         ) {
         tracing::debug!("Using fast note-based attribution reconstruction (skipping blame)");
         let ts = std::time::SystemTime::now()
@@ -1585,6 +1849,26 @@ pub fn rewrite_authorship_after_rebase_v2(
         // Get hunk data for this commit (from the pre-computed diff-tree -p -U0 output)
         let commit_hunks = hunks_by_commit.get(new_commit);
 
+        // Files this commit renamed carry their state to the new path. Their
+        // hunks are relative to the old content, so a synced file stays synced.
+        if let Some(renames) = renames_by_commit.get(new_commit) {
+            for (old_path, new_path) in renames {
+                if let Some(attrs) = current_attributions.remove(old_path) {
+                    current_attributions.insert(new_path.clone(), attrs);
+                }
+                if let Some(content) = current_file_contents.remove(old_path) {
+                    current_file_contents.insert(new_path.clone(), content);
+                    if files_with_synced_state.remove(old_path.as_str()) {
+                        files_with_synced_state.insert(new_path.clone());
+                    } else {
+                        files_with_synced_state.remove(new_path.as_str());
+                    }
+                }
+                existing_files.remove(old_path);
+                cached_file_attestation_text.remove(old_path);
+            }
+        }
+
         // Only transform attributions for files that actually changed.
         if !changed_files_in_commit.is_empty() {
             // Update file existence: use blob content when available, hunk data otherwise.
@@ -1674,13 +1958,21 @@ pub fn rewrite_authorship_after_rebase_v2(
                     total_files_diffed += 1;
                     let new_line_count = new_content.lines().count();
                     total_lines_diffed += new_line_count;
+                    let state_path = if current_file_contents.contains_key(file_path) {
+                        file_path.as_str()
+                    } else {
+                        renamed_path_targets
+                            .get(file_path.as_str())
+                            .map(String::as_str)
+                            .unwrap_or(file_path.as_str())
+                    };
                     let result = compute_line_attrs_for_changed_file(
                         new_content,
-                        current_file_contents.get(file_path),
+                        current_file_contents.get(state_path),
                         current_attributions
-                            .get(file_path)
+                            .get(state_path)
                             .map(|(_, la)| la.as_slice()),
-                        original_head_line_to_author.get(file_path),
+                        original_head_line_to_author.get(state_path),
                     );
                     loop_diff_ms += tdiff.elapsed().as_micros();
                     files_with_synced_state.insert(file_path.clone());
@@ -2022,17 +2314,6 @@ pub fn rewrite_authorship_after_rebase_v2(
     Ok(())
 }
 
-/// Rewrite authorship logs after cherry-pick using VirtualAttributions
-///
-/// This is the new implementation that uses VirtualAttributions to transform authorship
-/// through cherry-picked commits. It's simpler than rebase since cherry-pick just applies
-/// patches from source commits onto the current branch.
-///
-/// # Arguments
-/// * `repo` - Git repository
-/// * `source_commits` - Vector of source commit SHAs (commits being cherry-picked), oldest first
-/// * `new_commits` - Vector of new commit SHAs (after cherry-pick), oldest first
-/// * `_human_author` - The human author identifier (unused in this implementation)
 /// Renames of `paths` made by the branch a rebase replayed onto: compares the
 /// fork point of the original branch with the parent of the first rebased
 /// commit, with rename detection. Returns old path -> new path. Best effort: any
@@ -2092,6 +2373,117 @@ fn parse_name_status_renames(raw: &[u8], wanted: &HashSet<&str>) -> HashMap<Stri
     renames
 }
 
+/// Paths that tracked files are renamed to by `commits`, following chains of
+/// renames (a -> b, then b -> c). Returns only paths not already in `pathspecs`.
+/// Best effort: a git failure yields no renames, which is the previous
+/// behavior.
+fn renamed_paths_within_commits(
+    repo: &Repository,
+    commits: &[String],
+    pathspecs: &[String],
+) -> Vec<String> {
+    let mut args = repo.global_args_for_exec();
+    args.extend([
+        "diff-tree".to_string(),
+        "--stdin".to_string(),
+        "-r".to_string(),
+        "-M".to_string(),
+        "--name-status".to_string(),
+        "-z".to_string(),
+    ]);
+    let stdin_data = commits.join("\n") + "\n";
+    let output = match exec_git_stdin(&args, stdin_data.as_bytes()) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(%error, "rebase rename detection failed");
+            return Vec::new();
+        }
+    };
+    let renames = parse_diff_tree_name_status_renames(&output.stdout);
+
+    let mut tracked: HashSet<String> = pathspecs.iter().cloned().collect();
+    let mut renamed_to = Vec::new();
+    loop {
+        let mut grew = false;
+        for (old_path, new_path) in &renames {
+            if tracked.contains(old_path) && !tracked.contains(new_path) {
+                tracked.insert(new_path.clone());
+                renamed_to.push(new_path.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    renamed_to
+}
+
+/// Rename pairs from `git diff-tree --stdin -r -M --name-status -z` output,
+/// which puts each commit id before that commit's `status NUL path [NUL path]`
+/// records.
+fn parse_diff_tree_name_status_renames(raw: &[u8]) -> Vec<(String, String)> {
+    let is_commit_id = |token: &str| {
+        matches!(token.len(), 40 | 64) && token.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .map(|field| String::from_utf8_lossy(field).trim_matches('\n').to_string())
+        .filter(|field| !field.is_empty());
+    let mut renames = Vec::new();
+    while let Some(status) = fields.next() {
+        if is_commit_id(status.as_str()) {
+            continue;
+        }
+        if status.starts_with('R') || status.starts_with('C') {
+            let (Some(old_path), Some(new_path)) = (fields.next(), fields.next()) else {
+                break;
+            };
+            if status.starts_with('R') {
+                renames.push((old_path, new_path));
+            }
+        } else if fields.next().is_none() {
+            break;
+        }
+    }
+    renames
+}
+
+/// For every path that is renamed, the path it ends up at after all renames.
+fn final_paths_for_renames<'a>(
+    renames: impl Iterator<Item = &'a (String, String)>,
+) -> HashMap<String, String> {
+    let next: HashMap<&str, &str> = renames
+        .map(|(old_path, new_path)| (old_path.as_str(), new_path.as_str()))
+        .collect();
+    let mut targets = HashMap::new();
+    for start in next.keys() {
+        let mut current = *start;
+        // Bounded walk, so a rename cycle (a -> b, b -> a) cannot loop forever.
+        for _ in 0..next.len() {
+            match next.get(current) {
+                Some(following) if *following != *start => current = *following,
+                _ => break,
+            }
+        }
+        if current != *start {
+            targets.insert(start.to_string(), current.to_string());
+        }
+    }
+    targets
+}
+
+/// Rewrite authorship logs after cherry-pick using VirtualAttributions
+///
+/// This is the new implementation that uses VirtualAttributions to transform authorship
+/// through cherry-picked commits. It's simpler than rebase since cherry-pick just applies
+/// patches from source commits onto the current branch.
+///
+/// # Arguments
+/// * `repo` - Git repository
+/// * `source_commits` - Vector of source commit SHAs (commits being cherry-picked), oldest first
+/// * `new_commits` - Vector of new commit SHAs (after cherry-pick), oldest first
+/// * `_human_author` - The human author identifier (unused in this implementation)
 pub fn rewrite_authorship_after_cherry_pick(
     repo: &Repository,
     source_commits: &[String],
@@ -2613,6 +3005,13 @@ impl DiffTreeResult {
         }
         files
     }
+
+    /// Whether any commit deleted (or renamed away) a tracked file.
+    fn removes_a_tracked_file(&self) -> bool {
+        self.commit_deltas
+            .iter()
+            .any(|(_, delta)| delta.file_to_blob_oid.values().any(Option::is_none))
+    }
 }
 
 /// A unified diff hunk header parsed from `git diff-tree -p -U0` output.
@@ -2758,6 +3157,7 @@ fn run_diff_tree_with_hunks(
     commit_shas: &[String],
     pathspecs_lookup: &HashSet<&str>,
     pathspecs: &[String],
+    detect_renames: bool,
 ) -> Result<(DiffTreeResult, HunksByCommitAndFile), AutterError> {
     if commit_shas.is_empty() {
         return Ok((
@@ -2779,6 +3179,9 @@ fn run_diff_tree_with_hunks(
     args.push("--no-color".to_string());
     args.push("--no-abbrev".to_string());
     args.push("-r".to_string());
+    if detect_renames {
+        args.push("-M".to_string());
+    }
     if !pathspecs.is_empty() {
         args.push("--".to_string());
         args.extend(pathspecs.iter().cloned());
@@ -2845,6 +3248,13 @@ fn run_diff_tree_with_hunks(
                     };
 
                     if pathspecs_lookup.contains(file_path.as_str()) {
+                        if status_char == 'R'
+                            && let Some((old_path, _)) = raw_path.rsplit_once('\t')
+                        {
+                            current_delta
+                                .renames
+                                .push((old_path.to_string(), file_path.clone()));
+                        }
                         current_delta.changed_files.insert(file_path.clone());
                         let new_blob_oid = if is_zero_oid(new_oid) || !is_blob_mode(new_mode) {
                             None
@@ -4880,8 +5290,41 @@ pub fn transform_attributions_to_final_state(
 
 #[cfg(test)]
 mod upstream_rename_parse_tests {
-    use super::parse_name_status_renames;
+    use super::{
+        final_paths_for_renames, parse_diff_tree_name_status_renames, parse_name_status_renames,
+    };
     use std::collections::HashSet;
+
+    #[test]
+    fn diff_tree_renames_skip_commit_ids() {
+        let first = b"1111111111111111111111111111111111111111\0D\0other.txt\0";
+        let second = b"2222222222222222222222222222222222222222\0R083\0a.txt\0b.txt\0A\0x.txt\0";
+        let raw = [&first[..], &second[..]].concat();
+        let renames = parse_diff_tree_name_status_renames(&raw);
+        assert_eq!(renames, vec![("a.txt".to_string(), "b.txt".to_string())]);
+    }
+
+    #[test]
+    fn final_paths_follow_rename_chains() {
+        let renames = [
+            ("a.txt".to_string(), "b.txt".to_string()),
+            ("b.txt".to_string(), "c.txt".to_string()),
+        ];
+        let targets = final_paths_for_renames(renames.iter());
+        assert_eq!(targets.get("a.txt").map(String::as_str), Some("c.txt"));
+        assert_eq!(targets.get("b.txt").map(String::as_str), Some("c.txt"));
+    }
+
+    #[test]
+    fn final_paths_stop_on_rename_cycles() {
+        let renames = [
+            ("a.txt".to_string(), "b.txt".to_string()),
+            ("b.txt".to_string(), "a.txt".to_string()),
+        ];
+        let targets = final_paths_for_renames(renames.iter());
+        assert_eq!(targets.get("a.txt").map(String::as_str), Some("b.txt"));
+        assert_eq!(targets.get("b.txt").map(String::as_str), Some("a.txt"));
+    }
 
     #[test]
     fn keeps_only_wanted_renames() {

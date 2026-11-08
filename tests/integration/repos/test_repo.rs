@@ -1020,6 +1020,35 @@ impl TestRepo {
         Self::new_with_daemon_scope(DaemonTestScope::Dedicated)
     }
 
+    /// Stops this repo's dedicated background service and starts a new one,
+    /// so a test can check what survives a restart (anything the old process
+    /// only kept in memory is gone). Only for repos created with
+    /// `new_dedicated_daemon`.
+    pub fn restart_dedicated_daemon(&mut self) {
+        assert_eq!(
+            self.daemon_scope,
+            DaemonTestScope::Dedicated,
+            "restart_dedicated_daemon needs a repo with a dedicated daemon"
+        );
+        self.sync_daemon();
+        let old = self
+            .daemon_process
+            .take()
+            .expect("dedicated daemon should be running");
+        // Dropping the last handle shuts the process down exactly once.
+        match Arc::try_unwrap(old) {
+            Ok(daemon) => drop(daemon),
+            Err(shared) => shared.shutdown(),
+        }
+        let daemon = Arc::new(DaemonProcess::start(
+            &self.path,
+            &self.test_home,
+            &self.test_db_path,
+        ));
+        self.test_db_path = daemon.test_db_path.clone();
+        self.daemon_process = Some(daemon);
+    }
+
     fn write_test_config_to_home(&self, home: &Path) {
         let Some(patch) = &self.config_patch else {
             return;
