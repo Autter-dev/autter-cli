@@ -51,6 +51,22 @@ pub enum ParsedHookEvent {
     SessionActivity(SessionActivity),
 }
 
+impl ParsedHookEvent {
+    /// The agent context of an AI event. Session activity is left out: it
+    /// takes no checkpoint, and it never reads the model.
+    pub fn context_mut(&mut self) -> Option<&mut PresetContext> {
+        match self {
+            ParsedHookEvent::PreFileEdit(e) => Some(&mut e.context),
+            ParsedHookEvent::PostFileEdit(e) => Some(&mut e.context),
+            ParsedHookEvent::PreBashCall(e) => Some(&mut e.context),
+            ParsedHookEvent::PostBashCall(e) => Some(&mut e.context),
+            ParsedHookEvent::KnownHumanEdit(_)
+            | ParsedHookEvent::UntrackedEdit(_)
+            | ParsedHookEvent::SessionActivity(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreFileEdit {
     pub context: PresetContext,

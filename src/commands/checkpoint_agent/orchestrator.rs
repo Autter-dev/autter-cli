@@ -202,8 +202,16 @@ pub fn execute_preset_checkpoint(
 
     let trace_id = generate_trace_id();
     let preset = super::presets::resolve_preset(preset_name)?;
-    let events = preset.parse(hook_input, &trace_id)?;
+    let mut events = preset.parse(hook_input, &trace_id)?;
     let events_len = events.len();
+
+    // A checkpoint whose preset could not find the model takes the session's
+    // last known model; one that found it records it for the next.
+    for event in &mut events {
+        if let Some(context) = event.context_mut() {
+            super::session_model_cache::reconcile(&mut context.agent_id);
+        }
+    }
 
     if perf {
         eprintln!(

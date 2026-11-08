@@ -71,7 +71,24 @@ fn is_placeholder_model(model: &str) -> bool {
     m.is_empty() || m.eq_ignore_ascii_case("unknown") || m.eq_ignore_ascii_case("default")
 }
 
+/// True when a model string says nothing about the real model: a placeholder
+/// (empty, "unknown", "default") or the tool-default that
+/// [`default_model_for_tool`] fills in (`claude/unknown-model`).
+pub fn is_unknown_model(model: &str) -> bool {
+    is_placeholder_model(model) || model.trim().ends_with("/unknown-model")
+}
+
 impl AgentId {
+    /// True when this id names a real model rather than a placeholder.
+    pub fn has_known_model(&self) -> bool {
+        !is_unknown_model(&self.model)
+    }
+
+    /// True when `other` is the same agent session (same tool and session id).
+    pub fn same_session(&self, other: &AgentId) -> bool {
+        self.tool == other.tool && self.id == other.id
+    }
+
     /// Normalize `tool` and `model` so the resulting attestation always carries a
     /// concrete tool and a concrete model. Real, extracted models are left intact;
     /// only placeholder/empty values are replaced with a tool-default.
@@ -220,9 +237,115 @@ impl Checkpoint {
     }
 }
 
+/// Give every checkpoint of one agent session a known model when any of them
+/// has one. `new` is about to join `existing`:
+/// - if `new` has no known model, it takes the newest known model of its
+///   session in `existing`;
+/// - if `new` knows the model, earlier checkpoints of its session still
+///   recorded as unknown take it (a backfill).
+///
+/// A session that changes model keeps each checkpoint's own known model; only
+/// unknown ones are filled. Returns how many checkpoints were changed.
+pub fn reconcile_session_models(existing: &mut [Checkpoint], new: &mut Checkpoint) -> usize {
+    let Some(new_agent) = new.agent_id.as_mut() else {
+        return 0;
+    };
+
+    if !new_agent.has_known_model() {
+        let known = existing.iter().rev().find_map(|c| {
+            c.agent_id
+                .as_ref()
+                .filter(|a| a.same_session(new_agent) && a.has_known_model())
+                .map(|a| a.model.clone())
+        });
+        return match known {
+            Some(model) => {
+                new_agent.model = model;
+                1
+            }
+            None => 0,
+        };
+    }
+
+    let mut changed = 0;
+    for checkpoint in existing.iter_mut() {
+        if let Some(agent) = checkpoint.agent_id.as_mut()
+            && agent.same_session(new_agent)
+            && !agent.has_known_model()
+        {
+            agent.model = new_agent.model.clone();
+            changed += 1;
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ai_checkpoint(session: &str, model: &str) -> Checkpoint {
+        let mut c = Checkpoint::new(
+            CheckpointKind::AiAgent,
+            String::new(),
+            "claude".to_string(),
+            Vec::new(),
+        );
+        c.agent_id = Some(AgentId {
+            tool: "claude".to_string(),
+            id: session.to_string(),
+            model: model.to_string(),
+        });
+        c
+    }
+
+    fn model_of(c: &Checkpoint) -> &str {
+        &c.agent_id.as_ref().unwrap().model
+    }
+
+    #[test]
+    fn test_is_unknown_model() {
+        for m in [
+            "",
+            "unknown",
+            "Default",
+            "claude/unknown-model",
+            "unknown-tool/unknown-model",
+        ] {
+            assert!(is_unknown_model(m), "{m}");
+        }
+        for m in ["claude-opus-4-7", "copilot/gpt-4o", "gpt-5"] {
+            assert!(!is_unknown_model(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_fills_unknown_new_checkpoint_from_session() {
+        let mut existing = vec![
+            ai_checkpoint("s1", "claude-opus-4-7"),
+            ai_checkpoint("other", "claude-sonnet-4-5"),
+        ];
+        let mut new = ai_checkpoint("s1", "claude/unknown-model");
+        assert_eq!(reconcile_session_models(&mut existing, &mut new), 1);
+        assert_eq!(model_of(&new), "claude-opus-4-7");
+    }
+
+    #[test]
+    fn test_reconcile_backfills_earlier_unknown_checkpoints() {
+        let mut existing = vec![
+            ai_checkpoint("s1", "claude/unknown-model"),
+            ai_checkpoint("s1", "unknown"),
+            ai_checkpoint("other", "claude/unknown-model"),
+            ai_checkpoint("s1", "claude-sonnet-4-5"),
+        ];
+        let mut new = ai_checkpoint("s1", "claude-opus-4-7");
+        assert_eq!(reconcile_session_models(&mut existing, &mut new), 2);
+        assert_eq!(model_of(&existing[0]), "claude-opus-4-7");
+        assert_eq!(model_of(&existing[1]), "claude-opus-4-7");
+        // Another session and an earlier known model are left alone.
+        assert_eq!(model_of(&existing[2]), "claude/unknown-model");
+        assert_eq!(model_of(&existing[3]), "claude-sonnet-4-5");
+    }
 
     #[test]
     fn test_checkpoint_serialization() {

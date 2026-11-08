@@ -11,6 +11,25 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 
+/// Record a session from a checkpoint. A later checkpoint replaces the
+/// session's record (its model may have changed), except that a checkpoint
+/// whose model is unknown never replaces a known one: the session would
+/// otherwise show `<tool>/unknown-model` in the note because its last edit was
+/// the one whose model could not be read.
+fn insert_session_keeping_known_model(
+    sessions: &mut BTreeMap<String, SessionRecord>,
+    session_id: String,
+    mut record: SessionRecord,
+) {
+    if !record.agent_id.has_known_model()
+        && let Some(existing) = sessions.get(&session_id)
+        && existing.agent_id.has_known_model()
+    {
+        record.agent_id.model = existing.agent_id.model.clone();
+    }
+    sessions.insert(session_id, record);
+}
+
 /// Extract the session id (`s_<14hex>`) from an attestation author key of the form
 /// `s_<14hex>::t_<14hex>`. Returns `None` for human (`h_…`), legacy prompt, or the
 /// plain `"human"` author ids.
@@ -481,7 +500,11 @@ impl VirtualAttributions {
                         custom_attributes: None,
                     };
 
-                    sessions.insert(session_id.clone(), session_record);
+                    insert_session_keeping_known_model(
+                        &mut sessions,
+                        session_id.clone(),
+                        session_record,
+                    );
 
                     // Track additions/deletions keyed by session_id
                     *session_additions.entry(session_id.clone()).or_insert(0) +=
@@ -690,7 +713,11 @@ impl VirtualAttributions {
                         custom_attributes: None,
                     };
 
-                    sessions.insert(session_id.clone(), session_record);
+                    insert_session_keeping_known_model(
+                        &mut sessions,
+                        session_id.clone(),
+                        session_record,
+                    );
 
                     // Track additions/deletions keyed by session_id
                     *session_additions.entry(session_id.clone()).or_insert(0) +=
@@ -887,7 +914,11 @@ impl VirtualAttributions {
                         custom_attributes: None,
                     };
 
-                    sessions.insert(session_id.clone(), session_record);
+                    insert_session_keeping_known_model(
+                        &mut sessions,
+                        session_id.clone(),
+                        session_record,
+                    );
 
                     // Track additions/deletions keyed by session_id
                     *session_additions.entry(session_id.clone()).or_insert(0) +=

@@ -394,7 +394,22 @@ impl PersistedWorkingLog {
 
     /* append checkpoint */
     pub fn append_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), AutterError> {
+        let mut checkpoint = checkpoint.clone();
+        self.append_checkpoint_reconciling_model(&mut checkpoint)
+    }
+
+    /// Append `checkpoint`, first reconciling its session's model with the
+    /// working log (see
+    /// [`crate::authorship::working_log::reconcile_session_models`]): an unknown model is
+    /// filled from the session's earlier checkpoints, and a known one is
+    /// written back to the session's earlier unknown checkpoints. `checkpoint`
+    /// is updated so the caller reports the same model that was stored.
+    pub fn append_checkpoint_reconciling_model(
+        &self,
+        checkpoint: &mut Checkpoint,
+    ) -> Result<(), AutterError> {
         self.mutate_all_checkpoints(|checkpoints| {
+            crate::authorship::working_log::reconcile_session_models(checkpoints, checkpoint);
             // Create a copy, potentially without transcript to reduce storage size.
             //
             // Tools that DON'T support refetch (transcript must be kept):

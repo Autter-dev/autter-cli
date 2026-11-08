@@ -28,6 +28,33 @@ impl ClaudePreset {
         }
     }
 
+    /// The model behind a tool call: the payload's `model` when it names one,
+    /// else the model on the assistant message that issued this tool call,
+    /// else the newest model in the transcript. The transcript is read
+    /// backwards a whole line at a time: a batch of edits writes large tool
+    /// results after the assistant message, and a fixed tail window lost it.
+    /// Anything still unknown is filled from the session's last known model
+    /// by the orchestrator.
+    fn resolve_model(
+        data: &serde_json::Value,
+        transcript_path: &Path,
+        tool_use_id: Option<&str>,
+    ) -> String {
+        if let Some(model) = parse::optional_str(data, "model")
+            && !crate::authorship::working_log::is_unknown_model(model)
+        {
+            return model.to_string();
+        }
+        crate::streams::model_extraction::extract_model_for_tool_use(
+            transcript_path,
+            crate::streams::sweep::StreamFormat::ClaudeJsonl,
+            tool_use_id,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string())
+    }
+
     fn is_cursor_hook_payload(data: &serde_json::Value) -> bool {
         data.get("cursor_version").is_some()
             || parse::optional_str(data, "transcript_path")
@@ -71,7 +98,8 @@ impl AgentPreset for ClaudePreset {
 
         let tool_name = parse::optional_str_multi(&data, &["tool_name", "toolName"]);
         let hook_event = parse::optional_str_multi(&data, &["hook_event_name", "hookEventName"]);
-        let tool_use_id = parse::str_or_default_multi(&data, &["tool_use_id", "toolUseId"], "bash");
+        let payload_tool_use_id = parse::optional_str_multi(&data, &["tool_use_id", "toolUseId"]);
+        let tool_use_id = payload_tool_use_id.unwrap_or("bash");
 
         let is_bash = tool_name
             .map(|n| bash_tool::classify_tool(Agent::Claude, n) == ToolClass::Bash)
@@ -84,14 +112,7 @@ impl AgentPreset for ClaudePreset {
         let model = if is_session_activity {
             "unknown".to_string()
         } else {
-            crate::streams::model_extraction::extract_model(
-                Path::new(transcript_path),
-                crate::streams::sweep::StreamFormat::ClaudeJsonl,
-                None,
-            )
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "unknown".to_string())
+            Self::resolve_model(&data, Path::new(transcript_path), payload_tool_use_id)
         };
 
         let context = PresetContext {

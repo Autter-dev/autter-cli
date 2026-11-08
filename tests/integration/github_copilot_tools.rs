@@ -812,3 +812,103 @@ fn run_copilot_hook(repo: &TestRepo, payload: &Value) {
 fn fs_write(path: &std::path::Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
+
+/// VS Code's Copilot agent writes no model into its transcript, so every edit
+/// was recorded as `github-copilot/unknown-model`. The model is in the
+/// workspace's chatSessions file: the chat whose finished request names this
+/// agent session, and its newest request (still in flight, so not yet linked
+/// to the session) carries the model in use.
+#[test]
+fn test_copilot_vscode_edit_records_model_from_chat_sessions() {
+    let repo = TestRepo::new();
+    let root = repo.canonical_path();
+    let file_path = root.join("app.py");
+    std::fs::write(&file_path, "# human\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.filename("app.py")
+        .assert_committed_lines(crate::lines!["# human".unattributed_human()]);
+
+    let session_id = "0ae773c0-f1c2-4904-bd18-fb1046ff61cd";
+    let storage = tempfile::tempdir().unwrap();
+    let workspace = storage.path().join("workspaceStorage").join("ws-1");
+    let transcripts = workspace.join("GitHub.copilot-chat").join("transcripts");
+    let chat_sessions = workspace.join("chatSessions");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::create_dir_all(&chat_sessions).unwrap();
+    let transcript = transcripts.join(format!("{session_id}.jsonl"));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session.start","data":{"sessionId":session_id,"producer":"copilot-agent"},"id":"e1","timestamp":"2026-11-08T10:00:00Z","parentId":null}),
+            json!({"type":"assistant.message","data":{"content":"Editing app.py","toolRequests":[{"toolCallId":"call_edit","name":"replace_string_in_file"}]},"id":"e2","timestamp":"2026-11-08T10:00:01Z","parentId":"e1"}),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        chat_sessions.join("chat-1.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"kind":0,"v":{"sessionId":"chat-1","inputState":{"selectedModel":{"identifier":"copilot/auto"}},"requests":[]}}),
+            json!({"kind":2,"k":["requests"],"v":[{"requestId":"r1","modelId":"copilot/gpt-4o","result":{"metadata":{"sessionId":session_id}}}]}),
+            json!({"kind":2,"k":["requests"],"v":[{"requestId":"r2","modelId":"copilot/claude-opus-4.5"}]}),
+        ),
+    )
+    .unwrap();
+
+    let hook = |event: &str| {
+        json!({
+            "hook_event_name": event,
+            "session_id": session_id,
+            "transcript_path": transcript.to_string_lossy(),
+            "tool_name": "replace_string_in_file",
+            "tool_input": {
+                "filePath": file_path.to_string_lossy(),
+                "oldString": "# human",
+                "newString": "# human\nprint('ai')"
+            },
+            "tool_response": "",
+            "tool_use_id": "call_edit__vscode-1",
+            "cwd": root.to_string_lossy()
+        })
+        .to_string()
+    };
+
+    repo.autter(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &hook("PreToolUse"),
+    ])
+    .unwrap();
+    std::fs::write(&file_path, "# human\nprint('ai')\n").unwrap();
+    repo.autter(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &hook("PostToolUse"),
+    ])
+    .unwrap();
+
+    let models: Vec<String> = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind.is_ai())
+        .map(|c| c.agent_id.unwrap().model)
+        .collect();
+    assert_eq!(models, vec!["copilot/claude-opus-4.5"]);
+
+    let commit = repo.stage_all_and_commit("Copilot edit").unwrap();
+    let sessions = &commit.authorship_log.metadata.sessions;
+    assert_eq!(sessions.len(), 1);
+    let session = sessions.values().next().unwrap();
+    assert_eq!(session.agent_id.tool, "github-copilot");
+    assert_eq!(session.agent_id.model, "copilot/claude-opus-4.5");
+    repo.filename("app.py")
+        .assert_committed_lines(crate::lines![
+            "# human".unattributed_human(),
+            "print('ai')".ai()
+        ]);
+}

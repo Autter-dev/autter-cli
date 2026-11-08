@@ -250,14 +250,27 @@ pub(super) fn parse_vscode_native_hooks(
                         }
                         _ => crate::streams::sweep::StreamFormat::CopilotSessionJson,
                     };
-                    model_extraction::extract_model(path, sweep_format, None)
-                        .ok()
-                        .flatten()
-                        .or_else(|| {
-                            model_extraction::extract_model_from_copilot_models_json(path)
-                                .ok()
-                                .flatten()
-                        })
+                    // The agent transcript names no model; the workspace's
+                    // chat-session files do, and the debug log's models.json
+                    // (only written with debug logging on) is the last resort.
+                    model_extraction::extract_model_for_tool_use(
+                        path,
+                        sweep_format,
+                        Some(tool_use_id.as_str()).filter(|id| *id != "unknown"),
+                    )
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        model_extraction::extract_model_from_copilot_chat_sessions(
+                            path,
+                            Some(session_id.as_str()),
+                        )
+                    })
+                    .or_else(|| {
+                        model_extraction::extract_model_from_copilot_models_json(path)
+                            .ok()
+                            .flatten()
+                    })
                 })
                 .unwrap_or_else(|| "unknown".to_string()),
         },

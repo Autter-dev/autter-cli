@@ -499,6 +499,7 @@ fn configure_test_home_env(command: &mut Command, test_home: &Path) {
         ("AUTTER_TEST_METRICS_DB_PATH", "metrics-db"),
         ("AUTTER_TEST_NOTES_DB_PATH", "notes-db"),
         ("AUTTER_TEST_CREDENTIALS_PATH", "credentials"),
+        ("AUTTER_TEST_SESSION_MODELS_PATH", "session-models"),
     ] {
         if !command.get_envs().any(|(name, _)| name == key) {
             command.env(key, test_home.join(".autter/internal").join(filename));

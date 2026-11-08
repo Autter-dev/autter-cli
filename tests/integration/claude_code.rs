@@ -464,3 +464,291 @@ fn test_claude_preset_parses_real_prompt_submit_payload() {
         _ => panic!("Expected SessionActivity"),
     }
 }
+
+// ============================================================================
+// The model on every checkpoint
+// ============================================================================
+
+const OPUS: &str = "claude-opus-4-7";
+
+/// Session-start records Claude Code writes before the first assistant message
+/// (hook progress, file-history snapshots). Enough of them that the first
+/// assistant message is not among the first lines of the transcript.
+fn claude_session_preamble(session_id: &str) -> String {
+    let mut out = String::new();
+    for i in 0..30 {
+        out.push_str(
+            &json!({
+                "type": "progress",
+                "data": {"type": "hook_progress", "hookEvent": "SessionStart", "index": i},
+                "sessionId": session_id,
+                "uuid": format!("progress-{i}"),
+                "timestamp": "2026-11-08T10:00:00.000Z"
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    out.push_str(
+        &json!({
+            "type": "user",
+            "message": {"role": "user", "content": "Write the nine files"},
+            "sessionId": session_id,
+            "uuid": "prompt-1",
+            "timestamp": "2026-11-08T10:00:01.000Z"
+        })
+        .to_string(),
+    );
+    out.push('\n');
+    out
+}
+
+fn claude_tool_use_line(
+    session_id: &str,
+    tool_use_id: &str,
+    file_path: &str,
+    model: &str,
+) -> String {
+    let mut line = json!({
+        "type": "assistant",
+        "message": {
+            "model": model,
+            "id": "msg_batch",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "Write",
+                "input": {"file_path": file_path, "content": "..."}
+            }]
+        },
+        "sessionId": session_id,
+        "uuid": format!("assistant-{tool_use_id}"),
+        "timestamp": "2026-11-08T10:00:02.000Z"
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// A tool result carrying the whole written file, about 900 KB, the size of
+/// the records in the report.
+fn claude_large_tool_result_line(session_id: &str, tool_use_id: &str, file_path: &str) -> String {
+    let big = "x".repeat(120).repeat(7_500);
+    let mut line = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "File created"}]
+        },
+        "toolUseResult": {"type": "create", "filePath": file_path, "content": big},
+        "sessionId": session_id,
+        "uuid": format!("result-{tool_use_id}"),
+        "timestamp": "2026-11-08T10:00:03.000Z"
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+fn append(path: &std::path::Path, text: &str) {
+    let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
+fn claude_hook(
+    event: &str,
+    cwd: &std::path::Path,
+    session_id: &str,
+    transcript: &std::path::Path,
+    tool_use_id: &str,
+    file_path: &std::path::Path,
+) -> String {
+    json!({
+        "session_id": session_id,
+        "transcript_path": transcript.to_string_lossy(),
+        "cwd": cwd.to_string_lossy(),
+        "hook_event_name": event,
+        "tool_name": "Write",
+        "tool_use_id": tool_use_id,
+        "tool_input": {"file_path": file_path.to_string_lossy(), "content": "..."}
+    })
+    .to_string()
+}
+
+fn ai_checkpoint_models(repo: &crate::repos::test_repo::TestRepo) -> Vec<String> {
+    repo.current_working_logs()
+        .read_all_checkpoints()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind.is_ai())
+        .map(|c| c.agent_id.expect("AI checkpoint has an agent").model)
+        .collect()
+}
+
+/// Nine consecutive Writes from one assistant turn, with a ~900 KB tool result
+/// written to the transcript after each and no assistant message in between.
+/// The model was read from a fixed 50 KB tail of the transcript, so from the
+/// second write on it found only tool-result bytes and recorded
+/// `claude/unknown-model`. Every checkpoint and the note must name the model.
+#[test]
+fn test_claude_rapid_consecutive_writes_keep_model() {
+    use crate::repos::test_file::ExpectedLineExt;
+    use crate::repos::test_repo::TestRepo;
+
+    let repo = TestRepo::new();
+    let root = repo.canonical_path();
+    fs::write(root.join("README.md"), "readme\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.filename("README.md")
+        .assert_committed_lines(crate::lines!["readme".unattributed_human()]);
+
+    let transcript_dir = tempfile::tempdir().unwrap();
+    let transcript = transcript_dir.path().join("rapid-session.jsonl");
+    let session_id = "rapid-session";
+    let files: Vec<_> = (1..=9).map(|k| root.join(format!("f{k}.txt"))).collect();
+
+    // The assistant issues all nine Writes in one message.
+    let mut text = claude_session_preamble(session_id);
+    for (k, file) in files.iter().enumerate() {
+        text.push_str(&claude_tool_use_line(
+            session_id,
+            &format!("toolu_{k}"),
+            &file.to_string_lossy(),
+            OPUS,
+        ));
+    }
+    fs::write(&transcript, text).unwrap();
+
+    for (k, file) in files.iter().enumerate() {
+        let tool_use_id = format!("toolu_{k}");
+        let pre = claude_hook(
+            "PreToolUse",
+            &root,
+            session_id,
+            &transcript,
+            &tool_use_id,
+            file,
+        );
+        repo.autter(&["checkpoint", "claude", "--hook-input", &pre])
+            .unwrap();
+        fs::write(file, format!("ai line {}\n", k + 1)).unwrap();
+        let post = claude_hook(
+            "PostToolUse",
+            &root,
+            session_id,
+            &transcript,
+            &tool_use_id,
+            file,
+        );
+        repo.autter(&["checkpoint", "claude", "--hook-input", &post])
+            .unwrap();
+        append(
+            &transcript,
+            &claude_large_tool_result_line(session_id, &tool_use_id, &file.to_string_lossy()),
+        );
+    }
+
+    let models = ai_checkpoint_models(&repo);
+    assert_eq!(models.len(), 9, "one AI checkpoint per write: {models:?}");
+    assert!(
+        models.iter().all(|m| m == OPUS),
+        "every checkpoint names the model: {models:?}"
+    );
+
+    let commit = repo.stage_all_and_commit("Nine AI files").unwrap();
+    let sessions = &commit.authorship_log.metadata.sessions;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions.values().next().unwrap().agent_id.model, OPUS);
+    for k in 1..=9 {
+        repo.filename(&format!("f{k}.txt"))
+            .assert_committed_lines(crate::lines![format!("ai line {k}").ai()]);
+    }
+}
+
+/// Checkpoints taken before the transcript names the model are filled in once
+/// it does, and a later checkpoint whose transcript shows no model (a new
+/// working log after the commit) takes the session's last known model.
+#[test]
+fn test_claude_unknown_model_is_backfilled_and_remembered() {
+    use crate::repos::test_file::ExpectedLineExt;
+    use crate::repos::test_repo::TestRepo;
+
+    let repo = TestRepo::new();
+    let root = repo.canonical_path();
+    fs::write(root.join("README.md"), "readme\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.filename("README.md")
+        .assert_committed_lines(crate::lines!["readme".unattributed_human()]);
+
+    let transcript_dir = tempfile::tempdir().unwrap();
+    let transcript = transcript_dir.path().join("late-session.jsonl");
+    let session_id = "late-session";
+    let preamble = claude_session_preamble(session_id);
+    fs::write(&transcript, &preamble).unwrap();
+
+    let edit = |name: &str, tool_use_id: &str, content: &str| {
+        let file = root.join(name);
+        let pre = claude_hook(
+            "PreToolUse",
+            &root,
+            session_id,
+            &transcript,
+            tool_use_id,
+            &file,
+        );
+        repo.autter(&["checkpoint", "claude", "--hook-input", &pre])
+            .unwrap();
+        fs::write(&file, content).unwrap();
+        let post = claude_hook(
+            "PostToolUse",
+            &root,
+            session_id,
+            &transcript,
+            tool_use_id,
+            &file,
+        );
+        repo.autter(&["checkpoint", "claude", "--hook-input", &post])
+            .unwrap();
+    };
+
+    // The transcript has no assistant message yet: the model is unknown.
+    edit("a.txt", "toolu_a", "ai a\n");
+    assert_eq!(ai_checkpoint_models(&repo), vec!["claude/unknown-model"]);
+
+    // Now it names the model: the earlier checkpoint is backfilled.
+    append(
+        &transcript,
+        &claude_tool_use_line(
+            session_id,
+            "toolu_b",
+            &root.join("b.txt").to_string_lossy(),
+            OPUS,
+        ),
+    );
+    edit("b.txt", "toolu_b", "ai b\n");
+    assert_eq!(ai_checkpoint_models(&repo), vec![OPUS, OPUS]);
+
+    let commit = repo.stage_all_and_commit("Two AI files").unwrap();
+    let sessions = &commit.authorship_log.metadata.sessions;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions.values().next().unwrap().agent_id.model, OPUS);
+    repo.filename("a.txt")
+        .assert_committed_lines(crate::lines!["ai a".ai()]);
+    repo.filename("b.txt")
+        .assert_committed_lines(crate::lines!["ai b".ai()]);
+
+    // The transcript again shows no model (rewritten, or not flushed yet):
+    // the session's last known model is used.
+    fs::write(&transcript, &preamble).unwrap();
+    edit("c.txt", "toolu_c", "ai c\n");
+    assert_eq!(ai_checkpoint_models(&repo), vec![OPUS]);
+
+    let commit = repo.stage_all_and_commit("Third AI file").unwrap();
+    let sessions = &commit.authorship_log.metadata.sessions;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions.values().next().unwrap().agent_id.model, OPUS);
+    repo.filename("c.txt")
+        .assert_committed_lines(crate::lines!["ai c".ai()]);
+}

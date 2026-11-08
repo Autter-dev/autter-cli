@@ -377,7 +377,9 @@ fn execute_resolved_checkpoint(
         );
 
         let append_start = Instant::now();
-        working_log.append_checkpoint(&checkpoint)?;
+        // Reconcile the session's model with the working log first, so the
+        // checkpoint event below reports the model that was stored.
+        working_log.append_checkpoint_reconciling_model(&mut checkpoint)?;
         tracing::debug!(
             "[BENCHMARK] Appending checkpoint to working log took {:?}",
             append_start.elapsed()
