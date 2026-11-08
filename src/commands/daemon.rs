@@ -223,9 +223,7 @@ fn handle_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn ensure_daemon_running(
-    #[cfg_attr(any(test, feature = "test-support"), allow(unused))] timeout: Duration,
-) -> Result<DaemonConfig, String> {
+pub(crate) fn ensure_daemon_running(timeout: Duration) -> Result<DaemonConfig, String> {
     let config = daemon_config_from_env_or_default_paths()?;
     if daemon_is_up(&config) {
         return Ok(config);
@@ -235,9 +233,19 @@ pub(crate) fn ensure_daemon_running(
     // daemon lifecycle via DaemonProcess::start / shared daemon pool.
     // Without this guard, parallel test threads that see a briefly-unavailable
     // daemon each call spawn_daemon_run_detached, creating a process storm.
+    // A daemon whose sockets are on disk but that is only slow to accept on a
+    // loaded machine gets until `timeout`, the same grace a production caller
+    // gets for a fresh spawn. With no socket files there is no daemon to wait
+    // for, so that still fails at once.
     #[cfg(any(test, feature = "test-support"))]
     {
-        Err("daemon not running (test build: auto-spawn disabled)".to_string())
+        let sockets_exist =
+            config.control_socket_path.exists() && config.trace_socket_path.exists();
+        if sockets_exist && wait_for_daemon_up(&config, timeout) {
+            Ok(config)
+        } else {
+            Err("daemon not running (test build: auto-spawn disabled)".to_string())
+        }
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
@@ -434,7 +442,6 @@ pub(crate) fn daemon_is_up(config: &DaemonConfig) -> bool {
             .is_ok()
 }
 
-#[cfg(any(windows, not(any(test, feature = "test-support"))))]
 fn wait_for_daemon_up(config: &DaemonConfig, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {

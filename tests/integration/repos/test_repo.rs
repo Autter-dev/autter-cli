@@ -497,6 +497,26 @@ impl DaemonProcess {
         )
     }
 
+    /// If the daemon process has exited, reap it and describe how it ended.
+    #[cfg(unix)]
+    fn reap_if_exited(&self) -> Option<String> {
+        let mut status: libc::c_int = 0;
+        let rc = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if rc != self.pid as libc::pid_t {
+            return None;
+        }
+        Some(if libc::WIFSIGNALED(status) {
+            format!("was killed by signal {}", libc::WTERMSIG(status))
+        } else {
+            format!("exited with code {}", libc::WEXITSTATUS(status))
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn reap_if_exited(&self) -> Option<String> {
+        None
+    }
+
     fn shutdown(&self) {
         let _ = send_control_request(&self.control_socket_path, &ControlRequest::Shutdown);
 
@@ -647,9 +667,23 @@ fn shared_daemon_process(repo_path: &Path) -> Arc<DaemonProcess> {
     let shard = shared_daemon_pool_shard(pool_size);
     let pool = SHARED_DAEMON_POOL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut pool = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    pool.entry(shard)
-        .or_insert_with(|| Arc::new(start_shared_daemon_process(repo_path, Some(shard))))
-        .clone()
+    let daemon = pool
+        .entry(shard)
+        .or_insert_with(|| Arc::new(start_shared_daemon_process(repo_path, Some(shard))));
+    // A pool daemon lives for the whole run. If it has exited, every later
+    // test on this shard would fail with "daemon not running", so start a
+    // fresh one and say how the old one ended.
+    if let Some(how) = daemon.reap_if_exited() {
+        eprintln!(
+            "[test harness] shared daemon pool shard {} (pid {}) {}; starting a new one{}",
+            shard,
+            daemon.pid,
+            how,
+            daemon.read_stderr_tail()
+        );
+        *daemon = Arc::new(start_shared_daemon_process(repo_path, Some(shard)));
+    }
+    daemon.clone()
 }
 
 fn start_shared_daemon_process(repo_path: &Path, shard: Option<usize>) -> DaemonProcess {
