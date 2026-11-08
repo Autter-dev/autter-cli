@@ -298,12 +298,21 @@ impl DaemonProcess {
             .env("AUTTER_DAEMON_CONTROL_SOCKET", &control_socket_path)
             .env("AUTTER_DAEMON_TRACE_SOCKET", &trace_socket_path)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            // The daemon's tracing goes to stdout. Keep warnings and errors in
+            // the log so a daemon that shuts itself down says why.
+            .stdout(
+                stderr_log
+                    .try_clone()
+                    .expect("failed to clone daemon stderr log file"),
+            )
             .stderr(
                 stderr_log
                     .try_clone()
                     .expect("failed to clone daemon stderr log file"),
             );
+        if std::env::var_os("RUST_LOG").is_none() {
+            command.env("RUST_LOG", "warn");
+        }
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -674,7 +683,11 @@ fn shared_daemon_process(repo_path: &Path) -> Arc<DaemonProcess> {
     // test on this shard would fail with "daemon not running", so start a
     // fresh one and say how the old one ended.
     if let Some(how) = daemon.reap_if_exited() {
-        eprintln!(
+        // Written to the process's stderr directly, past libtest's output
+        // capture, so it shows even when the test that notices it passes.
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
             "[test harness] shared daemon pool shard {} (pid {}) {}; starting a new one{}",
             shard,
             daemon.pid,
