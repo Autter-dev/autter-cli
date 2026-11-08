@@ -3358,7 +3358,7 @@ fn find_real_git_by_probe() -> String {
 ///   so no daemon auto-spawn from in-process Config::get() calls.
 /// - `~/.gitconfig` is a minimal stub so plain git subprocesses don't fail.
 /// - Developer's real `~/.autter/`, `~/.claude/`, `~/.gitconfig` are unreachable.
-fn ensure_isolated_process_home() {
+pub(crate) fn ensure_isolated_process_home() {
     static PROCESS_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
     PROCESS_HOME.get_or_init(|| {
         let home = std::env::temp_dir().join(format!("autter-test-home-{}", std::process::id()));

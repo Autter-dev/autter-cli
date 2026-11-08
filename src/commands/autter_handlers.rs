@@ -5,6 +5,7 @@ use crate::authorship::stats::stats_command;
 use crate::commands;
 use crate::config;
 use crate::daemon::ControlRequest;
+use crate::error::AutterError;
 use crate::git::find_repository;
 use crate::git::find_repository_in_path;
 use crate::git::repository::{CommitRange, Repository};
@@ -301,6 +302,10 @@ pub fn handle_autter(args: &[String]) {
                     log_message("install-hooks", "info", Some(statuses_value));
                 }
             }
+            Err(AutterError::Usage(message)) => {
+                eprintln!("{message}");
+                std::process::exit(commands::EXIT_USAGE_ERROR);
+            }
             Err(e) => {
                 eprintln!("Install hooks failed: {}", e);
                 commands::suggest_autter_doctor();
@@ -312,6 +317,10 @@ pub fn handle_autter(args: &[String]) {
                 if let Ok(statuses_value) = serde_json::to_value(&statuses) {
                     log_message("uninstall-hooks", "info", Some(statuses_value));
                 }
+            }
+            Err(AutterError::Usage(message)) => {
+                eprintln!("{message}");
+                std::process::exit(commands::EXIT_USAGE_ERROR);
             }
             Err(e) => {
                 eprintln!("Uninstall hooks failed: {}", e);
@@ -325,6 +334,10 @@ pub fn handle_autter(args: &[String]) {
                 if let Ok(statuses_value) = serde_json::to_value(&statuses) {
                     log_message("uninstall", "info", Some(statuses_value));
                 }
+            }
+            Err(AutterError::Usage(message)) => {
+                eprintln!("{message}");
+                std::process::exit(commands::EXIT_USAGE_ERROR);
             }
             Err(e) => {
                 eprintln!("Uninstall failed: {}", e);

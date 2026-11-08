@@ -483,13 +483,7 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
             crate::commands::EXIT_RUNTIME_ERROR
         });
     }
-    let mut options = match parse_install_options(args) {
-        Ok(options) => options,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
-    };
+    let mut options = parse_install_options(args).map_err(AutterError::Usage)?;
     // Verbose output interleaves diffs, which don't belong on the rail.
     options.rail_layout =
         !options.verbose && std::io::stdout().is_terminal() && crate::ui::caps().tty;
@@ -730,31 +724,24 @@ fn global_git_config_has_section(git_cmd: &str, section: &str) -> bool {
 /// the daemon. Asks first at a terminal; without one it needs `--yes`. Prints
 /// a line only for what was actually removed.
 pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
-    let options = match parse_full_uninstall_options(args) {
-        Ok(options) => options,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
-    };
+    let options = parse_full_uninstall_options(args).map_err(AutterError::Usage)?;
 
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     match uninstall_consent(&options, interactive) {
         UninstallConsent::Proceed => {}
         UninstallConsent::Ask => {
             if !confirm_full_uninstall() {
-                eprintln!("Uninstall cancelled. Nothing was changed.");
-                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                return Err(AutterError::Usage(
+                    "Uninstall cancelled. Nothing was changed.".to_string(),
+                ));
             }
         }
         UninstallConsent::Refuse => {
-            eprintln!(
-                "error: `autter uninstall` removes autter's hooks, editor extensions, git trace2 settings and background service."
-            );
-            eprintln!(
-                "There's no terminal to confirm at, so nothing was changed. Re-run with --yes to uninstall, or --dry-run to see what would be removed."
-            );
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+            return Err(AutterError::Usage(
+                "error: `autter uninstall` removes autter's hooks, editor extensions, git trace2 settings and background service.\n\
+                 There's no terminal to confirm at, so nothing was changed. Re-run with --yes to uninstall, or --dry-run to see what would be removed."
+                    .to_string(),
+            ));
         }
     }
 
@@ -952,13 +939,7 @@ pub(crate) fn parse_uninstall_hooks_options(args: &[String]) -> Result<(bool, bo
 
 /// Main entry point for uninstall-hooks command
 pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
-    let (dry_run, verbose) = match parse_uninstall_hooks_options(args) {
-        Ok(flags) => flags,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
-    };
+    let (dry_run, verbose) = parse_uninstall_hooks_options(args).map_err(AutterError::Usage)?;
 
     // Match the path resolution used at install time so uninstall targets the
     // same hook entries.

@@ -3,10 +3,24 @@
 //! This module tests the autter install-hooks and uninstall-hooks commands,
 //! which handle installation of git hooks for various IDEs and coding agents.
 
-use autter::commands::install_hooks::{
-    InstallResult, InstallStatus, run, run_uninstall, to_hashmap,
-};
+use crate::repos::test_repo::ensure_isolated_process_home;
+use autter::commands::install_hooks::{InstallResult, InstallStatus, to_hashmap};
+use autter::error::AutterError;
 use std::collections::HashMap;
+
+// `run` and `run_uninstall` install into and remove from the agents found
+// under HOME. Point HOME at the test process's isolated home first, so these
+// tests never touch the developer's real ~/.claude, ~/.cursor and so on, even
+// when one of them is the first test to run in the process.
+fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
+    ensure_isolated_process_home();
+    autter::commands::install_hooks::run(args)
+}
+
+fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
+    ensure_isolated_process_home();
+    autter::commands::install_hooks::run_uninstall(args)
+}
 
 // ==============================================================================
 // InstallStatus Tests
@@ -335,22 +349,37 @@ fn test_run_install_hooks_with_dry_run_false() {
 }
 
 #[test]
-fn test_run_install_hooks_ignores_unknown_args() {
-    // Unknown arguments should be ignored
+fn test_run_install_hooks_rejects_unknown_args() {
+    // Since "--help never runs a command" (a6de5be), an unknown flag is a usage
+    // error so a typo never runs a real install. It must come back as an error,
+    // not exit the process: this test calls `run` in-process.
     let args = vec![
         "--unknown-flag".to_string(),
         "random-arg".to_string(),
         "--dry-run".to_string(),
     ];
-    let result = run(&args);
+    match run(&args) {
+        Err(AutterError::Usage(message)) => {
+            assert!(
+                message.contains("--unknown-flag"),
+                "usage error should name the flag: {message}"
+            );
+        }
+        other => panic!("expected a usage error, got {other:?}"),
+    }
+}
 
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
+#[test]
+fn test_run_uninstall_hooks_rejects_unknown_args() {
+    let args = vec!["--force".to_string()];
+    match run_uninstall(&args) {
+        Err(AutterError::Usage(message)) => {
+            assert!(
+                message.contains("--force"),
+                "usage error should name the flag: {message}"
+            );
         }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
+        other => panic!("expected a usage error, got {other:?}"),
     }
 }
 

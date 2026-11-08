@@ -17,6 +17,10 @@ pub enum AutterError {
     PresetError(String),
     SqliteError(rusqlite::Error),
     Generic(String),
+    /// The caller misused a command (unknown flag, missing confirmation). The
+    /// message is printed as is and the process exits with
+    /// [`crate::commands::EXIT_USAGE_ERROR`].
+    Usage(String),
 }
 
 impl AutterError {
@@ -34,6 +38,7 @@ impl AutterError {
             AutterError::PresetError(_) => "PresetError",
             AutterError::SqliteError(_) => "SqliteError",
             AutterError::Generic(_) => "Generic",
+            AutterError::Usage(_) => "Usage",
         }
     }
 }
@@ -59,6 +64,7 @@ impl fmt::Display for AutterError {
             AutterError::SqliteError(e) => write!(f, "SQLite error: {}", e),
             AutterError::Generic(e) => write!(f, "Generic error: {}", e),
             AutterError::GixError(e) => write!(f, "Gix error: {}", e),
+            AutterError::Usage(e) => write!(f, "{}", e),
         }
     }
 }
@@ -113,6 +119,7 @@ impl Clone for AutterError {
             AutterError::SqliteError(e) => AutterError::Generic(format!("SQLite error: {}", e)),
             AutterError::Generic(s) => AutterError::Generic(s.clone()),
             AutterError::GixError(e) => AutterError::Generic(format!("Gix error: {}", e)),
+            AutterError::Usage(s) => AutterError::Usage(s.clone()),
         }
     }
 }
