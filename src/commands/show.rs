@@ -1,10 +1,12 @@
 use crate::authorship::guidance;
+use crate::authorship::record_status::{DEFAULT_PENDING_WAIT, RecordClassifier};
 use crate::error::AutterError;
 use crate::git::find_repository;
 use crate::git::notes_api::{
     CommitAuthorship, filter_commits_with_notes as get_commits_with_notes_from_list,
 };
 use crate::git::repository::{CommitRange, Repository};
+use std::time::Duration;
 
 pub fn handle_show(args: &[String]) {
     // A revision never starts with `-`: an option here is a typo, not a ref.
@@ -13,10 +15,7 @@ pub fn handle_show(args: &[String]) {
     }
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
-        Err(e) => {
-            eprintln!("Failed to find repository: {}", e);
-            std::process::exit(1);
-        }
+        Err(e) => crate::commands::exit_repository_error("show", &e),
     };
 
     if args.is_empty() {
@@ -38,11 +37,19 @@ pub fn handle_show(args: &[String]) {
 fn show_authorship(repo: &Repository, spec: &str) -> Result<(), AutterError> {
     let commits = resolve_commits(repo, spec)?;
     if commits.is_empty() {
-        print!("{}", guidance::show_missing_data_message());
+        println!("No commits in {spec}.");
         return Ok(());
     }
 
     let entries = get_commits_with_notes_from_list(repo, &commits)?;
+    let classifier = RecordClassifier::new(repo);
+    // Only a single commit is worth waiting for: it is usually HEAD, right
+    // after `git commit`, while the background service writes its note.
+    let wait = if entries.len() == 1 {
+        DEFAULT_PENDING_WAIT
+    } else {
+        Duration::ZERO
+    };
 
     let multiple_commits = entries.len() > 1;
     for (index, entry) in entries.iter().enumerate() {
@@ -68,7 +75,14 @@ fn show_authorship(repo: &Repository, spec: &str) -> Result<(), AutterError> {
                 if multiple_commits {
                     println!("{}", sha);
                 }
-                print!("{}", guidance::show_missing_data_message());
+                let record = classifier.classify(sha, wait);
+                if record.is_recorded()
+                    && let Some(note) = crate::git::notes_api::read_note(repo, sha)
+                {
+                    println!("{}", note.trim_end());
+                    continue;
+                }
+                print!("{}", guidance::show_missing_record_message(&record));
             }
         }
     }

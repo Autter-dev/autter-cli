@@ -11,6 +11,7 @@ use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profi
 use crate::git::status::MAX_PATHSPEC_ARGS;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
+use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize)]
@@ -26,6 +27,8 @@ struct CheckpointInfo {
 struct StatusOutput {
     stats: CommitStats,
     checkpoints: Vec<CheckpointInfo>,
+    /// Checkpoints the background service has received but not yet written.
+    pending_checkpoints: usize,
     cloud_sync: crate::auth::notice::CloudSyncStatusReport,
 }
 
@@ -52,7 +55,10 @@ pub fn handle_status(args: &[String]) {
 }
 
 fn run_status(json: bool) -> Result<(), AutterError> {
-    let repo = find_repository(&[])?;
+    let repo = match find_repository(&[]) {
+        Ok(repo) => repo,
+        Err(e) => crate::commands::exit_repository_error("status", &e),
+    };
     let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
     let ignore_matcher = build_ignore_matcher(&ignore_patterns);
 
@@ -60,6 +66,13 @@ fn run_status(json: bool) -> Result<(), AutterError> {
 
     let head = repo.head()?;
     let head_sha = head.target()?;
+
+    // A checkpoint an agent just sent may still be queued in the background
+    // service; give it a moment to land before reading the working log.
+    let pending_checkpoints = crate::authorship::record_status::wait_for_queued_checkpoints(
+        &repo,
+        PENDING_CHECKPOINT_WAIT,
+    );
 
     let working_log = repo.storage.working_log_for_base_commit(&head_sha)?;
     let checkpoints = working_log.read_all_checkpoints()?;
@@ -73,27 +86,19 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             let output = StatusOutput {
                 stats: CommitStats::default(),
                 checkpoints: vec![],
+                pending_checkpoints,
                 cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
             };
             let json_str = serde_json::to_string(&output)?;
             println!("{}", json_str);
         } else if !crate::commands::arg_parser::quiet() {
-            eprintln!(
-                "No checkpoints recorded since last commit ({})",
-                &head_sha[..7]
-            );
-            eprintln!();
-
-            eprintln!(
-                "If you've made AI edits recently and don't see them here, you might need to install hooks:"
-            );
-            eprintln!();
-            eprintln!("  autter install-hooks");
-            eprintln!();
-            eprintln!(
-                "If hooks are already installed, run `autter debug` and check the 'AI Agent Capture' section to see whether each agent/editor is actually able to checkpoint."
-            );
-            eprintln!();
+            eprint!("{}", no_checkpoints_message(&head_sha, pending_checkpoints));
+            if pending_checkpoints == 0 && std::io::stderr().is_terminal() {
+                eprintln!(
+                    "{}",
+                    crate::authorship::record_status::capture_boundary_line()
+                );
+            }
         }
         if !json
             && !crate::commands::arg_parser::quiet()
@@ -160,14 +165,14 @@ fn run_status(json: bool) -> Result<(), AutterError> {
     // For status (uncommitted changes), the AI attributions are in `initial` (uncommitted),
     // not in authorship_log.attestations (which is for committed changes).
     // Count AI lines from the uncommitted attributions.
-    let ai_accepted = count_ai_lines_from_initial(&initial, &ignore_matcher);
+    let (ai_accepted, known_human) = count_lines_from_initial(&initial, &ignore_matcher);
 
     let stats = stats_from_authorship_log(
         Some(&authorship_log),
         total_additions,
         total_deletions,
         ai_accepted,
-        0,
+        known_human,
         &BTreeMap::new(),
     );
 
@@ -175,6 +180,7 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         let output = StatusOutput {
             stats,
             checkpoints: checkpoint_infos,
+            pending_checkpoints,
             cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
         };
         let json_str = serde_json::to_string(&output)?;
@@ -186,6 +192,9 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         return Ok(());
     }
     write_stats_to_terminal(&stats, true);
+    if pending_checkpoints > 0 {
+        println!("{}", pending_line(pending_checkpoints));
+    }
     println!("Changes captured on this computer. Commit them to record committed-code totals.");
     if let Some(line) = crate::auth::notice::format_cloud_sync_status_line() {
         println!("{line}");
@@ -327,11 +336,14 @@ fn get_working_dir_diff_stats(
 }
 
 /// Count AI-attributed lines from InitialAttributions (uncommitted changes)
-fn count_ai_lines_from_initial(
+/// Uncommitted (AI, known-human) line counts from the working log's
+/// carried attributions.
+fn count_lines_from_initial(
     initial: &InitialAttributions,
     ignore_matcher: &IgnoreMatcher,
-) -> u32 {
+) -> (u32, u32) {
     let mut ai_lines = 0u32;
+    let mut human_lines = 0u32;
 
     for (file_path, line_attrs) in &initial.files {
         if should_ignore_file_with_matcher(file_path, ignore_matcher) {
@@ -349,12 +361,71 @@ fn count_ai_lines_from_initial(
             } else {
                 initial.prompts.contains_key(&line_attr.author_id)
             };
+            let lines_count = line_attr.end_line - line_attr.start_line + 1;
             if is_ai {
-                let lines_count = line_attr.end_line - line_attr.start_line + 1;
                 ai_lines += lines_count;
+            } else if line_attr.author_id.starts_with("h_") {
+                human_lines += lines_count;
             }
         }
     }
 
-    ai_lines
+    (ai_lines, human_lines)
+}
+
+/// How long `autter status` waits for checkpoints still queued in the
+/// background service.
+const PENDING_CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn pending_line(pending: usize) -> String {
+    let noun = if pending == 1 {
+        "checkpoint is"
+    } else {
+        "checkpoints are"
+    };
+    format!(
+        "{pending} {noun} still being written by the background service; run `autter status` again in a moment."
+    )
+}
+
+/// Shown when nothing has been checkpointed since HEAD. A quiet working tree
+/// is normal, so this suggests nothing unless checkpoints are still pending.
+fn no_checkpoints_message(head_sha: &str, pending: usize) -> String {
+    let short = &head_sha[..head_sha.len().min(7)];
+    if pending > 0 {
+        format!(
+            "No checkpoints written since the last commit ({short}) yet.\n{}\n",
+            pending_line(pending)
+        )
+    } else {
+        format!("No AI activity recorded since the last commit ({short}).\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_working_tree_gets_no_install_advice() {
+        let message = no_checkpoints_message("abcdef1234", 0);
+        assert_eq!(
+            message,
+            "No AI activity recorded since the last commit (abcdef1).\n"
+        );
+    }
+
+    #[test]
+    fn queued_checkpoints_are_reported_as_pending() {
+        let message = no_checkpoints_message("abcdef1234", 2);
+        assert!(
+            message.contains("2 checkpoints are still being written"),
+            "{message}"
+        );
+        assert!(!message.contains("install-hooks"), "{message}");
+        assert_eq!(
+            pending_line(1),
+            "1 checkpoint is still being written by the background service; run `autter status` again in a moment."
+        );
+    }
 }

@@ -639,9 +639,9 @@ fn async_commit_with_ai_content(extra_envs: &[(&str, &str)]) -> (TestRepo, Strin
 fn async_mode_post_commit_shows_stats_for_ai_commit() {
     let (_repo, output) = async_commit_with_ai_content(&[]);
     // The wrapper should have found the authorship note and printed the
-    // stats progress bar (contains "you" label and "ai" label).
+    // stats bar ("human" … "AI") and the per-category counts line.
     assert!(
-        output.contains("you") && output.contains("ai"),
+        output.contains("human") && output.contains(" AI") && output.contains(" added, "),
         "expected stats output in async commit, got:\n{}",
         output
     );
@@ -668,7 +668,7 @@ fn async_mode_post_commit_quiet_flag_suppresses_stats() {
 
     // With -q the wrapper should suppress all autter post-commit output.
     assert!(
-        !output.contains("you") && !output.contains("[autter]"),
+        !output.contains(" added, ") && !output.contains("[autter]"),
         "expected no stats/processing output with -q, got:\n{}",
         output
     );
@@ -691,7 +691,7 @@ fn async_mode_post_commit_non_interactive_suppresses_stats() {
         .expect("commit should succeed");
 
     assert!(
-        !output.contains("you") && !output.contains("[autter]"),
+        !output.contains(" added, ") && !output.contains("[autter]"),
         "expected no stats output in non-interactive mode, got:\n{}",
         output
     );
@@ -728,7 +728,7 @@ fn async_mode_post_commit_skips_stats_for_large_commit() {
     // Since these files have no AI attribution, the authorship note will
     // be empty/minimal - the skip check runs before stats computation.
     assert!(
-        !output.contains("you") || output.contains("Skipped"),
+        !output.contains(" added, ") || output.contains("Skipped"),
         "expected either skip message or no stats bar for large commit, got:\n{}",
         output
     );

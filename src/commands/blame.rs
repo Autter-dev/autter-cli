@@ -1,6 +1,7 @@
 use crate::auth::CredentialStore;
 use crate::authorship::authorship_log::{HumanRecord, PromptRecord, SessionRecord};
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
+use crate::authorship::labels::LineCategory;
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::AutterError;
 use crate::git::notes_api::read_authorship_v3 as get_reference_as_authorship_log_v3;
@@ -69,6 +70,10 @@ pub struct BlameAnalysisResult {
     pub blame_hunks: Vec<BlameHunk>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub humans: BTreeMap<String, HumanRecord>,
+    /// Each line's authorship category (AI / human / untracked / unknown),
+    /// independent of the names shown for it.
+    #[serde(skip)]
+    pub line_categories: HashMap<u32, LineCategory>,
 }
 
 struct PreparedBlameRequest {
@@ -164,6 +169,11 @@ pub struct AutterBlameOptions {
     // Mark lines from commits without authorship logs as "Unknown"
     pub mark_unknown: bool,
 
+    // Category column (AI / human / untracked / unknown) in the default
+    // output. `None` shows it when stdout is a terminal, so piped output stays
+    // byte-compatible with `git blame`.
+    pub markers: Option<bool>,
+
     // Show prompt hashes inline and dump prompts when piped
     pub show_prompt: bool,
 
@@ -223,6 +233,7 @@ impl Default for AutterBlameOptions {
             ignore_whitespace: false,
             json: false,
             mark_unknown: false,
+            markers: None,
             show_prompt: false,
             split_hunks_by_ai_author: true,
             why_line: None,
@@ -425,7 +436,7 @@ impl Repository {
 
         // Step 2: Overlay AI authorship information.
         let (
-            line_authors,
+            (line_authors, line_categories),
             prompt_records,
             session_records,
             humans,
@@ -441,6 +452,7 @@ impl Repository {
                 session_records,
                 blame_hunks,
                 humans,
+                line_categories,
             },
             authorship_logs,
             prompt_commits,
@@ -571,6 +583,7 @@ impl Repository {
             session_records: _,
             blame_hunks: _,
             humans: _,
+            line_categories,
         } = analysis;
 
         if request.options.no_output {
@@ -625,6 +638,7 @@ impl Repository {
             output_default_format(
                 self,
                 &line_authors,
+                &line_categories,
                 &prompt_records,
                 &request.relative_file_path,
                 &lines,
@@ -1099,7 +1113,7 @@ fn overlay_ai_authorship(
     options: &AutterBlameOptions,
 ) -> Result<
     (
-        HashMap<u32, String>,
+        (HashMap<u32, String>, HashMap<u32, LineCategory>),
         HashMap<String, PromptRecord>,
         HashMap<String, SessionRecord>,
         BTreeMap<String, HumanRecord>, // humans map
@@ -1110,6 +1124,7 @@ fn overlay_ai_authorship(
     AutterError,
 > {
     let mut line_authors: HashMap<u32, String> = HashMap::new();
+    let mut line_categories: HashMap<u32, LineCategory> = HashMap::new();
     let mut prompt_records: HashMap<String, PromptRecord> = HashMap::new();
     let mut session_records: HashMap<String, SessionRecord> = HashMap::new();
     let mut humans: BTreeMap<String, HumanRecord> = BTreeMap::new();
@@ -1177,6 +1192,14 @@ fn overlay_ai_authorship(
                     orig_line_num,
                     &mut foreign_prompts_cache,
                 ) {
+                    let category = if prompt.is_some() {
+                        LineCategory::Ai
+                    } else if prompt_hash.as_deref().is_some_and(|h| h.starts_with("h_")) {
+                        LineCategory::Human
+                    } else {
+                        LineCategory::Untracked
+                    };
+                    line_categories.insert(current_line_num, category);
                     // If this line is AI-assisted, display the tool name; otherwise the human username
                     if let Some(prompt_record) = prompt {
                         let prompt_hash = prompt_hash.unwrap();
@@ -1220,6 +1243,7 @@ fn overlay_ai_authorship(
                     }
                 } else {
                     // Has authorship log but no attribution found = unattested (unknown)
+                    line_categories.insert(current_line_num, LineCategory::Untracked);
                     if options.return_human_authors_as_human {
                         line_authors
                             .insert(current_line_num, CheckpointKind::Human.to_str().to_string());
@@ -1285,6 +1309,7 @@ fn overlay_ai_authorship(
 
             // Mark all lines in this hunk as AI-authored by the detected tool
             for line_num in hunk.range.0..=hunk.range.1 {
+                line_categories.insert(line_num, LineCategory::Ai);
                 if options.use_prompt_hashes_as_names {
                     line_authors.insert(line_num, prompt_hash.clone());
                 } else {
@@ -1294,6 +1319,7 @@ fn overlay_ai_authorship(
         } else {
             // No authorship log for this commit and not a known agent
             for line_num in hunk.range.0..=hunk.range.1 {
+                line_categories.insert(line_num, LineCategory::Unknown);
                 if options.mark_unknown {
                     // User wants explicit distinction - mark as Unknown
                     line_authors.insert(line_num, "Unknown".to_string());
@@ -1322,7 +1348,7 @@ fn overlay_ai_authorship(
         .collect();
 
     Ok((
-        line_authors,
+        (line_authors, line_categories),
         prompt_records,
         session_records,
         humans,
@@ -1746,6 +1772,7 @@ fn output_incremental_format(
 fn output_default_format(
     repo: &Repository,
     line_authors: &HashMap<u32, String>,
+    line_categories: &HashMap<u32, LineCategory>,
     prompt_records: &HashMap<String, PromptRecord>,
     file_path: &str,
     lines: &[&str],
@@ -1771,20 +1798,40 @@ fn output_default_format(
     let mut requested_lines: Vec<u32> = line_to_hunk.keys().copied().collect();
     requested_lines.sort_unstable();
 
-    // Lines shown as the git author because Autter has no note (and the commit
-    // isn't a known-agent email simulation). Used for the consistency notice.
-    let mut unattested_git_author_lines = 0usize;
-    if !options.mark_unknown {
+    // Category column: each line's AI / human / untracked / unknown marker,
+    // shown by default only on a terminal.
+    let show_markers = options
+        .markers
+        .unwrap_or_else(|| io::stdout().is_terminal());
+    let marker_for = |line_num: u32| -> Option<LineCategory> {
+        let hunk = line_to_hunk.get(&line_num)?;
+        // Uncommitted lines: git already says "Not Committed Yet".
+        if hunk.commit_sha.bytes().all(|b| b == b'0') {
+            return None;
+        }
+        Some(line_categories.get(&line_num).copied().unwrap_or(
+            if commits_with_notes.contains(&hunk.commit_sha) {
+                LineCategory::Untracked
+            } else {
+                LineCategory::Unknown
+            },
+        ))
+    };
+    let mut categories_shown: Vec<LineCategory> = Vec::new();
+    if show_markers {
         for line_num in &requested_lines {
-            if let Some(hunk) = line_to_hunk.get(line_num)
-                && !commits_with_notes.contains(&hunk.commit_sha)
-                && crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email)
-                    .is_none()
+            if let Some(category) = marker_for(*line_num)
+                && !categories_shown.contains(&category)
             {
-                unattested_git_author_lines += 1;
+                categories_shown.push(category);
             }
         }
     }
+    let marker_width = categories_shown
+        .iter()
+        .map(|category| category.label().len())
+        .max()
+        .unwrap_or(0);
 
     // Calculate the maximum line number width for proper padding
     let max_line_num = lines.len() as u32;
@@ -1823,6 +1870,11 @@ fn output_default_format(
         } else {
             ""
         };
+
+        if show_markers {
+            let label = marker_for(line_num).map_or("", LineCategory::label);
+            output.push_str(&format!("{label:<marker_width$} "));
+        }
 
         if let Some(hunk) = line_to_hunk.get(&line_num) {
             let sha = &hunk.abbrev_sha;
@@ -1941,15 +1993,12 @@ fn output_default_format(
         output.push_str(stats);
     }
 
-    // Interactive TTY only: explain git-author fallback so blame doesn't look
-    // like it contradicts `autter stats` on the same commit. Keep porcelain /
-    // pager-piped / scripted output byte-compatible with git blame.
-    if unattested_git_author_lines > 0 && io::stdout().is_terminal() {
-        output.push_str(
-            &crate::authorship::guidance::blame_git_author_fallback_notice(
-                unattested_git_author_lines,
-            ),
-        );
+    // With markers, end with what each shown marker means, so the git author
+    // shown on untracked and unknown lines isn't read as "written by".
+    if !categories_shown.is_empty() {
+        output.push('\n');
+        output.push_str(&crate::authorship::labels::legend(&categories_shown));
+        output.push('\n');
     }
 
     // Output handling - respect pager environment variables
@@ -2453,6 +2502,16 @@ pub fn parse_blame_args(args: &[String]) -> Result<(String, AutterBlameOptions),
             // Mark unknown authorship
             "--mark-unknown" => {
                 options.mark_unknown = true;
+                i += 1;
+            }
+
+            // Category column in the default output
+            "--markers" => {
+                options.markers = Some(true);
+                i += 1;
+            }
+            "--no-markers" => {
+                options.markers = Some(false);
                 i += 1;
             }
 

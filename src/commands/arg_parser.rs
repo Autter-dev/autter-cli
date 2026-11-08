@@ -322,7 +322,13 @@ autter blame <file>
   Git blame with an AI authorship overlay. Accepts git blame arguments
   (-L, -C, --porcelain, etc.).
 
+  On a terminal each line starts with its category: AI, human, untracked
+  (no agent or Autter editor extension recorded it) or unknown (its commit
+  has no Autter record). The author column is always the git author.
+
   --json                Output in JSON format
+  --markers             Show the category column even when piped
+  --no-markers          Hide it on a terminal (plain git blame layout)
   -i, --interactive     Browse the file full-screen: AI, human and untracked
                         lines, and the prompt behind each AI change",
     },
@@ -351,9 +357,22 @@ autter stats [commit]
 
   Show AI authorship statistics for a commit or range.
 
-  --json              Output in JSON format
+  Lines are counted as AI (an agent wrote them), human (typed in an editor
+  with the Autter extension), untracked (Autter recorded the commit but
+  nothing recorded the line, usually typed by hand) or unknown (the commit
+  has no Autter record). AI % is the share of added lines an agent wrote
+  into the file, not who directed or reviewed the work.
+
+  Right after a commit, stats waits up to 10s for the background service to
+  write the commit's record.
+
+  --json              Output in JSON format; `record` says whether the commit
+                      has an Autter record and, if not, why
   --ignore <pat>      Ignore files matching the given pattern(s)
   --wait[=secs]       Wait for the authorship note (default 30s); exit 1 if still pending
+  --coverage [range]  Which commits have an Autter record (default: the last
+                      50 from HEAD), why the others don't, and whether the
+                      records are on the remote
   -i, --interactive   Browse recent commits full-screen by AI share, with each
                       commit's breakdown by tool and model",
     },

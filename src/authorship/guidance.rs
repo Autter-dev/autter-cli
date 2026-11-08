@@ -1,103 +1,75 @@
+//! Messages shown when lines or commits have no Autter attestation.
+//!
+//! Each message says what the missing data means. Troubleshooting is never
+//! attached by default: a commit typed by hand, or one that predates Autter,
+//! is normal. [`crate::authorship::record_status`] decides when a commit
+//! really needs a next step, and supplies exactly one.
+
+use crate::authorship::labels::LineCategory;
+use crate::authorship::record_status::{RecordStatus, explain};
+use crate::authorship::stats::CommitStats;
+
 /// Short explanation printed when authorship attestations are missing.
 pub const NO_AUTHORSHIP_DATA_MESSAGE: &str = "No authorship data found for this revision";
 
 /// Footer appended to terminal `autter diff` output when lines lack attestations.
 pub fn diff_missing_data_footer() -> String {
-    let mut out = String::new();
-    out.push('\n');
-    out.push_str(
-        "Some added lines show [no-data] because no checkpoint recorded who wrote them before commit.\n",
-    );
-    append_capture_steps(&mut out);
-    out
+    format!(
+        "\n[no-data] lines have no Autter attestation: {} ({}), or {} ({}). `autter stats <commit>` says which and why.\n",
+        LineCategory::Untracked.label(),
+        LineCategory::Untracked.meaning(),
+        LineCategory::Unknown.label(),
+        LineCategory::Unknown.meaning(),
+    )
 }
 
-/// Guidance printed under stats when every added line is unattested.
-pub fn stats_all_untracked_footer() -> String {
-    let mut out = String::new();
-    out.push('\n');
-    out.push_str(
-        "No authorship was recorded for this commit, so added lines are shown as untracked.\n",
-    );
-    append_capture_steps(&mut out);
-    out
-}
-
-/// Guidance for a single blame line with no attestation.
+/// Guidance for a single blame line with no attestation (`blame --why`).
 pub fn blame_line_missing_data_message() -> String {
-    let mut out = String::from(
-        "No authorship information is available for this line.\n\
-         Autter only knows who wrote a line when a checkpoint ran before the change was committed.\n",
-    );
-    append_capture_steps(&mut out);
-    out
+    format!(
+        "No authorship information is available for this line: {}.\n\
+         `autter stats <commit>` says why its commit has no record.\n",
+        LineCategory::Unknown.meaning()
+    )
 }
 
-/// Short notice when `autter blame` falls back to the git author for lines
-/// without Autter attestations — so it does not contradict `autter stats`,
-/// which reports those same lines as untracked.
-pub fn blame_git_author_fallback_notice(unattested_lines: usize) -> String {
-    if unattested_lines == 1 {
-        "\nNote: 1 line has no Autter attestation, so blame shows the git author \
-(same as `git blame`). `autter stats` counts that line as untracked. Use `--mark-unknown` to label it Unknown.\n"
-            .to_string()
-    } else {
-        format!(
-            "\nNote: {unattested_lines} lines have no Autter attestation, so blame shows the git author \
-(same as `git blame`). `autter stats` counts those lines as untracked. Use `--mark-unknown` to label them Unknown.\n"
-        )
+/// `autter show` for a commit with no authorship note: why, and at most one
+/// next step.
+pub fn show_missing_record_message(record: &RecordStatus) -> String {
+    match explain(record, &CommitStats::default()) {
+        Some(explanation) => explanation.render(),
+        None => format!("{NO_AUTHORSHIP_DATA_MESSAGE}.\n"),
     }
-}
-
-/// Guidance when `autter show` finds commits but no authorship notes.
-pub fn show_missing_data_message() -> String {
-    let mut out = format!("{NO_AUTHORSHIP_DATA_MESSAGE}.\n");
-    out.push('\n');
-    out.push_str("Autter stores authorship in git notes when checkpoints run before commits.\n");
-    append_capture_steps(&mut out);
-    out
-}
-
-fn append_capture_steps(out: &mut String) {
-    out.push_str("\nLikely cause: agent/editor hooks or the git proxy did not checkpoint before this commit.\n");
-    out.push_str("\nTo diagnose and start capturing authorship:\n");
-    out.push_str("  autter install-hooks    # wire up agent and editor hooks\n");
-    out.push_str("  autter install          # ensure git proxy + trace2 are configured\n");
-    out.push_str("  autter doctor           # verify checkpoint → attribution round-trip\n");
-    out.push_str("  autter bg restart       # if doctor says checkpoints are not persisting\n");
-    out.push_str("  autter debug            # full support dump if doctor still fails\n");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorship::record_status::MissingCause;
 
     #[test]
-    fn capture_steps_point_at_doctor_and_daemon() {
+    fn diff_footer_explains_labels_without_repair_commands() {
         let footer = diff_missing_data_footer();
-        assert!(footer.contains("autter doctor"), "{footer}");
-        assert!(footer.contains("autter bg restart"), "{footer}");
-        assert!(footer.contains("Likely cause:"), "{footer}");
-        assert!(footer.contains("autter install-hooks"), "{footer}");
+        assert!(footer.contains("untracked"), "{footer}");
+        assert!(footer.contains("unknown"), "{footer}");
+        assert!(!footer.contains("install-hooks"), "{footer}");
+        assert!(!footer.contains("bg restart"), "{footer}");
     }
 
     #[test]
-    fn show_message_keeps_notes_explanation() {
-        let msg = show_missing_data_message();
-        assert!(msg.contains(NO_AUTHORSHIP_DATA_MESSAGE), "{msg}");
-        assert!(msg.contains("git notes"), "{msg}");
-        assert!(msg.contains("autter doctor"), "{msg}");
-    }
+    fn show_message_gives_one_reason_and_at_most_one_step() {
+        let predates = show_missing_record_message(&RecordStatus::PredatesAutter {
+            first_recorded_at: None,
+        });
+        assert!(
+            predates.contains("No commit in this repository"),
+            "{predates}"
+        );
+        assert!(!predates.contains("Next:"), "{predates}");
 
-    #[test]
-    fn blame_fallback_notice_points_at_stats_and_mark_unknown() {
-        let one = blame_git_author_fallback_notice(1);
-        assert!(one.contains("1 line has"), "{one}");
-        assert!(one.contains("autter stats"), "{one}");
-        assert!(one.contains("--mark-unknown"), "{one}");
-
-        let many = blame_git_author_fallback_notice(4);
-        assert!(many.contains("4 lines have"), "{many}");
-        assert!(many.contains("untracked"), "{many}");
+        let failed = show_missing_record_message(&RecordStatus::Missing {
+            cause: MissingCause::CaptureFailed,
+        });
+        assert!(failed.starts_with("Capture failed"), "{failed}");
+        assert_eq!(failed.matches("Next:").count(), 1, "{failed}");
     }
 }

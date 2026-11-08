@@ -1,0 +1,6 @@
+---
+source: src/authorship/stats.rs
+assertion_line: 931
+expression: unknown_output
+---
+"human ········································ AI\n      100 unknown (100%) · 0 AI (0%) · 100 added, 0 deleted\n"
