@@ -1630,9 +1630,9 @@ mod tests {
     #[test]
     fn parse_install_options_rejects_unknown_args() {
         // `install --foo` used to run a real install with the flag ignored.
-        let err = parse_install_options(&strings(&["--sytem"]))
-            .err()
-            .expect("unknown flag must be rejected");
+        let Err(err) = parse_install_options(&strings(&["--sytem"])) else {
+            panic!("unknown flag must be rejected");
+        };
         assert!(err.contains("unknown option '--sytem'"), "{err}");
         assert!(err.contains("autter install-hooks --help"), "{err}");
         assert!(parse_install_options(&strings(&["extra"])).is_err());
@@ -1657,9 +1657,9 @@ mod tests {
             parse_full_uninstall_options(&strings(&["--yes", "--dry-run", "--verbose"])).unwrap();
         assert!(options.yes && options.dry_run && options.verbose);
         assert!(parse_full_uninstall_options(&strings(&["-y"])).unwrap().yes);
-        let err = parse_full_uninstall_options(&strings(&["--all"]))
-            .err()
-            .expect("unknown flag must be rejected");
+        let Err(err) = parse_full_uninstall_options(&strings(&["--all"])) else {
+            panic!("unknown flag must be rejected");
+        };
         assert!(err.contains("autter uninstall --help"), "{err}");
     }
 

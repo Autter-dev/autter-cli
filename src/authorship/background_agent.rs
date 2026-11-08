@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(merge_trace2_env_vars(&[]), trace2_env_vars_value());
         let merged = merge_trace2_env_vars(&["MY_VAR, CURSOR_AGENT".to_string()]);
         assert!(merged.starts_with("MY_VAR,CURSOR_AGENT,AUTTER_WRAPPER_INVOCATION_ID"));
-        assert_eq!(merge_trace2_env_vars(&[merged.clone()]), merged);
+        assert_eq!(merge_trace2_env_vars(std::slice::from_ref(&merged)), merged);
     }
 
     #[test]

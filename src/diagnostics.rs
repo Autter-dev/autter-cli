@@ -1866,7 +1866,10 @@ mod tests {
     fn stale_trace2_repair_only_touches_old_autter_targets() {
         let expected = "af_unix:stream:/home/me/.autter/internal/daemon/trace2.sock";
         let old = "af_unix:stream:/Users/old/.autter/internal/daemon/trace2.sock".to_string();
-        assert!(trace2_targets_are_stale_autter(&[old.clone()], expected));
+        assert!(trace2_targets_are_stale_autter(
+            std::slice::from_ref(&old),
+            expected
+        ));
         // Nothing configured: needs consent, not a silent write.
         assert!(!trace2_targets_are_stale_autter(&[], expected));
         // Already right.

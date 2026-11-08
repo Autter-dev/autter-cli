@@ -222,7 +222,7 @@ fn repo_with_ai_line() -> TestRepo {
 /// The only session ID in HEAD's authorship note.
 fn head_session_id(repo: &TestRepo) -> String {
     let note = repo
-        .read_authorship_note(&repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string())
+        .read_authorship_note(repo.git(&["rev-parse", "HEAD"]).unwrap().trim())
         .expect("HEAD has an authorship note");
     let log =
         autter::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(

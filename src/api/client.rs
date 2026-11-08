@@ -293,7 +293,8 @@ const ORG_RESOLVE_TTL_SECS: i64 = 3_600;
 /// In-process cache: repo remote URL → (owning org id, None = no org connected it;
 /// unix time it was resolved). Only answers from the server are cached, never
 /// errors: an outage must not turn into "this repo isn't connected".
-static ORG_RESOLVE_CACHE: Lazy<Mutex<std::collections::HashMap<String, (Option<String>, i64)>>> =
+type OrgResolveCache = std::collections::HashMap<String, (Option<String>, i64)>;
+static ORG_RESOLVE_CACHE: Lazy<Mutex<OrgResolveCache>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// In-process cache: org id → (access token, unix expiry).

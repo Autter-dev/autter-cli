@@ -270,7 +270,7 @@ fn set_up_conflicted_cherry_pick(repo: &TestRepo, name: &str) -> (std::path::Pat
         "AI version".ai(),
         "Line 3".unattributed_human(),
     ]);
-    let source = head_sha(&repo);
+    let source = head_sha(repo);
 
     repo.git(&["checkout", &main_branch]).unwrap();
     fs::write(&file_path, "Line 1\nMain version\nLine 3\n").unwrap();

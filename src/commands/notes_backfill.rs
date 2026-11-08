@@ -14,7 +14,9 @@ use crate::git::find_repository;
 
 /// Entry point for `autter notes backfill`.
 pub fn handle_notes_backfill(args: &[String]) {
-    for arg in args {
+    // The command takes no options: the first argument is either help or an
+    // unknown option.
+    if let Some(arg) = args.first() {
         match arg.as_str() {
             "--help" | "-h" => {
                 print_help();

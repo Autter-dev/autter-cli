@@ -993,6 +993,7 @@ pub fn rewrite_authorship_after_squash_or_rebase(
 /// Cached version: uses pre-loaded note contents from RebaseNoteCache.
 /// Returns: (attributions, file_contents, prompts, humans) or None if reconstruction fails.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn try_reconstruct_attributions_from_notes_cached(
     repo: &Repository,
     original_head: &str,
