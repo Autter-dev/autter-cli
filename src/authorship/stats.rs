@@ -111,12 +111,16 @@ pub fn stats_command(
     );
     print!("{}", stats_footer(&stats, &record));
 
-    let interactive = std::io::stdout().is_terminal();
-    if interactive && stats.unknown_additions > 0 && record.is_recorded() {
-        println!(
-            "{}",
-            crate::authorship::record_status::capture_boundary_line()
-        );
+    if stats.unknown_additions > 0 && record.is_recorded() {
+        // Probing every agent installer is slow, so only on a terminal.
+        if std::io::stdout().is_terminal() {
+            println!(
+                "{}",
+                crate::authorship::record_status::capture_boundary_line()
+            );
+        }
+        // The unsupported-agent notice is cheap and explains the untracked
+        // share, so it is printed in piped output too, as before.
         if untracked_share_is_high(&stats) {
             let agents = crate::mdm::unsupported_agents::detect_unsupported_agents();
             if let Some(notice) = unsupported_agent_notice(&agents) {
