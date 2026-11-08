@@ -76,6 +76,10 @@ impl HookInstaller for GitHubCopilotInstaller {
         "github-copilot"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![Self::hooks_path(), Self::legacy_hooks_path()]
+    }
+
     fn process_names(&self) -> Vec<&str> {
         vec!["Code", "code"]
     }

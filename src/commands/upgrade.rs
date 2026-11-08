@@ -842,6 +842,10 @@ fn run_impl_with_url(
                     paint("1;32", "✓"),
                     release.tag
                 );
+                // Rewrite the hooks of agents already set up so they call the
+                // new binary. Windows installs finish in the background; there
+                // the first command after the install does it instead.
+                crate::mdm::hook_refresh::refresh_with_installed_binary();
             }
 
             log_message(

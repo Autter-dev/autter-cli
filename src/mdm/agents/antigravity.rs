@@ -27,7 +27,9 @@
 
 use crate::error::AutterError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
-use crate::mdm::utils::{binary_exists, generate_diff, home_dir, write_atomic};
+use crate::mdm::utils::{
+    binary_exists, generate_diff, home_dir, normalize_windows_path_for_shell, write_atomic,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,12 +64,15 @@ impl AntigravityInstaller {
                 .any(|dir| app_data.join(dir).is_dir())
     }
 
-    /// The `autter` hook entry for this binary.
+    /// The `autter` hook entry for this binary. Windows paths use forward
+    /// slashes, as in every other agent's hooks: backslashes are escape
+    /// characters in the POSIX shells some agents run hook commands with.
     fn desired_entry(binary: &Path) -> Value {
+        let binary = normalize_windows_path_for_shell(binary);
         let handler = |preset: &str| {
             json!({
                 "type": "command",
-                "command": format!("{} checkpoint {} --hook-input stdin", binary.display(), preset),
+                "command": format!("{binary} checkpoint {preset} --hook-input stdin"),
                 "timeout": HOOK_TIMEOUT_SECS,
             })
         };
@@ -158,6 +163,10 @@ impl HookInstaller for AntigravityInstaller {
 
     fn id(&self) -> &str {
         "antigravity"
+    }
+
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![Self::hooks_path(&home_dir())]
     }
 
     fn process_names(&self) -> Vec<&str> {
@@ -287,6 +296,16 @@ mod tests {
         let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(after.get("autter").is_none());
         assert!(after.get("my-linter-hook").is_some());
+    }
+
+    #[test]
+    fn windows_binary_path_uses_forward_slashes() {
+        let entry =
+            AntigravityInstaller::desired_entry(Path::new(r"C:\Users\dev\.autter\bin\autter.exe"));
+        assert_eq!(
+            entry["PreToolUse"][0]["hooks"][0]["command"],
+            "C:/Users/dev/.autter/bin/autter.exe checkpoint antigravity-pre --hook-input stdin"
+        );
     }
 
     #[test]

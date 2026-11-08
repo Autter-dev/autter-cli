@@ -1,0 +1,15 @@
+---
+source: src/commands/doctor.rs
+expression: "stale_json(\"Google Antigravity\",\n&[\"/gone/autter checkpoint antigravity-pre --hook-input stdin\",\n\"/gone/autter checkpoint antigravity-post --hook-input stdin\",], None,)"
+---
+{
+  "section": "AI agent hooks",
+  "name": "Google Antigravity",
+  "status": "failed",
+  "summary": "hooks out of date and failing every time the agent runs them: it runs /gone/autter, which no longer exists",
+  "details": [
+    "fails because it runs /gone/autter, which no longer exists: /gone/autter checkpoint antigravity-pre --hook-input stdin",
+    "fails because it runs /gone/autter, which no longer exists: /gone/autter checkpoint antigravity-post --hook-input stdin"
+  ],
+  "remediation": "run `autter install-hooks` to refresh them, then restart Google Antigravity"
+}

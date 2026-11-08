@@ -53,6 +53,13 @@ pub trait HookInstaller: Send + Sync {
         true
     }
 
+    /// Config files holding this agent's autter hook commands, so `autter
+    /// doctor` can check that each command still runs. Empty for agents whose
+    /// hooks are plugins or editor extensions.
+    fn hook_config_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Check if the tool is installed and hook status
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError>;
 

@@ -111,6 +111,10 @@ fn main() {
         {
             auth::notice::maybe_warn_logged_out();
         }
+        // First command after an upgrade: refresh the hooks of agents the user
+        // already set up, in the background, so no hook keeps calling a binary
+        // or preset from the previous version.
+        autter::mdm::hook_refresh::maybe_refresh_after_upgrade(&cli.args);
         commands::autter_handlers::handle_autter(&cli.args);
         std::process::exit(0);
     }

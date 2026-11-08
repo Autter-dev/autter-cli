@@ -1,0 +1,14 @@
+---
+source: src/commands/doctor.rs
+expression: "stale_json(\"Cursor\",\n&[\"/usr/local/bin/autter checkpoint cursor --hook-input stdin\"],\nSome(\"permission denied: ~/.cursor/hooks.json\"),)"
+---
+{
+  "section": "AI agent hooks",
+  "name": "Cursor",
+  "status": "failed",
+  "summary": "hooks out of date and could not be refreshed: permission denied: ~/.cursor/hooks.json",
+  "details": [
+    "hook command: /usr/local/bin/autter checkpoint cursor --hook-input stdin"
+  ],
+  "remediation": "run `autter install-hooks` to refresh them, then restart Cursor"
+}

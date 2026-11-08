@@ -706,6 +706,10 @@ impl HookInstaller for CodexInstaller {
         "codex"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![Self::config_path(), Self::hooks_json_path()]
+    }
+
     fn process_names(&self) -> Vec<&str> {
         vec!["codex"]
     }

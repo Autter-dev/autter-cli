@@ -68,6 +68,10 @@ impl HookInstaller for CursorInstaller {
         "cursor"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![Self::hooks_path()]
+    }
+
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let resolved_cli = resolve_editor_cli("cursor");
         let has_cli = resolved_cli.is_some();

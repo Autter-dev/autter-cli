@@ -137,6 +137,7 @@ mod show_prompt;
 mod simple_additions;
 mod simple_benchmark;
 mod squash_merge;
+mod stale_hooks;
 mod stale_prompt_carry;
 mod stash_attribution;
 mod stash_hooks_unit;

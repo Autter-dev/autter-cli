@@ -646,9 +646,16 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
     use crate::mdm::agents::get_all_installers;
     use crate::mdm::hook_installer::HookInstallerParams;
 
-    let binary_path =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("autter"));
+    // The same path `install-hooks` writes, so a symlinked or cargo-built
+    // binary isn't reported as out of date when the hooks are current.
+    let binary_path = crate::mdm::utils::resolve_hook_binary_path()
+        .or_else(|_| std::env::current_exe())
+        .unwrap_or_else(|_| std::path::PathBuf::from("autter"));
     let params = HookInstallerParams { binary_path };
+    // Refresh failures only count for this CLI version: an older version's
+    // failures say nothing about the hooks this binary would write.
+    let refresh_state = crate::mdm::hook_refresh::read_state()
+        .filter(|state| state.version == env!("CARGO_PKG_VERSION"));
 
     let mut checks = Vec::new();
     let mut not_detected = Vec::new();
@@ -726,17 +733,20 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
                 details: Vec::new(),
                 remediation: None,
             }),
-            Ok(_) => checks.push(DoctorCheck {
-                section: SECTION_AGENTS,
-                name: name.clone(),
-                status: DoctorStatus::Warning,
-                summary: "hooks installed but out of date".to_string(),
-                details: Vec::new(),
-                remediation: Some(format!(
-                    "run `autter install-hooks` to refresh them, then restart {}",
-                    name
-                )),
-            }),
+            Ok(_) => {
+                let commands = crate::mdm::hook_refresh::autter_commands_in_files(
+                    &installer.hook_config_paths(),
+                );
+                let refresh_failure = refresh_state
+                    .as_ref()
+                    .and_then(|s| s.failed.iter().find(|f| f.id == installer.id()));
+                checks.push(stale_hooks_check(
+                    &name,
+                    &commands,
+                    &|cmd: &str| crate::mdm::hook_refresh::command_problem(cmd),
+                    refresh_failure.map(|f| f.error.as_str()),
+                ));
+            }
             Err(err) => checks.push(DoctorCheck {
                 section: SECTION_AGENTS,
                 name,
@@ -794,6 +804,67 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
     }
 
     checks
+}
+
+/// Out-of-date hooks for one agent. **Failed** when a hook command will fail
+/// when the agent runs it (the binary it names is gone, or its preset is one
+/// this autter doesn't know) or when the automatic refresh after an upgrade
+/// could not rewrite them; each failing command is listed exactly. Otherwise
+/// the hooks still run and only differ cosmetically: **Warning**.
+fn stale_hooks_check(
+    name: &str,
+    commands: &[String],
+    problem: &dyn Fn(&str) -> Option<String>,
+    refresh_failure: Option<&str>,
+) -> DoctorCheck {
+    let remediation = Some(format!(
+        "run `autter install-hooks` to refresh them, then restart {name}"
+    ));
+    let failing: Vec<(String, &String)> = commands
+        .iter()
+        .filter_map(|cmd| problem(cmd).map(|why| (why, cmd)))
+        .collect();
+    if let Some((why, _)) = failing.first() {
+        let mut details: Vec<String> = failing
+            .iter()
+            .map(|(why, cmd)| format!("fails because {why}: {cmd}"))
+            .collect();
+        if let Some(error) = refresh_failure {
+            details.push(format!(
+                "automatic refresh after the last upgrade failed: {error}"
+            ));
+        }
+        return DoctorCheck {
+            section: SECTION_AGENTS,
+            name: name.to_string(),
+            status: DoctorStatus::Failed,
+            summary: format!("hooks out of date and failing every time the agent runs them: {why}"),
+            details,
+            remediation,
+        };
+    }
+    if let Some(error) = refresh_failure {
+        let details = commands
+            .iter()
+            .map(|cmd| format!("hook command: {cmd}"))
+            .collect();
+        return DoctorCheck {
+            section: SECTION_AGENTS,
+            name: name.to_string(),
+            status: DoctorStatus::Failed,
+            summary: format!("hooks out of date and could not be refreshed: {error}"),
+            details,
+            remediation,
+        };
+    }
+    DoctorCheck {
+        section: SECTION_AGENTS,
+        name: name.to_string(),
+        status: DoctorStatus::Warning,
+        summary: "hooks installed but out of date (they still run)".to_string(),
+        details: Vec::new(),
+        remediation,
+    }
 }
 
 /// Claude Code shell-tool capture: hooks installed by older autter versions
@@ -1627,6 +1698,48 @@ mod tests {
             details: Vec::new(),
             remediation: None,
         }
+    }
+
+    /// Pretend `/gone/` binaries were deleted by an upgrade.
+    fn fake_problem(cmd: &str) -> Option<String> {
+        cmd.starts_with("/gone/")
+            .then(|| "it runs /gone/autter, which no longer exists".to_string())
+    }
+
+    fn stale_json(name: &str, commands: &[&str], refresh_failure: Option<&str>) -> String {
+        let commands: Vec<String> = commands.iter().map(|c| c.to_string()).collect();
+        let check = stale_hooks_check(name, &commands, &fake_problem, refresh_failure);
+        serde_json::to_string_pretty(&check).unwrap()
+    }
+
+    #[test]
+    fn stale_hooks_that_break_the_agent_fail_with_the_command() {
+        insta::assert_snapshot!(stale_json(
+            "Google Antigravity",
+            &[
+                "/gone/autter checkpoint antigravity-pre --hook-input stdin",
+                "/gone/autter checkpoint antigravity-post --hook-input stdin",
+            ],
+            None,
+        ));
+    }
+
+    #[test]
+    fn stale_hooks_that_still_run_are_a_warning() {
+        insta::assert_snapshot!(stale_json(
+            "Claude Code",
+            &["/usr/local/bin/autter checkpoint claude --hook-input stdin"],
+            None,
+        ));
+    }
+
+    #[test]
+    fn stale_hooks_that_could_not_be_refreshed_fail() {
+        insta::assert_snapshot!(stale_json(
+            "Cursor",
+            &["/usr/local/bin/autter checkpoint cursor --hook-input stdin"],
+            Some("permission denied: ~/.cursor/hooks.json"),
+        ));
     }
 
     #[test]

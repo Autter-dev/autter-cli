@@ -393,6 +393,10 @@ impl HookInstaller for GeminiInstaller {
         "gemini"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![Self::settings_path()]
+    }
+
     fn process_names(&self) -> Vec<&str> {
         vec!["gemini"]
     }

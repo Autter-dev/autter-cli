@@ -206,6 +206,10 @@ impl HookInstaller for WindsurfInstaller {
         "windsurf"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        Self::hooks_paths().to_vec()
+    }
+
     fn process_names(&self) -> Vec<&str> {
         vec!["Windsurf", "windsurf"]
     }

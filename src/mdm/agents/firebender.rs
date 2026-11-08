@@ -36,6 +36,10 @@ impl HookInstaller for FirebenderInstaller {
         "firebender"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![Self::hooks_path()]
+    }
+
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_dotfiles = home_dir().join(".firebender").exists();
         if !has_dotfiles {

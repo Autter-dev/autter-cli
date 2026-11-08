@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod claude_config_registry;
 pub mod hook_installer;
+pub mod hook_refresh;
 pub mod jetbrains;
 pub mod mcp_servers;
 pub mod skills_installer;

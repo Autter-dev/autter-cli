@@ -472,6 +472,17 @@ fn ensure_daemon(dry_run: bool) -> Result<(), String> {
 /// after the user consents — so `npm install` / bare `install-hooks` no longer
 /// mutate the machine silently.
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
+    // Internal: rewrite only out-of-date hooks of agents already set up. Started
+    // in the background on the first command after an upgrade, and by
+    // `autter upgrade` with the newly installed binary.
+    if args.len() == 1 && args[0] == crate::mdm::hook_refresh::REFRESH_STALE_FLAG {
+        let ok = crate::mdm::hook_refresh::run_refresh_command();
+        std::process::exit(if ok {
+            crate::commands::EXIT_SUCCESS
+        } else {
+            crate::commands::EXIT_RUNTIME_ERROR
+        });
+    }
     let mut options = match parse_install_options(args) {
         Ok(options) => options,
         Err(message) => {
@@ -591,6 +602,35 @@ fn run_with_options(options: InstallOptions) -> Result<InstallOutcome, AutterErr
     // These are no longer used — all telemetry now routes through the daemon.
     if !options.dry_run {
         cleanup_legacy_envelope_logs();
+        // Hooks now match this CLI version, so the first command after this
+        // one doesn't start a refresh. A full run (every agent) also clears
+        // earlier refresh failures; a run limited to some agents keeps the
+        // failures of the others.
+        let failed_ids: HashSet<&str> = statuses
+            .iter()
+            .filter(|(_, status)| **status == InstallStatus::Failed)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let mut failed: Vec<crate::mdm::hook_refresh::RefreshFailure> = get_all_installers()
+            .iter()
+            .filter(|i| failed_ids.contains(i.id()))
+            .map(|i| crate::mdm::hook_refresh::RefreshFailure {
+                id: i.id().to_string(),
+                name: i.name().to_string(),
+                error: "`autter install-hooks` could not update its hooks".to_string(),
+            })
+            .collect();
+        if let Some(only) = &options.only
+            && let Some(previous) = crate::mdm::hook_refresh::read_state()
+        {
+            failed.extend(
+                previous
+                    .failed
+                    .into_iter()
+                    .filter(|f| !only.contains(&f.id) && !failed_ids.contains(f.id.as_str())),
+            );
+        }
+        crate::mdm::hook_refresh::record_refresh(failed);
     }
 
     outcome.statuses = to_hashmap(statuses);
@@ -1036,7 +1076,7 @@ async fn async_run_install(
                             let error_msg = e.to_string();
                             spinner.error(&format!("{}: Failed to update hooks", name));
                             eprintln!("  Error: {}", error_msg);
-                            statuses.insert(id.to_string(), InstallStatus::NotFound);
+                            statuses.insert(id.to_string(), InstallStatus::Failed);
                             detailed_results
                                 .push((id.to_string(), InstallResult::failed(error_msg)));
                         }

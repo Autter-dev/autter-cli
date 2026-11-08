@@ -453,6 +453,10 @@ impl HookInstaller for ClaudeCodeInstaller {
         "claude-code"
     }
 
+    fn hook_config_paths(&self) -> Vec<std::path::PathBuf> {
+        Self::all_settings_paths()
+    }
+
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_binary = binary_exists("claude");
         let has_dotfiles = claude_config_dir().exists();

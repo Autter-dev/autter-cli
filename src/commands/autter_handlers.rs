@@ -46,6 +46,9 @@ pub fn handle_autter(args: &[String]) {
     ) {
         Ok(p) => p,
         Err(e) => {
+            if invoked_by_agent_hook(args) {
+                exit_stale_hook(&e.to_string());
+            }
             eprintln!("error: {}", e);
             std::process::exit(2);
         }
@@ -78,6 +81,13 @@ pub fn handle_autter(args: &[String]) {
 
     // Record the subcommand so any later panic report can name it.
     crate::observability::set_current_command(args[0].as_str());
+
+    // Agents that parse a hook's stdout get their no-op reply before anything
+    // else can fail (the background service check below, argument parsing,
+    // a panic), so every exit path leaves the agent unblocked.
+    if args[0] == "checkpoint" {
+        answer_checkpoint_hook_early(&args[1..]);
+    }
 
     // `-h`/`--help` anywhere after the subcommand (`autter uninstall --help`)
     // prints that command's help and exits 0 here, before the background
@@ -151,7 +161,9 @@ pub fn handle_autter(args: &[String]) {
                     err
                 );
                 commands::suggest_autter_doctor();
-                if args[0].as_str() == "checkpoint" {
+                // Agent hooks never fail the agent: right after an upgrade the
+                // old service may be stopping while the new one starts.
+                if matches!(args[0].as_str(), "checkpoint" | "memory-hook") {
                     std::process::exit(0);
                 }
                 std::process::exit(1);
@@ -247,7 +259,17 @@ pub fn handle_autter(args: &[String]) {
                     t.elapsed().as_secs_f64() * 1000.0
                 );
             }
-            handle_checkpoint(&args[1..]);
+            if invoked_by_agent_hook(args) {
+                // A bug in autter must not block the agent either: the panic
+                // is still reported (panic hook), then the hook exits 0.
+                let checkpoint_args = args[1..].to_vec();
+                if std::panic::catch_unwind(move || handle_checkpoint(&checkpoint_args)).is_err() {
+                    eprintln!("autter checkpoint failed internally; the agent was not blocked");
+                    std::process::exit(0);
+                }
+            } else {
+                handle_checkpoint(&args[1..]);
+            }
         }
         "log" => {
             let status = commands::log::handle_log(&args[1..]);
@@ -433,9 +455,13 @@ fn handle_checkpoint(args: &[String]) {
     //     the checkpoint can't be captured: not in a repository, the background
     //     service unreachable, or git not set up to report the commit. A script
     //     must be able to tell "recorded" from "lost".
-    //   * Usage / argument errors (the caller invoked the command incorrectly:
-    //     missing flag value, unknown preset) exit non-zero, so scripts, CI, and
-    //     integration code can detect that they're calling it wrong.
+    //   * Usage / argument errors from a person or script (unknown preset with
+    //     no hook payload) exit non-zero, so they can detect the mistake.
+    //   * Usage / argument errors from an agent hook (anything carrying
+    //     `--hook-input`, or AUTTER_CHECKPOINT_HOOK set) mean the hook config
+    //     was written by another autter version: exit 0 with the agent's
+    //     no-op reply and "autter hook is out of date" on stderr
+    //     (`exit_stale_hook`). The agent must never be blocked by autter.
     let perf = std::env::var("AUTTER_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
     let t0 = std::time::Instant::now();
 
@@ -448,6 +474,9 @@ fn handle_checkpoint(args: &[String]) {
     ) {
         Ok(p) => p,
         Err(e) => {
+            if invoked_by_agent_hook(args) {
+                exit_stale_hook(&e.to_string());
+            }
             eprintln!("error: {}", e);
             std::process::exit(0);
         }
@@ -457,21 +486,8 @@ fn handle_checkpoint(args: &[String]) {
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
+    let from_agent_hook = invoked_by_agent_hook(args);
     let args = &pp.rest;
-
-    // Antigravity reads every hook's stdout as JSON
-    // (https://antigravity.google/docs/hooks). Answer `{}` up front so every
-    // exit path below, including failures, returns valid output that leaves
-    // the agent's behavior unchanged: PostToolUse expects `{}`, and a
-    // PreToolUse reply without a `decision` is treated as no decision.
-    if args
-        .first()
-        .is_some_and(|preset| preset.starts_with("antigravity-"))
-    {
-        use std::io::Write as _;
-        println!("{{}}");
-        let _ = std::io::stdout().flush();
-    }
 
     let mut hook_input = None;
     let mut i = 0;
@@ -495,19 +511,17 @@ fn handle_checkpoint(args: &[String]) {
                         }
                         hook_input = Some(strip_utf8_bom(buffer));
                     } else if hook_input.as_ref().unwrap().trim().is_empty() {
-                        // Usage error: caller passed `--hook-input` with an empty value.
-                        eprintln!("Error: --hook-input requires a value");
+                        // The hook command lost its payload argument: a hook
+                        // config autter no longer writes. Never block the agent.
                         report_checkpoint_usage_error("--hook-input requires a value");
-                        std::process::exit(1);
+                        exit_stale_hook("--hook-input has an empty value");
                     }
                     i += 2;
                 } else {
-                    // Usage error: caller passed `--hook-input` with no value at all.
-                    eprintln!("Error: --hook-input requires a value or 'stdin' to read from stdin");
                     report_checkpoint_usage_error(
                         "--hook-input requires a value or 'stdin' to read from stdin",
                     );
-                    std::process::exit(1);
+                    exit_stale_hook("--hook-input has no value");
                 }
             }
             _ => {
@@ -529,10 +543,14 @@ fn handle_checkpoint(args: &[String]) {
         ("human", &args[1..])
     } else if crate::commands::checkpoint_agent::presets::resolve_preset(args[0].as_str()).is_err()
     {
-        // Usage error: caller named a preset that doesn't exist.
+        report_checkpoint_usage_error(&format!("unknown checkpoint preset '{}'", args[0]));
+        if from_agent_hook {
+            // A hook written by an autter that used another preset name.
+            exit_stale_hook(&format!("unknown checkpoint preset '{}'", args[0]));
+        }
+        // Usage error: a person or script named a preset that doesn't exist.
         eprintln!("Error: unknown checkpoint preset '{}'", args[0]);
         eprintln!("Usage: autter checkpoint <preset> [--hook-input <json|stdin>] [files...]");
-        report_checkpoint_usage_error(&format!("unknown checkpoint preset '{}'", args[0]));
         std::process::exit(1);
     } else {
         (args[0].as_str(), &args[1..])
@@ -839,6 +857,55 @@ const DIRECT_CHECKPOINT_PRESETS: &[&str] = &["human", "mock_ai", "mock_known_hum
 /// when the caller sets `AUTTER_CHECKPOINT_HOOK=1`.
 fn checkpoint_runs_in_hook(preset: &str, has_hook_input: bool, hook_env: bool) -> bool {
     !DIRECT_CHECKPOINT_PRESETS.contains(&preset) || has_hook_input || hook_env
+}
+
+/// Whether these arguments come from an agent's hook config rather than a
+/// person: every hook autter installs passes `--hook-input`, and editor
+/// extensions set `AUTTER_CHECKPOINT_HOOK`.
+fn invoked_by_agent_hook(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--hook-input" || a.starts_with("--hook-input="))
+        || env_flag_set("AUTTER_CHECKPOINT_HOOK")
+}
+
+static HOOK_NOOP_ANSWERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Print `{}` once. Antigravity reads every hook's stdout as JSON
+/// (https://antigravity.google/docs/hooks); `{}` leaves its behavior
+/// unchanged: PostToolUse expects `{}`, and a PreToolUse reply without a
+/// `decision` is no decision. Claude Code, Codex, Gemini CLI, Droid and
+/// Copilot read `{}` as "no fields set", the same as empty output.
+fn answer_hook_noop() {
+    use std::io::Write as _;
+    if HOOK_NOOP_ANSWERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    println!("{{}}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Called before any checkpoint work. Antigravity presets (any name starting
+/// with `antigravity`, so a renamed one still counts) always get `{}` first.
+/// A preset this autter doesn't know, sent by an agent hook, gets it too: we
+/// can't tell which agent sent it, and `{}` is a no-op for every agent that
+/// parses hook output.
+fn answer_checkpoint_hook_early(checkpoint_args: &[String]) {
+    let Some(preset) = checkpoint_args.iter().find(|a| !a.starts_with('-')) else {
+        return;
+    };
+    let unknown = crate::commands::checkpoint_agent::presets::resolve_preset(preset).is_err();
+    if preset.starts_with("antigravity") || (unknown && invoked_by_agent_hook(checkpoint_args)) {
+        answer_hook_noop();
+    }
+}
+
+/// End a hook invocation whose command this autter can't run as written: the
+/// hook config came from another autter version. Exit 0 so the agent carries
+/// on, and say on stderr how to fix it.
+fn exit_stale_hook(detail: &str) -> ! {
+    eprintln!("autter hook is out of date. Run `autter install-hooks` to refresh it ({detail}).");
+    std::process::exit(0);
 }
 
 fn env_flag_set(name: &str) -> bool {

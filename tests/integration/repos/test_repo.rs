@@ -2811,6 +2811,21 @@ impl TestRepo {
         }
     }
 
+    /// Build a configured `autter` [`Command`] with `args` passed verbatim:
+    /// no checkpoint-argument normalization, so tests can replay a hook
+    /// command exactly as an agent config file spells it.
+    pub fn autter_command_verbatim(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(get_binary_path());
+        command.args(args).current_dir(&self.path);
+        self.configure_autter_env(&mut command);
+        if let Some(patch) = &self.config_patch
+            && let Ok(patch_json) = serde_json::to_string(patch)
+        {
+            command.env("AUTTER_TEST_CONFIG_PATCH", patch_json);
+        }
+        command
+    }
+
     /// Build a configured `autter` [`Command`] without running it, so tests can
     /// control stdio (e.g. to exercise closed-pipe behavior). Mirrors the env
     /// setup used by [`Self::autter_with_env`].

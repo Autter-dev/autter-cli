@@ -1,0 +1,11 @@
+---
+source: src/commands/doctor.rs
+expression: "stale_json(\"Claude Code\",\n&[\"/usr/local/bin/autter checkpoint claude --hook-input stdin\"], None,)"
+---
+{
+  "section": "AI agent hooks",
+  "name": "Claude Code",
+  "status": "warning",
+  "summary": "hooks installed but out of date (they still run)",
+  "remediation": "run `autter install-hooks` to refresh them, then restart Claude Code"
+}
