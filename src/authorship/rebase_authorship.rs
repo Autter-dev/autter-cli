@@ -1507,8 +1507,13 @@ pub fn rewrite_authorship_after_rebase_v2(
         Vec::with_capacity(commits_to_process.len() + original_commits_for_processing.len());
     combined_commits.extend(commits_to_process.iter().cloned());
     combined_commits.extend(original_commits_for_processing.iter().cloned());
-    let (mut combined_diff_tree_result, mut combined_hunks) =
-        run_diff_tree_with_hunks(repo, &combined_commits, &pathspecs_lookup, &pathspecs, false)?;
+    let (mut combined_diff_tree_result, mut combined_hunks) = run_diff_tree_with_hunks(
+        repo,
+        &combined_commits,
+        &pathspecs_lookup,
+        &pathspecs,
+        false,
+    )?;
 
     // A tracked file that disappears in one of these commits may have been
     // renamed there. Track the paths it was renamed to and diff again with
@@ -2439,7 +2444,11 @@ fn parse_diff_tree_name_status_renames(raw: &[u8]) -> Vec<(String, String)> {
     };
     let mut fields = raw
         .split(|b| *b == 0)
-        .map(|field| String::from_utf8_lossy(field).trim_matches('\n').to_string())
+        .map(|field| {
+            String::from_utf8_lossy(field)
+                .trim_matches('\n')
+                .to_string()
+        })
         .filter(|field| !field.is_empty());
     let mut renames = Vec::new();
     while let Some(status) = fields.next() {

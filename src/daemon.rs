@@ -1792,7 +1792,10 @@ fn apply_fetch_notes_sync_side_effect(
     // autter's own notes fetch is a `git fetch` with a `refs/notes/...` refspec;
     // reacting to it would fetch again forever. A user fetching notes by hand
     // has already done what this would do. A dry run fetches nothing.
-    if args.iter().any(|arg| arg.contains("refs/notes/") || arg == "--dry-run") {
+    if args
+        .iter()
+        .any(|arg| arg.contains("refs/notes/") || arg == "--dry-run")
+    {
         return Ok(());
     }
     let repo = find_repository_in_path(worktree)?;

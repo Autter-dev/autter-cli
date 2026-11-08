@@ -178,8 +178,7 @@ pub fn init_daemon_telemetry_handle_with(allow_spawn: bool) -> DaemonTelemetryIn
     {
         // Try to ensure daemon is running and connect
         let config = if allow_spawn {
-            match crate::commands::daemon::ensure_daemon_running(DAEMON_TELEMETRY_CONNECT_TIMEOUT)
-            {
+            match crate::commands::daemon::ensure_daemon_running(DAEMON_TELEMETRY_CONNECT_TIMEOUT) {
                 Ok(config) => config,
                 Err(e) => {
                     let _ = DAEMON_TELEMETRY_HANDLE.get_or_init(|| Mutex::new(None));

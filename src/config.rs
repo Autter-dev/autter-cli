@@ -1082,9 +1082,8 @@ fn build_config() -> Config {
                 .ok()
         })
         .collect();
-    let telemetry_oss_disabled = !telemetry_oss_opted_in(
-        file_cfg.as_ref().and_then(|c| c.telemetry_oss.as_deref()),
-    );
+    let telemetry_oss_disabled =
+        !telemetry_oss_opted_in(file_cfg.as_ref().and_then(|c| c.telemetry_oss.as_deref()));
     let telemetry_enterprise_dsn = file_cfg
         .as_ref()
         .and_then(|c| c.telemetry_enterprise_dsn.clone())
