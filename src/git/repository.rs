@@ -2004,10 +2004,9 @@ pub fn find_repository(global_args: &[String]) -> Result<Repository, AutterError
 
     let rev_parse_output = exec_git(&rev_parse_args)?;
     let rev_parse_stdout = String::from_utf8(rev_parse_output.stdout)?;
-    let mut lines = rev_parse_stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
+    // `lines()` strips only the line terminator. Do not trim other whitespace:
+    // a trailing space can be part of a directory name.
+    let mut lines = rev_parse_stdout.lines().filter(|line| !line.is_empty());
 
     let is_bare = match lines.next() {
         Some("true") => true,
@@ -2068,7 +2067,7 @@ pub fn find_repository(global_args: &[String]) -> Result<Repository, AutterError
         top_level_args.push("rev-parse".to_string());
         top_level_args.push("--show-toplevel".to_string());
         let output = exec_git(&top_level_args)?;
-        PathBuf::from(String::from_utf8(output.stdout)?.trim())
+        PathBuf::from(String::from_utf8(output.stdout)?.trim_end_matches(['\r', '\n']))
     };
 
     if !workdir.is_dir() {
@@ -3181,6 +3180,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let error = discover_repository_in_path_no_git_exec(tmp.path()).unwrap_err();
         assert!(is_no_repository_discovered_error(&error), "{error}");
+    }
+
+    // Windows does not allow a trailing space in a directory name.
+    #[cfg(unix)]
+    #[test]
+    fn find_repository_keeps_trailing_space_in_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo ");
+        std::fs::create_dir(&repo_dir).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&repo_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let repo = find_repository_in_path(&repo_dir.to_string_lossy()).unwrap();
+        assert_eq!(
+            repo.workdir().unwrap().canonicalize().unwrap(),
+            repo_dir.canonicalize().unwrap()
+        );
     }
 
     #[test]
