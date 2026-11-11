@@ -551,6 +551,14 @@ fn collect_vscode_native_hooks_chain() -> Vec<String> {
     inspect_vscode_native_hooks_chain().lines
 }
 
+/// Whether this `code --version` output is a build with native agent hooks
+/// (>= [`crate::mdm::utils::MIN_VSCODE_NATIVE_HOOKS_VERSION`]); `None` when
+/// it holds no version number.
+fn vscode_uses_native_hooks(version_output: &str) -> Option<bool> {
+    crate::mdm::utils::parse_version_triple(version_output)
+        .map(|version| version >= crate::mdm::utils::MIN_VSCODE_NATIVE_HOOKS_VERSION)
+}
+
 /// Walk the chain VS Code's built-in Copilot agent needs for AI edits to
 /// checkpoint on VS Code >= 1.109.3: the autter extension stands down there
 /// and capture only happens if VS Code loads ~/.copilot/hooks/autter.json.
@@ -585,9 +593,18 @@ pub(crate) fn inspect_vscode_native_hooks_chain() -> VsCodeNativeHooksChain {
     lines.push(format!("  VS Code version: {}", first_line));
 
     let (min_major, min_minor, min_patch) = MIN_VSCODE_NATIVE_HOOKS_VERSION;
-    let native_mode = parse_version_triple(&version_str)
-        .map(|v| v >= MIN_VSCODE_NATIVE_HOOKS_VERSION)
-        .unwrap_or(false);
+    // A version that cannot be read is unknown, not old: saying it "predates
+    // native agent hooks" sent users of current VS Code builds down the
+    // wrong path.
+    let Some(native_mode) = vscode_uses_native_hooks(&version_str) else {
+        lines.push(
+            "  Capture mode: unknown (that is not a version number autter can read)".to_string(),
+        );
+        return VsCodeNativeHooksChain {
+            outcome: VsCodeChainOutcome::VersionUnknown,
+            lines,
+        };
+    };
 
     if !native_mode {
         lines.push(format!(
@@ -1865,6 +1882,26 @@ fn redact_env_value(key: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vscode_version_decides_native_hooks_and_unreadable_is_unknown() {
+        // `code --version` prints the version, the commit and the arch.
+        assert_eq!(
+            vscode_uses_native_hooks("1.144.1\n4e71e1d1a2a2f1b3c0d9\nx64"),
+            Some(true)
+        );
+        assert_eq!(vscode_uses_native_hooks("1.109.3"), Some(true));
+        assert_eq!(vscode_uses_native_hooks("1.110.0-insider"), Some(true));
+        assert_eq!(vscode_uses_native_hooks("1.109.2"), Some(false));
+        assert_eq!(vscode_uses_native_hooks("1.99.0"), Some(false));
+        // No version number: unknown, never "predates native agent hooks".
+        assert_eq!(vscode_uses_native_hooks(""), None);
+        assert_eq!(vscode_uses_native_hooks("Code.exe"), None);
+        assert_eq!(
+            vscode_uses_native_hooks("Warning: 'sandbox' is not in the list of known options"),
+            None
+        );
+    }
 
     #[cfg(not(windows))]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
