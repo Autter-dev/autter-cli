@@ -86,12 +86,10 @@ fn main() {
         if !is_superuser_exempt_command(&cli.args) {
             match check_superuser_guard() {
                 SuperuserCheckResult::WarnFutureBlock => print_superuser_warning(),
-                SuperuserCheckResult::AllowedWithWarning => {
-                    eprintln!(
-                        "[autter] warning: running as superuser (AUTTER_ALLOW_SUPERUSER is set)"
-                    );
-                }
-                SuperuserCheckResult::Allowed => {}
+                // Opted in with AUTTER_ALLOW_SUPERUSER=1 or `allow_superuser`:
+                // the user said they know, so stay quiet. This used to print a
+                // warning line on every command anyway.
+                SuperuserCheckResult::AllowedWithWarning | SuperuserCheckResult::Allowed => {}
             }
         }
         // Warn if the CLI is below the platform's minimum required version.

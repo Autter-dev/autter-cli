@@ -19,11 +19,21 @@ npx @autter/cli onboard
 
 The package version matches the CLI release, so `npm install -g @autter/cli@<version>` installs that exact release.
 
+Run `autter onboard` after installing: npm hides the output of install scripts, so nothing on screen tells you to, and nothing is captured until onboarding has run.
+
+If your package manager skips install scripts (`--ignore-scripts`, pnpm, or an npm setting), the binary is downloaded the first time you run `autter` instead. No extra flag is needed.
+
+## Upgrade and pin
+
+- Upgrade with `autter upgrade`, or `npm install -g @autter/cli@latest`. `npm update` alone does not upgrade the CLI, because this package only bootstraps the binary.
+- The background service installs new releases by itself. To stay on the version you installed, set `AUTTER_DISABLE_AUTO_UPDATES=1` or run `autter config set disable_auto_updates true`. In CI it never upgrades by itself.
+
 ## Environment variables
 
 - `AUTTER_NPM_SKIP_DOWNLOAD=1` — skip the postinstall binary download (it happens on first run instead).
 - `AUTTER_RELEASE_TAG=vX.Y.Z` — install a specific release.
 - `AUTTER_NO_INSTALL_PING=1` — disable the anonymous install-count ping (OS, architecture, and version only).
+- `AUTTER_DISABLE_AUTO_UPDATES=1` — stop the background service from upgrading the binary by itself.
 
 ## Links
 

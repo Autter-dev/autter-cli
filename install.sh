@@ -1,7 +1,68 @@
 #!/bin/bash
+# autter-install-script
+
+# This script is written for bash. `curl … | sh` ignores the line above, and
+# where `sh` is dash (Debian, Ubuntu) the script used to stop at the first
+# bash-only line with "set: Illegal option -o pipefail". Everything up to
+# `set -euo pipefail` is plain POSIX sh: hand over to bash when the script is
+# a file, and say exactly what to run when it arrives on a pipe (the rest of
+# a piped script cannot be handed to another shell reliably).
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        if [ -f "$0" ] && grep -q '^# autter-install-script$' "$0" 2>/dev/null; then
+            exec bash "$0" "$@"
+        fi
+        echo "Error: the autter installer needs bash, and it was started with sh." >&2
+        echo "" >&2
+        echo "Run the same command again with 'bash' in place of 'sh' at the end:" >&2
+        echo "" >&2
+        echo "    curl -fsSL https://api.autter.dev/install.sh | bash" >&2
+        echo "" >&2
+        echo "Nothing was installed or changed." >&2
+    else
+        echo "Error: the autter installer needs bash, which is not installed here." >&2
+        echo "" >&2
+        echo "Install bash and re-run, or install with npm instead:" >&2
+        echo "" >&2
+        echo "    npm install -g @autter/cli && autter onboard" >&2
+        echo "" >&2
+        echo "Nothing was installed or changed." >&2
+    fi
+    exit 1
+fi
 
 set -euo pipefail
 IFS=$'\n\t'
+
+# `--dry-run` (or AUTTER_INSTALL_DRY_RUN=1) prints what the installer would do
+# and exits before anything is downloaded, written or started. With a piped
+# install: curl -fsSL https://api.autter.dev/install.sh | bash -s -- --dry-run
+DRY_RUN=false
+if [ "${AUTTER_INSTALL_DRY_RUN:-}" = "1" ]; then
+    DRY_RUN=true
+fi
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)
+            DRY_RUN=true
+            ;;
+        -h|--help)
+            echo "Usage: install.sh [--dry-run]"
+            echo ""
+            echo "Installs the autter binary into ~/.autter/bin, adds it to your PATH and"
+            echo "runs 'autter onboard', which asks before it installs agent hooks, changes"
+            echo "your global git config or starts the background service."
+            echo ""
+            echo "  --dry-run   Print what would be done; download, write and start nothing."
+            echo "              (also AUTTER_INSTALL_DRY_RUN=1)"
+            exit 0
+            ;;
+        *)
+            echo "Error: unknown option '$arg'. Run with --help for usage." >&2
+            exit 2
+            ;;
+    esac
+done
 
 # ============================================================
 # Ensure HOME is set when running via MDMs (e.g. JAMF) or other environments where HOME may be unbound.
@@ -87,6 +148,19 @@ warn() {
 success() {
     printf '%b\n' "${GREEN}$1${NC}"
 }
+
+# What to try when a download from GitHub fails (a 502, a proxy, a blocked
+# host): the npm package installs the same binary and is a second route.
+NPM_FALLBACK_HINT="This is usually temporary: wait a minute and run the installer again.
+If it keeps failing on this network, install with npm instead (needs Node 18+):
+  npm install -g @autter/cli && autter onboard"
+
+# Show a progress bar for the binary download when a person is watching
+# (stderr is a terminal); stay quiet in CI logs and scripted installs.
+CURL_PROGRESS="--silent"
+if [ -t 2 ]; then
+    CURL_PROGRESS="--progress-bar"
+fi
 
 # Function to verify checksum of downloaded binary
 verify_checksum() {
@@ -401,6 +475,40 @@ else
     RELEASE_TAG="latest"
 fi
 
+# Dry run: say what would happen and stop before the first network request.
+if [ "$DRY_RUN" = "true" ]; then
+    if [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
+        DRY_SOURCE="copy the local binary ${AUTTER_LOCAL_BINARY}"
+    elif [ "$RELEASE_TAG" = "latest" ]; then
+        DRY_SOURCE="download ${BINARY_NAME} from the latest release at https://github.com/${REPO}/releases/latest and check its SHA-256 against that release's checksums.txt"
+    else
+        DRY_SOURCE="download ${DOWNLOAD_URL} and check its SHA-256 against that release's checksums.txt"
+    fi
+    echo "Dry run: nothing is downloaded, written or started."
+    echo ""
+    echo "The installer would:"
+    echo "  1. ${DRY_SOURCE}"
+    echo "  2. install it as $HOME/.autter/bin/autter and link $HOME/.local/bin/autter to it"
+    echo "  3. write $HOME/.autter/env and $HOME/.autter/env.fish, and add one line that loads them to:"
+    while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        if grep -qsF "$HOME/.autter/bin" "$config_file" || grep -qsF '.autter/env' "$config_file"; then
+            echo "       $config_file (already has it, left as is)"
+        else
+            echo "       $config_file"
+        fi
+    done <<< "$(detect_all_shells)"
+    if [ "${AUTTER_NO_INSTALL_PING:-}" = "1" ] || [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
+        echo "  4. send no install ping"
+    else
+        echo "  4. send one anonymous install ping (OS, CPU architecture and version only; AUTTER_NO_INSTALL_PING=1 turns it off)"
+    fi
+    echo "  5. run 'autter onboard', which asks before it installs agent hooks, changes your global git config or starts the background service"
+    echo ""
+    echo "Run it again without --dry-run to install. To undo an install later: autter uninstall"
+    exit 0
+fi
+
 # Resolve a specific release and load the checksum file produced by release.yml
 # before downloading the executable. A missing/malformed checksum is fatal.
 if [ -z "${AUTTER_LOCAL_BINARY:-}" ]; then
@@ -409,7 +517,7 @@ if [ -z "${AUTTER_LOCAL_BINARY:-}" ]; then
         if ! LATEST_RELEASE_URL=$(curl --fail --location --silent --show-error \
             --output /dev/null --write-out '%{url_effective}' "https://github.com/${REPO}/releases/latest"); then
             rm -f "$CHECKSUMS_TMP" 2>/dev/null || true
-            error "Failed to resolve the latest release"
+            error "Failed to resolve the latest release from https://github.com/${REPO}/releases/latest\n\n${NPM_FALLBACK_HINT}"
         fi
         RELEASE_TAG=$(printf '%s' "$LATEST_RELEASE_URL" | sed -n 's#^.*/releases/tag/\([^/?]*\).*$#\1#p')
         [ -n "$RELEASE_TAG" ] || { rm -f "$CHECKSUMS_TMP"; error "Failed to resolve latest release to a specific version"; }
@@ -418,7 +526,7 @@ if [ -z "${AUTTER_LOCAL_BINARY:-}" ]; then
     if ! curl --fail --location --silent --show-error \
         --output "$CHECKSUMS_TMP" "$CHECKSUMS_URL"; then
         rm -f "$CHECKSUMS_TMP" 2>/dev/null || true
-        error "Failed to download release checksums"
+        error "Failed to download release checksums from ${CHECKSUMS_URL}\n\n${NPM_FALLBACK_HINT}"
     fi
     EMBEDDED_CHECKSUMS=$(awk 'NF { printf "%s%s", separator, $0; separator="|" }' "$CHECKSUMS_TMP")
     rm -f "$CHECKSUMS_TMP"
@@ -494,9 +602,9 @@ if [ -n "${AUTTER_LOCAL_BINARY:-}" ]; then
     cp "$AUTTER_LOCAL_BINARY" "$TMP_FILE"
 else
     echo "Downloading autter (release: ${RELEASE_TAG})..."
-    if ! curl --fail --location --silent --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
+    if ! curl --fail --location "$CURL_PROGRESS" --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
         rm -f "$TMP_FILE" 2>/dev/null || true
-        error "Failed to download binary (HTTP error)"
+        error "Failed to download the autter binary from ${DOWNLOAD_URL}\n\n${NPM_FALLBACK_HINT}"
     fi
 fi
 

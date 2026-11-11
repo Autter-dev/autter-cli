@@ -286,7 +286,8 @@ pub enum SuperuserCheckResult {
 
 /// Checks whether the current process is running with elevated privileges.
 /// Returns `Allowed` if not superuser or in CI/agent environments.
-/// Returns `AllowedWithWarning` if user explicitly opted in.
+/// Returns `AllowedWithWarning` if user explicitly opted in (nothing is printed:
+/// `AUTTER_ALLOW_SUPERUSER=1` or `allow_superuser` means "I know").
 /// Returns `WarnFutureBlock` if running as superuser without opt-in (warn-only
 /// for now; a future version will block).
 pub fn check_superuser_guard() -> SuperuserCheckResult {
@@ -302,8 +303,35 @@ pub fn check_superuser_guard() -> SuperuserCheckResult {
     SuperuserCheckResult::WarnFutureBlock
 }
 
-pub fn print_superuser_warning() {
-    eprintln!(
+/// How long the full superuser warning stays quiet after it was shown.
+const SUPERUSER_WARNING_REPEAT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Marker for "the full warning was shown". It lives in the temp directory,
+/// not under `~/.autter`: this code runs as root, and a root-owned file in the
+/// user's autter directory is the very problem the warning is about.
+fn superuser_warning_marker() -> std::path::PathBuf {
+    std::env::temp_dir().join("autter-superuser-warning-shown")
+}
+
+/// Whether the full warning is due: it was never shown, or not in the last day.
+fn superuser_warning_is_due(
+    last_shown: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    match last_shown {
+        None => true,
+        // A marker dated in the future (clock change) counts as just shown.
+        Some(shown) => now
+            .duration_since(shown)
+            .is_ok_and(|age| age >= SUPERUSER_WARNING_REPEAT),
+    }
+}
+
+/// The warning for a command run as root/Administrator without opting in: in
+/// full the first time and once a day after that, one line in between. It was
+/// eleven lines on every command.
+fn superuser_warning_text(full: bool) -> String {
+    if full {
         "[autter] warning: running as superuser (root/Administrator) is not recommended.\n\
          \n\
          Running with elevated privileges creates files owned by root that become\n\
@@ -314,8 +342,26 @@ pub fn print_superuser_warning() {
          - Run autter as your normal user (recommended), or\n\
          - Set AUTTER_ALLOW_SUPERUSER=1 or add \"allow_superuser\": true to ~/.autter/config.json\n\
          \n\
-         This warning is automatically suppressed in CI environments."
-    );
+         This warning is automatically suppressed in CI environments. It is shown in\n\
+         full once a day; other commands print one line."
+            .to_string()
+    } else {
+        "[autter] warning: running as superuser is not recommended (run as your normal user, or set AUTTER_ALLOW_SUPERUSER=1 to silence this)."
+            .to_string()
+    }
+}
+
+pub fn print_superuser_warning() {
+    let marker = superuser_warning_marker();
+    let last_shown = std::fs::metadata(&marker)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let full = superuser_warning_is_due(last_shown, std::time::SystemTime::now());
+    eprintln!("{}", superuser_warning_text(full));
+    if full {
+        // Best effort: without the marker the full text prints again.
+        let _ = std::fs::write(&marker, b"");
+    }
 }
 
 /// A cross-platform exclusive file lock.
@@ -484,6 +530,38 @@ pub fn unescape_git_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superuser_warning_is_shown_in_full_once_a_day() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        // Never shown: in full.
+        assert!(superuser_warning_is_due(None, now));
+        // Shown an hour ago: one line.
+        assert!(!superuser_warning_is_due(
+            Some(now - Duration::from_secs(60 * 60)),
+            now
+        ));
+        // Shown yesterday or earlier: in full again.
+        assert!(superuser_warning_is_due(
+            Some(now - Duration::from_secs(24 * 60 * 60)),
+            now
+        ));
+        // A marker from the future (clock moved back) does not repeat it.
+        assert!(!superuser_warning_is_due(
+            Some(now + Duration::from_secs(60)),
+            now
+        ));
+
+        let full = superuser_warning_text(true);
+        let short = superuser_warning_text(false);
+        assert!(full.lines().count() > 5, "{full}");
+        assert_eq!(short.lines().count(), 1, "{short}");
+        for text in [&full, &short] {
+            assert!(text.contains("running as superuser"), "{text}");
+            assert!(text.contains("AUTTER_ALLOW_SUPERUSER=1"), "{text}");
+        }
+    }
 
     // =========================================================================
     // LockFile Tests

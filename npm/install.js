@@ -354,6 +354,7 @@ async function main() {
   console.log('');
   console.log(`autter installed at ${result.bin}`);
   console.log("Run 'autter onboard' to finish setup (consent for hooks, git config, and daemon).");
+  console.log("Upgrade later with 'autter upgrade' (or npm install -g @autter/cli@latest); 'npm update' alone does not upgrade the CLI.");
 }
 
 module.exports = {

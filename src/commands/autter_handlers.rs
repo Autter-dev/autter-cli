@@ -1623,6 +1623,9 @@ fn handle_stats(args: &[String]) {
         Err(crate::error::AutterError::Generic(msg)) if msg.starts_with("No commit found:") => {
             output::fail(ErrorKind::RevisionNotFound, msg)
         }
+        Err(_) if commit_sha.is_none() && commands::repository_has_no_commits(&repo) => {
+            output::fail(ErrorKind::Runtime, commands::no_commits_message("stats"))
+        }
         Err(e) => output::fail(ErrorKind::Runtime, format!("Stats failed: {}", e)),
     };
     let status = report.summary.capture.status;
