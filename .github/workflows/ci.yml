@@ -45,6 +45,27 @@ jobs:
       - name: Check (release binary, default features)
         run: cargo check --locked --bin autter
 
+  # The release workflow was the first place the Windows build compiled, after
+  # the tag existed, so a `#[cfg(windows)]` error could only be found by a
+  # failed release. Compile the release binary for Windows on every PR.
+  windows-check:
+    name: cargo check (Windows)
+    runs-on: blacksmith-4vcpu-windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The binary only: the test targets have never been compiled on
+      # Windows, and this job exists to protect the release build.
+      - name: Check (release binary, default features)
+        run: cargo check --locked --bin autter
+
   windows-installer:
     name: install.ps1 (Windows PowerShell 5.1 + pwsh)
     runs-on: blacksmith-4vcpu-windows-2025
