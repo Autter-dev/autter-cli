@@ -4262,6 +4262,193 @@ fn wrapper_proxy_survives_panic_in_post_state_hook() {
     assert_proxy_survives_hook_panic("post_state");
 }
 
+/// A sender that does not wait for a response (every `autter checkpoint`
+/// before this fix, and any older autter still installed) writes its request
+/// and closes the connection at once. The handler thread then finds the
+/// client gone before it has read anything, and on macOS cannot even set a
+/// timeout on that socket. The request must still be read and handled.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_handles_a_request_from_a_client_that_already_left() {
+    use std::os::unix::net::UnixStream;
+
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+    );
+
+    // A request whose effect can be read back: it stores a bash session.
+    let repo_dir = repo_workdir_string(&repo);
+    let start_session = json!({
+        "method": "bash_session.start",
+        "params": {
+            "repo_work_dir": repo_dir,
+            "session_id": "left-early",
+            "tool_use_id": "tool-1",
+            "agent_id": {"tool": "mock", "id": "left-early", "model": "mock-model"},
+            "metadata": {},
+            "stat_snapshot": {
+                "entries": {},
+                "invocation_key": "left-early:tool-1",
+                "repo_root": repo_dir,
+            },
+        },
+    });
+    for _ in 0..20 {
+        let mut connection =
+            UnixStream::connect(&daemon.control_socket_path).expect("connect to control socket");
+        connection
+            .write_all(format!("{start_session}\n").as_bytes())
+            .expect("write request");
+        drop(connection);
+    }
+
+    let mut stored = false;
+    for _ in 0..100 {
+        let response = send_control_request(
+            &daemon.control_socket_path,
+            &ControlRequest::BashSnapshotQuery {
+                session_id: "left-early".to_string(),
+                tool_use_id: "tool-1".to_string(),
+            },
+        )
+        .expect("snapshot query should be answered");
+        if response
+            .data
+            .as_ref()
+            .and_then(|data| data["found"].as_bool())
+            == Some(true)
+        {
+            stored = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        stored,
+        "a request from a client that closed its connection at once should still be handled"
+    );
+    daemon.shutdown();
+}
+
+/// Connections that are opened on the control socket and then left idle each
+/// hold a handler thread. Nothing used to close them, so enough of them (about
+/// 4,100 on macOS) pinned the daemon at its thread limit for good: it kept
+/// accepting connections and dropped every one, checkpoints included.
+///
+/// Now at most a fixed number of handler threads run at once, a connection
+/// past that is told so, and an idle connection is closed after a timeout,
+/// which gives its thread back. Both limits are lowered here so the test does
+/// not need thousands of connections or the real timeout.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_closes_idle_control_connections_and_keeps_serving() {
+    use std::os::unix::net::UnixStream;
+
+    const HANDLER_LIMIT: usize = 8;
+    const IDLE_CONNECTIONS: usize = 40;
+
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let control_socket_path = daemon_control_socket_path(&repo);
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("AUTTER_TEST_CONTROL_IDLE_TIMEOUT_MS", "2000"),
+            ("AUTTER_TEST_CONTROL_MAX_HANDLERS", "8"),
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+    );
+    let status_request = ControlRequest::StatusFamily {
+        repo_working_dir: repo_workdir_string(&repo),
+    };
+
+    let idle = (0..IDLE_CONNECTIONS)
+        .map(|_| {
+            let connection = UnixStream::connect(&control_socket_path).expect("idle connection");
+            // Best effort: macOS rejects this once the daemon has closed the
+            // connection, and then the read below cannot block anyway.
+            let _ = connection.set_read_timeout(Some(Duration::from_secs(15)));
+            connection
+        })
+        .collect::<Vec<_>>();
+
+    // Every handler thread is now held by an idle connection, so a real
+    // request is not served. (Whether it gets to read its refusal or finds
+    // the connection already closed depends on timing; the idle connections
+    // below read theirs.)
+    let at_limit = send_control_request(&control_socket_path, &status_request);
+    assert!(
+        at_limit
+            .as_ref()
+            .map_or(true, |response| response.is_refusal()),
+        "a request past the handler limit should be refused: {at_limit:?}"
+    );
+
+    // The daemon ends every idle connection itself: the ones past the limit
+    // with a refusal, the ones holding a handler thread when they time out.
+    let mut refused_idle = 0;
+    let mut timed_out_idle = 0;
+    for mut connection in idle {
+        let mut received = String::new();
+        connection
+            .read_to_string(&mut received)
+            .expect("the daemon should close an idle control connection");
+        if received.is_empty() {
+            timed_out_idle += 1;
+        } else {
+            let response: autter::daemon::ControlResponse =
+                serde_json::from_str(received.trim()).expect("refusal should be a response");
+            assert!(response.is_refusal(), "unexpected response: {received}");
+            assert!(
+                received.contains("connection limit"),
+                "the refusal should say why: {received}"
+            );
+            refused_idle += 1;
+        }
+    }
+    assert!(
+        (1..=HANDLER_LIMIT).contains(&timed_out_idle),
+        "between 1 and {HANDLER_LIMIT} idle connections should have held a handler thread \
+         until the idle timeout, got {timed_out_idle} (refused: {refused_idle})"
+    );
+    assert_eq!(refused_idle + timed_out_idle, IDLE_CONNECTIONS);
+
+    // With the idle connections gone the daemon serves again, without a
+    // restart.
+    let mut served = false;
+    for _ in 0..100 {
+        if send_control_request(&control_socket_path, &status_request)
+            .is_ok_and(|response| response.ok)
+        {
+            served = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        served,
+        "daemon should serve requests again once idle connections are closed"
+    );
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("failed to poll daemon")
+            .is_none(),
+        "daemon should have stayed up through the idle connections"
+    );
+    daemon.shutdown();
+}
+
 /// What 4540ac5 was for, kept: a few connections in a row that cannot get a
 /// handler thread (a busy machine) are dropped, and the daemon keeps going.
 #[test]

@@ -89,6 +89,28 @@ impl ControlResponse {
             error: Some(msg.into()),
         }
     }
+
+    /// The service did not take the request at all (too busy, or shutting
+    /// down) and is closing the connection. Marked in `data` so a client can
+    /// tell this from a request that was handled and failed.
+    pub fn refused(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            seq: None,
+            data: Some(serde_json::json!({ "refused": true })),
+            error: Some(msg.into()),
+        }
+    }
+
+    pub fn is_refusal(&self) -> bool {
+        !self.ok
+            && self
+                .data
+                .as_ref()
+                .and_then(|data| data.get("refused"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

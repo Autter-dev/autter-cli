@@ -8744,6 +8744,17 @@ const HANDOFF_FAILURE_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
     max_duration: Duration::from_secs(5),
 };
 
+/// Every control handler thread is in use. Idle connections are closed after
+/// [`CONTROL_CONNECTION_IDLE_TIMEOUT`], so a flood of them clears by itself
+/// within that time; 5 seconds more means the threads are held by requests
+/// that are not finishing. Refusals are not counted: a flood refuses hundreds
+/// of connections in a moment and must not restart the service.
+#[cfg(not(windows))]
+const AT_CAPACITY_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
+    max_consecutive: None,
+    max_duration: Duration::from_secs(15),
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListenerFailureVerdict {
     KeepServing,
@@ -8884,6 +8895,120 @@ fn test_support_fail_next_handler_spawn() -> bool {
         .is_ok()
 }
 
+/// A control connection that sends nothing for this long is closed.
+///
+/// Every connection holds a handler thread, so connections that are opened and
+/// then left idle would otherwise pin the service at its thread limit for
+/// good. Clients that send one request write it right after connecting. The
+/// one long-lived client is the shared connection a command keeps for
+/// telemetry and wrapper state (`telemetry_handle`): it can sit idle for as
+/// long as a git command runs, and it reconnects and resends when it finds
+/// its connection closed, so closing it costs one reconnect. The trace socket
+/// has no such timeout: git holds its connection for the life of a command
+/// (an open editor, a long fetch) and never reconnects.
+const CONTROL_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn control_connection_idle_timeout() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(millis) = std::env::var("AUTTER_TEST_CONTROL_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+    {
+        return Duration::from_millis(millis);
+    }
+    CONTROL_CONNECTION_IDLE_TIMEOUT
+}
+
+/// Most control handler threads alive at once. Far above real use (a client
+/// holds a connection for one short request) and far below the per-process
+/// thread limit (about 4,096 on macOS), so connections left open on the
+/// control socket cannot starve the rest of the service of threads.
+#[cfg(not(windows))]
+const CONTROL_MAX_HANDLER_THREADS: usize = 512;
+
+/// Each handler holds one file descriptor, so stay within half of what this
+/// process may open (macOS starts processes with 256).
+#[cfg(not(windows))]
+fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
+    match open_file_limit {
+        Some(limit) => usize::try_from(limit / 2)
+            .unwrap_or(usize::MAX)
+            .clamp(16, CONTROL_MAX_HANDLER_THREADS),
+        None => CONTROL_MAX_HANDLER_THREADS,
+    }
+}
+
+#[cfg(not(windows))]
+fn control_handler_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    if let Some(limit) = std::env::var("AUTTER_TEST_CONTROL_MAX_HANDLERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+    {
+        return limit;
+    }
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` is a valid, writable rlimit for getrlimit to fill.
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0;
+    // `rlim_t` is not 64 bits wide on every platform.
+    #[allow(clippy::unnecessary_cast)]
+    let open_file_limit = ok.then_some(limits.rlim_cur as u64);
+    control_handler_limit_for(open_file_limit)
+}
+
+/// Counts live control handler threads against a fixed limit.
+#[cfg(not(windows))]
+struct HandlerSlots {
+    live: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+/// One handler thread's place in [`HandlerSlots`], given back when dropped.
+#[cfg(not(windows))]
+struct HandlerSlot(Arc<AtomicUsize>);
+
+#[cfg(not(windows))]
+impl HandlerSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            live: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<HandlerSlot> {
+        self.live
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                (live < self.limit).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| HandlerSlot(self.live.clone()))
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Tell a client its request was not taken, then close the connection.
+#[cfg(not(windows))]
+fn refuse_control_connection(mut stream: LocalSocketStream, reason: &str) {
+    let _ = stream.set_send_timeout(Some(Duration::from_millis(100)));
+    if let Ok(mut raw) = serde_json::to_vec(&ControlResponse::refused(reason)) {
+        raw.push(b'\n');
+        let _ = stream.write_all(&raw);
+        let _ = stream.flush();
+    }
+}
+
 fn control_listener_loop_actor(
     control_socket_path: PathBuf,
     coordinator: Arc<ActorDaemonCoordinator>,
@@ -8897,9 +9022,14 @@ fn control_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding control socket: {}", e)))?;
         set_socket_owner_only(&control_socket_path)?;
+        let slots = HandlerSlots::new(control_handler_limit());
         let mut handoff_failures = ListenerFailureStreak::default();
+        let mut at_capacity = ListenerFailureStreak::default();
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
+                if let Ok(stream) = stream {
+                    refuse_control_connection(stream, "the background service is shutting down");
+                }
                 break;
             }
             let stream = match stream {
@@ -8921,14 +9051,45 @@ fn control_listener_loop_actor(
                     continue;
                 }
             };
+            let Some(slot) = slots.try_acquire() else {
+                refuse_control_connection(
+                    stream,
+                    "the background service is at its connection limit",
+                );
+                let now = std::time::Instant::now();
+                let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
+                if verdict == ListenerFailureVerdict::ShutDown {
+                    tracing::error!(
+                        limit = slots.limit,
+                        refused = at_capacity.consecutive,
+                        failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
+                        "control listener: every handler thread has been busy since the first \
+                         refusal; shutting the background service down so it is started again"
+                    );
+                    coordinator.request_shutdown_unhealthy();
+                    break;
+                }
+                if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
+                    tracing::warn!(
+                        limit = slots.limit,
+                        refused = at_capacity.consecutive,
+                        "control listener: every handler thread is busy; refusing connections"
+                    );
+                }
+                continue;
+            };
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
             match spawn_connection_handler(move || {
+                let _slot = slot;
                 if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
                     tracing::debug!(%e, "control connection error");
                 }
             }) {
-                Ok(()) => handoff_failures.record_success(),
+                Ok(()) => {
+                    handoff_failures.record_success();
+                    at_capacity.record_success();
+                }
                 Err(error) => {
                     // Usually a transient resource limit on a busy machine, so
                     // one failure must not take the whole service down. The
@@ -9099,6 +9260,9 @@ fn handle_windows_control_pipe_connection(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) {
+    let idle_timeout = control_connection_idle_timeout();
+    server.set_read_timeout(Some(idle_timeout));
+    server.set_write_timeout(Some(idle_timeout));
     let mut reader = BufReader::new(&mut server);
     if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
     {
@@ -9112,6 +9276,16 @@ fn handle_control_connection_actor(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), AutterError> {
+    // Waiting for a request (or for a client to take its response) ends after
+    // the idle timeout, which ends this thread. Handling a request is not
+    // timed: that happens between the read and the write.
+    //
+    // Setting a timeout fails (EINVAL on macOS) when the client has already
+    // closed its end, as a sender that does not wait for a response does. Its
+    // request is still there to read, so that must not end the connection.
+    let idle_timeout = control_connection_idle_timeout();
+    let _ = stream.set_recv_timeout(Some(idle_timeout));
+    let _ = stream.set_send_timeout(Some(idle_timeout));
     let mut reader = BufReader::new(stream);
     handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
 }
@@ -10328,6 +10502,31 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn a_flood_of_refusals_at_capacity_does_not_stop_the_listener_until_time_is_up() {
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        // Thousands of idle connections arriving at once are refused in a
+        // moment; they clear when the idle timeout closes the ones held.
+        for _ in 0..5000 {
+            assert_eq!(
+                streak.record_failure(AT_CAPACITY_LIMITS, start + Duration::from_millis(200)),
+                ListenerFailureVerdict::KeepServing
+            );
+        }
+        assert_eq!(
+            streak.record_failure(
+                AT_CAPACITY_LIMITS,
+                start + Duration::from_millis(200) + AT_CAPACITY_LIMITS.max_duration
+            ),
+            ListenerFailureVerdict::ShutDown
+        );
+        // Idle connections must have been closed before the service gives up
+        // on being at capacity.
+        assert!(AT_CAPACITY_LIMITS.max_duration > CONTROL_CONNECTION_IDLE_TIMEOUT);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn only_accept_errors_that_mean_the_listener_cannot_serve_are_counted() {
         for kind in [
             std::io::ErrorKind::ConnectionAborted,
@@ -10340,6 +10539,34 @@ mod tests {
         assert!(!accept_error_is_transient(
             &std::io::Error::from_raw_os_error(libc::EMFILE)
         ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_handler_limit_stays_below_the_descriptor_limit() {
+        assert_eq!(control_handler_limit_for(None), CONTROL_MAX_HANDLER_THREADS);
+        assert_eq!(
+            control_handler_limit_for(Some(u64::MAX)),
+            CONTROL_MAX_HANDLER_THREADS
+        );
+        assert_eq!(control_handler_limit_for(Some(256)), 128);
+        assert_eq!(control_handler_limit_for(Some(8)), 16);
+        assert!(control_handler_limit() >= 16);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn handler_slots_refuse_past_the_limit_and_free_on_drop() {
+        let slots = HandlerSlots::new(2);
+        let first = slots.try_acquire().expect("first slot");
+        let second = slots.try_acquire().expect("second slot");
+        assert!(slots.try_acquire().is_none(), "limit reached");
+        drop(first);
+        let third = slots.try_acquire().expect("slot freed by drop");
+        assert!(slots.try_acquire().is_none());
+        drop(second);
+        drop(third);
+        assert_eq!(slots.live.load(Ordering::SeqCst), 0);
     }
 
     #[test]
