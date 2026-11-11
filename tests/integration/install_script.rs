@@ -222,3 +222,99 @@ fn download_failures_point_at_npm() {
         "the binary download must not be forced silent"
     );
 }
+
+/// A stand-in for the autter binary: it answers `--version`, logs every other
+/// invocation to `calls.log` beside itself, and fails `exchange-nonce` when
+/// `FAKE_EXCHANGE_FAILS=1`.
+fn fake_autter(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-autter");
+    let log = dir.join("calls.log");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/bash\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"9.9.9\"; exit 0; fi\n\
+             echo \"$1\" >> '{}'\n\
+             if [ \"$1\" = \"exchange-nonce\" ] && [ \"${{FAKE_EXCHANGE_FAILS:-}}\" = \"1\" ]; then exit 1; fi\n\
+             exit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Install the stand-in binary with no controlling terminal (a new session),
+/// so the installer takes its no-terminal path wherever the tests run.
+fn install_without_a_terminal(envs: &[(&str, &str)]) -> (Output, Vec<String>) {
+    use std::os::unix::process::CommandExt;
+    let home = home_with_zshrc();
+    let tools = tempfile::tempdir().unwrap();
+    let binary = fake_autter(tools.path());
+    let mut command = Command::new("bash");
+    command.arg(install_script());
+    // SAFETY: setsid is async-signal-safe and touches no memory.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut all = vec![
+        ("AUTTER_LOCAL_BINARY", binary.to_str().unwrap()),
+        ("AUTTER_NO_INSTALL_PING", "1"),
+    ];
+    all.extend_from_slice(envs);
+    let output = run(command, home.path(), &all, None);
+    let calls = std::fs::read_to_string(tools.path().join("calls.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (output, calls)
+}
+
+#[test]
+fn failed_install_token_exchange_says_how_to_sign_in() {
+    // The install command from the app carries a one-time token. When the
+    // exchange failed the installer set a flag nothing read, and went on
+    // signed out without a word.
+    let (output, calls) = install_without_a_terminal(&[
+        ("INSTALL_NONCE", "expired"),
+        ("API_BASE", "http://127.0.0.1:9"),
+        ("FAKE_EXCHANGE_FAILS", "1"),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the install itself still succeeds: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not sign you in automatically") && stderr.contains("autter login"),
+        "must say sign-in failed and what to run: {stderr}"
+    );
+    // No terminal: login is not started (it would wait for a person), and
+    // onboarding still runs after the exchange.
+    assert_eq!(calls, vec!["exchange-nonce", "onboard"]);
+}
+
+#[test]
+fn install_token_exchange_that_works_or_is_absent_stays_quiet() {
+    let (output, calls) = install_without_a_terminal(&[
+        ("INSTALL_NONCE", "good"),
+        ("API_BASE", "http://127.0.0.1:9"),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("sign you in"), "{stderr}");
+    assert_eq!(calls, vec!["exchange-nonce", "onboard"]);
+
+    // No token in the install command: nothing to exchange, nothing to say.
+    let (output, calls) = install_without_a_terminal(&[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("sign you in"), "{stderr}");
+    assert_eq!(calls, vec!["onboard"]);
+}
