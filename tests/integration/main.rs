@@ -86,6 +86,7 @@ mod history_rewrite_attribution;
 mod ignore_prompts;
 mod ignore_unit;
 mod initial_attributions;
+mod install_script;
 mod install_hooks_comprehensive;
 mod install_system_capture;
 mod internal_machine_commands;
