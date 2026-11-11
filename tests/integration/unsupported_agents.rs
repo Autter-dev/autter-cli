@@ -50,9 +50,16 @@ fn stats_notes_unsupported_agent_when_commit_is_untracked() {
         .unwrap();
 
     let output = repo.autter(&["stats"]).expect("stats should succeed");
+    // Other uncapturable tools installed on the machine running the tests
+    // (found under /Applications or on PATH) are named in the same note, which
+    // then reads "Kiro, Zed (agent panel) detected — autter cannot capture…".
+    let note = output
+        .lines()
+        .find(|line| line.starts_with("Note: "))
+        .unwrap_or_else(|| panic!("stats should explain the untracked share: {output}"));
     assert!(
-        output.contains("Kiro detected — its edits are not captured"),
-        "stats should explain the untracked share: {output}"
+        note.contains("Kiro") && note.contains("detected") && note.contains("capture"),
+        "the note should name Kiro as not captured: {output}"
     );
 }
 
