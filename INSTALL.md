@@ -6,6 +6,20 @@ Connecting to the platform is optional. The CLI's local authorship tracking, bla
 
 ## 1. Install the CLI
 
+### Which install to use
+
+Install Autter in the environment where your coding agents and your `git` run.
+
+| Where you work | Use | Notes |
+| --- | --- | --- |
+| macOS or Linux | the shell installer below | needs `bash` and `curl` |
+| Windows, agents started from Windows (PowerShell, Command Prompt, VS Code, Cursor) | the PowerShell installer, or npm if you already have Node.js | run it from a normal terminal, not "Run as administrator" |
+| Windows, agents running inside WSL | the shell installer, run inside the WSL terminal | a Windows install does not cover WSL, and the reverse |
+| CI | `npm install -g @autter/cli@<version>` or `AUTTER_RELEASE_TAG=v<version>` with the shell installer | the background service never replaces the binary by itself in CI |
+| NixOS, nix-darwin, Home Manager | the [Nix guide](README-nix.md) | |
+
+All of them install the same binary into `~/.autter/bin` (`%USERPROFILE%\.autter\bin` on Windows). Installing only downloads the binary and adds it to your `PATH`. Agent hooks, global git settings and the background service are set up by `autter onboard`, which asks first.
+
 ### macOS, Linux, and Windows with WSL
 
 Run:
@@ -13,6 +27,16 @@ Run:
 ```bash
 curl -fsSL https://api.autter.dev/install.sh | bash
 ```
+
+Pipe it to `bash`, not `sh`: the script needs bash, and on Debian and Ubuntu `sh` is a different shell. Started with `sh`, it stops and tells you to re-run with `bash`.
+
+To see what the installer would do without downloading, writing or starting anything:
+
+```bash
+curl -fsSL https://api.autter.dev/install.sh | bash -s -- --dry-run
+```
+
+It lists the download and its checksum check, the binary path, the shell file it would add a line to, the anonymous install ping and the onboarding step. The download is checked against the SHA-256 published with the release before it is installed. If the download fails (a `502`, a proxy, a blocked host), wait a minute and retry, or use npm below.
 
 ### Windows (PowerShell, Command Prompt, or Git Bash)
 
@@ -34,6 +58,12 @@ autter onboard
 ```
 
 The npm package is a thin bootstrapper that downloads the same release binary into `~/.autter/bin` and verifies its checksum against the GitHub release, then exposes `autter` through the npm global bin directory. Hooks, the background service, and `autter upgrade` work identically to the script installs. One-shot bootstrap without a global install: `npx @autter/cli onboard`.
+
+Three things about the npm route:
+
+- **Run `autter onboard` after installing.** npm hides the output of install scripts, so the hint to do this is not shown. Until onboarding runs, nothing is captured.
+- **If install scripts are blocked** (`--ignore-scripts`, pnpm, npm settings that skip them), the binary is not downloaded during `npm install`. It downloads the first time you run `autter`, so no extra flag is needed.
+- **Upgrade with `autter upgrade`**, or `npm install -g @autter/cli@latest`. `npm update` alone does not upgrade the CLI, because the package only bootstraps the binary. To stay on one version, install `@autter/cli@<version>` and set `AUTTER_DISABLE_AUTO_UPDATES=1` (or `autter config set disable_auto_updates true`); in CI the background service never upgrades the binary by itself.
 
 > **Git Bash is not WSL.** The bash installer only runs on macOS, Linux, and WSL; in Git Bash it exits with instructions instead of installing. Use the Windows command above (it also works from Git Bash), and install Autter in the environment where your coding agents run — agents inside WSL need the WSL install.
 
@@ -226,6 +256,50 @@ New terminals load it automatically via your shell configuration. If the command
 . "$HOME/.autter/env"
 ```
 
+### `autter` is not recognized (Windows PowerShell or Command Prompt)
+
+The installer adds `%USERPROFILE%\.autter\bin` to your user `PATH`, which only reaches terminals opened afterwards. Open a new terminal, or load it into the current PowerShell window:
+
+```powershell
+$env:Path = [Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine')
+autter --version
+```
+
+You can always run it by its full path: `& "$env:USERPROFILE\.autter\bin\autter.exe" doctor`. Restart your IDE as well, so its terminals and agents see the new `PATH`.
+
+### The installer stops with "needs bash" or `Illegal option -o pipefail`
+
+The script was started with `sh`. Run the same command with `bash` at the end (`curl -fsSL https://api.autter.dev/install.sh | bash`). Nothing was installed by the failed run.
+
+### The download fails or returns HTML
+
+A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli && autter onboard`). If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
+
+### Windows or WSL: which one to set up
+
+Autter records edits made by agents and commits made by `git` in the environment it is installed in. An agent started from Windows needs the Windows install; an agent running inside WSL needs the install inside WSL. If you use both, install in both and run `autter doctor` in each.
+
+### A warning about running as root or Administrator
+
+Run autter as your normal user. Installed or run with elevated privileges, it creates files your own account cannot open, and the background service then fails with "Access is denied" or "lock held". The warning is printed in full once a day and as one line on other commands. If you do mean to run as root (a container, a build machine), set `AUTTER_ALLOW_SUPERUSER=1`, which silences it. It is already silent in CI.
+
+### `autter doctor` reports timeouts on a slow machine
+
+Doctor's time limits grow with how slowly the machine starts `git` (up to 10 times). On a machine that is slower still, set a scale yourself and re-run: `AUTTER_DOCTOR_TIMEOUT_SCALE=5 autter doctor`.
+
+### `autter doctor` in local mode
+
+Local mode needs no account. Doctor reports sign-in and upload checks as skipped there, not as warnings. To sync to the Autter dashboard, run `autter onboard --connect`.
+
+### Remove Autter's setup
+
+```bash
+autter uninstall --dry-run   # lists what would be removed
+autter uninstall             # asks first; --yes for scripts
+```
+
+This removes Autter's agent hooks and editor extensions, its settings in your global git `trace2` config (your own trace2 settings stay) and stops the background service. The binary and the `PATH` entry are left in place.
+
 ### An agent or editor installed after Autter is not detected
 
 Re-run integration setup:
@@ -264,3 +338,5 @@ autter onboard --force
 When `autter diff` / `blame` / `show` report missing authorship on real commits, the same sequence applies: hooks (`install-hooks`) → install → doctor.
 
 For additional diagnostics, run `autter debug` and review its output before including it in an issue.
+
+What the background service is, what it listens to and how to inspect it: [docs/background-service.md](docs/background-service.md).
