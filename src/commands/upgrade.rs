@@ -1004,6 +1004,35 @@ fn update_prompt_context_allows_interaction() -> bool {
     .all(|var| std::env::var(var).as_deref() != Ok("1"))
 }
 
+/// `AUTTER_DISABLE_AUTO_UPDATES=1`: the same as `disable_auto_updates` in the
+/// config file, for environments that set variables, not files.
+const DISABLE_AUTO_UPDATES_ENV: &str = "AUTTER_DISABLE_AUTO_UPDATES";
+
+/// Why the background service must not replace the binary by itself, or
+/// `None` when it may. A CI job that installed `@autter/cli@3.4.0` (or set
+/// `AUTTER_RELEASE_TAG`) pinned a version; the service used to upgrade it to
+/// the latest release in the middle of the job. `autter upgrade` still
+/// upgrades when asked.
+fn self_update_hold(
+    in_ci: bool,
+    release_tag: Option<&str>,
+    disabled: Option<&str>,
+) -> Option<&'static str> {
+    if disabled.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        return Some("AUTTER_DISABLE_AUTO_UPDATES is set");
+    }
+    if release_tag
+        .map(str::trim)
+        .is_some_and(|tag| !tag.is_empty() && tag != "latest")
+    {
+        return Some("AUTTER_RELEASE_TAG pins a release");
+    }
+    if in_ci {
+        return Some("running in CI");
+    }
+    None
+}
+
 fn running_in_ci() -> bool {
     [
         "CI",
@@ -1242,6 +1271,14 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
     if config.version_checks_disabled() || config.auto_updates_disabled() {
         return Ok(DaemonUpdateCheckResult::NoUpdate);
     }
+    if let Some(reason) = self_update_hold(
+        running_in_ci(),
+        std::env::var(AUTTER_RELEASE_ENV).ok().as_deref(),
+        std::env::var(DISABLE_AUTO_UPDATES_ENV).ok().as_deref(),
+    ) {
+        tracing::debug!(reason, "background self-update skipped");
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
 
     let channel = config.update_channel();
     let api_base_url = config.api_base_url();
@@ -1380,6 +1417,28 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_self_update_respects_ci_and_version_pins() {
+        // A developer machine with nothing set: updates go ahead.
+        assert_eq!(self_update_hold(false, None, None), None);
+        assert_eq!(self_update_hold(false, Some("latest"), Some("0")), None);
+        assert_eq!(self_update_hold(false, Some("  "), Some("")), None);
+        // CI installed a specific version; the service must not replace it.
+        assert_eq!(self_update_hold(true, None, None), Some("running in CI"));
+        // A pinned release, in CI or not.
+        assert_eq!(
+            self_update_hold(false, Some("v3.4.0"), None),
+            Some("AUTTER_RELEASE_TAG pins a release")
+        );
+        // The explicit switch.
+        for on in ["1", "true", "TRUE"] {
+            assert_eq!(
+                self_update_hold(false, None, Some(on)),
+                Some("AUTTER_DISABLE_AUTO_UPDATES is set")
+            );
+        }
+    }
     use serial_test::serial;
 
     fn set_test_cache_dir(dir: &tempfile::TempDir) {
