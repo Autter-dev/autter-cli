@@ -4504,7 +4504,8 @@ fn daemon_survives_a_brief_run_of_handler_spawn_failures() {
 /// accepting every connection and dropping it: checkpoints sent to it were
 /// lost while the sender reported success, and the health check (which only
 /// connected) saw nothing wrong. It now says why and exits within seconds so
-/// a fresh daemon can be started.
+/// a fresh daemon can be started, and the sender is told its request went
+/// nowhere.
 #[test]
 #[serial]
 #[cfg(unix)]
@@ -4534,7 +4535,7 @@ fn daemon_exits_when_handler_threads_cannot_be_started() {
         "daemon should have bound its control socket"
     );
 
-    // Send requests until the daemon exits.
+    // Send requests the way `autter checkpoint` does until the daemon exits.
     let first_send = std::time::Instant::now();
     let mut send_results = Vec::new();
     let mut exited_after = None;
@@ -4548,10 +4549,20 @@ fn daemon_exits_when_handler_threads_cannot_be_started() {
             exited_after = Some(first_send.elapsed());
             break;
         }
-        send_results.push(
-            send_control_request(&daemon.control_socket_path, &ControlRequest::FlushNotes)
+        // Two in a row: the daemon closes the first at once, which can beat
+        // the sender's write (an error even before this fix). The second
+        // arrives while the listener backs off, so its write lands and only
+        // the closed connection gives the drop away.
+        for _ in 0..2 {
+            send_results.push(
+                autter::daemon::send_control_request_fire_and_forget(
+                    &daemon.control_socket_path,
+                    &ControlRequest::Ping,
+                    Duration::from_millis(250),
+                )
                 .map_err(|error| error.to_string()),
-        );
+            );
+        }
         thread::sleep(Duration::from_millis(100));
     }
 
@@ -4565,7 +4576,13 @@ fn daemon_exits_when_handler_threads_cannot_be_started() {
     );
     assert!(
         send_results.iter().all(Result::is_err),
-        "no request was handled, so none may get a response: {send_results:?}"
+        "no request was handled, so no send may report success: {send_results:?}"
+    );
+    assert!(
+        send_results.iter().any(|result| result
+            .as_ref()
+            .is_err_and(|error| error.contains("without handling the request"))),
+        "senders should be told the connection was dropped: {send_results:?}"
     );
     assert!(
         log.contains("failed to spawn handler thread"),
@@ -4580,4 +4597,107 @@ fn daemon_exits_when_handler_threads_cannot_be_started() {
         "an exited daemon should have removed its control socket"
     );
     daemon.shutdown();
+}
+
+/// A background service that accepts a checkpoint's connection and then
+/// closes it without handling the request (it could not start a handler
+/// thread, or it is shutting down) used to look exactly like one that took
+/// the checkpoint: `autter checkpoint` exited 0 and nothing was recorded.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn checkpoint_reports_a_connection_the_service_dropped() {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    fs::write(repo.path().join("dropped.txt"), "base\n").expect("failed to write base");
+    repo.git(&["add", "dropped.txt"])
+        .expect("add should succeed");
+    repo.git(&["commit", "-m", "base commit"])
+        .expect("base commit should succeed");
+    fs::write(repo.path().join("dropped.txt"), "base\nai line\n").expect("failed to write edit");
+
+    // No daemon: listeners that accept and never serve stand in for one.
+    let control_socket_path = daemon_control_socket_path(&repo);
+    let trace_socket_path = daemon_trace_socket_path(&repo);
+    fs::create_dir_all(
+        control_socket_path
+            .parent()
+            .expect("control socket path should have a parent"),
+    )
+    .expect("failed to create socket directory");
+    let control = UnixListener::bind(&control_socket_path).expect("bind stand-in control socket");
+    let trace = UnixListener::bind(&trace_socket_path).expect("bind stand-in trace socket");
+    thread::spawn(move || {
+        // Take the request off each connection, then close it unanswered.
+        // One thread each: every autter command also keeps an idle
+        // connection open for telemetry, which must not hold up the rest.
+        for connection in control.incoming().flatten() {
+            thread::spawn(move || {
+                let mut request = String::new();
+                let _ = std::io::BufReader::new(connection).read_line(&mut request);
+            });
+        }
+    });
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for connection in trace.incoming() {
+            held.push(connection);
+        }
+    });
+    let checkpoint_command = || {
+        let mut command = repo.autter_command(&["checkpoint", "mock_ai", "dropped.txt"]);
+        configure_test_daemon_env(
+            &mut command,
+            &repo.daemon_home_path(),
+            &control_socket_path,
+            &trace_socket_path,
+        );
+        command
+    };
+
+    // A direct run exits non-zero and says the checkpoint was dropped.
+    let direct_run = checkpoint_command()
+        .output()
+        .expect("spawn autter checkpoint");
+    let direct_stderr = String::from_utf8_lossy(&direct_run.stderr);
+    assert!(
+        !direct_run.status.success(),
+        "a direct checkpoint the service dropped must not exit 0:\n{direct_stderr}"
+    );
+    assert!(
+        direct_stderr.contains("checkpoint dropped")
+            && direct_stderr.contains("closed the connection without handling the request"),
+        "the failure should say the checkpoint was dropped and why, got:\n{direct_stderr}"
+    );
+
+    // A hook run still exits 0 (it must never block the agent) and says the
+    // same on stderr. A hook only watches the connection for a few
+    // milliseconds, so on a loaded machine a run can miss the close: every
+    // run must exit 0, and one of a few must report the drop.
+    let mut hook_reported_drop = false;
+    for _ in 0..5 {
+        let hook_run = checkpoint_command()
+            .env("AUTTER_CHECKPOINT_HOOK", "1")
+            .output()
+            .expect("spawn autter checkpoint");
+        let hook_stderr = String::from_utf8_lossy(&hook_run.stderr);
+        assert!(
+            hook_run.status.success(),
+            "a hook checkpoint must exit 0 even when the service dropped it:\n{hook_stderr}"
+        );
+        if hook_stderr.contains("checkpoint dropped") {
+            hook_reported_drop = true;
+            break;
+        }
+    }
+    assert!(
+        hook_reported_drop,
+        "a hook should still say the checkpoint was not recorded"
+    );
+
+    let _ = fs::remove_file(&control_socket_path);
+    let _ = fs::remove_file(&trace_socket_path);
 }

@@ -10424,9 +10424,67 @@ pub fn send_control_request(
     )
 }
 
+/// What a sender that does not wait for its response saw on the connection
+/// right after writing the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnacknowledgedSend {
+    /// A response arrived, or the service is still working on the request.
+    Taken,
+    /// The service said it would not take the request.
+    Refused(String),
+    /// The service answered that it could not take the request in (for a
+    /// checkpoint: it was never queued, so it will not be recorded).
+    Rejected(String),
+    /// The connection was closed with no response: the request went nowhere.
+    Dropped,
+}
+
+/// Classify the first read after an unacknowledged send. `read` is the result
+/// of reading one line into `line` under a short timeout.
+fn classify_unacknowledged_send(read: &std::io::Result<usize>, line: &str) -> UnacknowledgedSend {
+    match read {
+        Ok(0) => UnacknowledgedSend::Dropped,
+        Ok(_) => match serde_json::from_str::<ControlResponse>(line.trim()) {
+            Ok(response) if response.is_refusal() => UnacknowledgedSend::Refused(
+                response
+                    .error
+                    .unwrap_or_else(|| "request refused".to_string()),
+            ),
+            Ok(response) if !response.ok => UnacknowledgedSend::Rejected(
+                response
+                    .error
+                    .unwrap_or_else(|| "request failed".to_string()),
+            ),
+            _ => UnacknowledgedSend::Taken,
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            UnacknowledgedSend::Taken
+        }
+        Err(_) => UnacknowledgedSend::Dropped,
+    }
+}
+
+/// Send a request without waiting for it to be handled.
+///
+/// After writing the request the sender watches the connection for `watch`. A
+/// service that cannot take the request closes the connection (with a refusal
+/// when it can say why) as soon as it accepts it; a service that is handling
+/// the request stays silent until it is done. So an error here means the
+/// request went nowhere, and `watch` is also the most a request that takes
+/// longer costs the sender.
+///
+/// The protocol has no acknowledgement: silence past `watch` is read as
+/// "taken". A connection the service closes later than that (it was still
+/// queued behind others) is not noticed.
 pub fn send_control_request_fire_and_forget(
     socket_path: &Path,
     request: &ControlRequest,
+    watch: Duration,
 ) -> Result<(), AutterError> {
     let mut stream =
         open_local_socket_stream_with_timeout(socket_path, DAEMON_CONTROL_CONNECT_TIMEOUT)?;
@@ -10435,7 +10493,27 @@ pub fn send_control_request_fire_and_forget(
     let mut body = serde_json::to_vec(request)?;
     body.push(b'\n');
     write_all_daemon_client_stream(&mut stream, socket_path, &body)?;
-    Ok(())
+
+    // Fails when the service has already closed the connection (EINVAL on
+    // macOS); the read below then returns at once and says what happened.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, watch);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line);
+    match classify_unacknowledged_send(&read, &line) {
+        UnacknowledgedSend::Taken => Ok(()),
+        UnacknowledgedSend::Refused(reason) => Err(AutterError::Generic(format!(
+            "the background service refused the request: {}",
+            reason
+        ))),
+        UnacknowledgedSend::Rejected(reason) => Err(AutterError::Generic(format!(
+            "the background service could not take the request: {}",
+            reason
+        ))),
+        UnacknowledgedSend::Dropped => Err(AutterError::Generic(
+            "the background service closed the connection without handling the request".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -10665,6 +10743,50 @@ mod tests {
         assert_eq!(slots.live.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn unacknowledged_send_classification() {
+        // Closed with nothing sent back: the request went nowhere.
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(0), ""),
+            UnacknowledgedSend::Dropped
+        );
+        assert_eq!(
+            classify_unacknowledged_send(
+                &Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                ""
+            ),
+            UnacknowledgedSend::Dropped
+        );
+        // Still silent when the watch ends: the service is working on it.
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            assert_eq!(
+                classify_unacknowledged_send(&Err(std::io::Error::from(kind)), ""),
+                UnacknowledgedSend::Taken
+            );
+        }
+        let refusal = serde_json::to_string(&ControlResponse::refused("at its limit")).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(refusal.len()), &refusal),
+            UnacknowledgedSend::Refused("at its limit".to_string())
+        );
+        // An answer that the request could not be taken in is not a send.
+        let rejected = serde_json::to_string(&ControlResponse::err("no repository")).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(rejected.len()), &rejected),
+            UnacknowledgedSend::Rejected("no repository".to_string())
+        );
+        let handled = serde_json::to_string(&ControlResponse::ok(None, None)).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(handled.len()), &handled),
+            UnacknowledgedSend::Taken
+        );
+    }
+
+    /// Long enough that a test only passes when the sender saw the connection
+    /// close, short enough to show it does not wait for a response.
+    #[cfg(unix)]
+    const SEND_WATCH: Duration = Duration::from_millis(500);
+
     /// A stand-in control socket whose listener treats each connection the
     /// way `serve` says, for testing what a client makes of it.
     #[cfg(unix)]
@@ -10683,6 +10805,100 @@ mod tests {
             }
         });
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_request_that_was_read_and_never_answered() {
+        // The request was written in full, then the connection was closed
+        // with no response: this used to be reported as sent.
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+        });
+        let error = send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect_err("a dropped connection must not look like a sent request");
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection without handling the request"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_connection_dropped_unread() {
+        // What a listener that cannot start a handler thread does: close the
+        // connection without reading it. Whether the sender's write still
+        // lands first is a race; either way the send must fail.
+        for delay_ms in [0, 30] {
+            let (_dir, path) = fake_control_socket(move |stream| {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                drop(stream);
+            });
+            for _ in 0..5 {
+                assert!(
+                    send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+                        .is_err(),
+                    "a connection dropped after {delay_ms} ms must not look like a sent request"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_refusal_with_its_reason() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            refuse_control_connection(stream, "the background service is at its connection limit")
+        });
+        let error = send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect_err("a refused request must not look like a sent request");
+        assert!(
+            error
+                .to_string()
+                .contains("refused the request: the background service is at its connection limit"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_does_not_wait_for_a_request_that_is_being_handled() {
+        // The service read the request and is busy with it for a long time.
+        let (_dir, path) = fake_control_socket(|stream| {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                std::thread::sleep(Duration::from_secs(5));
+            });
+        });
+        let started = std::time::Instant::now();
+        send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect("a request the service is handling counts as sent");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sender waited {:?} for a response it does not need",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_accepts_a_handled_request() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut raw = serde_json::to_vec(&ControlResponse::ok(None, None)).unwrap();
+            raw.push(b'\n');
+            let _ = reader.get_mut().write_all(&raw);
+        });
+        send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect("a handled request is sent");
     }
 
     #[cfg(unix)]
