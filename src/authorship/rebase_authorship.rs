@@ -4767,12 +4767,17 @@ fn serialize_attestation_from_line_attrs(
 
     let human_id = crate::authorship::working_log::CheckpointKind::Human.to_str();
 
-    // Collect runs of (author_id, start, end) merging adjacent lines
+    // Collect runs of (author_id, start, end) merging adjacent lines. The runs
+    // are built in line order whatever order the attributions arrive in: lines
+    // stamped after a hunk shift are appended to the list, and merging those
+    // as they come would swallow a line that sits above an earlier one.
+    let mut ordered: Vec<&crate::authorship::attribution_tracker::LineAttribution> = line_attrs
+        .iter()
+        .filter(|attr| attr.author_id != human_id)
+        .collect();
+    ordered.sort_by_key(|attr| attr.start_line);
     let mut runs: Vec<(&str, u32, u32)> = Vec::new();
-    for attr in line_attrs {
-        if attr.author_id == human_id {
-            continue;
-        }
+    for attr in ordered {
         match runs.last_mut() {
             Some((last_author, _, last_end))
                 if *last_author == attr.author_id.as_str() && attr.start_line <= *last_end + 1 =>
@@ -5485,8 +5490,9 @@ mod rename_tracking_tests {
     use super::{
         CommitTrackedDelta, later_paths_by_commit, move_renamed_entries, move_renamed_members,
         parse_diff_tree_name_status_renames, parse_name_status_renames, path_after_later_commits,
-        untracked_rename_targets,
+        serialize_attestation_from_line_attrs, untracked_rename_targets,
     };
+    use crate::authorship::attribution_tracker::LineAttribution;
     use std::collections::{HashMap, HashSet};
 
     fn rename(old_path: &str, new_path: &str) -> (String, String) {
@@ -5702,5 +5708,28 @@ mod rename_tracking_tests {
     fn empty_output_has_no_renames() {
         let wanted: HashSet<&str> = ["old.txt"].into_iter().collect();
         assert!(parse_name_status_renames(b"", &wanted).is_empty());
+    }
+
+    fn attr(start_line: u32, end_line: u32, author_id: &str) -> LineAttribution {
+        LineAttribution {
+            start_line,
+            end_line,
+            author_id: author_id.to_string(),
+            overrode: None,
+        }
+    }
+
+    #[test]
+    fn attestation_text_does_not_depend_on_attribution_order() {
+        // A line stamped after a hunk shift is appended, above an earlier line
+        // from the same author.
+        let text =
+            serialize_attestation_from_line_attrs("a.txt", &[attr(5, 5, "ai"), attr(2, 2, "ai")])
+                .unwrap();
+        assert_eq!(text, "a.txt\n  ai 2,5\n");
+        let text =
+            serialize_attestation_from_line_attrs("a.txt", &[attr(5, 5, "ai"), attr(4, 4, "ai")])
+                .unwrap();
+        assert_eq!(text, "a.txt\n  ai 4-5\n");
     }
 }
