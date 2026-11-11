@@ -415,6 +415,19 @@ impl DaemonGuard {
     }
 
     fn start_with_env(repo: &TestRepo, extra_env: &[(&str, &str)]) -> Self {
+        let mut daemon = Self::spawn_with_env(repo, extra_env, None);
+        daemon.wait_until_ready();
+        daemon
+    }
+
+    /// Start the daemon without waiting for it to serve, for tests of a
+    /// daemon that never does. Its log goes to `log_path` when given (a test
+    /// daemon logs to its standard streams, not to a log file).
+    fn spawn_with_env(
+        repo: &TestRepo,
+        extra_env: &[(&str, &str)],
+        log_path: Option<&Path>,
+    ) -> Self {
         let daemon_home = repo.daemon_home_path();
         let control_socket_path = daemon_control_socket_path(repo);
         let trace_socket_path = daemon_trace_socket_path(repo);
@@ -427,6 +440,12 @@ impl DaemonGuard {
             .env("AUTTER_TEST_DB_PATH", repo.test_db_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(log_path) = log_path {
+            let log = fs::File::create(log_path).expect("failed to create daemon log file");
+            command
+                .stdout(log.try_clone().expect("failed to clone daemon log handle"))
+                .stderr(log);
+        }
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -439,14 +458,12 @@ impl DaemonGuard {
         );
 
         let child = command.spawn().expect("failed to spawn autter subprocess");
-        let mut daemon = Self {
+        Self {
             child,
             control_socket_path,
             trace_socket_path,
             repo_working_dir: repo_workdir_string(repo),
-        };
-        daemon.wait_until_ready();
-        daemon
+        }
     }
 
     fn wait_until_ready(&mut self) {
@@ -4243,4 +4260,137 @@ fn wrapper_proxy_survives_panic_in_pre_state_hook() {
 #[serial]
 fn wrapper_proxy_survives_panic_in_post_state_hook() {
     assert_proxy_survives_hook_panic("post_state");
+}
+
+/// What 4540ac5 was for, kept: a few connections in a row that cannot get a
+/// handler thread (a busy machine) are dropped, and the daemon keeps going.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_survives_a_brief_run_of_handler_spawn_failures() {
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let log_path = repo.test_home_path().join("daemon-brief-overload.log");
+    let mut daemon = DaemonGuard::spawn_with_env(
+        &repo,
+        &[
+            ("AUTTER_TEST_FAIL_HANDLER_SPAWNS", "5"),
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+        Some(&log_path),
+    );
+    // The first five connections are dropped; readiness polling uses them up.
+    daemon.wait_until_ready();
+
+    let status = send_control_request(
+        &daemon.control_socket_path,
+        &ControlRequest::StatusFamily {
+            repo_working_dir: repo_workdir_string(&repo),
+        },
+    )
+    .expect("daemon should serve after a brief run of spawn failures");
+    assert!(status.ok, "{status:?}");
+
+    let log = fs::read_to_string(&log_path).expect("daemon log should be readable");
+    assert_eq!(
+        log.matches("failed to spawn handler thread").count(),
+        5,
+        "each dropped connection should be logged:\n{log}"
+    );
+    assert!(
+        !log.contains("shutting the background service down"),
+        "a brief run of failures must not stop the daemon:\n{log}"
+    );
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("failed to poll daemon")
+            .is_none(),
+        "daemon should still be running"
+    );
+    daemon.shutdown();
+}
+
+/// A daemon that can never start a handler thread used to stay up for good,
+/// accepting every connection and dropping it: checkpoints sent to it were
+/// lost while the sender reported success, and the health check (which only
+/// connected) saw nothing wrong. It now says why and exits within seconds so
+/// a fresh daemon can be started.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_exits_when_handler_threads_cannot_be_started() {
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let log_path = repo.test_home_path().join("daemon-sustained-overload.log");
+    let mut daemon = DaemonGuard::spawn_with_env(
+        &repo,
+        &[
+            ("AUTTER_TEST_FAIL_HANDLER_SPAWNS", "1000000"),
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+        Some(&log_path),
+    );
+
+    // Wait for the listener, without using up a connection on it.
+    for _ in 0..400 {
+        if daemon.control_socket_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        daemon.control_socket_path.exists(),
+        "daemon should have bound its control socket"
+    );
+
+    // Send requests until the daemon exits.
+    let first_send = std::time::Instant::now();
+    let mut send_results = Vec::new();
+    let mut exited_after = None;
+    while first_send.elapsed() < Duration::from_secs(30) {
+        if daemon
+            .child
+            .try_wait()
+            .expect("failed to poll daemon")
+            .is_some()
+        {
+            exited_after = Some(first_send.elapsed());
+            break;
+        }
+        send_results.push(
+            send_control_request(&daemon.control_socket_path, &ControlRequest::FlushNotes)
+                .map_err(|error| error.to_string()),
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let exited_after = exited_after.unwrap_or_else(|| {
+        panic!("daemon should exit when it cannot serve any connection; log:\n{log}")
+    });
+    assert!(
+        exited_after < Duration::from_secs(15),
+        "daemon took {exited_after:?} to give up; log:\n{log}"
+    );
+    assert!(
+        send_results.iter().all(Result::is_err),
+        "no request was handled, so none may get a response: {send_results:?}"
+    );
+    assert!(
+        log.contains("failed to spawn handler thread"),
+        "the log should say what failed:\n{log}"
+    );
+    assert!(
+        log.contains("shutting the background service down"),
+        "the log should say why the daemon exited:\n{log}"
+    );
+    assert!(
+        !daemon.control_socket_path.exists(),
+        "an exited daemon should have removed its control socket"
+    );
+    daemon.shutdown();
 }
