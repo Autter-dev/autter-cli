@@ -101,6 +101,29 @@ pub fn exit_repository_error(command: &str, error: &crate::error::AutterError) -
     )
 }
 
+/// Whether the repository has no commits yet: `HEAD` points at a branch that
+/// does not exist (a fresh `git init`). Any other reason `HEAD` cannot be read
+/// is not this.
+pub fn repository_has_no_commits(repo: &crate::git::repository::Repository) -> bool {
+    use crate::git::repository::exec_git;
+    let git = |args: &[&str]| {
+        let mut full = repo.global_args_for_exec();
+        full.extend(args.iter().map(|a| a.to_string()));
+        exec_git(&full).is_ok()
+    };
+    git(&["symbolic-ref", "--quiet", "HEAD"])
+        && !git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+}
+
+/// What a reporting command says in a repository with no commits yet. It used
+/// to print git's own "ambiguous argument 'refs/heads/main'" error, which is
+/// the first thing someone trying autter in a fresh `git init` saw.
+pub fn no_commits_message(command: &str) -> String {
+    format!(
+        "This repository has no commits yet, so there is nothing for `autter {command}` to report. Make a first commit (`git add -A && git commit -m \"first commit\"`), then run it again."
+    )
+}
+
 /// Print a one-line stderr pointer to `autter doctor`.
 ///
 /// Reserved for error paths that usually mean a broken installation

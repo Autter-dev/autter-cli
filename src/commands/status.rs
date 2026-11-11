@@ -63,6 +63,10 @@ pub fn handle_status(args: &[String]) {
     };
     match run_status(&repo, arg_parser::json(), output::strict()) {
         Ok(()) => {}
+        Err(_) if crate::commands::repository_has_no_commits(&repo) => output::fail(
+            ErrorKind::Runtime,
+            crate::commands::no_commits_message("status"),
+        ),
         Err(e) => output::fail(ErrorKind::Runtime, format!("Error: {}", e)),
     }
 }

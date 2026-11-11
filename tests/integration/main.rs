@@ -136,6 +136,7 @@ mod service_down_attribution;
 mod session_event_repo_url;
 mod sessions_backwards_compat;
 mod sessions_cutover;
+mod setup_clarity;
 mod show_prompt;
 mod simple_additions;
 mod simple_benchmark;
