@@ -310,6 +310,69 @@ fn uninstall_yes_removes_trace2_and_says_so() {
 }
 
 #[test]
+fn uninstall_keeps_the_users_own_trace2_settings() {
+    // Someone who already traced git for their own reasons: a normal-format
+    // target, a perf target and a variable of their own in envVars, next to
+    // what `autter install` wrote. Uninstall used to delete the whole
+    // `[trace2]` section.
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let gitconfig = repo.test_home_path().join(".gitconfig");
+    let mut contents = fs::read_to_string(&gitconfig).unwrap_or_default();
+    contents.push_str(
+        "[trace2]\n\
+         \tnormalTarget = /tmp/my-git-trace.log\n\
+         \tperfTarget = /tmp/my-git-perf.log\n\
+         \teventTarget = af_unix:stream:/tmp/autter-d-0000/trace.sock\n\
+         \teventNesting = 10\n\
+         \tenvVars = MY_VAR,AUTTER_WRAPPER_INVOCATION_ID,CLAUDE_CODE_REMOTE,HOSTNAME,CURSOR_AGENT,CODEX_INTERNAL_ORIGINATOR_OVERRIDE,CODEX_THREAD_ID,AUTTER_CLOUD_AGENT\n",
+    );
+    fs::write(&gitconfig, contents).unwrap();
+
+    let dry = run_uninstall_isolated(&repo, &["uninstall", "--dry-run"]);
+    let dry_stderr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        dry_stderr.contains("your own trace2 settings stay"),
+        "{dry_stderr}"
+    );
+
+    let output = run_uninstall_isolated(&repo, &["uninstall", "--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "uninstall --yes failed:\n{stderr}");
+    assert!(
+        stderr.contains("global git trace2 config"),
+        "uninstall should report removing its trace2 settings:\n{stderr}"
+    );
+
+    let after = fs::read_to_string(&gitconfig).unwrap();
+    for kept in [
+        "normalTarget = /tmp/my-git-trace.log",
+        "perfTarget = /tmp/my-git-perf.log",
+        "envVars = MY_VAR\n",
+    ] {
+        assert!(after.contains(kept), "`{kept}` must be kept:\n{after}");
+    }
+    for gone in [
+        "eventTarget",
+        "eventNesting",
+        "CURSOR_AGENT",
+        "autter-d-0000",
+    ] {
+        assert!(!after.contains(gone), "`{gone}` must be removed:\n{after}");
+    }
+
+    // Nothing of autter's is left, so a second run reports nothing removed.
+    let again = run_uninstall_isolated(&repo, &["uninstall", "--yes"]);
+    let again_stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !again_stderr.contains("global git trace2 config"),
+        "{again_stderr}"
+    );
+    assert_eq!(fs::read_to_string(&gitconfig).unwrap(), after);
+}
+
+#[test]
 fn state_changing_commands_reject_unknown_flags() {
     let repo = repo_with_setup();
     let before = disk_state(&repo);
