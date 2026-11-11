@@ -50,6 +50,18 @@ Use the `api.autter.dev` URL exactly as shown. Other hosts (such as `autter.dev/
 
 The installer adds `%USERPROFILE%\.autter\bin` to your user `PATH`. That reaches terminals opened afterwards, not the window you ran the command from: open a new terminal (and restart your IDE) before running `autter`. The installer prints the full path to `autter.exe` at the end so you can run it straight away. If you are already in PowerShell, `irm https://api.autter.dev/install.ps1 | iex` runs the same installer inside your current window, and `autter` works there immediately.
 
+To see what the installer would do without downloading, writing or starting anything, set `AUTTER_INSTALL_DRY_RUN` first. It is an environment variable because `irm | iex` cannot pass arguments:
+
+```powershell
+$env:AUTTER_INSTALL_DRY_RUN = '1'
+irm https://api.autter.dev/install.ps1 | iex
+Remove-Item Env:\AUTTER_INSTALL_DRY_RUN
+```
+
+It lists the download and its checksum check, where `autter.exe` goes, the `PATH` change, the Git Bash profile it would add a line to, the anonymous install ping and the onboarding step. Remove the variable afterwards, as shown: while it is set, every run in that window is a dry run. From Command Prompt, run `set AUTTER_INSTALL_DRY_RUN=1` before the `powershell ...` command above.
+
+In a terminal the binary download shows its progress on one line (megabytes received and percent). CI logs and redirected output stay quiet. The download is checked against the SHA-256 published with the release before it is installed. If a download fails (a `502`, a proxy, a blocked host), the error names the URL that failed: wait a minute and retry, or use npm below.
+
 ### npm (any platform, Node.js 18+)
 
 ```bash
@@ -273,7 +285,7 @@ The script was started with `sh`. Run the same command with `bash` at the end (`
 
 ### The download fails or returns HTML
 
-A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli && autter onboard`). If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
+A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli`, then `autter onboard`). Both installers name the URL that failed. If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
 
 ### Windows or WSL: which one to set up
 

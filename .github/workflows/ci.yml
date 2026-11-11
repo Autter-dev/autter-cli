@@ -78,7 +78,9 @@ jobs:
 
       # Pure ASCII, AST parse with this engine's parser, and no constructs that
       # break under iex (exit, top-level param(), $PSScriptRoot, unwrapped body).
-      # 5.1's parser is the one that rejects PowerShell 7-only syntax.
+      # 5.1's parser is the one that rejects PowerShell 7-only syntax. Also
+      # that the dry run returns before any request and that every failed
+      # download names the npm route.
       - name: Static checks (Windows PowerShell 5.1)
         shell: powershell
         run: |
@@ -99,7 +101,11 @@ jobs:
       # release through the normal checksum-verified download path, then
       # asserts `autter --version` resolves in the same session (PATH refresh),
       # a failing install throws instead of exiting the shell, and no
-      # StrictMode/preferences/functions leak into the caller.
+      # StrictMode/preferences/functions leak into the caller. Before that, a
+      # dry run (AUTTER_INSTALL_DRY_RUN=1) must print its plan and create
+      # nothing under a temporary profile directory, and a release that does
+      # not exist must fail naming the URL and the npm route. After it, a
+      # reinstall with AUTTER_INSTALL_PROGRESS=1 must show download progress.
       - name: End-to-end irm | iex install (Windows PowerShell 5.1)
         shell: powershell
         run: . ./scripts/test-install-ps1-iex.ps1
