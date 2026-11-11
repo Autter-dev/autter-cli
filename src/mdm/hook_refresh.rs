@@ -106,11 +106,26 @@ fn tracing_debug(message: &str) {
     }
 }
 
+/// Whether these arguments must not start a refresh. The subcommand is read
+/// past any leading global flags, the way `handle_autter` reads it, so
+/// `autter --json uninstall-hooks` is skipped like `autter uninstall-hooks`
+/// (a refresh running beside it would rewrite the files it is removing hooks
+/// from). Arguments that ask for help or do not parse start none either.
+fn args_skip_refresh(args: &[String]) -> bool {
+    use crate::commands::arg_parser::{ScanMode, pre_parse};
+    match pre_parse(args, ScanMode::LeadingOnly, true) {
+        Ok(parsed) => {
+            parsed.flags.help || command_skips_refresh(parsed.rest.first().map(String::as_str))
+        }
+        Err(_) => true,
+    }
+}
+
 /// Commands that must not start a refresh: they install or remove hooks
 /// themselves, replace the binary, or are read by scripts right after install.
-fn command_skips_refresh(first_arg: Option<&str>) -> bool {
+fn command_skips_refresh(subcommand: Option<&str>) -> bool {
     matches!(
-        first_arg,
+        subcommand,
         None | Some(
             "install-hooks"
                 | "install"
@@ -138,9 +153,7 @@ struct RefreshClaim {
 /// agents the user already set up, in a background `autter install-hooks
 /// --refresh-stale`. Costs one small file read when hooks are current.
 pub fn maybe_refresh_after_upgrade(args: &[String]) {
-    if std::env::var(WORKER_GUARD_ENV).as_deref() == Ok("1")
-        || command_skips_refresh(args.first().map(String::as_str))
-    {
+    if std::env::var(WORKER_GUARD_ENV).as_deref() == Ok("1") || args_skip_refresh(args) {
         return;
     }
     // Integration tests run hundreds of commands against throwaway homes; they
@@ -178,6 +191,18 @@ pub fn maybe_refresh_after_upgrade(args: &[String]) {
         WORKER_GUARD_ENV,
         &[],
     );
+}
+
+/// Whether the agent's hook config is exactly what `install_hooks` would write
+/// for this binary: a dry run that reports no change. Agents whose own check
+/// only looks for an autter checkpoint command, whatever binary it names, use
+/// this so a hook that still names a binary that moved (a nix store path, a
+/// dev build, a renamed home) counts as out of date and gets rewritten.
+pub fn install_would_change_nothing(
+    installer: &dyn HookInstaller,
+    params: &HookInstallerParams,
+) -> bool {
+    matches!(installer.install_hooks(params, true), Ok(None))
 }
 
 /// Installers whose hooks autter rewrites in place. Editor extensions (VS
@@ -527,5 +552,42 @@ mod tests {
         assert!(command_skips_refresh(None));
         assert!(!command_skips_refresh(Some("checkpoint")));
         assert!(!command_skips_refresh(Some("status")));
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn refresh_skip_list_reads_past_leading_global_flags() {
+        for args in [
+            &["uninstall-hooks"][..],
+            &["--json", "uninstall-hooks"],
+            &["--quiet", "--json", "install-hooks"],
+            &["-C", "/tmp", "uninstall"],
+            &["--no-color", "upgrade"],
+            &["--strict", "--json", "onboard"],
+            &["--json", "--version"],
+            &["--json"],
+            &["--help", "status"],
+            &["-h"],
+            // `-C` with no path: nothing to run.
+            &["-C"],
+            &[],
+        ] {
+            assert!(args_skip_refresh(&argv(args)), "{args:?} must not refresh");
+        }
+        for args in [
+            &["status"][..],
+            &["--json", "status"],
+            &["-C", "/tmp", "--json", "stats"],
+            &["checkpoint", "claude", "--hook-input", "stdin"],
+            // A flag after the subcommand belongs to the subcommand.
+            &["status", "--json"],
+            // A path that happens to be named like a skipped command.
+            &["-C", "uninstall-hooks", "status"],
+        ] {
+            assert!(!args_skip_refresh(&argv(args)), "{args:?} must refresh");
+        }
     }
 }

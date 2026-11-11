@@ -352,3 +352,274 @@ fn first_command_after_upgrade_refreshes_only_consented_hooks() {
     let after = doctor_check(&repo, "Google Antigravity");
     assert_eq!(after["status"], "passed", "{after}");
 }
+
+const OLD_BINARY: &str = "/old/autter-3.1.0/autter";
+
+/// Start the after-upgrade refresh and wait until it records the current
+/// version. Clears the claim an earlier refresh in the same test left.
+fn refresh_after_pretend_upgrade(repo: &TestRepo) {
+    let internal = repo.test_home_path().join(".autter").join("internal");
+    let state_path = internal.join("hooks_version.json");
+    std::fs::create_dir_all(&internal).unwrap();
+    std::fs::write(&state_path, r#"{"version": "0.0.1"}"#).unwrap();
+    let _ = std::fs::remove_file(internal.join("hooks_refresh_claim.json"));
+
+    run_in_test_home(repo, &["whoami"], &[("AUTTER_TEST_HOOK_REFRESH", "1")]);
+
+    let current = env!("CARGO_PKG_VERSION");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let state: Option<Value> = std::fs::read(&state_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if state.as_ref().is_some_and(|s| s["version"] == current) {
+            assert_eq!(state.unwrap()["failed"], serde_json::json!([]));
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hooks were not refreshed in time; state: {state:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Point every autter command in a hook config at `binary`, leaving the rest
+/// of each command, and everything else in the file, as written.
+fn repoint_hook_commands(value: &mut Value, binary: &str) -> usize {
+    match value {
+        Value::String(s) => {
+            for sep in [" checkpoint ", " memory-hook "] {
+                if let Some(at) = s.find(sep)
+                    && s[..at].contains("autter")
+                {
+                    *s = format!("{binary}{}", &s[at..]);
+                    return 1;
+                }
+            }
+            0
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|v| repoint_hook_commands(v, binary))
+            .sum(),
+        Value::Object(map) => map
+            .values_mut()
+            .map(|v| repoint_hook_commands(v, binary))
+            .sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn moved_binary_is_out_of_date_for_agents_whose_layout_is_current() {
+    // Claude Code, Droid, Gemini, Firebender and Windsurf: their hook layout
+    // can be exactly what this CLI writes while every command still names a
+    // binary that is gone (a nix store path, a dev build, a renamed home).
+    // That used to count as up to date: the refresh skipped it and doctor
+    // passed while nothing was captured.
+    let repo = TestRepo::new();
+    let home = repo.test_home_path().clone();
+    let old = |preset: &str| format!("{OLD_BINARY} checkpoint {preset} --hook-input stdin");
+    let command = |preset: &str| serde_json::json!({"type": "command", "command": old(preset)});
+
+    // Hooks from an older CLI, in the layout each agent counts as installed.
+    let windsurf_events: serde_json::Map<String, Value> = [
+        "pre_write_code",
+        "post_write_code",
+        "pre_run_command",
+        "post_run_command",
+        "post_cascade_response_with_transcript",
+    ]
+    .iter()
+    .map(|event| {
+        (
+            event.to_string(),
+            serde_json::json!([{"command": old("windsurf")}]),
+        )
+    })
+    .collect();
+    let seeds: Vec<(&str, std::path::PathBuf, Value)> = vec![
+        (
+            "Claude Code",
+            home.join(".claude").join("settings.json"),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Write|Edit", "hooks": [command("claude")]}]}}),
+        ),
+        (
+            "Droid",
+            home.join(".factory").join("settings.json"),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Edit", "hooks": [command("droid")]}]}}),
+        ),
+        (
+            "Gemini",
+            home.join(".gemini").join("settings.json"),
+            serde_json::json!({"hooks": {"BeforeTool": [
+                {"matcher": "write_file", "hooks": [command("gemini")]}]}}),
+        ),
+        (
+            "Firebender",
+            home.join(".firebender").join("hooks.json"),
+            serde_json::json!({"hooks": {
+                "preToolUse": [{"command": old("firebender")}],
+                "postToolUse": [{"command": old("firebender")}]}}),
+        ),
+        (
+            "Windsurf",
+            home.join(".codeium").join("windsurf").join("hooks.json"),
+            serde_json::json!({"hooks": windsurf_events}),
+        ),
+    ];
+    for (_, path, seed) in &seeds {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(seed).unwrap()).unwrap();
+    }
+
+    // First refresh: every agent gets this CLI's layout and binary.
+    refresh_after_pretend_upgrade(&repo);
+    let mut configs: Vec<(&str, std::path::PathBuf)> = seeds
+        .iter()
+        .map(|(name, path, _)| (*name, path.clone()))
+        .collect();
+    // Windsurf has a second hooks file, written by the install.
+    configs.push(("Windsurf", home.join(".codeium").join("hooks.json")));
+    for (name, path) in &configs {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{name}: {} not written: {e}", path.display()));
+        assert!(
+            !text.contains(OLD_BINARY),
+            "{name}: first refresh left the old binary in {}:\n{text}",
+            path.display()
+        );
+    }
+    for (name, _, _) in &seeds {
+        let check = doctor_check(&repo, name);
+        assert_eq!(check["status"], "passed", "{name} after install: {check}");
+    }
+
+    // The binary moves: same layout, same commands, another path.
+    for (name, path) in &configs {
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let repointed = repoint_hook_commands(&mut config, OLD_BINARY);
+        assert!(
+            repointed > 0,
+            "{name}: no autter command in {}",
+            path.display()
+        );
+        std::fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    }
+
+    // doctor fails and names the command that cannot run.
+    for (name, _, _) in &seeds {
+        let check = doctor_check(&repo, name);
+        assert_eq!(
+            check["status"], "failed",
+            "{name} with a moved binary: {check}"
+        );
+        assert!(
+            check["details"].to_string().contains(OLD_BINARY),
+            "{name}: doctor must show the failing command: {check}"
+        );
+        assert!(
+            check["remediation"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("autter install-hooks"),
+            "{name}: {check}"
+        );
+    }
+
+    // The next upgrade's refresh rewrites them.
+    refresh_after_pretend_upgrade(&repo);
+    for (name, path) in &configs {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !text.contains(OLD_BINARY),
+            "{name}: refresh left the moved binary in {}:\n{text}",
+            path.display()
+        );
+    }
+    for (name, _, _) in &seeds {
+        let check = doctor_check(&repo, name);
+        assert_eq!(check["status"], "passed", "{name} after refresh: {check}");
+    }
+}
+
+#[test]
+fn unknown_subcommand_from_a_hook_fails_open() {
+    // A hook written by another autter version can name a subcommand this one
+    // does not have. Exit 2 would block the tool call in Claude Code.
+    let repo = TestRepo::new();
+    for envs in [&[][..], &[("AUTTER_TEST_DAEMON_UNAVAILABLE", "1")][..]] {
+        for args in [
+            vec!["capture", "claude", "--hook-input", "stdin"],
+            vec!["capture", "antigravity-pre", "--hook-input=stdin"],
+            vec!["--json", "capture", "claude", "--hook-input", "stdin"],
+        ] {
+            let run = run_hook(&repo, &args, r#"{"cwd": "/tmp"}"#, envs);
+            let label = format!("{args:?} {envs:?}");
+            assert_eq!(
+                run.code,
+                Some(0),
+                "{label}: must exit 0\nstdout: {}\nstderr: {}",
+                run.stdout,
+                run.stderr
+            );
+            assert_eq!(run.stdout.trim(), "{}", "{label}: stderr: {}", run.stderr);
+            if envs.is_empty() {
+                assert!(
+                    run.stderr.contains(STALE_MESSAGE) && run.stderr.contains("capture"),
+                    "{label}: stderr must say the hook is stale and name the command: {}",
+                    run.stderr
+                );
+            }
+        }
+    }
+
+    // A person's typo is still a usage error, also with the hook variable
+    // editor extensions set left in the environment.
+    for envs in [&[][..], &[("AUTTER_CHECKPOINT_HOOK", "1")][..]] {
+        let run = run_hook(&repo, &["capture", "claude"], "", envs);
+        assert_eq!(run.code, Some(2), "{envs:?}: {}", run.stderr);
+        assert!(run.stdout.trim().is_empty(), "{envs:?}: {}", run.stdout);
+        assert!(
+            run.stderr.contains("Unknown autter command: capture"),
+            "{envs:?}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn hook_commands_behind_a_global_flag_start_no_refresh() {
+    // `autter --json uninstall-hooks` right after an upgrade must not start a
+    // refresh that rewrites the files it is removing hooks from.
+    let repo = TestRepo::new();
+    let internal = repo.test_home_path().join(".autter").join("internal");
+    std::fs::create_dir_all(&internal).unwrap();
+    std::fs::write(
+        internal.join("hooks_version.json"),
+        r#"{"version": "0.0.1"}"#,
+    )
+    .unwrap();
+    let claim = internal.join("hooks_refresh_claim.json");
+
+    for args in [
+        &["--json", "uninstall-hooks", "--help"][..],
+        &["--json", "--version"],
+        &["--quiet", "--json", "version"],
+    ] {
+        run_in_test_home(&repo, args, &[("AUTTER_TEST_HOOK_REFRESH", "1")]);
+        assert!(!claim.exists(), "{args:?} started a hook refresh");
+    }
+
+    // The same flag in front of an ordinary command still does.
+    run_in_test_home(
+        &repo,
+        &["--json", "whoami"],
+        &[("AUTTER_TEST_HOOK_REFRESH", "1")],
+    );
+    assert!(claim.exists(), "`--json whoami` must start the refresh");
+}

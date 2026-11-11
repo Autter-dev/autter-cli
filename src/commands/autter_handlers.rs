@@ -163,8 +163,13 @@ pub fn handle_autter(args: &[String]) {
                 );
                 commands::suggest_autter_doctor();
                 // Agent hooks never fail the agent: right after an upgrade the
-                // old service may be stopping while the new one starts.
+                // old service may be stopping while the new one starts. That
+                // holds for a hook subcommand this autter does not have, too.
                 if matches!(args[0].as_str(), "checkpoint" | "memory-hook") {
+                    std::process::exit(0);
+                }
+                if has_hook_input_arg(args) {
+                    answer_hook_noop();
                     std::process::exit(0);
                 }
                 std::process::exit(1);
@@ -403,6 +408,14 @@ pub fn handle_autter(args: &[String]) {
             handle_notes_subcommand(&args[1..]);
         }
         _ => {
+            // A hook written by another autter version can name a subcommand
+            // this one does not have (a downgrade, or a renamed command).
+            // Exit 2 is the code Claude Code treats as "block the tool call",
+            // so a hook gets the stale-hook answer instead: `{}` and exit 0.
+            if has_hook_input_arg(args) {
+                answer_hook_noop();
+                exit_stale_hook(&format!("unknown command '{}'", args[0]));
+            }
             eprintln!("Unknown autter command: {}", args[0]);
             std::process::exit(crate::commands::EXIT_USAGE_ERROR);
         }
@@ -876,9 +889,15 @@ fn checkpoint_runs_in_hook(preset: &str, has_hook_input: bool, hook_env: bool) -
 /// person: every hook autter installs passes `--hook-input`, and editor
 /// extensions set `AUTTER_CHECKPOINT_HOOK`.
 fn invoked_by_agent_hook(args: &[String]) -> bool {
+    has_hook_input_arg(args) || env_flag_set("AUTTER_CHECKPOINT_HOOK")
+}
+
+/// `--hook-input` on the command line: only an agent's hook config passes it.
+/// Used where the subcommand is not a checkpoint, so `AUTTER_CHECKPOINT_HOOK`
+/// left in a shell's environment never turns a person's command into a hook.
+fn has_hook_input_arg(args: &[String]) -> bool {
     args.iter()
         .any(|a| a == "--hook-input" || a.starts_with("--hook-input="))
-        || env_flag_set("AUTTER_CHECKPOINT_HOOK")
 }
 
 static HOOK_NOOP_ANSWERED: std::sync::atomic::AtomicBool =

@@ -440,7 +440,11 @@ fn collect_agent_capture_info() -> Vec<String> {
 
     let mut lines = Vec::new();
 
-    let binary_path = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("autter"));
+    // The binary `autter install-hooks` writes into hook commands, as `autter
+    // doctor` uses, so both report the same hooks as current.
+    let binary_path = crate::mdm::utils::resolve_hook_binary_path()
+        .or_else(|_| env::current_exe())
+        .unwrap_or_else(|_| std::path::PathBuf::from("autter"));
     let params = HookInstallerParams { binary_path };
 
     lines.push("Hooks status by agent (managed by `autter install-hooks`):".to_string());
