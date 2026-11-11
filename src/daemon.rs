@@ -8605,6 +8605,7 @@ impl ActorDaemonCoordinator {
                 Ok(response)
             }
             ControlRequest::Shutdown => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
         };
 
         match result {
@@ -9673,9 +9674,14 @@ enum SocketHealthVerdict {
 /// Decide what one round of socket probes means. A missing socket file is
 /// final at once; a failed connect to a file that exists only counts once it
 /// has failed [`DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART`] times in a row.
+///
+/// A daemon that is out of file descriptors is final at once too: that is not
+/// a busy listener, it cannot accept connections or open files at all, and
+/// only a restart gives the descriptors back.
 fn socket_health_verdict(
     probes_ok: bool,
     socket_file_missing: bool,
+    descriptors_exhausted: bool,
     consecutive_failures: &mut u32,
 ) -> SocketHealthVerdict {
     if probes_ok {
@@ -9683,11 +9689,60 @@ fn socket_health_verdict(
         return SocketHealthVerdict::Healthy;
     }
     *consecutive_failures = consecutive_failures.saturating_add(1);
-    if socket_file_missing || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
+    if socket_file_missing
+        || descriptors_exhausted
+        || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART
+    {
         SocketHealthVerdict::Unhealthy
     } else {
         SocketHealthVerdict::Retry
     }
+}
+
+/// Whether an I/O error means the process (or the machine) has no file
+/// descriptors left.
+#[cfg(unix)]
+fn io_error_is_descriptor_exhaustion(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
+/// Whether this process can no longer open a file descriptor. Asked only
+/// after a socket probe failed, to tell "the listener is busy" from "this
+/// process cannot open anything".
+fn process_descriptors_exhausted() -> bool {
+    #[cfg(unix)]
+    {
+        match File::open("/dev/null") {
+            Ok(_) => false,
+            Err(error) => io_error_is_descriptor_exhaustion(&error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Check that the control socket is served: connect, send a `ping` and read
+/// the reply. A connect alone succeeds while the listener accepts connections
+/// and then drops or refuses every one of them.
+fn control_socket_serves_requests(control_socket_path: &Path) -> Result<(), AutterError> {
+    let response = send_control_request_with_timeouts(
+        control_socket_path,
+        &ControlRequest::Ping,
+        DAEMON_SOCKET_PROBE_TIMEOUT,
+        DAEMON_CONTROL_RESPONSE_TIMEOUT,
+    )?;
+    if response.is_refusal() {
+        return Err(AutterError::Generic(format!(
+            "control socket refused the request: {}",
+            response.error.unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 fn socket_file_missing(path: &Path) -> bool {
@@ -9704,11 +9759,13 @@ fn socket_file_missing(path: &Path) -> bool {
 }
 
 /// Background loop that verifies the daemon's sockets are reachable by
-/// actually connecting to them.  A successful connect proves the socket file
-/// exists, points to this daemon's listener, and that the listener thread is
-/// alive and calling accept().  If either probe fails (deleted file, stale
-/// socket, hung listener), the daemon spawns a detached restart process and
-/// shuts down.
+/// actually using them.  A successful connect proves the socket file exists,
+/// points to this daemon's listener, and that the listener thread is alive and
+/// calling accept().  On the control socket the probe also sends a request and
+/// waits for the reply, which proves connections are served and not just
+/// accepted.  If either probe fails (deleted file, stale socket, hung
+/// listener, no file descriptors left), the daemon spawns a detached restart
+/// process and shuts down.
 ///
 /// To prevent restart loops when the underlying issue is systemic (e.g.
 /// filesystem permissions, broken paths), the daemon only self-restarts if
@@ -9748,14 +9805,21 @@ fn daemon_socket_health_check_loop(
             return;
         }
 
-        let control_ok =
-            local_socket_connects_with_timeout(&control_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
+        let control_ok = control_socket_serves_requests(&control_socket_path);
         let trace_ok =
             local_socket_connects_with_timeout(&trace_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
 
+        let probes_ok = control_ok.is_ok() && trace_ok.is_ok();
+        let descriptors_exhausted = !probes_ok && process_descriptors_exhausted();
+        if descriptors_exhausted {
+            tracing::error!(
+                "socket health check: the background service has no file descriptors left"
+            );
+        }
         let verdict = socket_health_verdict(
-            control_ok.is_ok() && trace_ok.is_ok(),
+            probes_ok,
             socket_file_missing(&control_socket_path) || socket_file_missing(&trace_socket_path),
+            descriptors_exhausted,
             &mut consecutive_probe_failures,
         );
         if verdict == SocketHealthVerdict::Retry {
@@ -10387,27 +10451,27 @@ mod tests {
     fn socket_health_tolerates_brief_probe_failures_on_existing_sockets() {
         let mut failures = 0;
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Retry
         );
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Retry
         );
         // A good probe resets the count.
         assert_eq!(
-            socket_health_verdict(true, false, &mut failures),
+            socket_health_verdict(true, false, false, &mut failures),
             SocketHealthVerdict::Healthy
         );
         assert_eq!(failures, 0);
         for _ in 1..DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
             assert_eq!(
-                socket_health_verdict(false, false, &mut failures),
+                socket_health_verdict(false, false, false, &mut failures),
                 SocketHealthVerdict::Retry
             );
         }
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Unhealthy
         );
     }
@@ -10416,9 +10480,41 @@ mod tests {
     fn socket_health_fails_at_once_when_a_socket_file_is_gone() {
         let mut failures = 0;
         assert_eq!(
-            socket_health_verdict(false, true, &mut failures),
+            socket_health_verdict(false, true, false, &mut failures),
             SocketHealthVerdict::Unhealthy
         );
+    }
+
+    #[test]
+    fn socket_health_fails_at_once_when_file_descriptors_are_exhausted() {
+        // Both socket files are on disk and this is the first failed probe: a
+        // busy listener would get two more checks, a daemon that cannot open
+        // a descriptor does not.
+        let mut failures = 0;
+        assert_eq!(
+            socket_health_verdict(false, false, true, &mut failures),
+            SocketHealthVerdict::Unhealthy
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_exhaustion_is_recognised_from_the_os_error() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert!(io_error_is_descriptor_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [libc::ECONNREFUSED, libc::ENOENT, libc::EAGAIN] {
+            assert!(!io_error_is_descriptor_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!io_error_is_descriptor_exhaustion(&std::io::Error::other(
+            "no os error"
+        )));
+        // This test process can open files, so the live check says so.
+        assert!(!process_descriptors_exhausted());
     }
 
     #[test]
@@ -10567,6 +10663,82 @@ mod tests {
         drop(second);
         drop(third);
         assert_eq!(slots.live.load(Ordering::SeqCst), 0);
+    }
+
+    /// A stand-in control socket whose listener treats each connection the
+    /// way `serve` says, for testing what a client makes of it.
+    #[cfg(unix)]
+    fn fake_control_socket(
+        serve: impl Fn(LocalSocketStream) + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sock");
+        let listener = ListenerOptions::new()
+            .name(local_socket_name(&path).unwrap())
+            .create_sync()
+            .unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                serve(stream);
+            }
+        });
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_probe_fails_when_connections_are_accepted_but_not_served() {
+        // The state the old connect-only probe called healthy.
+        let (_dir, path) = fake_control_socket(drop);
+        assert!(local_socket_connects_with_timeout(&path, DAEMON_SOCKET_PROBE_TIMEOUT).is_ok());
+        assert!(control_socket_serves_requests(&path).is_err());
+
+        let (_dir, path) =
+            fake_control_socket(|stream| refuse_control_connection(stream, "at its limit"));
+        let error = control_socket_serves_requests(&path).expect_err("a refusal is not service");
+        assert!(error.to_string().contains("refused"), "{error}");
+    }
+
+    /// An in-memory connection: the request bytes to read, and what the
+    /// handler wrote back.
+    struct ScriptedConnection {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for ScriptedConnection {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for ScriptedConnection {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ping_is_answered_and_proves_a_served_control_socket() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        let mut reader = BufReader::new(ScriptedConnection {
+            input: std::io::Cursor::new(b"{\"method\":\"ping\"}\n".to_vec()),
+            output: Vec::new(),
+        });
+        handle_control_connection_actor_reader(&mut reader, coordinator, runtime.handle().clone())
+            .unwrap();
+        let written = String::from_utf8(reader.get_ref().output.clone()).unwrap();
+        let response: ControlResponse = serde_json::from_str(written.trim()).unwrap();
+        assert!(response.ok, "{written}");
+        assert!(!response.is_refusal());
     }
 
     #[test]

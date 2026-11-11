@@ -58,6 +58,11 @@ pub enum ControlRequest {
     },
     #[serde(rename = "shutdown")]
     Shutdown,
+    /// Does nothing and answers `ok`. A reply proves the service is handling
+    /// requests, not just accepting connections. A service too old to know
+    /// this request still answers (with an error), which proves the same.
+    #[serde(rename = "ping")]
+    Ping,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
