@@ -8,7 +8,8 @@ name: CI
 # compiles the lib, bins, tests, and benches without running anything.
 #
 # Plus one Windows job for install.ps1, which users run as `irm <url> | iex`
-# under Windows PowerShell 5.1 or PowerShell 7 (issues #9 and #11).
+# under Windows PowerShell 5.1 or PowerShell 7 (issues #9 and #11), and the
+# node tests of the npm bootstrapper (npm/).
 
 on:
   pull_request:
@@ -65,6 +66,27 @@ jobs:
       # Windows, and this job exists to protect the release build.
       - name: Check (release binary, default features)
         run: cargo check --locked --bin autter
+
+  # The npm package (npm/) is a launcher that downloads the release binary.
+  # Its tests make no request: they pin the checked-in version (0.0.0-dev,
+  # stamped with the real one by release.yml at publish) and run an install
+  # from a checkout against a stand-in for GitHub.
+  npm-bootstrapper:
+    name: npm bootstrapper tests
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    env:
+      AUTTER_NO_INSTALL_PING: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test
+        run: node --test npm/install.test.js
 
   windows-installer:
     name: install.ps1 (Windows PowerShell 5.1 + pwsh)
