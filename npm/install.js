@@ -145,6 +145,61 @@ function checkLinuxGlibc() {
   }
 }
 
+// What to tell someone when the operating system refuses to start the
+// native binary. Node reports these as an error `code` on the spawn, and the
+// bare message ("spawnSync ...autter.exe UNKNOWN") says nothing about the
+// cause or the fix. Returns extra lines to print, or [] when there is
+// nothing platform-specific to add.
+function spawnFailureHelp(err, { platform = process.platform, bin = binaryDest() } = {}) {
+  const code = err && err.code;
+  if (platform !== 'win32') {
+    if (code === 'EACCES') {
+      return [`${bin} is not executable. Fix: chmod +x "${bin}"`];
+    }
+    return [];
+  }
+  const dir = path.win32.dirname(bin);
+  const seeWindowsError = `See Windows' own message by running it directly in PowerShell: & '${bin}' --version`;
+  const allowIt =
+    'If Windows Security (or another antivirus) blocked it: open Windows Security > Virus & threat protection > ' +
+    `Protection history and allow autter.exe, or add an exclusion for ${dir}.`;
+  const reinstall =
+    `To download it again, delete ${bin} and run the same autter command once more, ` +
+    'or install with PowerShell from a normal (not Administrator) window: irm https://api.autter.dev/install.ps1 | iex';
+  switch (code) {
+    case 'UNKNOWN':
+      return [
+        'Windows would not start the file. The usual causes: an antivirus blocked or quarantined it, ' +
+          'the download is incomplete, or the file is for another processor type ' +
+          `(this Node is ${process.arch}).`,
+        seeWindowsError,
+        allowIt,
+        reinstall,
+      ];
+    case 'EACCES':
+    case 'EPERM':
+      return [
+        'Windows denied access to the file. The usual causes: an antivirus is holding or blocking it, ' +
+          'or it was installed from an Administrator window and your account cannot run it.',
+        seeWindowsError,
+        allowIt,
+        reinstall,
+      ];
+    case 'ENOENT':
+      return [
+        'The file is gone. An antivirus that quarantines it removes it right after the download.',
+        allowIt,
+        reinstall,
+      ];
+    case 'EBUSY':
+      return [
+        'The file is in use: another autter install or upgrade is replacing it. Wait a few seconds and run the command again.',
+      ];
+    default:
+      return [];
+  }
+}
+
 function verifyBinaryRuns(bin) {
   try {
     const out = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 10_000 });
@@ -162,7 +217,10 @@ function verifyBinaryRuns(bin) {
           'autter requires glibc 2.35+ (Ubuntu 22.04+). On Ubuntu 20.04 / older WSL2, use a newer distro or Docker.'
       );
     }
-    throw new Error(`The autter binary could not run on this system: ${detail}`);
+    const help = spawnFailureHelp(err, { bin });
+    throw new Error(
+      [`The autter binary could not run on this system: ${detail}`, ...help].join('\n')
+    );
   }
 }
 
@@ -298,7 +356,14 @@ async function main() {
   console.log("Run 'autter onboard' to finish setup (consent for hooks, git config, and daemon).");
 }
 
-module.exports = { assetName, binaryDest, ensureBinary, releaseTag, verifyChecksum };
+module.exports = {
+  assetName,
+  binaryDest,
+  ensureBinary,
+  releaseTag,
+  spawnFailureHelp,
+  verifyChecksum,
+};
 
 if (require.main === module) {
   main().catch((err) => {

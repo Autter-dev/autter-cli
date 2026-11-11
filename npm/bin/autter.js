@@ -8,7 +8,7 @@
 
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
-const { binaryDest, ensureBinary } = require('../install.js');
+const { binaryDest, ensureBinary, spawnFailureHelp } = require('../install.js');
 
 async function main() {
   let bin = binaryDest();
@@ -31,6 +31,9 @@ async function main() {
   const result = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
   if (result.error) {
     console.error(`autter: failed to run ${bin}: ${result.error.message}`);
+    for (const line of spawnFailureHelp(result.error, { bin })) {
+      console.error(`autter: ${line}`);
+    }
     process.exit(1);
   }
   if (result.signal) {
