@@ -747,6 +747,32 @@ fn handle_checkpoint(args: &[String]) {
     // beats losing the data.
     const CHECKPOINT_DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    // A checkpoint is sent without waiting for the service to finish it. A
+    // service that cannot take it (overloaded, or shutting down) closes the
+    // connection instead, so the sender watches the connection briefly after
+    // writing: without that, a dropped checkpoint looks exactly like a sent
+    // one. The watch ends as soon as the service answers; until then a
+    // service that is working on the checkpoint is silent, so the watch is
+    // also the most a healthy send can cost.
+    //
+    // A hook runs before and after every edit an agent makes, so it only
+    // waits long enough to see a connection that is closed at once (about a
+    // millisecond; 25 ms leaves room for a busy machine, which is when this
+    // happens). A direct run waits as long as any other control request does
+    // for its answer: that also covers a connection left queued by a service
+    // that then gives up and exits, which closes it.
+    const HOOK_CHECKPOINT_DROP_WATCH: std::time::Duration = std::time::Duration::from_millis(25);
+    const DIRECT_CHECKPOINT_DROP_WATCH: std::time::Duration = std::time::Duration::from_secs(2);
+    let drop_watch = if hook_mode {
+        HOOK_CHECKPOINT_DROP_WATCH
+    } else {
+        DIRECT_CHECKPOINT_DROP_WATCH
+    };
+    // Before a resend. Longer than the 50 ms the service backs off after a
+    // connection it could not serve, so the resend is not left queued behind
+    // that pause, where a short watch would not see it dropped.
+    const CHECKPOINT_RESEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
     let mut sent_count = 0u64;
     // Session-activity requests wake the transcript reader and record no
     // checkpoint, so they are counted apart from checkpoints.
@@ -760,12 +786,17 @@ fn handle_checkpoint(args: &[String]) {
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
         };
-        let mut send_result =
-            crate::daemon::send_control_request_fire_and_forget(&active_socket, &control_request);
+        let mut send_result = crate::daemon::send_control_request_fire_and_forget(
+            &active_socket,
+            &control_request,
+            drop_watch,
+        );
 
         // A failed send almost always means the daemon is down (crashed, never
-        // started, or restarting). Rather than dropping the checkpoint — which
-        // silently loses the session's steps — spawn the daemon and retry once.
+        // started, or restarting), or that it took the connection and closed
+        // it without handling the request (overloaded, or shutting down).
+        // Rather than dropping the checkpoint — which silently loses the
+        // session's steps — spawn the daemon and retry once.
         // `ensure_daemon_running` is a no-op when the daemon is already up, so a
         // transient blip is retried too. Only attempt the spawn once per call.
         if send_result.is_err() && !tried_spawn {
@@ -773,9 +804,11 @@ fn handle_checkpoint(args: &[String]) {
             match crate::commands::daemon::ensure_daemon_running(CHECKPOINT_DAEMON_SPAWN_TIMEOUT) {
                 Ok(spawned) => {
                     active_socket = spawned.control_socket_path;
+                    std::thread::sleep(CHECKPOINT_RESEND_PAUSE);
                     send_result = crate::daemon::send_control_request_fire_and_forget(
                         &active_socket,
                         &control_request,
+                        drop_watch,
                     );
                 }
                 Err(e) => {

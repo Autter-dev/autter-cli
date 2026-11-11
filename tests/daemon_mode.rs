@@ -415,6 +415,19 @@ impl DaemonGuard {
     }
 
     fn start_with_env(repo: &TestRepo, extra_env: &[(&str, &str)]) -> Self {
+        let mut daemon = Self::spawn_with_env(repo, extra_env, None);
+        daemon.wait_until_ready();
+        daemon
+    }
+
+    /// Start the daemon without waiting for it to serve, for tests of a
+    /// daemon that never does. Its log goes to `log_path` when given (a test
+    /// daemon logs to its standard streams, not to a log file).
+    fn spawn_with_env(
+        repo: &TestRepo,
+        extra_env: &[(&str, &str)],
+        log_path: Option<&Path>,
+    ) -> Self {
         let daemon_home = repo.daemon_home_path();
         let control_socket_path = daemon_control_socket_path(repo);
         let trace_socket_path = daemon_trace_socket_path(repo);
@@ -427,6 +440,12 @@ impl DaemonGuard {
             .env("AUTTER_TEST_DB_PATH", repo.test_db_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(log_path) = log_path {
+            let log = fs::File::create(log_path).expect("failed to create daemon log file");
+            command
+                .stdout(log.try_clone().expect("failed to clone daemon log handle"))
+                .stderr(log);
+        }
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -439,14 +458,12 @@ impl DaemonGuard {
         );
 
         let child = command.spawn().expect("failed to spawn autter subprocess");
-        let mut daemon = Self {
+        Self {
             child,
             control_socket_path,
             trace_socket_path,
             repo_working_dir: repo_workdir_string(repo),
-        };
-        daemon.wait_until_ready();
-        daemon
+        }
     }
 
     fn wait_until_ready(&mut self) {
@@ -4243,4 +4260,444 @@ fn wrapper_proxy_survives_panic_in_pre_state_hook() {
 #[serial]
 fn wrapper_proxy_survives_panic_in_post_state_hook() {
     assert_proxy_survives_hook_panic("post_state");
+}
+
+/// A sender that does not wait for a response (every `autter checkpoint`
+/// before this fix, and any older autter still installed) writes its request
+/// and closes the connection at once. The handler thread then finds the
+/// client gone before it has read anything, and on macOS cannot even set a
+/// timeout on that socket. The request must still be read and handled.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_handles_a_request_from_a_client_that_already_left() {
+    use std::os::unix::net::UnixStream;
+
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+    );
+
+    // A request whose effect can be read back: it stores a bash session.
+    let repo_dir = repo_workdir_string(&repo);
+    let start_session = json!({
+        "method": "bash_session.start",
+        "params": {
+            "repo_work_dir": repo_dir,
+            "session_id": "left-early",
+            "tool_use_id": "tool-1",
+            "agent_id": {"tool": "mock", "id": "left-early", "model": "mock-model"},
+            "metadata": {},
+            "stat_snapshot": {
+                "entries": {},
+                "invocation_key": "left-early:tool-1",
+                "repo_root": repo_dir,
+            },
+        },
+    });
+    for _ in 0..20 {
+        let mut connection =
+            UnixStream::connect(&daemon.control_socket_path).expect("connect to control socket");
+        connection
+            .write_all(format!("{start_session}\n").as_bytes())
+            .expect("write request");
+        drop(connection);
+    }
+
+    let mut stored = false;
+    for _ in 0..100 {
+        let response = send_control_request(
+            &daemon.control_socket_path,
+            &ControlRequest::BashSnapshotQuery {
+                session_id: "left-early".to_string(),
+                tool_use_id: "tool-1".to_string(),
+            },
+        )
+        .expect("snapshot query should be answered");
+        if response
+            .data
+            .as_ref()
+            .and_then(|data| data["found"].as_bool())
+            == Some(true)
+        {
+            stored = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        stored,
+        "a request from a client that closed its connection at once should still be handled"
+    );
+    daemon.shutdown();
+}
+
+/// Connections that are opened on the control socket and then left idle each
+/// hold a handler thread. Nothing used to close them, so enough of them (about
+/// 4,100 on macOS) pinned the daemon at its thread limit for good: it kept
+/// accepting connections and dropped every one, checkpoints included.
+///
+/// Now at most a fixed number of handler threads run at once, a connection
+/// past that is told so, and an idle connection is closed after a timeout,
+/// which gives its thread back. Both limits are lowered here so the test does
+/// not need thousands of connections or the real timeout.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_closes_idle_control_connections_and_keeps_serving() {
+    use std::os::unix::net::UnixStream;
+
+    const HANDLER_LIMIT: usize = 8;
+    const IDLE_CONNECTIONS: usize = 40;
+
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let control_socket_path = daemon_control_socket_path(&repo);
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("AUTTER_TEST_CONTROL_IDLE_TIMEOUT_MS", "2000"),
+            ("AUTTER_TEST_CONTROL_MAX_HANDLERS", "8"),
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+    );
+    let status_request = ControlRequest::StatusFamily {
+        repo_working_dir: repo_workdir_string(&repo),
+    };
+
+    let idle = (0..IDLE_CONNECTIONS)
+        .map(|_| {
+            let connection = UnixStream::connect(&control_socket_path).expect("idle connection");
+            // Best effort: macOS rejects this once the daemon has closed the
+            // connection, and then the read below cannot block anyway.
+            let _ = connection.set_read_timeout(Some(Duration::from_secs(15)));
+            connection
+        })
+        .collect::<Vec<_>>();
+
+    // Every handler thread is now held by an idle connection, so a real
+    // request is not served. (Whether it gets to read its refusal or finds
+    // the connection already closed depends on timing; the idle connections
+    // below read theirs.)
+    let at_limit = send_control_request(&control_socket_path, &status_request);
+    assert!(
+        at_limit
+            .as_ref()
+            .map_or(true, |response| response.is_refusal()),
+        "a request past the handler limit should be refused: {at_limit:?}"
+    );
+
+    // The daemon ends every idle connection itself: the ones past the limit
+    // with a refusal, the ones holding a handler thread when they time out.
+    let mut refused_idle = 0;
+    let mut timed_out_idle = 0;
+    for mut connection in idle {
+        let mut received = String::new();
+        connection
+            .read_to_string(&mut received)
+            .expect("the daemon should close an idle control connection");
+        if received.is_empty() {
+            timed_out_idle += 1;
+        } else {
+            let response: autter::daemon::ControlResponse =
+                serde_json::from_str(received.trim()).expect("refusal should be a response");
+            assert!(response.is_refusal(), "unexpected response: {received}");
+            assert!(
+                received.contains("connection limit"),
+                "the refusal should say why: {received}"
+            );
+            refused_idle += 1;
+        }
+    }
+    assert!(
+        (1..=HANDLER_LIMIT).contains(&timed_out_idle),
+        "between 1 and {HANDLER_LIMIT} idle connections should have held a handler thread \
+         until the idle timeout, got {timed_out_idle} (refused: {refused_idle})"
+    );
+    assert_eq!(refused_idle + timed_out_idle, IDLE_CONNECTIONS);
+
+    // With the idle connections gone the daemon serves again, without a
+    // restart.
+    let mut served = false;
+    for _ in 0..100 {
+        if send_control_request(&control_socket_path, &status_request)
+            .is_ok_and(|response| response.ok)
+        {
+            served = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        served,
+        "daemon should serve requests again once idle connections are closed"
+    );
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("failed to poll daemon")
+            .is_none(),
+        "daemon should have stayed up through the idle connections"
+    );
+    daemon.shutdown();
+}
+
+/// What 4540ac5 was for, kept: a few connections in a row that cannot get a
+/// handler thread (a busy machine) are dropped, and the daemon keeps going.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_survives_a_brief_run_of_handler_spawn_failures() {
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let log_path = repo.test_home_path().join("daemon-brief-overload.log");
+    let mut daemon = DaemonGuard::spawn_with_env(
+        &repo,
+        &[
+            ("AUTTER_TEST_FAIL_HANDLER_SPAWNS", "5"),
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+        Some(&log_path),
+    );
+    // The first five connections are dropped; readiness polling uses them up.
+    daemon.wait_until_ready();
+
+    let status = send_control_request(
+        &daemon.control_socket_path,
+        &ControlRequest::StatusFamily {
+            repo_working_dir: repo_workdir_string(&repo),
+        },
+    )
+    .expect("daemon should serve after a brief run of spawn failures");
+    assert!(status.ok, "{status:?}");
+
+    let log = fs::read_to_string(&log_path).expect("daemon log should be readable");
+    assert_eq!(
+        log.matches("failed to spawn handler thread").count(),
+        5,
+        "each dropped connection should be logged:\n{log}"
+    );
+    assert!(
+        !log.contains("shutting the background service down"),
+        "a brief run of failures must not stop the daemon:\n{log}"
+    );
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("failed to poll daemon")
+            .is_none(),
+        "daemon should still be running"
+    );
+    daemon.shutdown();
+}
+
+/// A daemon that can never start a handler thread used to stay up for good,
+/// accepting every connection and dropping it: checkpoints sent to it were
+/// lost while the sender reported success, and the health check (which only
+/// connected) saw nothing wrong. It now says why and exits within seconds so
+/// a fresh daemon can be started, and the sender is told its request went
+/// nowhere.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn daemon_exits_when_handler_threads_cannot_be_started() {
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let log_path = repo.test_home_path().join("daemon-sustained-overload.log");
+    let mut daemon = DaemonGuard::spawn_with_env(
+        &repo,
+        &[
+            ("AUTTER_TEST_FAIL_HANDLER_SPAWNS", "1000000"),
+            ("AUTTER_DAEMON_UPDATE_CHECK_INTERVAL", "86400"),
+            ("AUTTER_DAEMON_MAX_UPTIME_SECS", "86400"),
+        ],
+        Some(&log_path),
+    );
+
+    // Wait for the listener, without using up a connection on it.
+    for _ in 0..400 {
+        if daemon.control_socket_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        daemon.control_socket_path.exists(),
+        "daemon should have bound its control socket"
+    );
+
+    // Send requests the way `autter checkpoint` does until the daemon exits.
+    let first_send = std::time::Instant::now();
+    let mut send_results = Vec::new();
+    let mut exited_after = None;
+    while first_send.elapsed() < Duration::from_secs(30) {
+        if daemon
+            .child
+            .try_wait()
+            .expect("failed to poll daemon")
+            .is_some()
+        {
+            exited_after = Some(first_send.elapsed());
+            break;
+        }
+        // Two in a row: the daemon closes the first at once, which can beat
+        // the sender's write (an error even before this fix). The second
+        // arrives while the listener backs off, so its write lands and only
+        // the closed connection gives the drop away.
+        for _ in 0..2 {
+            send_results.push(
+                autter::daemon::send_control_request_fire_and_forget(
+                    &daemon.control_socket_path,
+                    &ControlRequest::Ping,
+                    Duration::from_millis(250),
+                )
+                .map_err(|error| error.to_string()),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let exited_after = exited_after.unwrap_or_else(|| {
+        panic!("daemon should exit when it cannot serve any connection; log:\n{log}")
+    });
+    assert!(
+        exited_after < Duration::from_secs(15),
+        "daemon took {exited_after:?} to give up; log:\n{log}"
+    );
+    assert!(
+        send_results.iter().all(Result::is_err),
+        "no request was handled, so no send may report success: {send_results:?}"
+    );
+    assert!(
+        send_results.iter().any(|result| result
+            .as_ref()
+            .is_err_and(|error| error.contains("without handling the request"))),
+        "senders should be told the connection was dropped: {send_results:?}"
+    );
+    assert!(
+        log.contains("failed to spawn handler thread"),
+        "the log should say what failed:\n{log}"
+    );
+    assert!(
+        log.contains("shutting the background service down"),
+        "the log should say why the daemon exited:\n{log}"
+    );
+    assert!(
+        !daemon.control_socket_path.exists(),
+        "an exited daemon should have removed its control socket"
+    );
+    daemon.shutdown();
+}
+
+/// A background service that accepts a checkpoint's connection and then
+/// closes it without handling the request (it could not start a handler
+/// thread, or it is shutting down) used to look exactly like one that took
+/// the checkpoint: `autter checkpoint` exited 0 and nothing was recorded.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn checkpoint_reports_a_connection_the_service_dropped() {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    fs::write(repo.path().join("dropped.txt"), "base\n").expect("failed to write base");
+    repo.git(&["add", "dropped.txt"])
+        .expect("add should succeed");
+    repo.git(&["commit", "-m", "base commit"])
+        .expect("base commit should succeed");
+    fs::write(repo.path().join("dropped.txt"), "base\nai line\n").expect("failed to write edit");
+
+    // No daemon: listeners that accept and never serve stand in for one.
+    let control_socket_path = daemon_control_socket_path(&repo);
+    let trace_socket_path = daemon_trace_socket_path(&repo);
+    fs::create_dir_all(
+        control_socket_path
+            .parent()
+            .expect("control socket path should have a parent"),
+    )
+    .expect("failed to create socket directory");
+    let control = UnixListener::bind(&control_socket_path).expect("bind stand-in control socket");
+    let trace = UnixListener::bind(&trace_socket_path).expect("bind stand-in trace socket");
+    thread::spawn(move || {
+        // Take the request off each connection, then close it unanswered.
+        // One thread each: every autter command also keeps an idle
+        // connection open for telemetry, which must not hold up the rest.
+        for connection in control.incoming().flatten() {
+            thread::spawn(move || {
+                let mut request = String::new();
+                let _ = std::io::BufReader::new(connection).read_line(&mut request);
+            });
+        }
+    });
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for connection in trace.incoming() {
+            held.push(connection);
+        }
+    });
+    let checkpoint_command = || {
+        let mut command = repo.autter_command(&["checkpoint", "mock_ai", "dropped.txt"]);
+        configure_test_daemon_env(
+            &mut command,
+            &repo.daemon_home_path(),
+            &control_socket_path,
+            &trace_socket_path,
+        );
+        command
+    };
+
+    // A direct run exits non-zero and says the checkpoint was dropped.
+    let direct_run = checkpoint_command()
+        .output()
+        .expect("spawn autter checkpoint");
+    let direct_stderr = String::from_utf8_lossy(&direct_run.stderr);
+    assert!(
+        !direct_run.status.success(),
+        "a direct checkpoint the service dropped must not exit 0:\n{direct_stderr}"
+    );
+    assert!(
+        direct_stderr.contains("checkpoint dropped")
+            && direct_stderr.contains("closed the connection without handling the request"),
+        "the failure should say the checkpoint was dropped and why, got:\n{direct_stderr}"
+    );
+
+    // A hook run still exits 0 (it must never block the agent) and says the
+    // same on stderr. A hook only watches the connection for a few
+    // milliseconds, so on a loaded machine a run can miss the close: every
+    // run must exit 0, and one of a few must report the drop.
+    let mut hook_reported_drop = false;
+    for _ in 0..5 {
+        let hook_run = checkpoint_command()
+            .env("AUTTER_CHECKPOINT_HOOK", "1")
+            .output()
+            .expect("spawn autter checkpoint");
+        let hook_stderr = String::from_utf8_lossy(&hook_run.stderr);
+        assert!(
+            hook_run.status.success(),
+            "a hook checkpoint must exit 0 even when the service dropped it:\n{hook_stderr}"
+        );
+        if hook_stderr.contains("checkpoint dropped") {
+            hook_reported_drop = true;
+            break;
+        }
+    }
+    assert!(
+        hook_reported_drop,
+        "a hook should still say the checkpoint was not recorded"
+    );
+
+    let _ = fs::remove_file(&control_socket_path);
+    let _ = fs::remove_file(&trace_socket_path);
 }

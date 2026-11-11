@@ -4414,6 +4414,7 @@ pub struct ActorDaemonCoordinator {
     shutdown_notify: Notify,
     shutdown_condvar: std::sync::Condvar,
     shutdown_condvar_mutex: Mutex<()>,
+    created_at: std::time::Instant,
 }
 
 struct WrapperStateEntry {
@@ -4513,6 +4514,7 @@ impl ActorDaemonCoordinator {
             shutdown_notify: Notify::new(),
             shutdown_condvar: std::sync::Condvar::new(),
             shutdown_condvar_mutex: Mutex::new(()),
+            created_at: std::time::Instant::now(),
         }
     }
 
@@ -4564,6 +4566,19 @@ impl ActorDaemonCoordinator {
         self.shutdown_action
             .store(DaemonExitAction::Restart.as_u8(), Ordering::SeqCst);
         self.request_shutdown();
+    }
+
+    /// Shut down because the service can no longer serve connections. It comes
+    /// back by itself, unless it has only just started: then the cause is
+    /// likely still there, and restarting would loop. The next autter command
+    /// starts a fresh service in that case.
+    fn request_shutdown_unhealthy(&self) {
+        let min_uptime = Duration::from_secs(daemon_min_uptime_for_self_restart());
+        if self.created_at.elapsed() >= min_uptime {
+            self.request_restart();
+        } else {
+            self.request_shutdown();
+        }
     }
 
     fn request_restart_after_update(&self) {
@@ -8590,6 +8605,7 @@ impl ActorDaemonCoordinator {
                 Ok(response)
             }
             ControlRequest::Shutdown => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
         };
 
         match result {
@@ -8699,6 +8715,301 @@ impl ActorDaemonCoordinator {
     }
 }
 
+/// Pause after a listener could not serve a connection, so a listener that
+/// cannot serve does not spin.
+const LISTENER_FAILURE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// How long a listener may go without serving any connection before the
+/// service gives up and exits to be restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerFailureLimits {
+    /// Failures in a row, with no connection served in between.
+    max_consecutive: Option<u32>,
+    /// Time from the first failure of the run to the latest one.
+    max_duration: Duration,
+}
+
+/// A connection could not be handed to a handler thread (the thread could not
+/// be started, or `accept` itself failed). Nobody retries a dropped
+/// connection: checkpoints are sent once and git never resends trace events,
+/// so each failure is lost work.
+///
+/// A burst on a busy machine fails a handful of connections and then recovers,
+/// and must not restart the service. 20 failures in a row take at least a
+/// second of back-to-back failing (each one backs off 50 ms) in which not one
+/// handler thread could be started. On a quiet machine connections are rare,
+/// so the count alone could take hours: 5 seconds between the first and the
+/// latest failure, with nothing served in between, ends it too.
+const HANDOFF_FAILURE_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
+    max_consecutive: Some(20),
+    max_duration: Duration::from_secs(5),
+};
+
+/// Every control handler thread is in use. Idle connections are closed after
+/// [`CONTROL_CONNECTION_IDLE_TIMEOUT`], so a flood of them clears by itself
+/// within that time; 5 seconds more means the threads are held by requests
+/// that are not finishing. Refusals are not counted: a flood refuses hundreds
+/// of connections in a moment and must not restart the service.
+#[cfg(not(windows))]
+const AT_CAPACITY_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
+    max_consecutive: None,
+    max_duration: Duration::from_secs(15),
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerFailureVerdict {
+    KeepServing,
+    ShutDown,
+}
+
+/// Decide whether a listener that just failed to serve a connection should
+/// keep going. `consecutive` counts this failure; `failing_for` is the time
+/// since the first failure after the last served connection.
+fn listener_failure_verdict(
+    limits: ListenerFailureLimits,
+    consecutive: u32,
+    failing_for: Duration,
+) -> ListenerFailureVerdict {
+    let too_many = limits.max_consecutive.is_some_and(|max| consecutive >= max);
+    if too_many || failing_for >= limits.max_duration {
+        ListenerFailureVerdict::ShutDown
+    } else {
+        ListenerFailureVerdict::KeepServing
+    }
+}
+
+/// A run of connections a listener failed to serve, ended by the next one it
+/// serves.
+#[derive(Debug, Default)]
+struct ListenerFailureStreak {
+    consecutive: u32,
+    first_failure_at: Option<std::time::Instant>,
+}
+
+impl ListenerFailureStreak {
+    fn record_failure(
+        &mut self,
+        limits: ListenerFailureLimits,
+        now: std::time::Instant,
+    ) -> ListenerFailureVerdict {
+        self.consecutive = self.consecutive.saturating_add(1);
+        let first = *self.first_failure_at.get_or_insert(now);
+        listener_failure_verdict(
+            limits,
+            self.consecutive,
+            now.saturating_duration_since(first),
+        )
+    }
+
+    fn record_success(&mut self) {
+        *self = Self::default();
+    }
+
+    fn failing_for(&self, now: std::time::Instant) -> Duration {
+        self.first_failure_at
+            .map(|first| now.saturating_duration_since(first))
+            .unwrap_or_default()
+    }
+}
+
+/// Record that `listener` could not hand a connection to a handler thread.
+/// Returns `true` when the listener must stop, which shuts the service down;
+/// otherwise backs off and lets it keep accepting.
+fn listener_handoff_failed(
+    listener: &str,
+    streak: &mut ListenerFailureStreak,
+    what: &str,
+    error: &dyn std::fmt::Display,
+) -> bool {
+    let now = std::time::Instant::now();
+    match streak.record_failure(HANDOFF_FAILURE_LIMITS, now) {
+        ListenerFailureVerdict::KeepServing => {
+            tracing::error!(
+                consecutive = streak.consecutive,
+                %error,
+                "{} listener: {}",
+                listener,
+                what
+            );
+            std::thread::sleep(LISTENER_FAILURE_BACKOFF);
+            false
+        }
+        ListenerFailureVerdict::ShutDown => {
+            tracing::error!(
+                consecutive = streak.consecutive,
+                failing_for_ms = streak.failing_for(now).as_millis() as u64,
+                %error,
+                "{} listener: {}, and no connection has been served since the first failure; \
+                 shutting the background service down so it is started again",
+                listener,
+                what
+            );
+            true
+        }
+    }
+}
+
+/// Whether a failed `accept` says nothing about the listener's ability to
+/// serve: the client gave up while queued, or the call was interrupted.
+#[cfg(not(windows))]
+fn accept_error_is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Start the thread that serves one accepted connection.
+fn spawn_connection_handler<F>(handler: F) -> std::io::Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(feature = "test-support")]
+    if test_support_fail_next_handler_spawn() {
+        return Err(std::io::Error::other(
+            "handler thread spawn failure injected by AUTTER_TEST_FAIL_HANDLER_SPAWNS",
+        ));
+    }
+    std::thread::Builder::new().spawn(handler).map(|_| ())
+}
+
+/// Test builds can make the first N handler-thread spawns of a daemon fail
+/// (`AUTTER_TEST_FAIL_HANDLER_SPAWNS=N`), which is otherwise only reachable by
+/// exhausting the machine's threads.
+#[cfg(feature = "test-support")]
+fn test_support_fail_next_handler_spawn() -> bool {
+    static REMAINING: std::sync::OnceLock<AtomicUsize> = std::sync::OnceLock::new();
+    let remaining = REMAINING.get_or_init(|| {
+        AtomicUsize::new(
+            std::env::var("AUTTER_TEST_FAIL_HANDLER_SPAWNS")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .unwrap_or(0),
+        )
+    });
+    remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+}
+
+/// A control connection that sends nothing for this long is closed.
+///
+/// Every connection holds a handler thread, so connections that are opened and
+/// then left idle would otherwise pin the service at its thread limit for
+/// good. Clients that send one request write it right after connecting. The
+/// one long-lived client is the shared connection a command keeps for
+/// telemetry and wrapper state (`telemetry_handle`): it can sit idle for as
+/// long as a git command runs, and it reconnects and resends when it finds
+/// its connection closed, so closing it costs one reconnect. The trace socket
+/// has no such timeout: git holds its connection for the life of a command
+/// (an open editor, a long fetch) and never reconnects.
+const CONTROL_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn control_connection_idle_timeout() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(millis) = std::env::var("AUTTER_TEST_CONTROL_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+    {
+        return Duration::from_millis(millis);
+    }
+    CONTROL_CONNECTION_IDLE_TIMEOUT
+}
+
+/// Most control handler threads alive at once. Far above real use (a client
+/// holds a connection for one short request) and far below the per-process
+/// thread limit (about 4,096 on macOS), so connections left open on the
+/// control socket cannot starve the rest of the service of threads.
+#[cfg(not(windows))]
+const CONTROL_MAX_HANDLER_THREADS: usize = 512;
+
+/// Each handler holds one file descriptor, so stay within half of what this
+/// process may open (macOS starts processes with 256).
+#[cfg(not(windows))]
+fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
+    match open_file_limit {
+        Some(limit) => usize::try_from(limit / 2)
+            .unwrap_or(usize::MAX)
+            .clamp(16, CONTROL_MAX_HANDLER_THREADS),
+        None => CONTROL_MAX_HANDLER_THREADS,
+    }
+}
+
+#[cfg(not(windows))]
+fn control_handler_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    if let Some(limit) = std::env::var("AUTTER_TEST_CONTROL_MAX_HANDLERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+    {
+        return limit;
+    }
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` is a valid, writable rlimit for getrlimit to fill.
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0;
+    // `rlim_t` is not 64 bits wide on every platform.
+    #[allow(clippy::unnecessary_cast)]
+    let open_file_limit = ok.then_some(limits.rlim_cur as u64);
+    control_handler_limit_for(open_file_limit)
+}
+
+/// Counts live control handler threads against a fixed limit.
+#[cfg(not(windows))]
+struct HandlerSlots {
+    live: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+/// One handler thread's place in [`HandlerSlots`], given back when dropped.
+#[cfg(not(windows))]
+struct HandlerSlot(Arc<AtomicUsize>);
+
+#[cfg(not(windows))]
+impl HandlerSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            live: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<HandlerSlot> {
+        self.live
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                (live < self.limit).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| HandlerSlot(self.live.clone()))
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Tell a client its request was not taken, then close the connection.
+#[cfg(not(windows))]
+fn refuse_control_connection(mut stream: LocalSocketStream, reason: &str) {
+    let _ = stream.set_send_timeout(Some(Duration::from_millis(100)));
+    if let Ok(mut raw) = serde_json::to_vec(&ControlResponse::refused(reason)) {
+        raw.push(b'\n');
+        let _ = stream.write_all(&raw);
+        let _ = stream.flush();
+    }
+}
+
 fn control_listener_loop_actor(
     control_socket_path: PathBuf,
     coordinator: Arc<ActorDaemonCoordinator>,
@@ -8712,28 +9023,89 @@ fn control_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding control socket: {}", e)))?;
         set_socket_owner_only(&control_socket_path)?;
+        let slots = HandlerSlots::new(control_handler_limit());
+        let mut handoff_failures = ListenerFailureStreak::default();
+        let mut at_capacity = ListenerFailureStreak::default();
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
+                if let Ok(stream) = stream {
+                    refuse_control_connection(stream, "the background service is shutting down");
+                }
                 break;
             }
-            let Ok(stream) = stream else {
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) if accept_error_is_transient(&error) => continue,
+                Err(error) => {
+                    // Out of file descriptors, most likely. Retrying at once
+                    // would spin: the connection stays queued and `accept`
+                    // fails again until something frees a descriptor.
+                    if listener_handoff_failed(
+                        "control",
+                        &mut handoff_failures,
+                        "failed to accept a connection, which stays queued",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(slot) = slots.try_acquire() else {
+                refuse_control_connection(
+                    stream,
+                    "the background service is at its connection limit",
+                );
+                let now = std::time::Instant::now();
+                let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
+                if verdict == ListenerFailureVerdict::ShutDown {
+                    tracing::error!(
+                        limit = slots.limit,
+                        refused = at_capacity.consecutive,
+                        failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
+                        "control listener: every handler thread has been busy since the first \
+                         refusal; shutting the background service down so it is started again"
+                    );
+                    coordinator.request_shutdown_unhealthy();
+                    break;
+                }
+                if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
+                    tracing::warn!(
+                        limit = slots.limit,
+                        refused = at_capacity.consecutive,
+                        "control listener: every handler thread is busy; refusing connections"
+                    );
+                }
                 continue;
             };
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
-            if std::thread::Builder::new()
-                .spawn(move || {
-                    if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
-                        tracing::debug!(%e, "control connection error");
+            match spawn_connection_handler(move || {
+                let _slot = slot;
+                if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
+                    tracing::debug!(%e, "control connection error");
+                }
+            }) {
+                Ok(()) => {
+                    handoff_failures.record_success();
+                    at_capacity.record_success();
+                }
+                Err(error) => {
+                    // Usually a transient resource limit on a busy machine, so
+                    // one failure must not take the whole service down. The
+                    // connection is gone though, and nothing resends it, so a
+                    // service that keeps failing has to stop and be restarted.
+                    if listener_handoff_failed(
+                        "control",
+                        &mut handoff_failures,
+                        "failed to spawn handler thread, so its connection was dropped",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
                     }
-                })
-                .is_err()
-            {
-                // Usually a transient resource limit on a busy machine. The
-                // connection is dropped and the client retries; stopping the
-                // listener would take the whole daemon down instead.
-                tracing::error!("control listener: failed to spawn handler thread");
-                std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
         Ok(())
@@ -8836,6 +9208,7 @@ fn windows_control_pipe_worker_loop(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), AutterError> {
+    let mut handoff_failures = ListenerFailureStreak::default();
     loop {
         let server = connecting.wait().map_err(|e| {
             AutterError::Generic(format!(
@@ -8854,17 +9227,29 @@ fn windows_control_pipe_worker_loop(
 
         let coord = coordinator.clone();
         let handle = runtime_handle.clone();
-        std::thread::Builder::new()
-            .spawn(move || {
-                handle_windows_control_pipe_connection(server, coord, handle);
-            })
-            .map_err(|e| {
-                AutterError::Generic(format!(
-                    "failed spawning control pipe handler for {}: {}",
-                    control_socket_path.display(),
-                    e
-                ))
-            })?;
+        match spawn_connection_handler(move || {
+            handle_windows_control_pipe_connection(server, coord, handle);
+        }) {
+            Ok(()) => handoff_failures.record_success(),
+            Err(e) => {
+                // Same policy as the Unix listener: drop this connection and
+                // keep accepting, and stop only when it keeps failing. Each
+                // worker counts its own failures.
+                if listener_handoff_failed(
+                    "control",
+                    &mut handoff_failures,
+                    "failed to spawn handler thread, so its connection was dropped",
+                    &e,
+                ) {
+                    coordinator.request_shutdown_unhealthy();
+                    return Err(AutterError::Generic(format!(
+                        "failed spawning control pipe handler for {}: {}",
+                        control_socket_path.display(),
+                        e
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -8876,6 +9261,9 @@ fn handle_windows_control_pipe_connection(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) {
+    let idle_timeout = control_connection_idle_timeout();
+    server.set_read_timeout(Some(idle_timeout));
+    server.set_write_timeout(Some(idle_timeout));
     let mut reader = BufReader::new(&mut server);
     if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
     {
@@ -8889,6 +9277,16 @@ fn handle_control_connection_actor(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), AutterError> {
+    // Waiting for a request (or for a client to take its response) ends after
+    // the idle timeout, which ends this thread. Handling a request is not
+    // timed: that happens between the read and the write.
+    //
+    // Setting a timeout fails (EINVAL on macOS) when the client has already
+    // closed its end, as a sender that does not wait for a response does. Its
+    // request is still there to read, so that must not end the connection.
+    let idle_timeout = control_connection_idle_timeout();
+    let _ = stream.set_recv_timeout(Some(idle_timeout));
+    let _ = stream.set_send_timeout(Some(idle_timeout));
     let mut reader = BufReader::new(stream);
     handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
 }
@@ -8935,27 +9333,49 @@ fn trace_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding trace socket: {}", e)))?;
         set_socket_owner_only(&trace_socket_path)?;
+        let mut handoff_failures = ListenerFailureStreak::default();
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
                 break;
             }
-            let Ok(stream) = stream else {
-                continue;
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) if accept_error_is_transient(&error) => continue,
+                Err(error) => {
+                    if listener_handoff_failed(
+                        "trace",
+                        &mut handoff_failures,
+                        "failed to accept a connection, which stays queued",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
+                }
             };
             let coord = coordinator.clone();
-            if std::thread::Builder::new()
-                .spawn(move || {
-                    if let Err(e) = handle_trace_connection_actor(stream, coord) {
-                        tracing::debug!(%e, "trace connection error");
+            match spawn_connection_handler(move || {
+                if let Err(e) = handle_trace_connection_actor(stream, coord) {
+                    tracing::debug!(%e, "trace connection error");
+                }
+            }) {
+                Ok(()) => handoff_failures.record_success(),
+                Err(error) => {
+                    // Usually a transient resource limit on a busy machine, so
+                    // one failure must not take the whole service down. Git
+                    // never resends the dropped command's events though, so a
+                    // service that keeps failing has to stop and be restarted.
+                    if listener_handoff_failed(
+                        "trace",
+                        &mut handoff_failures,
+                        "failed to spawn handler thread, so its connection was dropped",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
                     }
-                })
-                .is_err()
-            {
-                // Usually a transient resource limit on a busy machine. The
-                // connection is dropped and the client retries; stopping the
-                // listener would take the whole daemon down instead.
-                tracing::error!("trace listener: failed to spawn handler thread");
-                std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
         Ok(())
@@ -9254,9 +9674,14 @@ enum SocketHealthVerdict {
 /// Decide what one round of socket probes means. A missing socket file is
 /// final at once; a failed connect to a file that exists only counts once it
 /// has failed [`DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART`] times in a row.
+///
+/// A daemon that is out of file descriptors is final at once too: that is not
+/// a busy listener, it cannot accept connections or open files at all, and
+/// only a restart gives the descriptors back.
 fn socket_health_verdict(
     probes_ok: bool,
     socket_file_missing: bool,
+    descriptors_exhausted: bool,
     consecutive_failures: &mut u32,
 ) -> SocketHealthVerdict {
     if probes_ok {
@@ -9264,11 +9689,60 @@ fn socket_health_verdict(
         return SocketHealthVerdict::Healthy;
     }
     *consecutive_failures = consecutive_failures.saturating_add(1);
-    if socket_file_missing || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
+    if socket_file_missing
+        || descriptors_exhausted
+        || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART
+    {
         SocketHealthVerdict::Unhealthy
     } else {
         SocketHealthVerdict::Retry
     }
+}
+
+/// Whether an I/O error means the process (or the machine) has no file
+/// descriptors left.
+#[cfg(unix)]
+fn io_error_is_descriptor_exhaustion(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
+/// Whether this process can no longer open a file descriptor. Asked only
+/// after a socket probe failed, to tell "the listener is busy" from "this
+/// process cannot open anything".
+fn process_descriptors_exhausted() -> bool {
+    #[cfg(unix)]
+    {
+        match File::open("/dev/null") {
+            Ok(_) => false,
+            Err(error) => io_error_is_descriptor_exhaustion(&error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Check that the control socket is served: connect, send a `ping` and read
+/// the reply. A connect alone succeeds while the listener accepts connections
+/// and then drops or refuses every one of them.
+fn control_socket_serves_requests(control_socket_path: &Path) -> Result<(), AutterError> {
+    let response = send_control_request_with_timeouts(
+        control_socket_path,
+        &ControlRequest::Ping,
+        DAEMON_SOCKET_PROBE_TIMEOUT,
+        DAEMON_CONTROL_RESPONSE_TIMEOUT,
+    )?;
+    if response.is_refusal() {
+        return Err(AutterError::Generic(format!(
+            "control socket refused the request: {}",
+            response.error.unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 fn socket_file_missing(path: &Path) -> bool {
@@ -9285,11 +9759,13 @@ fn socket_file_missing(path: &Path) -> bool {
 }
 
 /// Background loop that verifies the daemon's sockets are reachable by
-/// actually connecting to them.  A successful connect proves the socket file
-/// exists, points to this daemon's listener, and that the listener thread is
-/// alive and calling accept().  If either probe fails (deleted file, stale
-/// socket, hung listener), the daemon spawns a detached restart process and
-/// shuts down.
+/// actually using them.  A successful connect proves the socket file exists,
+/// points to this daemon's listener, and that the listener thread is alive and
+/// calling accept().  On the control socket the probe also sends a request and
+/// waits for the reply, which proves connections are served and not just
+/// accepted.  If either probe fails (deleted file, stale socket, hung
+/// listener, no file descriptors left), the daemon spawns a detached restart
+/// process and shuts down.
 ///
 /// To prevent restart loops when the underlying issue is systemic (e.g.
 /// filesystem permissions, broken paths), the daemon only self-restarts if
@@ -9329,14 +9805,21 @@ fn daemon_socket_health_check_loop(
             return;
         }
 
-        let control_ok =
-            local_socket_connects_with_timeout(&control_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
+        let control_ok = control_socket_serves_requests(&control_socket_path);
         let trace_ok =
             local_socket_connects_with_timeout(&trace_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
 
+        let probes_ok = control_ok.is_ok() && trace_ok.is_ok();
+        let descriptors_exhausted = !probes_ok && process_descriptors_exhausted();
+        if descriptors_exhausted {
+            tracing::error!(
+                "socket health check: the background service has no file descriptors left"
+            );
+        }
         let verdict = socket_health_verdict(
-            control_ok.is_ok() && trace_ok.is_ok(),
+            probes_ok,
             socket_file_missing(&control_socket_path) || socket_file_missing(&trace_socket_path),
+            descriptors_exhausted,
             &mut consecutive_probe_failures,
         );
         if verdict == SocketHealthVerdict::Retry {
@@ -9646,9 +10129,14 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
             tracing::debug!("skipping join for {} thread (deadline exceeded)", name);
             continue;
         }
-        let handle = std::thread::spawn(move || {
+        // Not `thread::spawn`: it panics when no thread can be started, and a
+        // service shutting down because it ran out of threads must still exit.
+        let Ok(handle) = std::thread::Builder::new().spawn(move || {
             let _ = thread.join();
-        });
+        }) else {
+            tracing::debug!("could not start a thread to join the {} thread", name);
+            continue;
+        };
         let poll_until =
             std::time::Instant::now() + remaining.min(std::time::Duration::from_millis(500));
         loop {
@@ -9936,9 +10424,67 @@ pub fn send_control_request(
     )
 }
 
+/// What a sender that does not wait for its response saw on the connection
+/// right after writing the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnacknowledgedSend {
+    /// A response arrived, or the service is still working on the request.
+    Taken,
+    /// The service said it would not take the request.
+    Refused(String),
+    /// The service answered that it could not take the request in (for a
+    /// checkpoint: it was never queued, so it will not be recorded).
+    Rejected(String),
+    /// The connection was closed with no response: the request went nowhere.
+    Dropped,
+}
+
+/// Classify the first read after an unacknowledged send. `read` is the result
+/// of reading one line into `line` under a short timeout.
+fn classify_unacknowledged_send(read: &std::io::Result<usize>, line: &str) -> UnacknowledgedSend {
+    match read {
+        Ok(0) => UnacknowledgedSend::Dropped,
+        Ok(_) => match serde_json::from_str::<ControlResponse>(line.trim()) {
+            Ok(response) if response.is_refusal() => UnacknowledgedSend::Refused(
+                response
+                    .error
+                    .unwrap_or_else(|| "request refused".to_string()),
+            ),
+            Ok(response) if !response.ok => UnacknowledgedSend::Rejected(
+                response
+                    .error
+                    .unwrap_or_else(|| "request failed".to_string()),
+            ),
+            _ => UnacknowledgedSend::Taken,
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            UnacknowledgedSend::Taken
+        }
+        Err(_) => UnacknowledgedSend::Dropped,
+    }
+}
+
+/// Send a request without waiting for it to be handled.
+///
+/// After writing the request the sender watches the connection for `watch`. A
+/// service that cannot take the request closes the connection (with a refusal
+/// when it can say why) as soon as it accepts it; a service that is handling
+/// the request stays silent until it is done. So an error here means the
+/// request went nowhere, and `watch` is also the most a request that takes
+/// longer costs the sender.
+///
+/// The protocol has no acknowledgement: silence past `watch` is read as
+/// "taken". A connection the service closes later than that (it was still
+/// queued behind others) is not noticed.
 pub fn send_control_request_fire_and_forget(
     socket_path: &Path,
     request: &ControlRequest,
+    watch: Duration,
 ) -> Result<(), AutterError> {
     let mut stream =
         open_local_socket_stream_with_timeout(socket_path, DAEMON_CONTROL_CONNECT_TIMEOUT)?;
@@ -9947,7 +10493,27 @@ pub fn send_control_request_fire_and_forget(
     let mut body = serde_json::to_vec(request)?;
     body.push(b'\n');
     write_all_daemon_client_stream(&mut stream, socket_path, &body)?;
-    Ok(())
+
+    // Fails when the service has already closed the connection (EINVAL on
+    // macOS); the read below then returns at once and says what happened.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, watch);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line);
+    match classify_unacknowledged_send(&read, &line) {
+        UnacknowledgedSend::Taken => Ok(()),
+        UnacknowledgedSend::Refused(reason) => Err(AutterError::Generic(format!(
+            "the background service refused the request: {}",
+            reason
+        ))),
+        UnacknowledgedSend::Rejected(reason) => Err(AutterError::Generic(format!(
+            "the background service could not take the request: {}",
+            reason
+        ))),
+        UnacknowledgedSend::Dropped => Err(AutterError::Generic(
+            "the background service closed the connection without handling the request".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -9963,27 +10529,27 @@ mod tests {
     fn socket_health_tolerates_brief_probe_failures_on_existing_sockets() {
         let mut failures = 0;
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Retry
         );
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Retry
         );
         // A good probe resets the count.
         assert_eq!(
-            socket_health_verdict(true, false, &mut failures),
+            socket_health_verdict(true, false, false, &mut failures),
             SocketHealthVerdict::Healthy
         );
         assert_eq!(failures, 0);
         for _ in 1..DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
             assert_eq!(
-                socket_health_verdict(false, false, &mut failures),
+                socket_health_verdict(false, false, false, &mut failures),
                 SocketHealthVerdict::Retry
             );
         }
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Unhealthy
         );
     }
@@ -9992,9 +10558,414 @@ mod tests {
     fn socket_health_fails_at_once_when_a_socket_file_is_gone() {
         let mut failures = 0;
         assert_eq!(
-            socket_health_verdict(false, true, &mut failures),
+            socket_health_verdict(false, true, false, &mut failures),
             SocketHealthVerdict::Unhealthy
         );
+    }
+
+    #[test]
+    fn socket_health_fails_at_once_when_file_descriptors_are_exhausted() {
+        // Both socket files are on disk and this is the first failed probe: a
+        // busy listener would get two more checks, a daemon that cannot open
+        // a descriptor does not.
+        let mut failures = 0;
+        assert_eq!(
+            socket_health_verdict(false, false, true, &mut failures),
+            SocketHealthVerdict::Unhealthy
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_exhaustion_is_recognised_from_the_os_error() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert!(io_error_is_descriptor_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [libc::ECONNREFUSED, libc::ENOENT, libc::EAGAIN] {
+            assert!(!io_error_is_descriptor_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!io_error_is_descriptor_exhaustion(&std::io::Error::other(
+            "no os error"
+        )));
+        // This test process can open files, so the live check says so.
+        assert!(!process_descriptors_exhausted());
+    }
+
+    #[test]
+    fn listener_keeps_serving_through_a_handful_of_failures() {
+        // What 4540ac5 was for: a brief overload must not stop the service.
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        for i in 0..10u32 {
+            let now = start + LISTENER_FAILURE_BACKOFF * i;
+            assert_eq!(
+                streak.record_failure(HANDOFF_FAILURE_LIMITS, now),
+                ListenerFailureVerdict::KeepServing,
+                "failure {} of a short burst must not stop the listener",
+                i + 1
+            );
+        }
+        // A served connection ends the run: the next burst starts from zero.
+        streak.record_success();
+        assert_eq!(streak.consecutive, 0);
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, start + Duration::from_secs(3600)),
+            ListenerFailureVerdict::KeepServing
+        );
+    }
+
+    #[test]
+    fn listener_stops_after_too_many_failures_in_a_row() {
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        let max = HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        for i in 1..max {
+            assert_eq!(
+                streak.record_failure(HANDOFF_FAILURE_LIMITS, start),
+                ListenerFailureVerdict::KeepServing,
+                "failure {i}"
+            );
+        }
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, start),
+            ListenerFailureVerdict::ShutDown
+        );
+    }
+
+    #[test]
+    fn listener_stops_when_nothing_was_served_for_too_long() {
+        // A quiet machine: two failures, far fewer than the count limit, but
+        // nothing was served in the seconds between them.
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, start),
+            ListenerFailureVerdict::KeepServing
+        );
+        let just_inside = start + HANDOFF_FAILURE_LIMITS.max_duration - Duration::from_millis(1);
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, just_inside),
+            ListenerFailureVerdict::KeepServing
+        );
+        assert_eq!(
+            streak.record_failure(
+                HANDOFF_FAILURE_LIMITS,
+                start + HANDOFF_FAILURE_LIMITS.max_duration
+            ),
+            ListenerFailureVerdict::ShutDown
+        );
+    }
+
+    #[test]
+    fn listener_failure_limits_are_seconds_not_minutes() {
+        assert!(HANDOFF_FAILURE_LIMITS.max_duration <= Duration::from_secs(10));
+        // The count limit, at one backoff per failure, is reached well inside
+        // the time limit, so it only shortens the wait under steady load.
+        let count_floor =
+            LISTENER_FAILURE_BACKOFF * HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        assert!(count_floor < HANDOFF_FAILURE_LIMITS.max_duration);
+        assert_eq!(
+            listener_failure_verdict(HANDOFF_FAILURE_LIMITS, 1, Duration::ZERO),
+            ListenerFailureVerdict::KeepServing
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_flood_of_refusals_at_capacity_does_not_stop_the_listener_until_time_is_up() {
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        // Thousands of idle connections arriving at once are refused in a
+        // moment; they clear when the idle timeout closes the ones held.
+        for _ in 0..5000 {
+            assert_eq!(
+                streak.record_failure(AT_CAPACITY_LIMITS, start + Duration::from_millis(200)),
+                ListenerFailureVerdict::KeepServing
+            );
+        }
+        assert_eq!(
+            streak.record_failure(
+                AT_CAPACITY_LIMITS,
+                start + Duration::from_millis(200) + AT_CAPACITY_LIMITS.max_duration
+            ),
+            ListenerFailureVerdict::ShutDown
+        );
+        // Idle connections must have been closed before the service gives up
+        // on being at capacity.
+        assert!(AT_CAPACITY_LIMITS.max_duration > CONTROL_CONNECTION_IDLE_TIMEOUT);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn only_accept_errors_that_mean_the_listener_cannot_serve_are_counted() {
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(accept_error_is_transient(&std::io::Error::from(kind)));
+        }
+        // Out of file descriptors: every accept fails until some are freed.
+        assert!(!accept_error_is_transient(
+            &std::io::Error::from_raw_os_error(libc::EMFILE)
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_handler_limit_stays_below_the_descriptor_limit() {
+        assert_eq!(control_handler_limit_for(None), CONTROL_MAX_HANDLER_THREADS);
+        assert_eq!(
+            control_handler_limit_for(Some(u64::MAX)),
+            CONTROL_MAX_HANDLER_THREADS
+        );
+        assert_eq!(control_handler_limit_for(Some(256)), 128);
+        assert_eq!(control_handler_limit_for(Some(8)), 16);
+        assert!(control_handler_limit() >= 16);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn handler_slots_refuse_past_the_limit_and_free_on_drop() {
+        let slots = HandlerSlots::new(2);
+        let first = slots.try_acquire().expect("first slot");
+        let second = slots.try_acquire().expect("second slot");
+        assert!(slots.try_acquire().is_none(), "limit reached");
+        drop(first);
+        let third = slots.try_acquire().expect("slot freed by drop");
+        assert!(slots.try_acquire().is_none());
+        drop(second);
+        drop(third);
+        assert_eq!(slots.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unacknowledged_send_classification() {
+        // Closed with nothing sent back: the request went nowhere.
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(0), ""),
+            UnacknowledgedSend::Dropped
+        );
+        assert_eq!(
+            classify_unacknowledged_send(
+                &Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                ""
+            ),
+            UnacknowledgedSend::Dropped
+        );
+        // Still silent when the watch ends: the service is working on it.
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            assert_eq!(
+                classify_unacknowledged_send(&Err(std::io::Error::from(kind)), ""),
+                UnacknowledgedSend::Taken
+            );
+        }
+        let refusal = serde_json::to_string(&ControlResponse::refused("at its limit")).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(refusal.len()), &refusal),
+            UnacknowledgedSend::Refused("at its limit".to_string())
+        );
+        // An answer that the request could not be taken in is not a send.
+        let rejected = serde_json::to_string(&ControlResponse::err("no repository")).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(rejected.len()), &rejected),
+            UnacknowledgedSend::Rejected("no repository".to_string())
+        );
+        let handled = serde_json::to_string(&ControlResponse::ok(None, None)).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(handled.len()), &handled),
+            UnacknowledgedSend::Taken
+        );
+    }
+
+    /// Long enough that a test only passes when the sender saw the connection
+    /// close, short enough to show it does not wait for a response.
+    #[cfg(unix)]
+    const SEND_WATCH: Duration = Duration::from_millis(500);
+
+    /// A stand-in control socket whose listener treats each connection the
+    /// way `serve` says, for testing what a client makes of it.
+    #[cfg(unix)]
+    fn fake_control_socket(
+        serve: impl Fn(LocalSocketStream) + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sock");
+        let listener = ListenerOptions::new()
+            .name(local_socket_name(&path).unwrap())
+            .create_sync()
+            .unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                serve(stream);
+            }
+        });
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_request_that_was_read_and_never_answered() {
+        // The request was written in full, then the connection was closed
+        // with no response: this used to be reported as sent.
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+        });
+        let error = send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect_err("a dropped connection must not look like a sent request");
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection without handling the request"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_connection_dropped_unread() {
+        // What a listener that cannot start a handler thread does: close the
+        // connection without reading it. Whether the sender's write still
+        // lands first is a race; either way the send must fail.
+        for delay_ms in [0, 30] {
+            let (_dir, path) = fake_control_socket(move |stream| {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                drop(stream);
+            });
+            for _ in 0..5 {
+                assert!(
+                    send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+                        .is_err(),
+                    "a connection dropped after {delay_ms} ms must not look like a sent request"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_refusal_with_its_reason() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            refuse_control_connection(stream, "the background service is at its connection limit")
+        });
+        let error = send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect_err("a refused request must not look like a sent request");
+        assert!(
+            error
+                .to_string()
+                .contains("refused the request: the background service is at its connection limit"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_does_not_wait_for_a_request_that_is_being_handled() {
+        // The service read the request and is busy with it for a long time.
+        let (_dir, path) = fake_control_socket(|stream| {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                std::thread::sleep(Duration::from_secs(5));
+            });
+        });
+        let started = std::time::Instant::now();
+        send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect("a request the service is handling counts as sent");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sender waited {:?} for a response it does not need",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_accepts_a_handled_request() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut raw = serde_json::to_vec(&ControlResponse::ok(None, None)).unwrap();
+            raw.push(b'\n');
+            let _ = reader.get_mut().write_all(&raw);
+        });
+        send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect("a handled request is sent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_probe_fails_when_connections_are_accepted_but_not_served() {
+        // The state the old connect-only probe called healthy.
+        let (_dir, path) = fake_control_socket(drop);
+        assert!(local_socket_connects_with_timeout(&path, DAEMON_SOCKET_PROBE_TIMEOUT).is_ok());
+        assert!(control_socket_serves_requests(&path).is_err());
+
+        let (_dir, path) =
+            fake_control_socket(|stream| refuse_control_connection(stream, "at its limit"));
+        let error = control_socket_serves_requests(&path).expect_err("a refusal is not service");
+        assert!(error.to_string().contains("refused"), "{error}");
+    }
+
+    /// An in-memory connection: the request bytes to read, and what the
+    /// handler wrote back.
+    struct ScriptedConnection {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for ScriptedConnection {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for ScriptedConnection {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ping_is_answered_and_proves_a_served_control_socket() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        let mut reader = BufReader::new(ScriptedConnection {
+            input: std::io::Cursor::new(b"{\"method\":\"ping\"}\n".to_vec()),
+            output: Vec::new(),
+        });
+        handle_control_connection_actor_reader(&mut reader, coordinator, runtime.handle().clone())
+            .unwrap();
+        let written = String::from_utf8(reader.get_ref().output.clone()).unwrap();
+        let response: ControlResponse = serde_json::from_str(written.trim()).unwrap();
+        assert!(response.ok, "{written}");
+        assert!(!response.is_refusal());
+    }
+
+    #[test]
+    fn a_daemon_that_only_just_started_shuts_down_without_restarting() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let coordinator = ActorDaemonCoordinator::new();
+        // Younger than the minimum uptime: restarting would likely loop.
+        coordinator.request_shutdown_unhealthy();
+        assert!(coordinator.is_shutting_down());
+        assert_eq!(coordinator.shutdown_action(), DaemonExitAction::Stop);
     }
 
     #[test]
