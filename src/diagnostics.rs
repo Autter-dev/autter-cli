@@ -38,6 +38,62 @@ const ATTRIBUTION_SELF_CHECK_TIMEOUT: Duration = if cfg!(windows) {
 const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// `git --version` slower than this means the machine runs git slowly (a
+/// loaded laptop, antivirus scanning every process start, a network home
+/// directory), and fixed check budgets start failing on a healthy setup.
+const TIMEOUT_SCALE_BASELINE: Duration = Duration::from_millis(100);
+const TIMEOUT_SCALE_MAX: f64 = 10.0;
+/// Overrides the measured scale, e.g. `AUTTER_DOCTOR_TIMEOUT_SCALE=4`.
+const TIMEOUT_SCALE_ENV: &str = "AUTTER_DOCTOR_TIMEOUT_SCALE";
+
+/// A check's time budget on this machine: `base` on a machine that runs git
+/// at normal speed, proportionally longer (up to 10x) on a slower one. The
+/// budgets were fixed at 3s and 12s, so `autter doctor` reported timeouts on
+/// machines where a plain `git commit` takes a few seconds.
+pub fn check_timeout(base: Duration) -> Duration {
+    scale_timeout(base, machine_timeout_scale())
+}
+
+/// How much longer than their base budget checks may take here. Measured once
+/// per process from one `git --version`, unless the environment sets it.
+pub fn machine_timeout_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        if let Some(scale) =
+            timeout_scale_from_env(std::env::var(TIMEOUT_SCALE_ENV).ok().as_deref())
+        {
+            return scale;
+        }
+        let started = Instant::now();
+        let ran = std::process::Command::new(Config::get().git_cmd())
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok();
+        if ran {
+            timeout_scale_for(started.elapsed())
+        } else {
+            1.0
+        }
+    })
+}
+
+fn timeout_scale_from_env(value: Option<&str>) -> Option<f64> {
+    let scale: f64 = value?.trim().parse().ok()?;
+    (scale.is_finite() && scale >= 1.0).then(|| scale.min(TIMEOUT_SCALE_MAX))
+}
+
+fn timeout_scale_for(git_version_elapsed: Duration) -> f64 {
+    (git_version_elapsed.as_secs_f64() / TIMEOUT_SCALE_BASELINE.as_secs_f64())
+        .clamp(1.0, TIMEOUT_SCALE_MAX)
+}
+
+fn scale_timeout(base: Duration, scale: f64) -> Duration {
+    base.mul_f64(scale.clamp(1.0, TIMEOUT_SCALE_MAX))
+}
+
 // Remediation strings surfaced as `fix:` lines in the doctor and debug
 // reports. Keep them to concrete next commands a stuck user can run without
 // support.
@@ -216,7 +272,8 @@ pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
         DaemonHealthState::Healthy => None,
         DaemonHealthState::NotRunning => Some((
             "starting the background service",
-            crate::commands::daemon::ensure_daemon_running(DEBUG_CHECK_TIMEOUT).map(|_| ()),
+            crate::commands::daemon::ensure_daemon_running(check_timeout(DEBUG_CHECK_TIMEOUT))
+                .map(|_| ()),
         )),
         DaemonHealthState::Outdated | DaemonHealthState::Unresponsive => Some((
             "restarting the background service",
@@ -269,7 +326,7 @@ pub fn check_daemon_trace2_ingestion(git_program: &str) -> DiagnosticCheckResult
         &mut commands,
         git_program,
         &config,
-        Instant::now() + DEBUG_CHECK_TIMEOUT,
+        Instant::now() + check_timeout(DEBUG_CHECK_TIMEOUT),
     ) {
         Ok(mut probe_details) => {
             details.append(&mut probe_details);
@@ -289,7 +346,7 @@ pub fn check_daemon_trace2_ingestion(git_program: &str) -> DiagnosticCheckResult
                 &mut commands,
                 git_program,
                 &config,
-                Instant::now() + DEBUG_CHECK_TIMEOUT,
+                Instant::now() + check_timeout(DEBUG_CHECK_TIMEOUT),
             ) {
                 Ok(mut probe_details) => {
                     details.append(&mut probe_details);
@@ -419,7 +476,7 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
 
 pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
     let mut commands = Vec::new();
-    let deadline = Instant::now() + ATTRIBUTION_SELF_CHECK_TIMEOUT;
+    let deadline = Instant::now() + check_timeout(ATTRIBUTION_SELF_CHECK_TIMEOUT);
     let repo_path = debug_self_check_root().join(format!(
         "{}-{}",
         sanitize_label(&target.label),
@@ -620,7 +677,7 @@ pub(crate) fn attribution_self_check_remediation(err: &str, daemon_detail: Optio
 
 pub fn run_trace2_file_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
     let mut commands = Vec::new();
-    let deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
+    let deadline = Instant::now() + check_timeout(DEBUG_CHECK_TIMEOUT);
     let trace_dir = crate::mdm::utils::home_dir()
         .join(".autter")
         .join("internal")
@@ -809,7 +866,7 @@ fn run_required_until(
             stdout: String::new(),
             stderr: format!(
                 "self-check timed out after {:.1}s before this command could start",
-                ATTRIBUTION_SELF_CHECK_TIMEOUT.as_secs_f64()
+                check_timeout(ATTRIBUTION_SELF_CHECK_TIMEOUT).as_secs_f64()
             ),
             timed_out: true,
         };
@@ -864,7 +921,7 @@ fn run_required_with_timeout(
 }
 
 fn run_logged_command(program: &str, args: &[&str], cwd: Option<&Path>) -> CommandRecord {
-    run_logged_command_with_timeout(program, args, cwd, DEBUG_CHECK_TIMEOUT)
+    run_logged_command_with_timeout(program, args, cwd, check_timeout(DEBUG_CHECK_TIMEOUT))
 }
 
 fn run_logged_command_with_timeout(
@@ -1724,6 +1781,44 @@ fn trace2_targets_are_stale_autter(targets: &[String], expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_budgets_grow_with_how_slowly_the_machine_runs_git() {
+        // A machine that starts git in a few milliseconds keeps the base budgets.
+        assert_eq!(timeout_scale_for(Duration::from_millis(8)), 1.0);
+        assert_eq!(timeout_scale_for(Duration::from_millis(100)), 1.0);
+        // One where `git --version` takes 400 ms gets four times as long: the
+        // 3 s checks get 12 s, enough for a commit that takes 4.8 s.
+        let slow = timeout_scale_for(Duration::from_millis(400));
+        assert_eq!(slow, 4.0);
+        assert_eq!(
+            scale_timeout(Duration::from_secs(3), slow),
+            Duration::from_secs(12)
+        );
+        // Capped, so a hung git cannot make doctor wait for minutes.
+        assert_eq!(
+            timeout_scale_for(Duration::from_secs(30)),
+            TIMEOUT_SCALE_MAX
+        );
+        assert_eq!(
+            scale_timeout(Duration::from_secs(3), 500.0),
+            Duration::from_secs(30)
+        );
+        // A budget is never shortened.
+        assert_eq!(
+            scale_timeout(Duration::from_secs(3), 0.2),
+            Duration::from_secs(3)
+        );
+
+        // The environment can set the scale; nonsense is ignored.
+        assert_eq!(timeout_scale_from_env(Some("4")), Some(4.0));
+        assert_eq!(timeout_scale_from_env(Some(" 2.5 ")), Some(2.5));
+        assert_eq!(timeout_scale_from_env(Some("50")), Some(TIMEOUT_SCALE_MAX));
+        for bad in ["0", "0.5", "-3", "fast", "", "NaN", "inf"] {
+            assert_eq!(timeout_scale_from_env(Some(bad)), None, "{bad}");
+        }
+        assert_eq!(timeout_scale_from_env(None), None);
+    }
 
     #[cfg(not(windows))]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {

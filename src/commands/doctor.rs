@@ -486,7 +486,7 @@ fn git_version_of(program: &str) -> Result<GitVersionProbe, String> {
         program,
         &["--version"],
         None,
-        DOCTOR_COMMAND_TIMEOUT,
+        crate::diagnostics::check_timeout(DOCTOR_COMMAND_TIMEOUT),
         DOCTOR_COMMAND_POLL_INTERVAL,
         &[],
     )?;
@@ -646,6 +646,16 @@ fn check_repository() -> DoctorCheck {
         );
     };
 
+    if let Ok(path) = repo.workdir()
+        && let Some(check) = home_folder_repository_check(
+            &name,
+            &path,
+            Some(crate::mdm::utils::home_dir().as_path()),
+        )
+    {
+        return check;
+    }
+
     let workdir = repo
         .workdir()
         .map(|p| p.display().to_string())
@@ -687,6 +697,60 @@ fn check_repository() -> DoctorCheck {
             ),
         }
     }
+}
+
+/// A JetBrains IDE without the autter plugin. A warning, not a failure: the
+/// plugin is an optional integration the user installs from inside the IDE,
+/// and capture for every other tool works without it. Reporting it as a
+/// failure made a healthy setup fail `autter doctor` for anyone who merely
+/// has a JetBrains IDE installed.
+fn jetbrains_plugin_missing_check(name: String) -> DoctorCheck {
+    DoctorCheck {
+        section: SECTION_AGENTS,
+        name,
+        status: DoctorStatus::Warning,
+        summary: "detected, but the optional autter JetBrains plugin is not installed -- edits made in JetBrains IDEs are not captured (other tools are unaffected)"
+            .to_string(),
+        details: Vec::new(),
+        remediation: Some(
+            "if you use an AI assistant in a JetBrains IDE: run `autter install-hooks`, then install/enable the `autter` plugin from JetBrains Settings > Plugins and restart the IDE; otherwise ignore this"
+                .to_string(),
+        ),
+    }
+}
+
+/// A repository whose top level is the user's home folder: usually a stray
+/// `git init` in `~` or a dotfiles repo. Every folder under home counts as
+/// inside it, so commands run "outside any project" land in this repository
+/// and capture is attributed to it.
+fn home_folder_repository_check(
+    name: &str,
+    workdir: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<DoctorCheck> {
+    let home = home?;
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        let canon =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canon(a) == canon(b)
+    };
+    if !same(workdir, home) {
+        return None;
+    }
+    Some(DoctorCheck {
+        section: SECTION_SETUP,
+        name: name.to_string(),
+        status: DoctorStatus::Warning,
+        summary: "this repository is your home folder -- every folder under it counts as part of this one repository".to_string(),
+        details: vec![
+            format!("workdir: {}", workdir.display()),
+            "a `.git` directory in your home folder makes git (and autter) treat everything below it as one project, unless a folder has its own repository".to_string(),
+        ],
+        remediation: Some(format!(
+            "if you meant to check a project, `cd` into it and re-run `autter doctor`; if `{}` was created by accident, move it away (for example `mv ~/.git ~/.git.bak`)",
+            workdir.join(".git").display()
+        )),
+    })
 }
 
 /// Per-agent hook status from the same installers `autter install-hooks`
@@ -742,19 +806,9 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
                     });
                 }
             }
-            Ok(result) if !result.hooks_installed && installer.id() == "jetbrains" => checks.push(DoctorCheck {
-                section: SECTION_AGENTS,
-                name: name.clone(),
-                status: DoctorStatus::Failed,
-                summary:
-                    "detected, but the autter JetBrains plugin is not installed -- edits are not captured"
-                        .to_string(),
-                details: Vec::new(),
-                remediation: Some(
-                    "run `autter install-hooks`, then install/enable the `autter` plugin from JetBrains Settings > Plugins and restart the IDE"
-                        .to_string(),
-                ),
-            }),
+            Ok(result) if !result.hooks_installed && installer.id() == "jetbrains" => {
+                checks.push(jetbrains_plugin_missing_check(name.clone()))
+            }
             Ok(result) if !result.hooks_installed => checks.push(DoctorCheck {
                 section: SECTION_AGENTS,
                 name: name.clone(),
@@ -1231,20 +1285,55 @@ fn check_auth() -> (DoctorCheck, bool) {
             true,
         ),
         AuthState::LoggedOut => (
-            DoctorCheck {
-                section: SECTION_ACCOUNT,
-                name,
-                status: DoctorStatus::Warning,
-                summary: "not logged in -- attribution is captured locally but never syncs"
-                    .to_string(),
-                details,
-                remediation: Some(
-                    "run `autter login` to enable cloud sync (ignore this if you use autter locally only)"
-                        .to_string(),
-                ),
-            },
+            logged_out_check(name, !Config::fresh().platform_sync_enabled(), details),
             false,
         ),
+    }
+}
+
+/// The sign-in verdict when nobody is signed in. Local mode needs no account,
+/// so it is not a warning there: a machine that keeps everything local used to
+/// finish doctor with "not logged in" and "no usable login" warnings and fixes
+/// that told it to log in.
+fn logged_out_check(name: String, local_mode: bool, details: Vec<String>) -> DoctorCheck {
+    if local_mode {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Skipped,
+            summary: "local mode -- no sign-in needed; attribution stays on this machine (`autter onboard --connect` turns on cloud sync)"
+                .to_string(),
+            details: Vec::new(),
+            remediation: None,
+        };
+    }
+    DoctorCheck {
+        section: SECTION_ACCOUNT,
+        name,
+        status: DoctorStatus::Warning,
+        summary: "not logged in -- attribution is captured locally but never syncs".to_string(),
+        details,
+        remediation: Some("run `autter login` to enable cloud sync".to_string()),
+    }
+}
+
+/// The data-plane verdict when there is no usable login to probe with. In
+/// local mode nothing is uploaded, so there is nothing to probe.
+fn data_plane_without_login_check(name: String, local_mode: bool, reason: String) -> DoctorCheck {
+    if local_mode {
+        return skipped_check(
+            SECTION_ACCOUNT,
+            name,
+            "local mode -- nothing is uploaded, so the upload API is not checked",
+        );
+    }
+    DoctorCheck {
+        section: SECTION_ACCOUNT,
+        name,
+        status: DoctorStatus::Warning,
+        summary: "data-plane probe skipped because no usable login is available".to_string(),
+        details: vec![format!("reason: {reason}")],
+        remediation: Some("run `autter login`, then re-run `autter doctor`".to_string()),
     }
 }
 
@@ -1302,14 +1391,11 @@ fn check_org_data_plane() -> DoctorCheck {
             .auth_issue()
             .map(ToString::to_string)
             .unwrap_or_else(|| "no access token".to_string());
-        return DoctorCheck {
-            section: SECTION_ACCOUNT,
+        return data_plane_without_login_check(
             name,
-            status: DoctorStatus::Warning,
-            summary: "data-plane probe skipped because no usable login is available".to_string(),
-            details: vec![format!("reason: {reason}")],
-            remediation: Some("run `autter login`, then re-run `autter doctor`".to_string()),
-        };
+            !Config::fresh().platform_sync_enabled(),
+            reason,
+        );
     }
 
     match client.check_data_plane() {
@@ -1630,7 +1716,52 @@ fn version_string() -> String {
 /// First failed check that names a fix, otherwise the first warning that does.
 /// Checks are already in dependency order (git, hooks, trace2, daemon, agents,
 /// account, checkpoint), so the first failure is the one to fix before the rest.
+/// One cause that explains several failed checks at once.
+struct RootCause {
+    what: String,
+    fix: String,
+}
+
+/// A machine where autter is installed but setup never ran: the background
+/// service has not been started and nothing is configured, so the git capture
+/// checks and every agent's hook check fail together. Doctor used to list
+/// each of them with its own fix (`autter install --system`, `autter
+/// install-hooks`, ...), which reads as many separate problems; the one thing
+/// to do is run setup.
+fn root_cause_from_checks(checks: &[DoctorCheck]) -> Option<RootCause> {
+    let never_set_up = checks.iter().any(|check| {
+        check.name == "background service"
+            && check.status == DoctorStatus::Skipped
+            && check.summary.contains("starts after setup")
+    });
+    if !never_set_up {
+        return None;
+    }
+    let explained = checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Failed)
+        .filter(|check| {
+            check.section == SECTION_TRACE2
+                || (check.section == SECTION_AGENTS && check.summary.contains("NOT installed"))
+        })
+        .count();
+    if explained == 0 {
+        return None;
+    }
+    Some(RootCause {
+        what: format!(
+            "autter is installed, but this machine has not been set up yet. That explains {explained} of the failed checks above (git capture and agent hooks)."
+        ),
+        fix:
+            "run `autter onboard` (it asks before it changes anything), then re-run `autter doctor`"
+                .to_string(),
+    })
+}
+
 fn next_step_from_checks(checks: &[DoctorCheck]) -> Option<String> {
+    if let Some(root) = root_cause_from_checks(checks) {
+        return Some(root.fix);
+    }
     for check in checks {
         if check.status == DoctorStatus::Failed
             && let Some(step) = &check.remediation
@@ -1798,6 +1929,9 @@ impl Reporter {
         } else {
             println!("All checks passed -- autter is capturing and attributing correctly.");
         }
+        if let Some(root) = root_cause_from_checks(&output.checks) {
+            println!("Root cause: {}", root.what);
+        }
         if let Some(step) = &output.next_step {
             println!("Next step: {}", step);
         }
@@ -1834,6 +1968,81 @@ fn print_human_check(check: &DoctorCheck, glyphs: &crate::ui::theme::Glyphs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_mode_needs_no_sign_in() {
+        let details = vec!["credential backend: file".to_string()];
+
+        // Local mode: not a warning, and no fix that says to log in.
+        let local = logged_out_check("authentication".to_string(), true, details.clone());
+        assert_eq!(local.status, DoctorStatus::Skipped);
+        assert!(local.summary.contains("local mode"), "{}", local.summary);
+        assert!(
+            local.summary.contains("autter onboard --connect"),
+            "{}",
+            local.summary
+        );
+        assert_eq!(local.remediation, None);
+
+        let plane = data_plane_without_login_check(
+            "organization data plane".to_string(),
+            true,
+            "no stored credentials".to_string(),
+        );
+        assert_eq!(plane.status, DoctorStatus::Skipped);
+        assert_eq!(plane.remediation, None);
+
+        // Connected mode without a login is still worth a warning.
+        let connected = logged_out_check("authentication".to_string(), false, details);
+        assert_eq!(connected.status, DoctorStatus::Warning);
+        assert_eq!(
+            connected.remediation.as_deref(),
+            Some("run `autter login` to enable cloud sync")
+        );
+        let plane = data_plane_without_login_check(
+            "organization data plane".to_string(),
+            false,
+            "no stored credentials".to_string(),
+        );
+        assert_eq!(plane.status, DoctorStatus::Warning);
+        assert!(plane.details[0].contains("no stored credentials"));
+    }
+
+    #[test]
+    fn jetbrains_without_the_plugin_is_a_warning() {
+        let check = jetbrains_plugin_missing_check("JetBrains IDEs".to_string());
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(check.summary.contains("optional"), "{}", check.summary);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("otherwise ignore this")
+        );
+    }
+
+    #[test]
+    fn a_repository_rooted_at_the_home_folder_is_a_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("code").join("app");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let check = home_folder_repository_check("repository", home.path(), Some(home.path()))
+            .expect("the home folder as a repository must be flagged");
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(check.summary.contains("home folder"), "{}", check.summary);
+        assert!(
+            check.remediation.as_deref().unwrap().contains(".git"),
+            "{:?}",
+            check.remediation
+        );
+
+        // A project under home is an ordinary repository.
+        assert!(home_folder_repository_check("repository", &project, Some(home.path())).is_none());
+        // No known home folder: nothing to compare with.
+        assert!(home_folder_repository_check("repository", home.path(), None).is_none());
+    }
 
     fn make_check(status: DoctorStatus) -> DoctorCheck {
         DoctorCheck {
@@ -2133,6 +2342,87 @@ mod tests {
     #[test]
     fn trace2_remediations_never_send_people_back_to_onboard() {
         assert!(!REMEDIATION_TRACE2_THEN_ATTRIBUTION.contains("onboard"));
+    }
+
+    #[test]
+    fn a_machine_that_was_never_set_up_gets_one_root_cause() {
+        let check =
+            |section: &'static str, name: &str, status, summary: &str, fix: Option<&str>| {
+                DoctorCheck {
+                    section,
+                    name: name.to_string(),
+                    status,
+                    summary: summary.to_string(),
+                    details: Vec::new(),
+                    remediation: fix.map(str::to_string),
+                }
+            };
+        let fresh_install = vec![
+            check(
+                SECTION_SERVICE,
+                "background service",
+                DoctorStatus::Skipped,
+                "not running; starts after setup (`autter onboard`)",
+                None,
+            ),
+            check(
+                SECTION_TRACE2,
+                "trace2 config (configured git)",
+                DoctorStatus::Failed,
+                "trace2 global config is not configured",
+                Some("run `autter install --system`"),
+            ),
+            check(
+                SECTION_TRACE2,
+                "trace2 config (terminal git)",
+                DoctorStatus::Failed,
+                "trace2 global config is not configured",
+                Some("run `autter install --system`"),
+            ),
+            check(
+                SECTION_AGENTS,
+                "Claude Code",
+                DoctorStatus::Failed,
+                "detected, but autter hooks are NOT installed -- its edits are not captured",
+                Some("run `autter install-hooks`, then restart Claude Code"),
+            ),
+        ];
+        let root = root_cause_from_checks(&fresh_install).expect("one root cause");
+        assert!(
+            root.what.contains("has not been set up yet"),
+            "{}",
+            root.what
+        );
+        assert!(
+            root.what.contains("3 of the failed checks"),
+            "{}",
+            root.what
+        );
+        // The next step is setup, not the first failed check's own fix.
+        let step = next_step_from_checks(&fresh_install).unwrap();
+        assert!(step.contains("autter onboard"), "{step}");
+        assert!(!step.contains("install --system"), "{step}");
+
+        // Once set up (the service check ran), the same failures keep their
+        // own fixes: onboarding is done and would not repair them.
+        let mut set_up = fresh_install;
+        set_up[0].status = DoctorStatus::Passed;
+        set_up[0].summary = "running".to_string();
+        assert!(root_cause_from_checks(&set_up).is_none());
+        assert_eq!(
+            next_step_from_checks(&set_up).as_deref(),
+            Some("run `autter install --system`")
+        );
+
+        // Never set up but nothing failing: no root cause to name.
+        let quiet = vec![check(
+            SECTION_SERVICE,
+            "background service",
+            DoctorStatus::Skipped,
+            "not running; starts after setup (`autter onboard`)",
+            None,
+        )];
+        assert!(root_cause_from_checks(&quiet).is_none());
     }
 
     #[test]
