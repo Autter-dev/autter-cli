@@ -83,6 +83,22 @@ Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autt
 
 The installer downloads Autter into `~/.autter/bin` and adds it to your user `PATH`. IDE/agent hooks, global git capture settings, and the background service are applied during `autter onboard` (with consent) or with `autter install --system`. On macOS, Linux, and WSL the script starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later with `autter onboard`.
 
+### Where Autter is installed
+
+The install location is fixed and is not configurable. Every install method puts the same binary in the same place:
+
+| | macOS, Linux, WSL | Windows |
+| --- | --- | --- |
+| Binary | `~/.autter/bin/autter` | `%USERPROFILE%\.autter\bin\autter.exe` |
+| `PATH` entry | `~/.autter/env` (and `env.fish`) adds `~/.autter/bin`; one line in your shell file loads it | `%USERPROFILE%\.autter\bin` on your user `PATH` (and one line in `~/.bashrc` for Git Bash) |
+| Link | `~/.local/bin/autter`, a symlink to the binary | none |
+
+With npm, the `autter` command in npm's global bin directory is a launcher for that same binary. The installers' dry run prints these paths for your machine.
+
+It is one fixed path because three things point at it: the agent hooks that `autter onboard` installs run the binary by its full path, `autter upgrade` replaces the binary at that path, and the background service runs from it and upgrades it in place. A binary somewhere else would not be upgraded, and hooks would keep running the old one.
+
+If you want `autter` somewhere else, leave the binary where it is and point at it: add a symlink (`ln -s "$HOME/.autter/bin/autter" /usr/local/bin/autter`) or add `~/.autter/bin` to the `PATH` of that environment. Do not move the binary. If you did move it, run `autter install-hooks` so the agent hooks name the path it is at now, then `autter doctor` to check that capture works.
+
 ### System requirements
 
 - **git** 2.22 or newer (required)
