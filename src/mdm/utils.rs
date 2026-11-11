@@ -396,7 +396,7 @@ pub(crate) fn plan_windows_editor_cli(
         }
         let Some((hit, ext)) = pathext.iter().find_map(|ext| {
             let candidate = dir.join(format!("{cli_name}{ext}"));
-            is_file(&candidate).then(|| (candidate, ext.as_str()))
+            is_file(&candidate).then_some((candidate, ext.as_str()))
         }) else {
             continue;
         };
@@ -2659,7 +2659,12 @@ mod tests {
         );
         // Only the install folder on PATH.
         assert_eq!(
-            plan_windows_editor_cli("code", &[install.clone()], &default_pathext(), &is_file),
+            plan_windows_editor_cli(
+                "code",
+                std::slice::from_ref(&install),
+                &default_pathext(),
+                &is_file
+            ),
             Some(wrapper.clone())
         );
         // The normal order.
@@ -2695,7 +2700,7 @@ mod tests {
         let files = vec![install.join("Code.exe"), cli_js.clone()];
         let plan = plan_windows_editor_cli(
             "code",
-            &[install.clone()],
+            std::slice::from_ref(&install),
             &default_pathext(),
             &windows_files(&files),
         )
@@ -2730,7 +2735,7 @@ mod tests {
         assert_eq!(
             plan_windows_editor_cli(
                 "cursor",
-                &[install.clone()],
+                std::slice::from_ref(&install),
                 &default_pathext(),
                 &windows_files(&files)
             ),
@@ -2757,7 +2762,12 @@ mod tests {
         // With no wrapper anywhere it is still returned (and the empty
         // `--version` check stops it if it turns out to be a window).
         assert_eq!(
-            plan_windows_editor_cli("code", &[tools.clone()], &default_pathext(), &is_file),
+            plan_windows_editor_cli(
+                "code",
+                std::slice::from_ref(&tools),
+                &default_pathext(),
+                &is_file
+            ),
             Some(WindowsEditorCli::Executable(tools.join("code.exe")))
         );
         // Nothing on PATH; an extensionless `code` (the Git Bash script) is

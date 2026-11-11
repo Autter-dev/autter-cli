@@ -241,9 +241,26 @@ pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
     if health.is_healthy() {
         DiagnosticCheckResult::passed(&health.summary, details, commands)
     } else {
+        let remediation = daemon_failure_remediation(cfg!(windows), &details);
         DiagnosticCheckResult::failed(&health.summary, details, commands)
-            .with_remediation(REMEDIATION_DAEMON_FAILED)
+            .with_remediation(remediation)
     }
+}
+
+/// What to do about a background service that stayed unhealthy after
+/// doctor's own start or restart. On Windows two causes show up in the
+/// errors those attempts leave in `details`, and for both a restart is the
+/// wrong advice: an antivirus block and a service running as Administrator.
+fn daemon_failure_remediation(windows: bool, details: &[String]) -> String {
+    windows
+        .then(|| {
+            details
+                .iter()
+                .find_map(|line| crate::commands::daemon::windows_service_failure_hint(line))
+        })
+        .flatten()
+        .map(|hint| format!("{hint}; then re-run `autter doctor`"))
+        .unwrap_or_else(|| REMEDIATION_DAEMON_FAILED.to_string())
 }
 
 /// End-to-end trace2 ingestion: a real `git init` must reach the background
@@ -1724,6 +1741,38 @@ fn trace2_targets_are_stale_autter(targets: &[String], expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_remediation_names_the_windows_cause_when_the_fix_attempt_shows_one() {
+        let restart = REMEDIATION_DAEMON_FAILED;
+        let antivirus = vec![
+            "initial state: not running".to_string(),
+            "doctor fix: starting the background service".to_string(),
+            "fix failed: failed to spawn detached daemon with flags 0x1000208: (os error 225)"
+                .to_string(),
+            "state after fix: not running".to_string(),
+        ];
+        let fix = daemon_failure_remediation(true, &antivirus);
+        assert!(fix.starts_with("Windows Security"), "{fix}");
+        assert!(fix.contains("Protection history"), "{fix}");
+        assert!(fix.ends_with("then re-run `autter doctor`"), "{fix}");
+        assert_ne!(fix, restart);
+
+        let elevated = vec![
+            "doctor fix: restarting the background service".to_string(),
+            "fix failed: taskkill /F /T /PID 4312 failed: ERROR: The process could not be terminated.\nReason: Access is denied.".to_string(),
+        ];
+        let fix = daemon_failure_remediation(true, &elevated);
+        assert!(fix.starts_with("Windows denied access"), "{fix}");
+        assert!(fix.contains("Run as administrator"), "{fix}");
+        assert_ne!(fix, restart);
+
+        // No recognised cause, or not Windows: the restart advice stands.
+        let timeout = vec!["fix failed: timed out after 5s waiting for daemon sockets".to_string()];
+        assert_eq!(daemon_failure_remediation(true, &timeout), restart);
+        assert_eq!(daemon_failure_remediation(false, &antivirus), restart);
+        assert_eq!(daemon_failure_remediation(true, &[]), restart);
+    }
 
     #[cfg(not(windows))]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {

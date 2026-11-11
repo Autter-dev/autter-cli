@@ -27,7 +27,10 @@ pub fn handle_daemon(args: &[String]) {
     match args[0].as_str() {
         "start" => {
             if let Err(e) = handle_start(&args[1..]) {
-                eprintln!("Failed to start: {}", e);
+                eprintln!(
+                    "Failed to start: {}",
+                    explain_service_error(cfg!(windows), &e)
+                );
                 std::process::exit(1);
             }
         }
@@ -46,13 +49,19 @@ pub fn handle_daemon(args: &[String]) {
         }
         "shutdown" => {
             if let Err(e) = handle_shutdown(&args[1..]) {
-                eprintln!("Failed to shut down: {}", e);
+                eprintln!(
+                    "Failed to shut down: {}",
+                    explain_service_error(cfg!(windows), &e)
+                );
                 std::process::exit(1);
             }
         }
         "restart" => {
             if let Err(e) = handle_restart(&args[1..]) {
-                eprintln!("Failed to restart: {}", e);
+                eprintln!(
+                    "Failed to restart: {}",
+                    explain_service_error(cfg!(windows), &e)
+                );
                 std::process::exit(1);
             }
         }
@@ -290,6 +299,46 @@ macro_rules! restart_command {
     };
 }
 pub(crate) use restart_command;
+
+/// Windows refused to start a program because its antivirus flagged it
+/// (ERROR_VIRUS_INFECTED 225, ERROR_VIRUS_DELETED 226). Restarting cannot
+/// help until the file is allowed.
+const WINDOWS_ANTIVIRUS_HINT: &str = "Windows Security (or another antivirus) stopped autter from starting its background service, so restarting will not help. Open Windows Security > Virus & threat protection > Protection history, allow the blocked autter.exe entry (or add an exclusion for %USERPROFILE%\\.autter\\bin), then run `autter bg restart` and `autter doctor`. Each release publishes the SHA-256 of autter.exe if you want to check the file first";
+
+/// The background service runs elevated and this terminal does not, so
+/// Windows denies reaching, stopping or replacing it.
+const WINDOWS_ELEVATED_SERVICE_HINT: &str = "Windows denied access to the background service. The usual cause: it was started from an Administrator window, so this normal window is not allowed to reach or stop it. Open PowerShell with \"Run as administrator\", run `autter bg shutdown --hard`, close that window, then run `autter bg restart` from a normal window. Install and run autter from a normal window from now on";
+
+/// A cause that the usual "restart the background service" advice cannot
+/// fix, read from the text of a Windows error: an antivirus block, or a
+/// service running elevated. `None` for anything else.
+pub(crate) fn windows_service_failure_hint(error_text: &str) -> Option<&'static str> {
+    let text = error_text.to_ascii_lowercase();
+    if text.contains("os error 225")
+        || text.contains("os error 226")
+        || text.contains("contains a virus")
+        || text.contains("potentially unwanted software")
+    {
+        return Some(WINDOWS_ANTIVIRUS_HINT);
+    }
+    if text.contains("access is denied") || text.contains("(os error 5)") {
+        return Some(WINDOWS_ELEVATED_SERVICE_HINT);
+    }
+    None
+}
+
+/// `error` with the Windows cause and fix in front when there is one, the
+/// raw error kept in brackets for support. Unchanged off Windows, where
+/// those error codes mean something else.
+pub(crate) fn explain_service_error(windows: bool, error: &str) -> String {
+    match windows
+        .then(|| windows_service_failure_hint(error))
+        .flatten()
+    {
+        Some(hint) => format!("{hint} [{error}]"),
+        None => error.to_string(),
+    }
+}
 
 /// Canonical restart suggestion. See [`restart_command!`].
 pub const RESTART_COMMAND: &str = restart_command!();
@@ -1074,6 +1123,61 @@ fn print_help() {
 #[cfg(test)]
 mod health_tests {
     use super::*;
+
+    #[test]
+    fn windows_antivirus_block_is_named_instead_of_suggesting_a_restart() {
+        // What starting the service got on Windows 11 while the binary's
+        // SHA-256 matched the release.
+        let spawn = "failed to spawn detached daemon with flags 0x1000208: Operation did not complete successfully because the file contains a virus or potentially unwanted software. (os error 225); retry without CREATE_BREAKAWAY_FROM_JOB also failed: Operation did not complete successfully because the file contains a virus or potentially unwanted software. (os error 225)";
+        let hint = windows_service_failure_hint(spawn).unwrap();
+        assert!(hint.contains("Protection history"), "{hint}");
+        // The restart comes after allowing the file, not instead of it.
+        assert!(hint.contains("restarting will not help"), "{hint}");
+        assert!(
+            hint.find("Protection history").unwrap() < hint.find(RESTART_COMMAND).unwrap(),
+            "{hint}"
+        );
+        // The localized message differs; the code does not.
+        assert!(windows_service_failure_hint("spawn failed (os error 226)").is_some());
+
+        let shown = explain_service_error(true, spawn);
+        assert!(shown.starts_with("Windows Security"), "{shown}");
+        assert!(shown.ends_with(&format!("[{spawn}]")), "{shown}");
+    }
+
+    #[test]
+    fn windows_elevated_service_is_named_instead_of_a_raw_taskkill_error() {
+        let taskkill = "taskkill /F /T /PID 4312 failed: ERROR: The process with PID 4312 (child process of PID 912) could not be terminated.\nReason: Access is denied.";
+        let hint = windows_service_failure_hint(taskkill).unwrap();
+        assert!(hint.contains("Run as administrator"), "{hint}");
+        assert!(hint.contains("autter bg shutdown --hard"), "{hint}");
+        assert!(hint.contains("normal window"), "{hint}");
+        assert_eq!(
+            windows_service_failure_hint("failed to connect: Access is denied. (os error 5)"),
+            Some(hint)
+        );
+        assert!(explain_service_error(true, taskkill).contains("Reason: Access is denied."));
+    }
+
+    #[test]
+    fn other_errors_and_other_platforms_are_left_alone() {
+        for error in [
+            "timed out after 5s waiting for daemon sockets a and b",
+            "daemon startup blocked: lock held at C:\\Users\\dev\\.autter\\internal\\daemon.lock",
+            "The system cannot find the file specified. (os error 2)",
+            // 225 and 5 inside other numbers are not those errors.
+            "exit status 2250",
+            "(os error 50)",
+            "",
+        ] {
+            assert_eq!(windows_service_failure_hint(error), None, "{error}");
+            assert_eq!(explain_service_error(true, error), error);
+        }
+        // On Unix, error 5 is EIO and "access is denied" is not an elevation
+        // problem: the text is passed through.
+        let unix = "kill -9 77 failed: Input/output error (os error 5)";
+        assert_eq!(explain_service_error(false, unix), unix);
+    }
 
     #[test]
     fn daemon_spawn_drops_agent_markers_but_keeps_hostname() {
