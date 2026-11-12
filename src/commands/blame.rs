@@ -2043,8 +2043,7 @@ fn output_default_format(
     // AI lines, with references `show-prompt` and `blame --why` take. Shown on
     // a terminal (and with `--show-prompt`), so piped output stays one line
     // per source line like `git blame`.
-    let interactive =
-        io::stdout().is_terminal() || std::env::var_os("AUTTER_TEST_FORCE_TTY").is_some();
+    let interactive = io::stdout().is_terminal() || crate::utils::test_forces_tty();
     if (interactive || options.show_prompt) && !shown_prompts.is_empty() {
         output.push_str(&format_prompt_legend(
             &shown_prompts,
