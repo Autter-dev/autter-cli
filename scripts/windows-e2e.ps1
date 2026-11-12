@@ -284,6 +284,13 @@ $ver = Invoke-Autter -Arguments @('--version')
 Write-Host ("autter --version: {0}" -f $ver.Stdout.Trim())
 
 $RepoDir = Join-Path $script:Root 'repo'
+# The test repository, with one commit made before any checkpoint.
+New-Item -ItemType Directory -Force -Path $RepoDir | Out-Null
+Invoke-Git -Arguments @('init') -Cwd $RepoDir | Out-Null
+$file = Join-Path $RepoDir 'app.txt'
+[IO.File]::WriteAllText($file, "human line`n")
+Invoke-Git -Arguments @('add', '.') -Cwd $RepoDir | Out-Null
+Invoke-Git -Arguments @('commit', '-m', 'initial') -Cwd $RepoDir | Out-Null
 
 # --- service ----------------------------------------------------------------
 
@@ -304,19 +311,14 @@ try {
 Begin-Section 'capture'
 try {
     # What onboarding does once the user agrees: hooks, trace2, service.
-    $r = Invoke-Autter -Arguments @('install', '--system', '--yes') -TimeoutSec 180
-    Check ($r.ExitCode -eq 0) 'install --system --yes succeeds (trace2 written, capture verified)' (Show-Output $r)
-    $target = (Invoke-Git -Arguments @('config', '--global', '--get', 'trace2.eventTarget')).Stdout.Trim()
+    $r = Invoke-Autter -Arguments @('install', '--system') -TimeoutSec 180
+    Check ($r.ExitCode -eq 0) 'install --system succeeds (trace2 written, capture verified)' (Show-Output $r)
+    $t = Invoke-Exe -File $script:GitExe -Arguments @('config', '--global', '--get', 'trace2.eventTarget') -Label 'git config --get trace2.eventTarget'
+    $target = $t.Stdout.Trim()
     Write-Host ("  trace2.eventTarget = {0}" -f $target)
     Check ($target -like '\\.\pipe\autter-*-trace2') 'global trace2.eventTarget is the service''s named pipe' $target
 
-    New-Item -ItemType Directory -Force -Path $RepoDir | Out-Null
-    Invoke-Git -Arguments @('init') -Cwd $RepoDir | Out-Null
     $file = Join-Path $RepoDir 'app.txt'
-    [IO.File]::WriteAllText($file, "human line`n")
-    Invoke-Git -Arguments @('add', '.') -Cwd $RepoDir | Out-Null
-    Invoke-Git -Arguments @('commit', '-m', 'initial') -Cwd $RepoDir | Out-Null
-
     [IO.File]::WriteAllText($file, "human line`nai line`n")
     $r = Invoke-Autter -Arguments @('checkpoint', 'mock_ai', 'app.txt') -Cwd $RepoDir
     Check ($r.ExitCode -eq 0) 'checkpoint mock_ai app.txt exits 0' (Show-Output $r)
@@ -519,7 +521,7 @@ $env:Path = $script:BasePath
 
 Begin-Section 'npm'
 try {
-    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue
+    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $node) { Fail 'node is not on PATH' } else {
         $npmHome = Join-Path $script:Root 'npm-profile'
         $npmBin = Join-Path $npmHome '.autter\bin'
@@ -634,6 +636,10 @@ Save-Screen 'vtcheck.txt'
             Check ($screen.Trim().Length -gt 0) ("{0} console: {1} shows output" -f $mode, $name)
             Check (-not $screen.Contains($esc)) ("{0} console (VT {1}): {2} has no raw ESC characters" -f $mode, $(if ($vtOn) { 'on' } else { 'off' }), $name)
             Check (-not $screen.Contains([string][char]0xFFFD)) ("{0} console: {1} has no replacement characters" -f $mode, $name)
+            # UTF-8 read as the OEM (437) or ANSI (1252) code page: an em dash
+            # shows as "G-C" or "a-euro" pairs.
+            $mojibake = $screen.Contains([string][char]0x393 + [char]0xC7) -or $screen.Contains([string][char]0xE2 + [char]0x20AC)
+            Check (-not $mojibake) ("{0} console: {1} has no UTF-8 mojibake" -f $mode, $name)
         }
         $onb = [IO.File]::ReadAllText((Join-Path $out 'onboard.txt'))
         Check ($onb -match '(?i)local') ("{0} console: the onboarding selection is on screen" -f $mode)
@@ -650,76 +656,154 @@ try {
     if (-not $IsElevated) {
         Note 'this shell is not elevated, so the elevated-service case cannot be set up here'
     } else {
-        # The service is running from this (elevated) shell. Ask it things
-        # from a Basic User token (runas /trustlevel:0x20000), the way a
-        # normal window would after an install from an Administrator one.
+        # The service runs from this elevated shell. A normal window's token
+        # is the same user with Administrators turned into a deny-only group,
+        # no privileges and medium integrity (what UAC gives). Build that token
+        # from this process's own and run autter with it. (runas /trustlevel
+        # does not filter the token on a machine with UAC off, such as a CI
+        # runner.)
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class FilteredToken {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID_AND_ATTRIBUTES { public IntPtr Sid; public uint Attributes; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+        public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags;
+        public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+        public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
+
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool CreateRestrictedToken(IntPtr existing, uint flags, uint disableCount, SID_AND_ATTRIBUTES[] disable,
+        uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr newToken);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool ConvertStringSidToSid(string sid, out IntPtr psid);
+    [DllImport("advapi32.dll")] static extern uint GetLengthSid(IntPtr sid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool SetTokenInformation(IntPtr token, int infoClass, IntPtr info, uint length);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr pa, IntPtr ta, bool inherit,
+        uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
+    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+
+    static IntPtr Sid(string text) {
+        IntPtr sid;
+        if (!ConvertStringSidToSid(text, out sid)) { throw new Win32Exception(); }
+        return sid;
+    }
+
+    // Runs commandLine with a UAC-style filtered copy of this process's
+    // token and returns its exit code (-1 on timeout).
+    public static int Run(string commandLine, string cwd, int timeoutMs) {
+        IntPtr token;
+        // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0001 | 0x0002 | 0x0008 | 0x0080 | 0x0100, out token)) { throw new Win32Exception(); }
+        SID_AND_ATTRIBUTES[] disable = new SID_AND_ATTRIBUTES[2];
+        disable[0].Sid = Sid("S-1-5-32-544");   // BUILTIN\Administrators
+        disable[1].Sid = Sid("S-1-5-114");      // Local account and member of Administrators group
+        IntPtr filtered;
+        // DISABLE_MAX_PRIVILEGE
+        if (!CreateRestrictedToken(token, 0x1, 2, disable, 0, IntPtr.Zero, 0, IntPtr.Zero, out filtered)) { throw new Win32Exception(); }
+
+        IntPtr medium = Sid("S-1-16-8192");
+        int labelSize = Marshal.SizeOf(typeof(SID_AND_ATTRIBUTES));
+        IntPtr label = Marshal.AllocHGlobal(labelSize);
+        SID_AND_ATTRIBUTES tml = new SID_AND_ATTRIBUTES();
+        tml.Sid = medium;
+        tml.Attributes = 0x20; // SE_GROUP_INTEGRITY
+        Marshal.StructureToPtr(tml, label, false);
+        // TokenIntegrityLevel
+        if (!SetTokenInformation(filtered, 25, label, (uint)labelSize + GetLengthSid(medium))) { throw new Win32Exception(); }
+
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        PROCESS_INFORMATION pi;
+        // CREATE_NO_WINDOW; environment block null: this process's environment.
+        if (!CreateProcessAsUser(filtered, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, cwd, ref si, out pi)) {
+            throw new Win32Exception();
+        }
+        uint code = 0;
+        if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) {
+            TerminateProcess(pi.hProcess, 1);
+            code = unchecked((uint)-1);
+        } else {
+            GetExitCodeProcess(pi.hProcess, out code);
+        }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        CloseHandle(filtered); CloseHandle(token);
+        return unchecked((int)code);
+    }
+}
+'@
         $r = Invoke-Autter -Arguments @('bg', 'status')
         Check ($r.ExitCode -eq 0) 'elevated service is running'
+        $elevPid = Get-ServicePid
+
+        # The profile folder lives under the runner's work folder, which only
+        # Administrators may write; give the user itself access, as a real
+        # profile folder does.
+        $sid = $identity.User.Value
+        & icacls.exe $script:Root /grant ("*{0}:(OI)(CI)F" -f $sid) /T /Q | Out-Null
+
         $elevDir = Join-Path $script:Root 'elevated'
         New-Item -ItemType Directory -Force -Path $elevDir | Out-Null
         $wrapper = Join-Path $elevDir 'as-standard-user.cmd'
-        $lines = @(
-            '@echo off',
-            ('set "USERPROFILE={0}"' -f $ProfileDir),
-            ('set "HOME={0}"' -f $ProfileDir),
-            ('set "APPDATA={0}"' -f $env:APPDATA),
-            ('set "LOCALAPPDATA={0}"' -f $env:LOCALAPPDATA),
-            'set "HOMEDRIVE="',
-            'set "HOMEPATH="',
-            'set "CI="',
-            'set "AUTTER_NO_INSTALL_PING=1"',
-            'set "AUTTER_DISABLE_AUTO_UPDATES=1"',
-            'set "AUTTER_DEBUG=0"',
-            ('set "PATH={0}"' -f $script:BasePath),
-            ('cd /d "{0}"' -f $RepoDir),
-            ('whoami /groups > "{0}\whoami.txt" 2>&1' -f $elevDir),
-            ('"{0}" bg status > "{1}\status.out" 2> "{1}\status.err"' -f $script:AutterExe, $elevDir),
-            ('echo %ERRORLEVEL% > "{0}\status.code"' -f $elevDir),
-            ('"{0}" bg start > "{1}\start.out" 2> "{1}\start.err"' -f $script:AutterExe, $elevDir),
-            ('echo %ERRORLEVEL% > "{0}\start.code"' -f $elevDir),
-            ('"{0}" bg restart > "{1}\restart.out" 2> "{1}\restart.err"' -f $script:AutterExe, $elevDir),
-            ('echo %ERRORLEVEL% > "{0}\restart.code"' -f $elevDir),
-            ('"{0}" bg shutdown > "{1}\shutdown.out" 2> "{1}\shutdown.err"' -f $script:AutterExe, $elevDir),
-            ('echo %ERRORLEVEL% > "{0}\shutdown.code"' -f $elevDir),
-            ('"{0}" doctor --json > "{1}\doctor.out" 2> "{1}\doctor.err"' -f $script:AutterExe, $elevDir),
-            ('echo %ERRORLEVEL% > "{0}\doctor.code"' -f $elevDir),
-            ('echo done > "{0}\done"' -f $elevDir)
+        $steps = @(
+            @('status', 'bg status'),
+            @('start', 'bg start'),
+            @('restart', 'bg restart'),
+            @('shutdown', 'bg shutdown'),
+            @('doctor', 'doctor --json')
         )
+        $lines = @('@echo off', 'set "CI="', ('cd /d "{0}"' -f $RepoDir),
+            ('whoami /groups > "{0}\whoami.txt" 2>&1' -f $elevDir))
+        foreach ($s in $steps) {
+            $lines += ('"{0}" {1} > "{2}\{3}.out" 2> "{2}\{3}.err"' -f $script:AutterExe, $s[1], $elevDir, $s[0])
+            $lines += ('echo %ERRORLEVEL% > "{0}\{1}.code"' -f $elevDir, $s[0])
+        }
+        $lines += ('echo done > "{0}\done"' -f $elevDir)
         [IO.File]::WriteAllText($wrapper, (($lines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
-        $runas = Invoke-Exe -File (Join-Path $env:SystemRoot 'System32\runas.exe') -Arguments @('/trustlevel:0x20000', ('cmd.exe /c "' + $wrapper + '"')) -TimeoutSec 60 -Label 'runas /trustlevel:0x20000'
-        $finished = Wait-Until -TimeoutSec 300 -Condition { Test-Path -LiteralPath (Join-Path $elevDir 'done') }
-        if (-not $finished) {
-            Note ("runas /trustlevel:0x20000 did not run the standard-user commands on this runner (exit {0}): {1}" -f $runas.ExitCode, (Show-Output $runas))
-        } else {
-            function Read-Part([string]$name) {
-                $p = Join-Path $elevDir $name
-                if (Test-Path -LiteralPath $p) { return [IO.File]::ReadAllText($p) } else { return '' }
-            }
-            $groups = Read-Part 'whoami.txt'
-            $restricted = ($groups -match 'Medium Mandatory Level') -or ($groups -match 'Group used for deny only')
-            Write-Host ("  standard-user token: {0}" -f $(if ($restricted) { 'yes (Administrators deny-only / medium integrity)' } else { 'NOT restricted' }))
-            Check $restricted 'runas /trustlevel gives a non-elevated token' $groups
-            foreach ($step in @('status', 'start', 'restart', 'shutdown', 'doctor')) {
-                $code = (Read-Part ($step + '.code')).Trim()
-                $text = (Read-Part ($step + '.out')) + (Read-Part ($step + '.err'))
-                [IO.File]::WriteAllText((Join-Path $script:LogDir ("elevated-" + $step + ".txt")), ("exit " + $code + "`r`n" + $text))
-                Write-Host ("  standard user: autter {0} -> exit {1}" -f $step, $code)
-                foreach ($l in @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 12)) { Write-Host ("    |" + $l) }
-            }
-            $startText = (Read-Part 'start.err') + (Read-Part 'start.out')
-            $restartText = (Read-Part 'restart.err') + (Read-Part 'restart.out')
-            $shutdownText = (Read-Part 'shutdown.err') + (Read-Part 'shutdown.out')
-            $doctorText = (Read-Part 'doctor.out') + (Read-Part 'doctor.err')
-            $hint = 'started from an Administrator window'
-            Check ($startText.Contains($hint)) 'bg start from a standard user names the elevated service' $startText
-            Check ($restartText.Contains($hint)) 'bg restart from a standard user names the elevated service' $restartText
-            Check ($shutdownText.Contains($hint)) 'bg shutdown from a standard user names the elevated service' $shutdownText
-            Check ($doctorText.Contains($hint)) 'doctor from a standard user names the elevated service' $doctorText
-            $all = $startText + $restartText + $shutdownText + $doctorText
-            Check (-not ($all -match 'ERROR: The process')) 'no raw taskkill error reaches a standard user' $all
+
+        $code = [FilteredToken]::Run(('cmd.exe /c "' + $wrapper + '"'), $RepoDir, 600000)
+        Write-Host ("  standard-user commands finished with exit {0}" -f $code)
+        function Read-Part([string]$name) {
+            $p = Join-Path $elevDir $name
+            if (Test-Path -LiteralPath $p) { return [IO.File]::ReadAllText($p) } else { return '' }
+        }
+        $groups = Read-Part 'whoami.txt'
+        $restricted = ($groups -match 'Medium Mandatory Level') -and ($groups -match 'S-1-5-32-544\s+Group used for deny only')
+        Check $restricted 'the standard-user token has Administrators deny-only at medium integrity' $groups
+        foreach ($s in $steps) {
+            $c = (Read-Part ($s[0] + '.code')).Trim()
+            $text = (Read-Part ($s[0] + '.out')) + (Read-Part ($s[0] + '.err'))
+            [IO.File]::WriteAllText((Join-Path $script:LogDir ("elevated-" + $s[0] + ".txt")), ("exit " + $c + "`r`n" + $text))
+            Write-Host ("  standard user: autter {0} -> exit {1}" -f $s[1], $c)
+            foreach ($l in @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 12)) { Write-Host ("    |" + $l) }
+        }
+        $hint = 'started from an Administrator window'
+        foreach ($s in @(@('status', 'bg status'), @('start', 'bg start'), @('restart', 'bg restart'), @('shutdown', 'bg shutdown'), @('doctor', 'doctor'))) {
+            $text = (Read-Part ($s[0] + '.out')) + (Read-Part ($s[0] + '.err'))
+            Check ($text.Contains($hint)) ("{0} from a standard user names the elevated service as the cause" -f $s[1]) $text
+            Check (-not ($text -match 'ERROR: The process|ERROR: Access')) ("{0} from a standard user shows no raw taskkill error" -f $s[1]) $text
         }
         $r = Invoke-Autter -Arguments @('bg', 'status')
-        Check ($r.ExitCode -eq 0) 'the elevated service is still running after the standard-user attempts' (Show-Output $r)
+        Check ($r.ExitCode -eq 0 -and (Get-ServicePid) -eq $elevPid) 'the elevated service is untouched by the standard-user attempts' (Show-Output $r)
     }
 } catch { Fail ("section error: " + $_.Exception.Message) }
 
