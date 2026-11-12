@@ -927,6 +927,9 @@ if (Test-Path -LiteralPath $finalExe) {
 
 Move-Item -Force -Path $tmpFile -Destination $finalExe
 try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
+# This installer now owns the binary: drop the npm package's marker, so the
+# background service updates it again and `autter upgrade` stops pointing at npm.
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $HOME '.autter\npm-install.json')
 
 # Verify the binary runs before reporting success.
 $installedVersion = ''

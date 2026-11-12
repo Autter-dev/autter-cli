@@ -349,6 +349,8 @@ Autter provides line-level attribution for AI-generated code whether it was writ
 
 Run `autter debug` and read the **AI Agent Capture** section to see, per agent, whether the capture chain on this machine is complete.
 
+Every supported agent and editor, its integration type, what is and is not captured, and the command that checks it end to end (`autter doctor --agent <name>`, which simulates the agent's hook calls) are listed in [docs/agents.md](docs/agents.md).
+
 Here is the full breakdown of what is supported today:
 
 | Capability                                                      | Status | Notes                                                                        |

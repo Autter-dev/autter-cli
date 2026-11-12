@@ -716,8 +716,11 @@ pub fn run_with_args(args: &[String]) {
 fn run_impl(force: bool, background: bool) {
     let config = config::Config::fresh();
     let channel = config.update_channel();
-    let skip_install = background && config.auto_updates_disabled();
-    let _ = run_impl_with_url(force, config.api_base_url(), channel, skip_install);
+    let npm = npm_managed_install();
+    // An npm install is never replaced in the background: npm picked its
+    // version. By hand, `autter upgrade` names the npm command instead.
+    let skip_install = background && (config.auto_updates_disabled() || npm);
+    let _ = run_impl_with_url(force, config.api_base_url(), channel, skip_install, npm);
 }
 
 fn run_impl_with_url(
@@ -725,6 +728,7 @@ fn run_impl_with_url(
     api_base_url: &str,
     channel: UpdateChannel,
     skip_install: bool,
+    npm_managed: bool,
 ) -> UpgradeAction {
     let current_version = env!("CARGO_PKG_VERSION");
 
@@ -733,7 +737,7 @@ fn run_impl_with_url(
     let release = match fetch_release_for_channel(api_base_url, channel) {
         Ok(release) => release,
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{}", upgrade_failure_message(&err));
             std::process::exit(1);
         }
     };
@@ -796,6 +800,10 @@ fn run_impl_with_url(
     if skip_install {
         return action;
     }
+    if npm_managed && let Some(instructions) = npm_upgrade_instructions(&action, &release.semver) {
+        println!("{instructions}");
+        return action;
+    }
 
     println!("Fetching and verifying release artifacts...");
 
@@ -807,7 +815,10 @@ fn run_impl_with_url(
                 checksums
             }
             Err(err) => {
-                eprintln!("Failed to fetch/verify checksums: {}", err);
+                eprintln!(
+                    "{}",
+                    upgrade_failure_message(&format!("Failed to fetch/verify checksums: {err}"))
+                );
                 std::process::exit(1);
             }
         };
@@ -823,7 +834,12 @@ fn run_impl_with_url(
                 content
             }
             Err(err) => {
-                eprintln!("Failed to fetch/verify install script: {}", err);
+                eprintln!(
+                    "{}",
+                    upgrade_failure_message(&format!(
+                        "Failed to fetch/verify install script: {err}"
+                    ))
+                );
                 std::process::exit(1);
             }
         };
@@ -860,7 +876,7 @@ fn run_impl_with_url(
             );
         }
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{}", upgrade_failure_message(&err));
             std::process::exit(1);
         }
     }
@@ -1008,15 +1024,63 @@ fn update_prompt_context_allows_interaction() -> bool {
 /// config file, for environments that set variables, not files.
 const DISABLE_AUTO_UPDATES_ENV: &str = "AUTTER_DISABLE_AUTO_UPDATES";
 
+/// Set to `npm` by the npm launcher (`npm/bin/autter.js`) on the binary it runs.
+pub const INSTALLED_BY_ENV: &str = "AUTTER_INSTALLED_BY";
+/// Written by the npm package (`npm/install.js`) when it installs the binary,
+/// and removed by the shell and PowerShell installers when they replace it.
+pub const NPM_INSTALL_MARKER: &str = "npm-install.json";
+/// What an npm user runs to move to the newest release.
+pub const NPM_UPGRADE_COMMAND: &str = "npm install -g @autter/cli@latest";
+
+/// An `autter upgrade` failure with what to do next. Nothing was installed
+/// when any of these happen, so the current version keeps working.
+fn upgrade_failure_message(error: &str) -> String {
+    format!(
+        "{error}\nNothing was changed. Run `autter upgrade` again in a few minutes; if it keeps failing, reinstall with the installer from INSTALL.md (curl -fsSL https://api.autter.dev/install.sh | bash)."
+    )
+}
+
+fn npm_install_marker_path() -> PathBuf {
+    crate::mdm::utils::home_dir()
+        .join(".autter")
+        .join(NPM_INSTALL_MARKER)
+}
+
+/// The binary in `~/.autter/bin` was installed by `npm install -g
+/// @autter/cli@<version>`, so npm picks the version: the background service
+/// must not replace it, and `autter upgrade` points at npm instead.
+fn npm_managed(installed_by: Option<&str>, marker_exists: bool) -> bool {
+    installed_by.is_some_and(|v| v.trim().eq_ignore_ascii_case("npm")) || marker_exists
+}
+
+pub fn npm_managed_install() -> bool {
+    npm_managed(
+        std::env::var(INSTALLED_BY_ENV).ok().as_deref(),
+        npm_install_marker_path().is_file(),
+    )
+}
+
+/// What `autter upgrade` says instead of installing, for an npm install.
+fn npm_upgrade_instructions(action: &UpgradeAction, available: &str) -> Option<String> {
+    match action {
+        UpgradeAction::UpgradeAvailable | UpgradeAction::ForceReinstall => Some(format!(
+            "This autter was installed with npm, so npm picks its version. To install v{available}, run:\n  {NPM_UPGRADE_COMMAND}\n(or `npm install -g @autter/cli@<version>` for a specific release)"
+        )),
+        UpgradeAction::AlreadyLatest | UpgradeAction::RunningNewerVersion => None,
+    }
+}
+
 /// Why the background service must not replace the binary by itself, or
 /// `None` when it may. A CI job that installed `@autter/cli@3.4.0` (or set
 /// `AUTTER_RELEASE_TAG`) pinned a version; the service used to upgrade it to
-/// the latest release in the middle of the job. `autter upgrade` still
-/// upgrades when asked.
+/// the latest release in the middle of the job. An npm install is the same:
+/// npm picked the version. `autter upgrade` still upgrades when asked (and,
+/// for npm, says which npm command does it).
 fn self_update_hold(
     in_ci: bool,
     release_tag: Option<&str>,
     disabled: Option<&str>,
+    npm_managed: bool,
 ) -> Option<&'static str> {
     if disabled.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
         return Some("AUTTER_DISABLE_AUTO_UPDATES is set");
@@ -1027,13 +1091,16 @@ fn self_update_hold(
     {
         return Some("AUTTER_RELEASE_TAG pins a release");
     }
+    if npm_managed {
+        return Some("installed with npm");
+    }
     if in_ci {
         return Some("running in CI");
     }
     None
 }
 
-fn running_in_ci() -> bool {
+pub(crate) fn running_in_ci() -> bool {
     [
         "CI",
         "GITHUB_ACTIONS",
@@ -1102,6 +1169,13 @@ fn print_cached_notice(cache: &UpdateCache) {
         return;
     }
 
+    // npm picks the version of an npm install: no prompt (it would run the
+    // installer), and the notice names the npm command, once per release.
+    if npm_managed_install() {
+        print_npm_update_notice(cache);
+        return;
+    }
+
     if UPDATE_NOTICE_EMITTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -1132,6 +1206,63 @@ fn print_cached_notice(cache: &UpdateCache) {
         paint_err("1;33", "to upgrade to the latest version."),
     );
     eprintln!();
+}
+
+fn npm_update_notice_stamp_path() -> PathBuf {
+    crate::mdm::utils::home_dir()
+        .join(".autter")
+        .join("internal")
+        .join("npm-update-notice")
+}
+
+/// The npm update notice for `available`, or `None` when this release was
+/// already announced (the stamp holds the last version announced).
+fn npm_update_notice(available: &str, already_told: Option<&str>) -> Option<String> {
+    if available.is_empty() || already_told.map(str::trim) == Some(available) {
+        return None;
+    }
+    Some(format!(
+        "autter v{available} is available (you have v{}). This install is managed by npm, so it is not updated automatically. Upgrade: {NPM_UPGRADE_COMMAND}",
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
+fn print_npm_update_notice(cache: &UpdateCache) {
+    let Some(available) = cache.available_semver.as_deref() else {
+        return;
+    };
+    let stamp = npm_update_notice_stamp_path();
+    let told = fs::read_to_string(&stamp).ok();
+    let Some(notice) = npm_update_notice(available, told.as_deref()) else {
+        return;
+    };
+    if UPDATE_NOTICE_EMITTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    if let Some(parent) = stamp.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&stamp, available);
+    eprintln!("{}", paint_err("1;33", &notice));
+}
+
+/// The npm update notice on an interactive `autter` command (the git proxy
+/// shows it through [`maybe_schedule_background_update_check`]). The caller
+/// has already checked that a person is at the terminal.
+pub fn maybe_print_npm_update_notice() {
+    let config = config::Config::get();
+    if config.version_checks_disabled() || !npm_managed_install() {
+        return;
+    }
+    let Some(cache) = read_update_cache() else {
+        return;
+    };
+    if cache.matches_channel(config.update_channel()) && cache.update_available() {
+        print_npm_update_notice(&cache);
+    }
 }
 
 /// Returns the required semver when the running CLI is older than the platform's
@@ -1275,6 +1406,7 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
         running_in_ci(),
         std::env::var(AUTTER_RELEASE_ENV).ok().as_deref(),
         std::env::var(DISABLE_AUTO_UPDATES_ENV).ok().as_deref(),
+        npm_managed_install(),
     ) {
         tracing::debug!(reason, "background self-update skipped");
         return Ok(DaemonUpdateCheckResult::NoUpdate);
@@ -1356,13 +1488,17 @@ pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
     let channel = config.update_channel();
     let api_base_url = config.api_base_url();
     let cache = read_update_cache();
+    // npm picks the version of an npm install: the check still runs (so the
+    // user is told a release exists), but the service never restarts to
+    // install it.
+    let installs_by_itself = !config.auto_updates_disabled() && !npm_managed_install();
 
     if !should_check_for_updates(channel, cache.as_ref()) {
         // Even if it's not time to re-check, an earlier check may have found an update.
         if let Some(ref c) = cache
             && c.matches_channel(channel)
             && c.update_available()
-            && !config.auto_updates_disabled()
+            && installs_by_itself
         {
             return Ok(DaemonUpdateCheckResult::UpdateReady);
         }
@@ -1386,7 +1522,7 @@ pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
         })),
     );
 
-    if action == UpgradeAction::UpgradeAvailable && !config.auto_updates_disabled() {
+    if action == UpgradeAction::UpgradeAvailable && installs_by_itself {
         Ok(DaemonUpdateCheckResult::UpdateReady)
     } else {
         Ok(DaemonUpdateCheckResult::NoUpdate)
@@ -1421,24 +1557,96 @@ mod tests {
     #[test]
     fn background_self_update_respects_ci_and_version_pins() {
         // A developer machine with nothing set: updates go ahead.
-        assert_eq!(self_update_hold(false, None, None), None);
-        assert_eq!(self_update_hold(false, Some("latest"), Some("0")), None);
-        assert_eq!(self_update_hold(false, Some("  "), Some("")), None);
+        assert_eq!(self_update_hold(false, None, None, false), None);
+        assert_eq!(
+            self_update_hold(false, Some("latest"), Some("0"), false),
+            None
+        );
+        assert_eq!(self_update_hold(false, Some("  "), Some(""), false), None);
         // CI installed a specific version; the service must not replace it.
-        assert_eq!(self_update_hold(true, None, None), Some("running in CI"));
+        assert_eq!(
+            self_update_hold(true, None, None, false),
+            Some("running in CI")
+        );
         // A pinned release, in CI or not.
         assert_eq!(
-            self_update_hold(false, Some("v3.4.0"), None),
+            self_update_hold(false, Some("v3.4.0"), None, false),
             Some("AUTTER_RELEASE_TAG pins a release")
         );
         // The explicit switch.
         for on in ["1", "true", "TRUE"] {
             assert_eq!(
-                self_update_hold(false, None, Some(on)),
+                self_update_hold(false, None, Some(on), false),
                 Some("AUTTER_DISABLE_AUTO_UPDATES is set")
             );
         }
+        // `npm install -g @autter/cli@<version>` picked the version.
+        assert_eq!(
+            self_update_hold(false, None, None, true),
+            Some("installed with npm")
+        );
     }
+
+    #[test]
+    fn upgrade_failures_say_what_to_do_next() {
+        let text = upgrade_failure_message("Failed to check for updates: timed out");
+        assert!(
+            text.starts_with("Failed to check for updates: timed out"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(text.contains("autter upgrade"), "{text}");
+        assert!(text.contains("install.sh"), "{text}");
+    }
+
+    #[test]
+    fn npm_install_is_recognised_from_the_launcher_or_the_marker() {
+        assert!(!npm_managed(None, false));
+        assert!(!npm_managed(Some("curl"), false));
+        assert!(!npm_managed(Some(""), false));
+        // The launcher sets AUTTER_INSTALLED_BY=npm on the binary it runs.
+        assert!(npm_managed(Some("npm"), false));
+        assert!(npm_managed(Some(" NPM "), false));
+        // The hooks and the background service run the binary directly, so
+        // the marker the npm package writes is what they see.
+        assert!(npm_managed(None, true));
+    }
+
+    #[test]
+    fn upgrade_by_hand_on_an_npm_install_names_the_npm_command() {
+        for action in [
+            UpgradeAction::UpgradeAvailable,
+            UpgradeAction::ForceReinstall,
+        ] {
+            let text = npm_upgrade_instructions(&action, "9.9.9").unwrap();
+            assert!(text.contains("installed with npm"), "{text}");
+            assert!(text.contains("npm install -g @autter/cli@latest"), "{text}");
+            assert!(text.contains("v9.9.9"), "{text}");
+        }
+        for action in [
+            UpgradeAction::AlreadyLatest,
+            UpgradeAction::RunningNewerVersion,
+        ] {
+            assert_eq!(npm_upgrade_instructions(&action, "9.9.9"), None);
+        }
+    }
+
+    #[test]
+    fn npm_update_notice_is_said_once_per_release() {
+        let first = npm_update_notice("9.9.9", None).unwrap();
+        assert!(first.contains("v9.9.9"), "{first}");
+        assert!(
+            first.contains("npm install -g @autter/cli@latest"),
+            "{first}"
+        );
+        assert!(first.contains("not updated automatically"), "{first}");
+        // Already told about this release.
+        assert_eq!(npm_update_notice("9.9.9", Some("9.9.9\n")), None);
+        // A newer release is news again.
+        assert!(npm_update_notice("9.9.10", Some("9.9.9")).is_some());
+        assert_eq!(npm_update_notice("", None), None);
+    }
+
     use serial_test::serial;
 
     fn set_test_cache_dir(dir: &tempfile::TempDir) {
@@ -1532,6 +1740,7 @@ mod tests {
             )),
             UpdateChannel::Latest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::UpgradeAvailable);
 
@@ -1545,6 +1754,7 @@ mod tests {
             &mock_url(&same_version_payload),
             UpdateChannel::Latest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::AlreadyLatest);
 
@@ -1554,6 +1764,7 @@ mod tests {
             &mock_url(&same_version_payload),
             UpdateChannel::Latest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);
 
@@ -1566,6 +1777,7 @@ mod tests {
             )),
             UpdateChannel::Latest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::RunningNewerVersion);
 
@@ -1578,9 +1790,35 @@ mod tests {
             )),
             UpdateChannel::Latest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);
 
+        clear_test_cache_dir();
+    }
+
+    /// On an npm install `autter upgrade` stops after saying which npm
+    /// command upgrades. It used to go on to download the release and run the
+    /// shell installer, moving the user off the version npm installed (here
+    /// that would fail: a mock URL serves no checksums, and the run exits).
+    #[test]
+    #[serial]
+    fn upgrade_on_an_npm_install_does_not_install() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let checksum = "a".repeat(64);
+        let newer = format!(
+            r#"mock://{{"channels":{{"latest":{{"version":"v999.0.0","checksum":"{checksum}"}}}}}}"#
+        );
+        for force in [false, true] {
+            let action = run_impl_with_url(force, &newer, UpdateChannel::Latest, false, true);
+            let expected = if force {
+                UpgradeAction::ForceReinstall
+            } else {
+                UpgradeAction::UpgradeAvailable
+            };
+            assert_eq!(action, expected);
+        }
         clear_test_cache_dir();
     }
 
@@ -1603,6 +1841,7 @@ mod tests {
             )),
             UpdateChannel::EnterpriseLatest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::UpgradeAvailable);
 
@@ -1616,6 +1855,7 @@ mod tests {
             &mock_url(&same_version_payload),
             UpdateChannel::EnterpriseLatest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::AlreadyLatest);
 
@@ -1625,6 +1865,7 @@ mod tests {
             &mock_url(&same_version_payload),
             UpdateChannel::EnterpriseLatest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);
 
@@ -1637,6 +1878,7 @@ mod tests {
             )),
             UpdateChannel::EnterpriseLatest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::RunningNewerVersion);
 
@@ -1649,6 +1891,7 @@ mod tests {
             )),
             UpdateChannel::EnterpriseLatest,
             true,
+            false,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);
 

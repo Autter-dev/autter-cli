@@ -18,6 +18,8 @@ use serde::Serialize;
 use std::io::IsTerminal;
 use std::time::Duration;
 
+mod agent;
+
 const SKIP_TRACE2_CHECKS_FLAG: &str = "--skip-trace2-checks";
 const DOCTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const DOCTOR_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -89,9 +91,12 @@ struct DoctorOptions {
     skip_trace2_checks: bool,
     /// `--report <file>`: also write a support report to this file.
     report: Option<std::path::PathBuf>,
+    /// `--agent <name>`: check one agent's integration end to end instead.
+    agent: Option<String>,
 }
 
 const REPORT_FLAG: &str = "--report";
+const AGENT_FLAG: &str = "--agent";
 
 pub fn handle_doctor(args: &[String]) {
     let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
@@ -114,7 +119,21 @@ pub fn handle_doctor(args: &[String]) {
             options.report = Some(path.into());
             continue;
         }
+        if let Some(name) = arg.strip_prefix("--agent=") {
+            options.agent = Some(name.to_string());
+            continue;
+        }
         match arg.as_str() {
+            AGENT_FLAG => match rest.next() {
+                Some(name) => options.agent = Some(name.clone()),
+                None => crate::commands::output::fail(
+                    crate::commands::output::ErrorKind::Usage,
+                    format!(
+                        "error: --agent needs an agent name, e.g. `autter doctor --agent claude-code`. Agents: {}",
+                        agent_names()
+                    ),
+                ),
+            },
             SKIP_TRACE2_CHECKS_FLAG => options.skip_trace2_checks = true,
             REPORT_FLAG => match rest.next() {
                 Some(path) => options.report = Some(path.into()),
@@ -137,7 +156,10 @@ pub fn handle_doctor(args: &[String]) {
         }
     }
 
-    let output = run_doctor(&options);
+    let output = match &options.agent {
+        Some(name) => run_agent_doctor(name),
+        None => run_doctor(&options),
+    };
     if let Some(path) = &options.report {
         match std::fs::write(
             path,
@@ -164,8 +186,42 @@ pub fn handle_doctor(args: &[String]) {
     }
 }
 
+fn agent_names() -> String {
+    agent::known_agents()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `autter doctor --agent <name>`.
+fn run_agent_doctor(name: &str) -> DoctorOutput {
+    let known = agent::known_agents();
+    let Some(id) = agent::resolve_agent_id(name, &known) else {
+        crate::commands::output::fail(
+            crate::commands::output::ErrorKind::Usage,
+            format!(
+                "error: unknown agent '{name}'. Agents: {}. Which agents autter supports and how: docs/agents.md",
+                agent_names()
+            ),
+        );
+    };
+    let installer = crate::mdm::agents::get_all_installers()
+        .into_iter()
+        .find(|i| i.id() == id)
+        .expect("resolved agent ids come from the installers");
+    agent::run(installer.as_ref(), arg_parser::json())
+}
+
 /// Sections whose failures mean authorship is not being captured.
-const CAPTURE_SECTIONS: &[&str] = &[SECTION_SERVICE, SECTION_TRACE2, SECTION_E2E, SECTION_AGENTS];
+const CAPTURE_SECTIONS: &[&str] = &[
+    SECTION_SERVICE,
+    SECTION_TRACE2,
+    SECTION_E2E,
+    SECTION_AGENTS,
+    agent::SECTION_AGENT,
+    agent::SECTION_SIMULATION,
+];
 
 fn capture_ok(checks: &[DoctorCheck]) -> bool {
     !checks

@@ -25,8 +25,9 @@ If your package manager skips install scripts (`--ignore-scripts`, pnpm, or an n
 
 ## Upgrade and pin
 
-- Upgrade with `autter upgrade`, or `npm install -g @autter/cli@latest`. `npm update` alone does not upgrade the CLI, because this package only bootstraps the binary.
-- The background service installs new releases by itself. To stay on the version you installed, set `AUTTER_DISABLE_AUTO_UPDATES=1` or run `autter config set disable_auto_updates true`. In CI it never upgrades by itself.
+- npm picks the version. Upgrade with `npm install -g @autter/cli@latest`, or install `@autter/cli@<version>` to stay on that release. `npm update` alone does not upgrade the CLI, because this package only bootstraps the binary.
+- The background service does not replace an npm-installed binary by itself. When a newer release is out, autter tells you once and names the npm command; `autter upgrade` prints the same command instead of installing.
+- The package records this in `~/.autter/npm-install.json`. Installing afterwards with the shell or PowerShell installer removes that file and hands updates back to autter.
 
 ## Environment variables
 

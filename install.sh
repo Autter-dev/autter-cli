@@ -618,6 +618,9 @@ fi
 verify_checksum "$TMP_FILE" "$BINARY_NAME"
 
 mv -f "$TMP_FILE" "${INSTALL_DIR}/autter"
+# This installer now owns the binary: drop the npm package's marker, so the
+# background service updates it again and `autter upgrade` stops pointing at npm.
+rm -f "$HOME/.autter/npm-install.json" 2>/dev/null || true
 
 # Make executable
 chmod +x "${INSTALL_DIR}/autter"

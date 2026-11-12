@@ -59,6 +59,52 @@ function binaryDest() {
   return path.join(installDir(), process.platform === 'win32' ? 'autter.exe' : 'autter');
 }
 
+// ~/.autter/npm-install.json says the binary in ~/.autter/bin was installed
+// by this package, so npm picks its version: the autter background service
+// then never replaces it, and `autter upgrade` names the npm command instead
+// (src/commands/upgrade.rs reads it). The shell and PowerShell installers
+// remove it when they install over an npm install.
+function installMarkerPath(home = os.homedir()) {
+  return path.join(home, '.autter', 'npm-install.json');
+}
+
+function readInstallMarker(home = os.homedir()) {
+  try {
+    return JSON.parse(fs.readFileSync(installMarkerPath(home), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeInstallMarker({ home = os.homedir(), packageVersion = pkg.version } = {}) {
+  const file = installMarkerPath(home);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        { installer: 'npm', package: pkg.name, package_version: packageVersion },
+        null,
+        2,
+      ) + '\n',
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Whether the launcher has to (re)install before it runs the binary: the
+// binary is missing, or this published package version has not installed its
+// binary yet. The second happens when npm skipped the postinstall script
+// (npm 10+ with scripts off, --ignore-scripts, pnpm): `npm install -g
+// @autter/cli@<version>` then changed nothing but the launcher.
+function launcherNeedsInstall({ binaryExists, marker, packageVersion = pkg.version }) {
+  if (!binaryExists) return true;
+  if (packageVersion === DEV_VERSION) return false;
+  return !marker || marker.package_version !== packageVersion;
+}
+
 // The version checked in to the repository. release.yml replaces it with the
 // release version before `npm publish`.
 const DEV_VERSION = '0.0.0-dev';
@@ -367,6 +413,7 @@ async function main() {
     console.warn('autter: it will be downloaded on first run instead');
     return;
   }
+  writeInstallMarker();
 
   if (!result.downloaded) {
     return;
@@ -377,7 +424,7 @@ async function main() {
   console.log('');
   console.log(`autter installed at ${result.bin}`);
   console.log("Run 'autter onboard' to finish setup (consent for hooks, git config, and daemon).");
-  console.log("Upgrade later with 'autter upgrade' (or npm install -g @autter/cli@latest); 'npm update' alone does not upgrade the CLI.");
+  console.log("Upgrade later with 'npm install -g @autter/cli@latest'; 'npm update' alone does not upgrade the CLI.");
 }
 
 module.exports = {
@@ -386,10 +433,14 @@ module.exports = {
   binaryDest,
   downloadUrl,
   ensureBinary,
+  installMarkerPath,
+  launcherNeedsInstall,
+  readInstallMarker,
   releaseTag,
   resolveLatestTag,
   spawnFailureHelp,
   verifyChecksum,
+  writeInstallMarker,
 };
 
 if (require.main === module) {

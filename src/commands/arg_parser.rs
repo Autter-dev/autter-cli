@@ -606,10 +606,19 @@ autter config [<key> | set <key> <value> | unset <key>]
         aliases: &[],
         summary: "Validate the autter setup end-to-end",
         body: "autter doctor [--json] [--strict] [--skip-trace2-checks] [--report <file>]
+autter doctor --agent <name> [--json]
 
   Run setup validation checks: git and config, the background service,
   trace2 capture, a real end-to-end checkpoint round-trip, AI agent hooks,
   and login/connectivity. Every failed check prints a concrete fix.
+
+  --agent <name> checks one agent instead: whether it is detected, the hook
+  files autter manages for it, whether each hook command runs, and a
+  simulated edit (the agent's own pre- and post-edit hook calls, in a
+  throwaway repository) that must reach the background service as an AI
+  checkpoint. Names: claude-code (or claude), codex, cursor, github-copilot
+  (or copilot), amp, opencode, pi, gemini, droid, firebender, antigravity,
+  windsurf, vscode, jetbrains. See docs/agents.md.
 
   Exits 0 when no check fails (warnings allowed), 1 when any check fails.
   With --strict, exits 4 instead when a check capture depends on fails

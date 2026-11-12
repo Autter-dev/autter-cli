@@ -109,6 +109,10 @@ fn main() {
         {
             auth::notice::maybe_warn_logged_out();
         }
+        // Setup not finished, an agent installed since onboarding, or (npm
+        // installs) a newer release: one line each, only for a person at a
+        // terminal on an everyday command.
+        commands::setup_notices::maybe_print(&cli.args);
         // First command after an upgrade: refresh the hooks of agents the user
         // already set up, in the background, so no hook keeps calling a binary
         // or preset from the previous version.
