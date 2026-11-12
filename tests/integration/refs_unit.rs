@@ -570,3 +570,178 @@ fn test_get_reference_as_authorship_log_v3_version_mismatch() {
         panic!("Expected version mismatch error");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ordering of commits made in the same second
+// ---------------------------------------------------------------------------
+
+const SAME_SECOND: [(&str, &str); 2] = [
+    ("GIT_AUTHOR_DATE", "2030-01-01T00:00:00Z"),
+    ("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z"),
+];
+
+/// An empty commit at the shared timestamp, made with plain git so nothing
+/// but the test writes its note.
+fn same_second_commit(repo: &TestRepo, message: &str) -> String {
+    repo.git_og_with_env(&["commit", "--allow-empty", "-m", message], &SAME_SECOND)
+        .unwrap_or_else(|e| panic!("commit {message}: {e}"));
+    head_sha(repo)
+}
+
+fn position(results: &[String], sha: &str) -> usize {
+    results
+        .iter()
+        .position(|candidate| candidate == sha)
+        .unwrap_or_else(|| panic!("{sha} missing from {results:?}"))
+}
+
+/// What the documented rule gives for commits tied on time: repeatedly list
+/// the smallest SHA among the commits whose tied descendants are all listed.
+/// `children` maps a commit to its descendants within the tie.
+fn expected_tie_order(commits: &[&String], descendants: &[(&String, &String)]) -> Vec<String> {
+    let mut listed: Vec<String> = Vec::new();
+    while listed.len() < commits.len() {
+        let next = commits
+            .iter()
+            .filter(|commit| !listed.contains(**commit))
+            .filter(|commit| {
+                descendants
+                    .iter()
+                    .filter(|(ancestor, _)| ancestor == *commit)
+                    .all(|(_, descendant)| listed.contains(*descendant))
+            })
+            .min()
+            .expect("history has no cycles");
+        listed.push((*next).clone());
+    }
+    listed
+}
+
+/// A, its child B and a commit X on another branch all share one second. B
+/// must come before A in every run, and X (related to neither) must land in
+/// the same, documented place in every run. An insertion sort over "is
+/// ancestor" fed from a hash set got this wrong in about a quarter of runs.
+#[test]
+fn test_grep_ai_notes_same_second_commits_follow_history_past_an_unrelated_branch() {
+    let (repo, autter_repo) = repo_with_handle();
+    repo.git_og(&["commit", "--allow-empty", "-m", "init"])
+        .expect("init");
+    let main = repo.current_branch();
+
+    let commit_a = same_second_commit(&repo, "A");
+    repo.git_og(&["checkout", "-q", "-b", "other", "HEAD~1"])
+        .expect("branch other from init");
+    let commit_x = same_second_commit(&repo, "X");
+    repo.git_og(&["checkout", "-q", &main])
+        .expect("back to main");
+    let commit_b = same_second_commit(&repo, "B");
+
+    let note = "{\"session\":\"s_sameSecond\"}";
+    for sha in [&commit_a, &commit_b, &commit_x] {
+        notes_add(&autter_repo, sha, note).expect("add note");
+    }
+
+    let expected = expected_tie_order(
+        &[&commit_a, &commit_b, &commit_x],
+        &[(&commit_a, &commit_b)],
+    );
+    for run in 0..40 {
+        let results = grep_ai_notes(&autter_repo, "s_sameSecond").expect("grep");
+        assert!(
+            position(&results, &commit_b) < position(&results, &commit_a),
+            "run {run}: the child B must come before its parent A: {results:?}"
+        );
+        assert_eq!(results, expected, "run {run}: order must not vary");
+    }
+}
+
+/// A merge made in the same second as both of its parents comes first, each
+/// side stays in history order, and a commit related only through a commit
+/// that has no matching note is still ordered after its descendant.
+#[test]
+fn test_grep_ai_notes_same_second_merge_comes_before_both_sides() {
+    let (repo, autter_repo) = repo_with_handle();
+    repo.git_og(&["commit", "--allow-empty", "-m", "init"])
+        .expect("init");
+    let main = repo.current_branch();
+
+    // main: A <- K (no note) <- B.   other: X <- Y.   M merges other into main.
+    let commit_a = same_second_commit(&repo, "A");
+    let _commit_k = same_second_commit(&repo, "K, no matching note");
+    let commit_b = same_second_commit(&repo, "B");
+    repo.git_og(&["checkout", "-q", "-b", "other", "HEAD~3"])
+        .expect("branch other from init");
+    let commit_x = same_second_commit(&repo, "X");
+    let commit_y = same_second_commit(&repo, "Y");
+    repo.git_og(&["checkout", "-q", &main])
+        .expect("back to main");
+    repo.git_og_with_env(&["merge", "--no-ff", "-m", "M", "other"], &SAME_SECOND)
+        .expect("merge other");
+    let commit_m = head_sha(&repo);
+
+    let note = "{\"session\":\"s_mergeTie\"}";
+    for sha in [&commit_a, &commit_b, &commit_x, &commit_y, &commit_m] {
+        notes_add(&autter_repo, sha, note).expect("add note");
+    }
+
+    let expected = expected_tie_order(
+        &[&commit_a, &commit_b, &commit_x, &commit_y, &commit_m],
+        &[
+            (&commit_a, &commit_b),
+            (&commit_a, &commit_m),
+            (&commit_b, &commit_m),
+            (&commit_x, &commit_y),
+            (&commit_x, &commit_m),
+            (&commit_y, &commit_m),
+        ],
+    );
+    for run in 0..25 {
+        let results = grep_ai_notes(&autter_repo, "s_mergeTie").expect("grep");
+        assert_eq!(results[0], commit_m, "run {run}: the merge is newest");
+        assert!(
+            position(&results, &commit_b) < position(&results, &commit_a),
+            "run {run}: B descends from A through K, which has no note: {results:?}"
+        );
+        assert!(
+            position(&results, &commit_y) < position(&results, &commit_x),
+            "run {run}: {results:?}"
+        );
+        assert_eq!(results, expected, "run {run}: order must not vary");
+    }
+}
+
+/// A later second still beats history order, and ties elsewhere in the list
+/// are ordered on their own.
+#[test]
+fn test_grep_ai_notes_orders_by_time_before_history() {
+    let (repo, autter_repo) = repo_with_handle();
+    let at = |second: &str| {
+        let date = format!("2030-01-01T00:00:{second}Z");
+        repo.git_og_with_env(
+            &["commit", "--allow-empty", "-m", second],
+            &[("GIT_AUTHOR_DATE", &date), ("GIT_COMMITTER_DATE", &date)],
+        )
+        .expect("commit");
+        head_sha(&repo)
+    };
+    let first = at("01");
+    let tied_parent = at("02");
+    let tied_child = at("02");
+    let last = at("03");
+    for sha in [&first, &tied_parent, &tied_child, &last] {
+        notes_add(&autter_repo, sha, "{\"session\":\"s_timeFirst\"}").expect("add note");
+    }
+
+    for _ in 0..10 {
+        let results = grep_ai_notes(&autter_repo, "s_timeFirst").expect("grep");
+        assert_eq!(
+            results,
+            vec![
+                last.clone(),
+                tied_child.clone(),
+                tied_parent.clone(),
+                first.clone()
+            ]
+        );
+    }
+}
