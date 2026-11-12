@@ -1711,8 +1711,20 @@ pub(crate) fn daemon_binary_is_stale(config: &crate::daemon::DaemonConfig) -> Re
     Ok(binary_modified_ns > started_at_ns)
 }
 
+/// Where the service writes its pid and start time: next to its lock, the
+/// way `daemon.rs` does. With long paths on macOS and Linux that is the short
+/// temp folder, not `~/.autter/internal/daemon`, which is where this used to
+/// look (so the start time, and an outdated binary, went unseen there).
+pub(crate) fn daemon_pid_metadata_path(config: &crate::daemon::DaemonConfig) -> std::path::PathBuf {
+    config
+        .lock_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("daemon.pid.json")
+}
+
 fn read_daemon_started_at_ns(config: &crate::daemon::DaemonConfig) -> Result<Option<u128>, String> {
-    let pid_path = config.internal_dir.join("daemon").join("daemon.pid.json");
+    let pid_path = daemon_pid_metadata_path(config);
     let contents = match fs::read_to_string(&pid_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
