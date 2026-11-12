@@ -957,6 +957,7 @@ fn is_known_checkpoint_preset(arg: &str) -> bool {
             | "agent-v1"
             | "antigravity-pre"
             | "antigravity-post"
+            | "kiro"
     )
 }
 
