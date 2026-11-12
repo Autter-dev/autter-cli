@@ -21,14 +21,16 @@ use crate::git::repository::{
     is_no_repository_discovered_error,
 };
 use crate::git::rewrite_log::{
-    CherryPickAbortEvent, CherryPickCompleteEvent, ConflictedFileStages, MergeSquashEvent,
-    RebaseAbortEvent, RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent,
-    StashOperation,
+    CherryPickAbortEvent, CherryPickCompleteEvent, MergeSquashEvent, RebaseAbortEvent,
+    RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent, StashOperation,
 };
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::LockFile;
 use crate::{
-    authorship::no_commit_pick::carry_no_commit_pick_into_working_log,
+    authorship::no_commit_pick::{
+        carry_no_commit_pick_into_working_log, forget_paths_taken_from_picked_side,
+        no_commit_pick_lines_remain, record_paths_taken_from_picked_side,
+    },
     authorship::post_commit::post_commit_with_final_state,
     authorship::rebase_authorship::{
         committed_file_snapshot_between_commits, prepare_working_log_after_squash_from_final_state,
@@ -792,6 +794,7 @@ fn trace_command_may_mutate_refs(primary_command: Option<&str>) -> bool {
                 | "push"
                 | "rebase"
                 | "reset"
+                | "restore"
                 | "stash"
                 | "switch"
         )
@@ -2272,9 +2275,21 @@ fn preceding_merge_squashes_for_pending_commit(
     repo: &Repository,
     base_commit: &str,
 ) -> Result<Vec<MergeSquashEvent>, AutterError> {
-    let mut pending = Vec::new();
     // The rewrite log is read newest event first.
-    for event in repo.storage.read_rewrite_events()? {
+    Ok(merge_squashes_pending_on(
+        repo.storage.read_rewrite_events()?,
+        base_commit,
+    ))
+}
+
+/// The squash events waiting for a commit on `base_commit` at the point of
+/// the rewrite log where `newest_first` starts, oldest first.
+fn merge_squashes_pending_on(
+    newest_first: impl IntoIterator<Item = RewriteLogEvent>,
+    base_commit: &str,
+) -> Vec<MergeSquashEvent> {
+    let mut pending = Vec::new();
+    for event in newest_first {
         match event {
             RewriteLogEvent::AuthorshipLogsSynced { .. } => continue,
             RewriteLogEvent::Commit { .. } | RewriteLogEvent::CommitAmend { .. } => continue,
@@ -2298,7 +2313,88 @@ fn preceding_merge_squashes_for_pending_commit(
         }
     }
     pending.reverse();
+    pending
+}
+
+/// The `git cherry-pick -n` runs still waiting for a commit on `head`.
+fn pending_no_commit_picks(
+    repo: &Repository,
+    head: &str,
+) -> Result<Vec<MergeSquashEvent>, AutterError> {
+    let mut pending = preceding_merge_squashes_for_pending_commit(repo, head)?;
+    pending.retain(|pick| pick.preserve_working_log);
     Ok(pending)
+}
+
+/// Throws away the `git cherry-pick -n` runs pending on `head`: the next
+/// commit carries nothing of them. `stashed_as` names the stash they went into,
+/// when a stash took them away.
+fn cancel_pending_no_commit_picks(
+    repo: &Repository,
+    head: &str,
+    stashed_as: Option<&str>,
+) -> Result<(), AutterError> {
+    let mut abort = CherryPickAbortEvent::new(head.to_string());
+    if let Some(stash_sha) = stashed_as {
+        abort = abort.stashed_as(stash_sha.to_string());
+    }
+    repo.storage
+        .append_rewrite_event(RewriteLogEvent::cherry_pick_abort(abort))?;
+    forget_paths_taken_from_picked_side(repo, head);
+    Ok(())
+}
+
+/// Whether the working tree still holds any line one of `picks` brought.
+fn working_tree_holds_no_commit_picks(
+    repo: &Repository,
+    worktree: &Path,
+    head: &str,
+    picks: &[MergeSquashEvent],
+) -> Result<bool, AutterError> {
+    let read_content = |path: &str| std::fs::read_to_string(worktree.join(path)).ok();
+    for pick in picks {
+        if no_commit_pick_lines_remain(repo, pick, head, read_content)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Applying `stash_sha` on `head` brings back the `git cherry-pick -n` runs
+/// that stash took away from that commit: records them as pending again.
+fn restore_no_commit_picks_from_stash(
+    repo: &Repository,
+    head: &str,
+    stash_sha: &str,
+) -> Result<(), AutterError> {
+    let events = repo.storage.read_rewrite_events()?;
+    let Some(stashed_at) = events.iter().position(|event| {
+        matches!(
+            event,
+            RewriteLogEvent::CherryPickAbort { cherry_pick_abort }
+                if cherry_pick_abort.original_head == head
+                    && cherry_pick_abort.stashed_as.as_deref() == Some(stash_sha)
+        )
+    }) else {
+        return Ok(());
+    };
+    let picks: Vec<MergeSquashEvent> =
+        merge_squashes_pending_on(events.into_iter().skip(stashed_at + 1), head)
+            .into_iter()
+            .filter(|pick| pick.preserve_working_log)
+            .collect();
+    if picks.is_empty() {
+        return Ok(());
+    }
+    if pending_no_commit_picks(repo, head)? == picks {
+        return Ok(());
+    }
+    for pick in picks {
+        repo.storage
+            .append_rewrite_event(RewriteLogEvent::merge_squash(pick))?;
+    }
+    crate::authorship::rebase_authorship::mark_pending_no_commit_pick(repo, head)?;
+    Ok(())
 }
 
 fn latest_reset_for_base_commit(
@@ -2738,6 +2834,7 @@ fn seed_merge_squash_working_log_for_commit_replay(
         )?;
         replace_working_log = false;
     }
+    forget_paths_taken_from_picked_side(repo, base_commit);
     Ok(())
 }
 
@@ -3701,45 +3798,6 @@ fn distinct_cherry_pick_lines_of_history(
     distinct
 }
 
-/// The files the index holds as conflicted, with the blob of each side. Empty
-/// when the conflicts were already resolved by the time this runs.
-fn conflicted_index_stages(worktree: &Path) -> BTreeMap<String, ConflictedFileStages> {
-    let mut conflicted = BTreeMap::new();
-    let args = [
-        "-C",
-        worktree.to_string_lossy().as_ref(),
-        "ls-files",
-        "--unmerged",
-        "--full-name",
-        "-z",
-    ]
-    .map(str::to_string);
-    let Ok(output) = exec_git(&args) else {
-        return conflicted;
-    };
-    // Each record is "<mode> <blob> <stage>\t<path>".
-    for record in String::from_utf8_lossy(&output.stdout).split('\0') {
-        let Some((meta, path)) = record.split_once('\t') else {
-            continue;
-        };
-        let mut meta = meta.split_whitespace();
-        let (Some(_mode), Some(blob), Some(stage)) = (meta.next(), meta.next(), meta.next()) else {
-            continue;
-        };
-        if !is_valid_oid(blob) {
-            continue;
-        }
-        let stages: &mut ConflictedFileStages = conflicted.entry(path.to_string()).or_default();
-        match stage {
-            "1" => stages.base = Some(blob.to_string()),
-            "2" => stages.ours = Some(blob.to_string()),
-            "3" => stages.theirs = Some(blob.to_string()),
-            _ => {}
-        }
-    }
-    conflicted
-}
-
 /// Git dir of the worktree (per-worktree, so linked worktrees each get their
 /// own), found without spawning git. Used for small state files that must
 /// outlive the daemon.
@@ -3932,6 +3990,311 @@ fn repo_is_ancestor(
     args.push(ancestor.to_string());
     args.push(descendant.to_string());
     exec_git(&args).is_ok()
+}
+
+/// What a command that left HEAD where it was did to uncommitted work.
+///
+/// - `git reset --hard` threw every change to a tracked file away: a pending
+///   `git cherry-pick -n` is cancelled. (`--merge` and `--keep` onto HEAD
+///   itself leave the working tree alone.)
+/// - `git checkout` / `git restore` of paths that leaves the tree without any
+///   line a pending pick brought (`checkout HEAD -- .`, `restore --staged
+///   --worktree .`) cancels it. `checkout --theirs` / `restore --theirs`
+///   record the paths resolved by taking the picked side.
+/// - `git stash` that takes a pending pick away cancels it, naming the stash;
+///   applying that stash on the same commit brings the pick back.
+fn apply_tree_discard_side_effects(
+    cmd: &crate::daemon::domain::NormalizedCommand,
+    events: &[crate::daemon::domain::SemanticEvent],
+    stash_events: &[StashEvent],
+) -> Result<(), AutterError> {
+    let Some(worktree) = cmd.worktree.as_deref() else {
+        return Ok(());
+    };
+    let primary = cmd.primary_command.as_deref();
+    if !matches!(
+        primary,
+        Some("reset" | "checkout" | "switch" | "restore" | "stash")
+    ) {
+        return Ok(());
+    }
+    // A stash that stopped on a conflict was still applied.
+    if primary != Some("stash") && cmd.exit_code != 0 {
+        return Ok(());
+    }
+    let repo = find_repository_in_path(&worktree.to_string_lossy())?;
+
+    if primary == Some("stash") {
+        for stash in stash_events {
+            let (Some(head), Some(stash_sha)) =
+                (stash.head_sha.as_deref(), stash.stash_sha.as_deref())
+            else {
+                continue;
+            };
+            match stash.operation {
+                StashOperation::Create => {
+                    let picks = pending_no_commit_picks(&repo, head)?;
+                    if picks.is_empty() {
+                        continue;
+                    }
+                    // A plain stash leaves every tracked file as HEAD has it.
+                    // One that keeps something behind is checked against the
+                    // tree.
+                    let keeps_some = !stash.pathspecs.is_empty()
+                        || cmd.invoked_args.iter().any(|arg| {
+                            matches!(
+                                arg.as_str(),
+                                "-k" | "--keep-index" | "-p" | "--patch" | "-S" | "--staged"
+                            )
+                        });
+                    if !keeps_some
+                        || !working_tree_holds_no_commit_picks(&repo, worktree, head, &picks)?
+                    {
+                        cancel_pending_no_commit_picks(&repo, head, Some(stash_sha))?;
+                    }
+                }
+                StashOperation::Apply | StashOperation::Pop | StashOperation::Branch => {
+                    restore_no_commit_picks_from_stash(&repo, head, stash_sha)?;
+                }
+                StashOperation::Drop | StashOperation::List => {}
+            }
+        }
+        return Ok(());
+    }
+
+    // Only commands that left HEAD in place; a move is handled as such.
+    let post_head = cmd
+        .post_repo
+        .as_ref()
+        .and_then(|repo| repo.head.clone())
+        .or_else(|| {
+            // `restore` never moves HEAD and is not snapshotted.
+            (primary == Some("restore"))
+                .then(|| repo.head().ok()?.target().ok())
+                .flatten()
+        });
+    let Some(head) = post_head.filter(|head| is_valid_oid(head) && !is_zero_oid(head)) else {
+        return Ok(());
+    };
+    if let Some(pre_head) = cmd.pre_repo.as_ref().and_then(|repo| repo.head.as_deref())
+        && pre_head != head
+    {
+        return Ok(());
+    }
+    if events
+        .iter()
+        .any(|event| matches!(event, crate::daemon::domain::SemanticEvent::Reset { .. }))
+    {
+        return Ok(());
+    }
+
+    let picks = pending_no_commit_picks(&repo, &head)?;
+    if primary == Some("reset") {
+        if cmd.invoked_args.iter().any(|arg| arg == "--hard") && !picks.is_empty() {
+            cancel_pending_no_commit_picks(&repo, &head, None)?;
+        }
+        return Ok(());
+    }
+
+    if picks.is_empty() {
+        return Ok(());
+    }
+    if let Some(pathspecs) = paths_taken_from_picked_side(cmd) {
+        return record_paths_taken_from_picked_side(&repo, &head, &pathspecs);
+    }
+    let Some(restored) = restored_paths(&repo, cmd, &head) else {
+        return Ok(());
+    };
+    // The restored files hold what the command wrote, read from where it read
+    // it, so this does not depend on what was typed since; the other files
+    // are read from the working tree.
+    let read_content = |path: &str| {
+        if !path_matches_any_pathspec(path, &restored.pathspecs) {
+            return std::fs::read_to_string(worktree.join(path)).ok();
+        }
+        match &restored.source {
+            RestoreSource::Commit(commit) => repo
+                .get_file_content(path, commit)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+            RestoreSource::Index => repo
+                .get_file_content(path, "")
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+        }
+    };
+    for pick in &picks {
+        if no_commit_pick_lines_remain(&repo, pick, &head, read_content)? {
+            return Ok(());
+        }
+    }
+    cancel_pending_no_commit_picks(&repo, &head, None)
+}
+
+/// Where `git checkout <paths>` / `git restore <paths>` took the content it
+/// wrote to the working tree from.
+enum RestoreSource {
+    Commit(String),
+    Index,
+}
+
+struct RestoredPaths {
+    source: RestoreSource,
+    /// Relative to the repository root; `.` is all of it.
+    pathspecs: Vec<String>,
+}
+
+/// The paths `git checkout [<tree-ish>] [--] <paths>` or `git restore
+/// [--source=<tree-ish>] [--staged] [--worktree] <paths>` wrote to the working
+/// tree, and where it took them from. `None` for any other command, a branch
+/// switch, and a restore of the index alone.
+fn restored_paths(
+    repo: &Repository,
+    cmd: &crate::daemon::domain::NormalizedCommand,
+    head: &str,
+) -> Option<RestoredPaths> {
+    let primary = cmd.primary_command.as_deref()?;
+    if !matches!(primary, "checkout" | "restore") {
+        return None;
+    }
+    let mut operands = Vec::new();
+    let mut after_separator = Vec::new();
+    let mut separator_seen = false;
+    let mut source = None;
+    let mut staged = false;
+    let mut worktree = false;
+    let mut args = cmd.invoked_args.iter();
+    while let Some(arg) = args.next() {
+        if separator_seen {
+            after_separator.push(arg.clone());
+        } else if arg == "--" {
+            separator_seen = true;
+        } else if matches!(arg.as_str(), "-s" | "--source") {
+            source = args.next().cloned();
+        } else if let Some(value) = arg.strip_prefix("--source=") {
+            source = Some(value.to_string());
+        } else if matches!(arg.as_str(), "-S" | "--staged") {
+            staged = true;
+        } else if matches!(arg.as_str(), "-W" | "--worktree") {
+            worktree = true;
+        } else if matches!(arg.as_str(), "--pathspec-from-file" | "--conflict") {
+            args.next();
+        } else if arg.starts_with('-') {
+            // `-b`, `-p`, `--ours`, ...: not a plain restore of paths.
+            if matches!(arg.as_str(), "-b" | "-B" | "--orphan" | "-p" | "--patch") {
+                return None;
+            }
+        } else {
+            operands.push(arg.clone());
+        }
+    }
+
+    let (source, pathspecs) = if primary == "restore" {
+        if staged && !worktree {
+            return None;
+        }
+        let pathspecs: Vec<String> = operands.into_iter().chain(after_separator).collect();
+        let source = match source {
+            Some(tree_ish) => RestoreSource::Commit(tree_ish),
+            None if staged => RestoreSource::Commit("HEAD".to_string()),
+            None => RestoreSource::Index,
+        };
+        (source, pathspecs)
+    } else if separator_seen {
+        match operands.as_slice() {
+            [] => (RestoreSource::Index, after_separator),
+            [tree_ish] => (RestoreSource::Commit(tree_ish.clone()), after_separator),
+            _ => return None,
+        }
+    } else {
+        // Without `--`, a first operand naming a commit is the tree-ish when
+        // paths follow it; otherwise every operand is a path. A lone operand
+        // naming a branch is a switch.
+        let names_commit = |name: &str| {
+            let mut args = repo.global_args_for_exec();
+            args.extend([
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                format!("{}^{{commit}}", name),
+            ]);
+            exec_git(&args).is_ok()
+        };
+        match operands.split_first() {
+            None => return None,
+            Some((first, [])) if names_commit(first) => return None,
+            Some((first, rest)) if names_commit(first) => {
+                (RestoreSource::Commit(first.clone()), rest.to_vec())
+            }
+            Some(_) => (RestoreSource::Index, operands),
+        }
+    };
+    if pathspecs.is_empty() {
+        return None;
+    }
+    let source = match source {
+        // HEAD as the command saw it: it may have moved since.
+        RestoreSource::Commit(tree_ish) if matches!(tree_ish.as_str(), "HEAD" | "@") => {
+            RestoreSource::Commit(head.to_string())
+        }
+        RestoreSource::Commit(tree_ish) => {
+            let mut args = repo.global_args_for_exec();
+            args.extend([
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                format!("{}^{{commit}}", tree_ish),
+            ]);
+            let output = exec_git(&args).ok()?;
+            RestoreSource::Commit(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        RestoreSource::Index => RestoreSource::Index,
+    };
+    Some(RestoredPaths { source, pathspecs })
+}
+
+/// Whether `path` (relative to the repository root) falls under one of
+/// `pathspecs`, `.` being the whole repository.
+fn path_matches_any_pathspec(path: &str, pathspecs: &[String]) -> bool {
+    pathspecs.iter().any(|spec| {
+        let spec = spec.trim_start_matches("./").trim_end_matches('/');
+        spec.is_empty()
+            || spec == "."
+            || path == spec
+            || path
+                .strip_prefix(spec)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// The paths of `git checkout --theirs <paths>` / `git restore --theirs
+/// <paths>`: a conflict resolved by taking the picked side. `None` for any
+/// other command.
+fn paths_taken_from_picked_side(
+    cmd: &crate::daemon::domain::NormalizedCommand,
+) -> Option<Vec<String>> {
+    if !matches!(cmd.primary_command.as_deref(), Some("checkout" | "restore"))
+        || !cmd.invoked_args.iter().any(|arg| arg == "--theirs")
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut only_paths = false;
+    let mut skip_value = false;
+    for arg in &cmd.invoked_args {
+        if only_paths {
+            paths.push(arg.clone());
+        } else if skip_value {
+            skip_value = false;
+        } else if arg == "--" {
+            only_paths = true;
+        } else if matches!(arg.as_str(), "-s" | "--source" | "--pathspec-from-file") {
+            skip_value = true;
+        } else if !arg.starts_with('-') {
+            paths.push(arg.clone());
+        }
+    }
+    Some(paths)
 }
 
 fn apply_reset_working_log_side_effect(
@@ -4899,6 +5262,7 @@ impl ActorDaemonCoordinator {
                     | "rebase"
                     | "remote"
                     | "reset"
+                    | "restore"
                     | "revert"
                     | "stash"
                     | "switch"
@@ -7311,7 +7675,9 @@ impl ActorDaemonCoordinator {
     /// attribution instead of recording the picked lines as untracked.
     ///
     /// A pick that stopped on a conflict still applied everything that merged
-    /// cleanly, so it is recorded too, along with the files it left conflicted.
+    /// cleanly, so it is recorded too. What it applied is worked out from the
+    /// picked commits when the next commit is made, not from the index, which
+    /// may already hold the resolution by the time this runs.
     fn synthesize_cherry_pick_no_commit_squash_event(
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<Option<MergeSquashEvent>, AutterError> {
@@ -7340,6 +7706,7 @@ impl ActorDaemonCoordinator {
             }
             Err(error) => return Err(error),
         };
+        let applied_commits = sources.clone();
         let sources = match find_repository_in_path(&worktree.to_string_lossy()) {
             Ok(repository) => distinct_cherry_pick_lines_of_history(&repository, sources),
             Err(_) => sources,
@@ -7372,10 +7739,7 @@ impl ActorDaemonCoordinator {
         if sources.len() > 1 {
             event = event.with_picked_commits(sources);
         }
-        if stopped {
-            event = event.with_conflicted_files(conflicted_index_stages(worktree));
-        }
-        Ok(Some(event))
+        Ok(Some(event.with_applied_commits(applied_commits)))
     }
 
     fn rewrite_events_from_semantic_events(
@@ -7905,51 +8269,8 @@ impl ActorDaemonCoordinator {
         if let Some(merge_squash) = implicit_merge_squash {
             out.push(RewriteLogEvent::merge_squash(merge_squash));
         }
-        if out.is_empty()
-            && let Some(discarded) = Self::synthesize_discarded_no_commit_pick_event(cmd)?
-        {
-            out.push(discarded);
-        }
 
         Ok(out)
-    }
-
-    /// `git reset --hard` (or `--merge` / `--keep`) that leaves HEAD where it is
-    /// throws away what an earlier `git cherry-pick -n` applied. Record it as an
-    /// abort of that pick, so the next commit does not hand the picked commits'
-    /// attribution to lines typed again by hand.
-    fn synthesize_discarded_no_commit_pick_event(
-        cmd: &crate::daemon::domain::NormalizedCommand,
-    ) -> Result<Option<RewriteLogEvent>, AutterError> {
-        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("reset") {
-            return Ok(None);
-        }
-        let discards_tree = cmd
-            .invoked_args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--hard" | "--merge" | "--keep"));
-        if !discards_tree {
-            return Ok(None);
-        }
-        let Some(head) = cmd
-            .post_repo
-            .as_ref()
-            .and_then(|repo| repo.head.clone())
-            .filter(|head| is_valid_oid(head) && !is_zero_oid(head))
-        else {
-            return Ok(None);
-        };
-        let Some(worktree) = cmd.worktree.as_deref() else {
-            return Ok(None);
-        };
-        let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-        let pending = preceding_merge_squashes_for_pending_commit(&repo, &head)?;
-        if !pending.iter().any(|pick| pick.preserve_working_log) {
-            return Ok(None);
-        }
-        Ok(Some(RewriteLogEvent::cherry_pick_abort(
-            CherryPickAbortEvent::new(head),
-        )))
     }
 
     async fn maybe_apply_side_effects_for_applied_command(
@@ -8313,6 +8634,13 @@ impl ActorDaemonCoordinator {
         let agent_env = crate::authorship::background_agent::AgentEnv::from_pairs(
             cmd.agent_env.iter().flatten(),
         );
+        let stash_events: Vec<StashEvent> = rewrite_events
+            .iter()
+            .filter_map(|event| match event {
+                RewriteLogEvent::Stash { stash } => Some(stash.clone()),
+                _ => None,
+            })
+            .collect();
         for rewrite_event in rewrite_events {
             if let Some(worktree) = cmd.worktree.as_ref() {
                 let worktree = worktree.to_string_lossy().to_string();
@@ -8327,6 +8655,8 @@ impl ActorDaemonCoordinator {
                 )?;
             }
         }
+
+        apply_tree_discard_side_effects(cmd, events, &stash_events)?;
 
         if let Some((new_head, carried_va, snapshot)) = deferred_rewrite_carryover
             && let Some(worktree) = cmd.worktree.as_ref()
