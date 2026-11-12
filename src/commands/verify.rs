@@ -2,7 +2,8 @@
 //! authorship notes (see `authorship::note_integrity`).
 //!
 //! Exit codes: 0 when no note fails; [`EXIT_INTEGRITY_FAILED`] (5) when a note
-//! belongs to another commit or was changed. Missing and legacy notes are
+//! belongs to another commit, was changed, or was carried by a rewrite from a
+//! note that failed. Missing and legacy notes are
 //! warnings, also with `--strict` for now (a later release will fail them
 //! under `--strict`).
 
@@ -184,7 +185,7 @@ fn print_human(target: &str, results: &[CommitIntegrity], strict: bool) {
     );
     if failed > 0 {
         eprintln!(
-            "A failed note does not belong to its commit or was changed after autter wrote it; stats and blame count its lines as unknown."
+            "A failed note does not belong to its commit, was changed after autter wrote it, or was carried by a rewrite from a note that failed; stats and blame count its lines as unknown."
         );
     }
 }
