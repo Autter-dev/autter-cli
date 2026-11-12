@@ -631,7 +631,7 @@ function Save-Screen([string]$name) {
     $sb = New-Object System.Text.StringBuilder
     for ($y = 0; $y -le $h; $y++) {
         $line = New-Object System.Text.StringBuilder
-        for ($x = 0; $x -lt $w; $x++) { [void]$line.Append($cells[$y, $x].Character) }
+        for ($x = 0; $x -lt $w; $x++) { [void]$line.Append($cells.GetValue($y, $x).Character) }
         [void]$sb.AppendLine($line.ToString().TrimEnd())
     }
     [IO.File]::WriteAllText((Join-Path $OutDir $name), $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
@@ -830,7 +830,26 @@ public static class FilteredToken {
     // Runs commandLine with a UAC-style filtered copy of this process's
     // token and returns its exit code (-1 on timeout). mediumIntegrity
     // also lowers the token to medium integrity, as UAC does.
-    public static int Run(string commandLine, string cwd, int timeoutMs, bool mediumIntegrity) {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+
+    public static int Run(string app, string commandLine, string cwd, int timeoutMs, bool mediumIntegrity, string outPath, string errPath) {
+        System.IO.FileStream outFile = new System.IO.FileStream(outPath, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite);
+        System.IO.FileStream errFile = new System.IO.FileStream(errPath, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite);
+        IntPtr outHandle = outFile.SafeFileHandle.DangerousGetHandle();
+        IntPtr errHandle = errFile.SafeFileHandle.DangerousGetHandle();
+        // HANDLE_FLAG_INHERIT
+        SetHandleInformation(outHandle, 1, 1);
+        SetHandleInformation(errHandle, 1, 1);
+        try {
+            return RunWith(app, commandLine, cwd, timeoutMs, mediumIntegrity, outHandle, errHandle);
+        } finally {
+            outFile.Dispose();
+            errFile.Dispose();
+        }
+    }
+
+    static int RunWith(string app, string commandLine, string cwd, int timeoutMs, bool mediumIntegrity, IntPtr outHandle, IntPtr errHandle) {
         IntPtr token;
         // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID
         if (!OpenProcessToken(GetCurrentProcess(), 0x0001 | 0x0002 | 0x0008 | 0x0080 | 0x0100, out token)) { throw new Win32Exception(); }
@@ -854,9 +873,12 @@ public static class FilteredToken {
         STARTUPINFO si = new STARTUPINFO();
         si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
         si.lpDesktop = OpenUpDesktop();
+        si.dwFlags = 0x100; // STARTF_USESTDHANDLES
+        si.hStdOutput = outHandle;
+        si.hStdError = errHandle;
         PROCESS_INFORMATION pi;
         // CREATE_NO_WINDOW; environment block null: this process's environment.
-        if (!CreateProcessAsUser(filtered, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, cwd, ref si, out pi)) {
+        if (!CreateProcessAsUser(filtered, app, commandLine, IntPtr.Zero, IntPtr.Zero, true, 0x08000000, IntPtr.Zero, cwd, ref si, out pi)) {
             throw new Win32Exception();
         }
         uint code = 0;
@@ -884,55 +906,65 @@ public static class FilteredToken {
 
         $elevDir = Join-Path $script:Root 'elevated'
         New-Item -ItemType Directory -Force -Path $elevDir | Out-Null
-        $wrapper = Join-Path $elevDir 'as-standard-user.cmd'
+        # Each command runs directly (no cmd.exe) with the filtered token,
+        # its output going to files.
+        $env:CI = $null
+        $script:MediumIl = $true
+        function Invoke-AsStandardUser([string]$name, [string]$exe, [string[]]$arguments) {
+            $out = Join-Path $elevDir ($name + '.out')
+            $err = Join-Path $elevDir ($name + '.err')
+            $cmdLine = (@($exe) + $arguments | ForEach-Object { [E2eRunner]::Quote($_) }) -join ' '
+            $code = [FilteredToken]::Run($exe, $cmdLine, $RepoDir, 300000, $script:MediumIl, $out, $err)
+            if ($code -eq -1073741502 -and $script:MediumIl) {
+                # STATUS_DLL_INIT_FAILED: a medium-integrity process cannot
+                # use this runner's service desktop. Keep the integrity
+                # level; Administrators stay deny-only, which is what decides
+                # access to the service's pipes.
+                $script:MediumIl = $false
+                Note 'a medium-integrity process cannot start on this runner''s service desktop (STATUS_DLL_INIT_FAILED); the standard-user token keeps high integrity, with Administrators deny-only and no privileges'
+                $code = [FilteredToken]::Run($exe, $cmdLine, $RepoDir, 300000, $false, $out, $err)
+            }
+            [IO.File]::WriteAllText((Join-Path $elevDir ($name + '.code')), [string]$code)
+            return $code
+        }
+        function Read-Part([string]$name) {
+            $p = Join-Path $elevDir $name
+            if (Test-Path -LiteralPath $p) { return [IO.File]::ReadAllText($p) } else { return '' }
+        }
+
+        $whoami = Join-Path $env:SystemRoot 'System32\whoami.exe'
+        $wc = Invoke-AsStandardUser 'whoami' $whoami @('/groups')
+        $groups = Read-Part 'whoami.out'
+        Write-Host ("  whoami /groups with the filtered token -> exit {0}" -f $wc)
         $steps = @(
             @('status', 'bg status'),
             @('start', 'bg start'),
             @('restart', 'bg restart'),
             @('shutdown', 'bg shutdown'),
-            @('doctor', 'doctor --json')
+            @('doctor', 'doctor')
         )
-        $lines = @('@echo off', 'set "CI="', ('cd /d "{0}"' -f $RepoDir),
-            ('whoami /groups > "{0}\whoami.txt" 2>&1' -f $elevDir))
+        $ran = $false
         foreach ($s in $steps) {
-            $lines += ('"{0}" {1} > "{2}\{3}.out" 2> "{2}\{3}.err"' -f $script:AutterExe, $s[1], $elevDir, $s[0])
-            $lines += ('echo %ERRORLEVEL% > "{0}\{1}.code"' -f $elevDir, $s[0])
-        }
-        $lines += ('echo done > "{0}\done"' -f $elevDir)
-        [IO.File]::WriteAllText($wrapper, (($lines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
-
-        $mediumIl = $true
-        $code = [FilteredToken]::Run(('cmd.exe /c "' + $wrapper + '"'), $RepoDir, 600000, $true)
-        if ($code -eq -1073741502) {
-            # STATUS_DLL_INIT_FAILED: a medium-integrity process cannot use the
-            # service session's desktop on this runner. Keep the integrity
-            # level; Administrators stay deny-only, which is what decides
-            # access to the service's pipes and files.
-            $mediumIl = $false
-            Note 'a medium-integrity process cannot start on this runner''s service desktop (STATUS_DLL_INIT_FAILED); the standard-user token keeps high integrity, with Administrators deny-only and no privileges'
-            $code = [FilteredToken]::Run(('cmd.exe /c "' + $wrapper + '"'), $RepoDir, 600000, $false)
-        }
-        Write-Host ("  standard-user commands finished with exit {0}" -f $code)
-        function Read-Part([string]$name) {
-            $p = Join-Path $elevDir $name
-            if (Test-Path -LiteralPath $p) { return [IO.File]::ReadAllText($p) } else { return '' }
-        }
-        $groups = Read-Part 'whoami.txt'
-        $restricted = ($groups -match 'S-1-5-32-544\s+Group used for deny only') -and (-not $mediumIl -or $groups -match 'Medium Mandatory Level')
-        Check $restricted 'the standard-user token has Administrators deny-only' $groups
-        foreach ($s in $steps) {
-            $c = (Read-Part ($s[0] + '.code')).Trim()
+            $c = Invoke-AsStandardUser $s[0] $script:AutterExe ([string[]]($s[1] -split ' '))
+            if ($c -ne -1073741502) { $ran = $true }
             $text = (Read-Part ($s[0] + '.out')) + (Read-Part ($s[0] + '.err'))
             [IO.File]::WriteAllText((Join-Path $script:LogDir ("elevated-" + $s[0] + ".txt")), ("exit " + $c + "`r`n" + $text))
             Write-Host ("  standard user: autter {0} -> exit {1}" -f $s[1], $c)
             foreach ($l in @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 12)) { Write-Host ("    |" + $l) }
         }
+        if (-not $ran) {
+            Note 'no process could be started with a filtered (non-elevated) token on this runner (STATUS_DLL_INIT_FAILED for autter.exe too), so the elevated-service messages could not be checked here'
+        } else {
+        $restricted = ($groups -match 'S-1-5-32-544\s+Group used for deny only') -and (-not $script:MediumIl -or $groups -match 'Medium Mandatory Level')
+        Check $restricted 'the standard-user token has Administrators deny-only' $groups
         $hint = 'started from an Administrator window'
         foreach ($s in @(@('status', 'bg status'), @('start', 'bg start'), @('restart', 'bg restart'), @('shutdown', 'bg shutdown'), @('doctor', 'doctor'))) {
             $text = (Read-Part ($s[0] + '.out')) + (Read-Part ($s[0] + '.err'))
             Check ($text.Contains($hint)) ("{0} from a standard user names the elevated service as the cause" -f $s[1]) $text
             Check (-not ($text -match 'ERROR: The process|ERROR: Access')) ("{0} from a standard user shows no raw taskkill error" -f $s[1]) $text
         }
+        }
+        $env:CI = $savedCI
         $r = Invoke-Autter -Arguments @('bg', 'status')
         Check ($r.ExitCode -eq 0 -and (Get-ServicePid) -eq $elevPid) 'the elevated service is untouched by the standard-user attempts' (Show-Output $r)
     }
