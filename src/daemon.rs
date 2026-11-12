@@ -3472,12 +3472,7 @@ fn recover_single_cherry_pick_by_content(
     context: &str,
 ) -> Option<String> {
     let repo = find_repository_in_path(&worktree.to_string_lossy()).ok()?;
-    let original_head = repo
-        .find_commit(new_head.to_string())
-        .ok()?
-        .parent(0)
-        .ok()?
-        .id();
+    let original_head = commit_parent_head_for_capture(&repo, new_head)?;
     let messages =
         head_reflog_path_messages_for_worktree(worktree, &original_head, new_head).ok()??;
     let content_matches = matches!(
