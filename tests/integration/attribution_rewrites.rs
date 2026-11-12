@@ -14,8 +14,17 @@
 //! - `git cherry-pick -n` that stops on a conflict keeps the picked attribution
 //!   of what merged cleanly; lines written to resolve the conflict are not the
 //!   picked AI's.
-//! - `git cherry-pick -n` thrown away by `git reset --hard` gives nothing to
-//!   lines typed again by hand.
+//!   That holds when the conflict was resolved and staged before the
+//!   background service got to the pick. A file resolved with `git checkout
+//!   --theirs` keeps the AI's picked lines, and a known-human checkpoint of
+//!   the resolution claims only the lines the person wrote.
+//! - `git cherry-pick -n` thrown away by `git reset --hard`, `git checkout HEAD
+//!   -- .`, `git restore --staged --worktree` or a stash never applied again
+//!   gives nothing to lines typed again by hand, nor to unrelated work.
+//! - A known-human checkpoint after a clean `git cherry-pick -n` claims only
+//!   the lines the person wrote.
+//! - Uncommitted AI work thrown away by `git reset --hard` gives nothing to
+//!   lines typed again by hand; an AI edit made again afterwards is the AI's.
 //! - A `git reset` that leaves HEAD where it is (no target, or only paths) is
 //!   not a move from the branch checked out before, and keeps live AI work.
 //! - Lines typed after switching back from a branch with AI commits, or after
@@ -570,6 +579,74 @@ fn line_typed_after_hard_reset_of_an_ai_commit_is_not_the_ais() {
     ]);
 }
 
+#[test]
+fn live_ai_work_thrown_away_by_hard_reset_is_not_given_to_retyped_lines() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("live.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("live.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    // Uncommitted AI work, thrown away; the same line is then typed by hand.
+    ai_edit(&repo, "live.txt", "Line 1\nLine 2\nLine 3\nLive AI line\n");
+    repo.git(&["reset", "--hard"]).unwrap();
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLive AI line\n").unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Live AI line".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn ai_edit_made_again_after_hard_reset_is_the_ais() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("again.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\n").unwrap();
+    fs::write(repo.path().join("kept.txt"), "Kept base\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("again.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    // A mistaken AI edit is undone with `reset --hard`, and the agent makes
+    // its edit again. A new file the agent wrote and nobody added survives
+    // the reset, and so does its attribution.
+    ai_edit(&repo, "again.txt", "Line 1\nWrong AI line\nLine 3\n");
+    ai_edit(&repo, "untracked.txt", "Untracked AI line\n");
+    repo.git(&["reset", "--hard"]).unwrap();
+    ai_edit(
+        &repo,
+        "again.txt",
+        "Line 1\nLine 2\nLine 3\nRight AI line\n",
+    );
+    repo.stage_all_and_commit("AI edit made again").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Right AI line".ai(),
+    ]);
+    repo.filename("untracked.txt")
+        .assert_committed_lines(lines!["Untracked AI line".ai()]);
+}
+
 /// Two AI commits on two branches that both start at the initial commit: one
 /// adds a line to `first`, the other to `second`. Returns both commits, in
 /// that order, with the main branch checked out again.
@@ -796,6 +873,36 @@ fn cherry_pick_no_commit_thrown_away_by_hard_reset_is_not_given_to_retyped_lines
 /// the AI commit, which stops on the conflict in line 2. Everything else the
 /// pick brought merged cleanly.
 fn conflicted_cherry_pick_no_commit(repo: &TestRepo, conflicted: &str, clean: &str) {
+    let source = commits_for_a_conflicting_pick(repo, conflicted, clean, true);
+    pick_and_stop_on_the_conflict(repo, conflicted, &source);
+    repo.sync_daemon();
+}
+
+/// `git cherry-pick -n <source>`, which stops on the conflict in line 2 of
+/// `conflicted` and merges the tail line.
+fn pick_and_stop_on_the_conflict(repo: &TestRepo, conflicted: &str, source: &str) {
+    assert!(
+        repo.git(&["cherry-pick", "-n", source]).is_err(),
+        "cherry-pick -n should stop on the conflict"
+    );
+    let stopped = fs::read_to_string(repo.path().join(conflicted)).unwrap();
+    assert!(
+        stopped.contains("<<<<<<<") && stopped.ends_with("AI tail line\n"),
+        "the pick should leave line 2 conflicted and merge the tail line, got:\n{}",
+        stopped
+    );
+}
+
+/// The commits of [`conflicted_cherry_pick_no_commit`], with the main branch
+/// checked out. `known_human` says whether the main branch's change to line 2
+/// went through a known-human checkpoint or was left untracked. Returns the
+/// AI commit.
+fn commits_for_a_conflicting_pick(
+    repo: &TestRepo,
+    conflicted: &str,
+    clean: &str,
+    known_human: bool,
+) -> String {
     let conflicted_path = repo.path().join(conflicted);
 
     fs::write(
@@ -847,30 +954,25 @@ fn conflicted_cherry_pick_no_commit(repo: &TestRepo, conflicted: &str, clean: &s
         "Line 1\nMain version\nLine 3\nLine 4\nLine 5\nLine 6\n",
     )
     .unwrap();
-    repo.autter(&["checkpoint", "mock_known_human", conflicted])
-        .unwrap();
+    if known_human {
+        repo.autter(&["checkpoint", "mock_known_human", conflicted])
+            .unwrap();
+    }
     repo.stage_all_and_commit("Main change").unwrap();
     conflicted_file.assert_committed_lines(lines![
         "Line 1".unattributed_human(),
-        "Main version".human(),
+        if known_human {
+            "Main version".human()
+        } else {
+            "Main version".unattributed_human()
+        },
         "Line 3".unattributed_human(),
         "Line 4".unattributed_human(),
         "Line 5".unattributed_human(),
         "Line 6".unattributed_human(),
     ]);
     clean_file.assert_committed_lines(lines!["Clean base".unattributed_human()]);
-
-    assert!(
-        repo.git(&["cherry-pick", "-n", &source]).is_err(),
-        "cherry-pick -n should stop on the conflict"
-    );
-    repo.sync_daemon();
-    let stopped = fs::read_to_string(&conflicted_path).unwrap();
-    assert!(
-        stopped.contains("<<<<<<<") && stopped.ends_with("AI tail line\n"),
-        "the pick should leave line 2 conflicted and merge the tail line, got:\n{}",
-        stopped
-    );
+    source
 }
 
 #[test]
@@ -934,6 +1036,256 @@ fn conflicted_cherry_pick_no_commit_does_not_give_the_ai_a_hand_resolved_line() 
         "Line 5".unattributed_human(),
         "Line 6".unattributed_human(),
         "AI tail line".ai(),
+    ]);
+}
+
+#[test]
+fn conflicted_cherry_pick_no_commit_resolved_before_the_service_reads_it() {
+    let repo = TestRepo::new();
+    // Main's line 2 is untracked, so nothing on the main side claims the
+    // resolved line: only the pick's own record can keep the AI off it.
+    let source = commits_for_a_conflicting_pick(&repo, "early.txt", "beside.txt", false);
+
+    // A command that waits in an editor holds the background service's queue
+    // for this repository, so the pick is only processed after the conflict
+    // was resolved and staged: by then the index has no conflict left.
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(|| {
+            repo.git_with_env(
+                &["tag", "-a", "held-queue"],
+                &[("GIT_EDITOR", "sleep 4; true")],
+                None,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        pick_and_stop_on_the_conflict(&repo, "early.txt", &source);
+        // The person resolving types the AI's text for line 2.
+        fs::write(
+            repo.path().join("early.txt"),
+            "Line 1\nAI version\nLine 3\nLine 4\nLine 5\nLine 6\nAI tail line\n",
+        )
+        .unwrap();
+        repo.git(&["add", "-A"]).unwrap();
+        let _ = holder.join();
+    });
+    repo.commit("Resolved pick").unwrap();
+    repo.sync_daemon();
+
+    let mut conflicted = repo.filename("early.txt");
+    let mut clean = repo.filename("beside.txt");
+    clean.assert_committed_lines(lines![
+        "Clean base".unattributed_human(),
+        "AI clean line".ai(),
+    ]);
+    conflicted.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "AI version".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+        "AI tail line".ai(),
+    ]);
+}
+
+#[test]
+fn conflicted_cherry_pick_no_commit_resolved_with_checkout_theirs_keeps_the_ais_lines() {
+    let repo = TestRepo::new();
+    conflicted_cherry_pick_no_commit(&repo, "theirs.txt", "side.txt");
+
+    // Take the picked side for the conflicted file, then type one more line.
+    repo.git(&["checkout", "--theirs", "theirs.txt"]).unwrap();
+    let taken = fs::read_to_string(repo.path().join("theirs.txt")).unwrap();
+    assert_eq!(
+        taken,
+        "Line 1\nAI version\nLine 3\nLine 4\nLine 5\nLine 6\nAI tail line\n"
+    );
+    fs::write(
+        repo.path().join("theirs.txt"),
+        format!("{}Typed after\n", taken),
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Resolved by taking theirs")
+        .unwrap();
+    repo.sync_daemon();
+
+    let mut conflicted = repo.filename("theirs.txt");
+    let mut clean = repo.filename("side.txt");
+    clean.assert_committed_lines(lines![
+        "Clean base".unattributed_human(),
+        "AI clean line".ai(),
+    ]);
+    conflicted.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "AI version".ai(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+        "AI tail line".ai(),
+        "Typed after".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn conflicted_cherry_pick_no_commit_resolved_with_a_known_human_checkpoint_keeps_the_picked_lines()
+{
+    let repo = TestRepo::new();
+    conflicted_cherry_pick_no_commit(&repo, "kh.txt", "kh_side.txt");
+
+    // The editor saves the resolution: a known-human checkpoint of the file,
+    // the first one since the pick.
+    fs::write(
+        repo.path().join("kh.txt"),
+        "Line 1\nResolved in the editor\nLine 3\nLine 4\nLine 5\nLine 6\nAI tail line\n",
+    )
+    .unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "kh.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("Resolved pick").unwrap();
+    repo.sync_daemon();
+
+    let mut conflicted = repo.filename("kh.txt");
+    let mut clean = repo.filename("kh_side.txt");
+    clean.assert_committed_lines(lines![
+        "Clean base".unattributed_human(),
+        "AI clean line".ai(),
+    ]);
+    conflicted.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Resolved in the editor".human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+        "AI tail line".ai(),
+    ]);
+}
+
+#[test]
+fn known_human_checkpoint_after_cherry_pick_no_commit_claims_only_its_own_lines() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "claimed.txt");
+
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    fs::write(
+        repo.path().join("claimed.txt"),
+        "Typed at the top\nLine 1\nLine 2\nLine 3\nFeature AI line\n",
+    )
+    .unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "claimed.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("Picked, then a line typed")
+        .unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("claimed.txt");
+    file.assert_committed_lines(lines![
+        "Typed at the top".human(),
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_stashed_and_never_popped_is_not_given_to_retyped_lines() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "stashed_away.txt");
+
+    // The pick goes into a stash that is never applied; the same line is then
+    // typed by hand.
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    repo.git(&["stash"]).unwrap();
+    fs::write(
+        repo.path().join("stashed_away.txt"),
+        "Line 1\nLine 2\nLine 3\nFeature AI line\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("stashed_away.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_thrown_away_by_checkout_is_not_given_to_retyped_lines() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "checked_out.txt");
+
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    // `checkout -- .` puts back what the index has, which still holds the
+    // pick; `checkout HEAD -- .` throws it away.
+    repo.git(&["checkout", "HEAD", "--", "."]).unwrap();
+    fs::write(
+        repo.path().join("checked_out.txt"),
+        "Line 1\nLine 2\nLine 3\nFeature AI line\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("checked_out.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_thrown_away_by_restore_is_not_given_to_retyped_lines() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "restored.txt");
+
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    repo.git(&["restore", "--staged", "--worktree", "."])
+        .unwrap();
+    fs::write(
+        repo.path().join("restored.txt"),
+        "Line 1\nLine 2\nLine 3\nFeature AI line\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("restored.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_stashed_then_unrelated_work_committed_gets_nothing_of_it() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "unrelated.txt");
+
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    repo.git(&["stash"]).unwrap();
+    fs::write(
+        repo.path().join("unrelated.txt"),
+        "Line 1\nLine 2 edited by hand\nLine 3\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Unrelated edit").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("unrelated.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2 edited by hand".unattributed_human(),
+        "Line 3".unattributed_human(),
     ]);
 }
 
@@ -1807,4 +2159,454 @@ fn rebasing_a_renaming_branch_twice_keeps_ai_attribution() {
         "AI one".ai(),
         "AI two".ai(),
     ]);
+}
+
+/// Run `git rebase -i <onto>` with the todo list replaced by `todo`, one
+/// `(command, commit)` per line, such as `("pick", sha)` or `("squash", sha)`.
+/// Commits the list leaves out are dropped; squash messages are kept as git
+/// proposes them.
+fn rebase_interactive_with_todo(repo: &TestRepo, onto: &str, todo: &[(&str, &str)]) {
+    let lines: String = todo
+        .iter()
+        .map(|(command, commit)| format!("{} {}\\n", command, commit))
+        .collect();
+    let sequence_editor = format!(
+        "perl -e 'open(my $todo, \">\", $ARGV[0]) or die; print $todo \"{}\"'",
+        lines
+    );
+    repo.git_with_env(
+        &["rebase", "-i", onto],
+        &[
+            ("GIT_SEQUENCE_EDITOR", sequence_editor.as_str()),
+            ("GIT_EDITOR", "true"),
+        ],
+        None,
+    )
+    .unwrap();
+    repo.sync_daemon();
+}
+
+/// Whether `commit`'s note attests `file`.
+fn note_names_file(repo: &TestRepo, commit: &str, file: &str) -> bool {
+    repo.read_authorship_note(commit)
+        .is_some_and(|note| note.lines().any(|line| line == file))
+}
+
+/// Have git copy notes onto rewritten commits, as the installer sets it up:
+/// git then records which commit each rebased commit replays.
+fn let_git_copy_notes(repo: &TestRepo) {
+    repo.git(&["config", "notes.rewriteRef", "refs/notes/ai"])
+        .unwrap();
+}
+
+/// Two AI commits on different files, with the given subjects, then a commit
+/// that rewrites the first one's AI line by hand. Returns the three commits,
+/// oldest first.
+fn two_ai_commits_and_a_rewrite(
+    repo: &TestRepo,
+    subjects: (&str, &str),
+) -> (String, String, String) {
+    ai_edit(repo, "a.txt", "Base line 1\nBase line 2\nAI a\n");
+    repo.stage_all_and_commit(subjects.0).unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    let ai_a = head_sha(repo);
+
+    ai_edit(repo, "b.txt", "AI b\n");
+    repo.stage_all_and_commit(subjects.1).unwrap();
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    let ai_b = head_sha(repo);
+
+    // No checkpoint: nothing recorded who rewrote the line.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Base line 1\nBase line 2\nHand a\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Rewrite the AI line by hand")
+        .unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    let rewrite = head_sha(repo);
+
+    (ai_a, ai_b, rewrite)
+}
+
+#[test]
+fn interactive_rebase_that_reorders_commits_on_different_files_keeps_ai_attribution() {
+    reorder_commits_on_different_files(false);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_commits_keeps_ai_attribution_when_git_copies_notes() {
+    reorder_commits_on_different_files(true);
+}
+
+fn reorder_commits_on_different_files(git_copies_notes: bool) {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+    let (ai_a, ai_b, rewrite) =
+        two_ai_commits_and_a_rewrite(&repo, ("AI edit to a", "AI edit to b"));
+    if git_copies_notes {
+        let_git_copy_notes(&repo);
+    }
+
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[("pick", &ai_b), ("pick", &ai_a), ("pick", &rewrite)],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the reorder should keep three commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    assert!(
+        !note_names_file(&repo, &rebased[0], "a.txt"),
+        "the commit that only adds b.txt should not attest a.txt"
+    );
+
+    // The AI line is gone at the tip, so only the note of the commit that
+    // added it says who wrote it.
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+}
+
+#[test]
+fn interactive_rebase_that_moves_commits_ahead_of_a_rename_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+    let ai_edit_commit = head_sha(&repo);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+    let rename = head_sha(&repo);
+
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("AI edit after rename").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+    let ai_edit_after_rename = head_sha(&repo);
+
+    // No checkpoint: nothing recorded who rewrote the line.
+    fs::write(
+        repo.path().join("b.txt"),
+        "Base line 1\nBase line 2\nAI one\nHand two\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Rewrite the second AI line by hand")
+        .unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "Hand two".unattributed_human(),
+    ]);
+    let rewrite = head_sha(&repo);
+
+    // A commit on a file no AI touched.
+    fs::write(repo.path().join("notes.txt"), "Human note\n").unwrap();
+    repo.stage_all_and_commit("Add notes").unwrap();
+    repo.filename("notes.txt")
+        .assert_committed_lines(lines!["Human note".unattributed_human()]);
+    let unrelated = head_sha(&repo);
+
+    // Move the second AI edit and the unrelated commit ahead of the rename:
+    // git applies the AI edit to a.txt, and the unrelated commit takes the
+    // slot the rename had.
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[
+            ("pick", &ai_edit_commit),
+            ("pick", &ai_edit_after_rename),
+            ("pick", &unrelated),
+            ("pick", &rename),
+            ("pick", &rewrite),
+        ],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 5, "the reorder should keep five commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[1]);
+    assert!(
+        !repo.path().join("b.txt").exists(),
+        "the AI edit should now be made before the rename"
+    );
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+    repo.filename("notes.txt")
+        .assert_committed_lines(lines!["Human note".unattributed_human()]);
+    assert!(
+        !note_names_file(&repo, &rebased[2], "b.txt"),
+        "the unrelated commit should not get the rename's note"
+    );
+
+    checkout_detached(&repo, &rebased[3]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[4]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "Hand two".unattributed_human(),
+    ]);
+    repo.filename("notes.txt")
+        .assert_committed_lines(lines!["Human note".unattributed_human()]);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_and_squashes_keeps_ai_attribution() {
+    reorder_and_squash(false);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_and_squashes_keeps_ai_attribution_when_git_copies_notes() {
+    reorder_and_squash(true);
+}
+
+fn reorder_and_squash(git_copies_notes: bool) {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+    let (ai_a, ai_b, rewrite) =
+        two_ai_commits_and_a_rewrite(&repo, ("AI edit to a", "AI edit to b"));
+    if git_copies_notes {
+        let_git_copy_notes(&repo);
+    }
+
+    // Move the b.txt commit first and squash the a.txt commit into it.
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[("pick", &ai_b), ("squash", &ai_a), ("pick", &rewrite)],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 2, "the squash should leave two commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_and_drops_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+    // A branch being cleaned up: its commits do not have telling subjects, so
+    // only what they change says which is which.
+    let (ai_a, ai_b, rewrite) = two_ai_commits_and_a_rewrite(&repo, ("WIP", "WIP"));
+
+    fs::write(repo.path().join("debug.txt"), "Debug output\n").unwrap();
+    repo.stage_all_and_commit("Add debug output").unwrap();
+    repo.filename("debug.txt")
+        .assert_committed_lines(lines!["Debug output".unattributed_human()]);
+
+    // Swap the two AI commits; leaving the debug commit out drops it.
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[("pick", &ai_b), ("pick", &ai_a), ("pick", &rewrite)],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the drop should leave three commits");
+    assert!(!repo.path().join("debug.txt").exists());
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+}
+
+#[test]
+fn autosquash_that_moves_a_fixup_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI a\n");
+    repo.stage_all_and_commit("Add the a line").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+
+    ai_edit(&repo, "b.txt", "AI b\n");
+    repo.stage_all_and_commit("Add the b line").unwrap();
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    // A fixup for the first commit, made after the second.
+    ai_edit(&repo, "c.txt", "AI c\n");
+    repo.stage_all_and_commit("fixup! Add the a line").unwrap();
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["AI c".ai()]);
+
+    // No checkpoint: nothing recorded who rewrote the lines.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Base line 1\nBase line 2\nHand a\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("c.txt"), "Hand c\n").unwrap();
+    repo.stage_all_and_commit("Rewrite the AI lines by hand")
+        .unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["Hand c".unattributed_human()]);
+
+    repo.git_with_env(
+        &["rebase", "-i", "--autosquash", &main_branch],
+        &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+        None,
+    )
+    .unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the fixup should leave three commits");
+
+    // The fixup moved up into the first commit.
+    checkout_detached(&repo, &rebased[0]);
+    assert!(!repo.path().join("b.txt").exists());
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["AI c".ai()]);
+
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["AI c".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["Hand c".unattributed_human()]);
 }

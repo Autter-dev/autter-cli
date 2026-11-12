@@ -168,6 +168,10 @@ pub fn handle_autter(args: &[String]) {
             args[0].as_str() == "checkpoint" || crate::config::collection_consented_now();
         match init_daemon_telemetry_handle_with(allow_spawn) {
             DaemonTelemetryInitResult::Connected | DaemonTelemetryInitResult::Skipped => {}
+            // A command that does not exist fails as one whether or not the
+            // service is up (`autter stat --json` is a usage error with its
+            // one JSON document), so it is left to the dispatcher below.
+            DaemonTelemetryInitResult::Failed(_) if !is_autter_command(args[0].as_str()) => {}
             DaemonTelemetryInitResult::Failed(err) => {
                 eprintln!(
                     "error: failed to connect to autter background service: {}",
@@ -441,6 +445,77 @@ pub fn handle_autter(args: &[String]) {
             );
         }
     }
+}
+
+/// Every command the dispatcher in [`handle_autter`] has an arm for. Keep the
+/// two in step: a command missing here is reported as unknown when the
+/// background service cannot be reached.
+const AUTTER_COMMANDS: &[&str] = &[
+    "--help",
+    "--version",
+    "-h",
+    "-v",
+    "ask",
+    "badge",
+    "bg",
+    "blame",
+    "blame-analysis",
+    "checkpoint",
+    "ci",
+    "config",
+    "context",
+    "d",
+    "daemon",
+    "dash",
+    "dashboard",
+    "debug",
+    "diff",
+    "doctor",
+    "effective-ignore-patterns",
+    "exchange-nonce",
+    "fetch-authorship-notes",
+    "fetch-notes",
+    "fetch_authorship_notes",
+    "file-changes",
+    "flush-metrics-db",
+    "git-hooks",
+    "git-path",
+    "help",
+    "install",
+    "install-hooks",
+    "log",
+    "login",
+    "logout",
+    "logs",
+    "mcp",
+    "memory",
+    "memory-hook",
+    "notes",
+    "onboard",
+    "onboarding",
+    "personal-dashboard",
+    "personal_dashboard",
+    "push-authorship-notes",
+    "push_authorship_notes",
+    "setup",
+    "show",
+    "show-prompt",
+    "squash-authorship",
+    "stats",
+    "status",
+    "sync",
+    "telemetry",
+    "threads",
+    "uninstall",
+    "uninstall-hooks",
+    "upgrade",
+    "version",
+    "whoami",
+    "wrapped",
+];
+
+fn is_autter_command(command: &str) -> bool {
+    AUTTER_COMMANDS.contains(&command)
 }
 
 /// The commands whose `--json` output is a documented contract
@@ -777,30 +852,37 @@ fn handle_checkpoint(args: &[String]) {
     // beats losing the data.
     const CHECKPOINT_DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    // A checkpoint is sent without waiting for the service to finish it. A
-    // service that cannot take it (overloaded, or shutting down) closes the
-    // connection instead, so the sender watches the connection briefly after
-    // writing: without that, a dropped checkpoint looks exactly like a sent
-    // one. The watch ends as soon as the service answers; until then a
-    // service that is working on the checkpoint is silent, so the watch is
-    // also the most a healthy send can cost.
+    // The service acknowledges a checkpoint with a receipt as soon as it has
+    // read it, before processing it: about a millisecond on a healthy
+    // service, however busy it is with other work. Without a receipt the
+    // checkpoint cannot be assumed recorded (the connection may sit queued
+    // behind others, or the service may be stuck), so the send is retried
+    // once and then reported.
     //
-    // A hook runs before and after every edit an agent makes, so it only
-    // waits long enough to see a connection that is closed at once (about a
-    // millisecond; 25 ms leaves room for a busy machine, which is when this
-    // happens). A direct run waits as long as any other control request does
-    // for its answer: that also covers a connection left queued by a service
-    // that then gives up and exits, which closes it.
-    const HOOK_CHECKPOINT_DROP_WATCH: std::time::Duration = std::time::Duration::from_millis(25);
-    const DIRECT_CHECKPOINT_DROP_WATCH: std::time::Duration = std::time::Duration::from_secs(2);
-    let drop_watch = if hook_mode {
-        HOOK_CHECKPOINT_DROP_WATCH
+    // A hook runs before and after every edit an agent makes, so it waits
+    // for nothing but the receipt, and not for long: 200 ms is two orders of
+    // magnitude above a healthy receipt, and the agent only ever waits that
+    // long when something is wrong. A direct run waits as long as any other
+    // control request does for its answer, and then up to as long again for
+    // the service to say whether it could record the checkpoint.
+    const HOOK_CHECKPOINT_RECEIPT_WAIT: crate::daemon::CheckpointReceiptWait =
+        crate::daemon::CheckpointReceiptWait {
+            receipt: std::time::Duration::from_millis(200),
+            outcome: std::time::Duration::ZERO,
+        };
+    const DIRECT_CHECKPOINT_RECEIPT_WAIT: crate::daemon::CheckpointReceiptWait =
+        crate::daemon::CheckpointReceiptWait {
+            receipt: std::time::Duration::from_secs(2),
+            outcome: std::time::Duration::from_secs(2),
+        };
+    let receipt_wait = if hook_mode {
+        HOOK_CHECKPOINT_RECEIPT_WAIT
     } else {
-        DIRECT_CHECKPOINT_DROP_WATCH
+        DIRECT_CHECKPOINT_RECEIPT_WAIT
     };
     // Before a resend. Longer than the 50 ms the service backs off after a
     // connection it could not serve, so the resend is not left queued behind
-    // that pause, where a short watch would not see it dropped.
+    // that pause.
     const CHECKPOINT_RESEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
     let mut sent_count = 0u64;
@@ -815,18 +897,27 @@ fn handle_checkpoint(args: &[String]) {
             crate::commands::checkpoint_agent::orchestrator::is_session_activity(&request);
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
+            receipt: true,
         };
-        let mut send_result = crate::daemon::send_control_request_fire_and_forget(
+        let mut send_result = crate::daemon::send_checkpoint_with_receipt(
             &active_socket,
             &control_request,
-            drop_watch,
+            receipt_wait,
+        );
+        // A checkpoint sent without a receipt may still be recorded, even if
+        // the resend then fails outright.
+        let mut maybe_recorded = matches!(
+            send_result,
+            Err(crate::daemon::CheckpointSendError::Unconfirmed(_))
         );
 
         // A failed send almost always means the daemon is down (crashed, never
-        // started, or restarting), or that it took the connection and closed
-        // it without handling the request (overloaded, or shutting down).
-        // Rather than dropping the checkpoint — which silently loses the
-        // session's steps — spawn the daemon and retry once.
+        // started, or restarting), that it took the connection and closed it
+        // without handling the request (overloaded, or shutting down), or
+        // that it did not confirm it (stuck, or the connection is queued
+        // behind others). Rather than dropping the checkpoint — which
+        // silently loses the session's steps — spawn the daemon and retry
+        // once.
         // `ensure_daemon_running` is a no-op when the daemon is already up, so a
         // transient blip is retried too. Only attempt the spawn once per call.
         if send_result.is_err() && !tried_spawn {
@@ -835,10 +926,14 @@ fn handle_checkpoint(args: &[String]) {
                 Ok(spawned) => {
                     active_socket = spawned.control_socket_path;
                     std::thread::sleep(CHECKPOINT_RESEND_PAUSE);
-                    send_result = crate::daemon::send_control_request_fire_and_forget(
+                    send_result = crate::daemon::send_checkpoint_with_receipt(
                         &active_socket,
                         &control_request,
-                        drop_watch,
+                        receipt_wait,
+                    );
+                    maybe_recorded |= matches!(
+                        send_result,
+                        Err(crate::daemon::CheckpointSendError::Unconfirmed(_))
                     );
                 }
                 Err(e) => {
@@ -870,12 +965,17 @@ fn handle_checkpoint(args: &[String]) {
                 crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome::Error,
                 Some(&format!("could not reach the background service: {}", e)),
             );
-            exit_checkpoint_not_captured(
-                hook_mode,
-                &format!(
+            let message = if maybe_recorded {
+                format!("Checkpoint may not have been recorded: {}", e)
+            } else {
+                format!(
                     "Failed to send checkpoint to background worker, checkpoint dropped: {}",
                     e
-                ),
+                )
+            };
+            exit_checkpoint_not_captured(
+                hook_mode,
+                &message,
                 &format!(
                     "run `{}`, then `autter doctor`",
                     crate::commands::daemon::RESTART_COMMAND
@@ -1933,6 +2033,31 @@ mod checkpoint_exit_policy_tests {
             assert!(!checkpoint_runs_in_hook(preset, false, false), "{preset}");
             assert!(checkpoint_runs_in_hook(preset, true, false), "{preset}");
             assert!(checkpoint_runs_in_hook(preset, false, true), "{preset}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_list_tests {
+    use super::is_autter_command;
+
+    #[test]
+    fn every_documented_command_is_a_known_command() {
+        for command in crate::commands::arg_parser::documented_commands() {
+            assert!(
+                is_autter_command(command),
+                "`autter {command}` is documented but missing from AUTTER_COMMANDS"
+            );
+        }
+        for command in ["version", "help", "memory-hook", "notes", "checkpoint"] {
+            assert!(is_autter_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_typo_is_not_a_command() {
+        for command in ["stat", "bogus", "", "--json", "checkpoints"] {
+            assert!(!is_autter_command(command), "{command}");
         }
     }
 }
