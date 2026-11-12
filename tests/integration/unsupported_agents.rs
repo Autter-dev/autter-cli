@@ -1,19 +1,20 @@
 //! AI tools autter cannot capture yet must be called out, not silently
 //! attributed to the user. Google Antigravity is captured through its hooks
-//! (see antigravity.rs); Kiro stands in here for a tool with no capture path.
+//! (see antigravity.rs), and so is Kiro (see kiro.rs); Trae stands in here for a
+//! tool with no capture path.
 
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use std::fs;
 
-fn mark_kiro_installed(repo: &TestRepo) {
-    fs::create_dir_all(repo.test_home_path().join(".kiro")).unwrap();
+fn mark_trae_installed(repo: &TestRepo) {
+    fs::create_dir_all(repo.test_home_path().join(".trae")).unwrap();
 }
 
 #[test]
 fn doctor_warns_when_an_unsupported_agent_is_installed() {
     let repo = TestRepo::new();
-    mark_kiro_installed(&repo);
+    mark_trae_installed(&repo);
 
     let raw = repo
         .autter(&["doctor", "--json"])
@@ -24,12 +25,12 @@ fn doctor_warns_when_an_unsupported_agent_is_installed() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["name"] == "Kiro")
-        .unwrap_or_else(|| panic!("doctor should report Kiro: {raw}"));
+        .find(|c| c["name"] == "Trae")
+        .unwrap_or_else(|| panic!("doctor should report Trae: {raw}"));
     assert_eq!(check["status"], "warning", "{raw}");
     assert_eq!(
         check["summary"],
-        "Kiro detected — its edits are not captured; they will be attributed to you",
+        "Trae detected — its edits are not captured; they will be attributed to you",
         "{raw}"
     );
     assert!(
@@ -43,7 +44,7 @@ fn doctor_warns_when_an_unsupported_agent_is_installed() {
 #[test]
 fn stats_notes_unsupported_agent_when_commit_is_untracked() {
     let repo = TestRepo::new();
-    mark_kiro_installed(&repo);
+    mark_trae_installed(&repo);
 
     // A commit with no checkpoints: 100% untracked, as with uncaptured edits.
     fs::write(repo.path().join("generated.rs"), "fn a() {}\nfn b() {}\n").unwrap();
@@ -53,14 +54,14 @@ fn stats_notes_unsupported_agent_when_commit_is_untracked() {
     let output = repo.autter(&["stats"]).expect("stats should succeed");
     // Other uncapturable tools installed on the machine running the tests
     // (found under /Applications or on PATH) are named in the same note, which
-    // then reads "Kiro, Zed (agent panel) detected — autter cannot capture…".
+    // then reads "Trae, Zed (agent panel) detected — autter cannot capture…".
     let note = output
         .lines()
         .find(|line| line.starts_with("Note: "))
         .unwrap_or_else(|| panic!("stats should explain the untracked share: {output}"));
     assert!(
-        note.contains("Kiro") && note.contains("detected") && note.contains("capture"),
-        "the note should name Kiro as not captured: {output}"
+        note.contains("Trae") && note.contains("detected") && note.contains("capture"),
+        "the note should name Trae as not captured: {output}"
     );
 }
 
@@ -84,7 +85,7 @@ fn gemini_cli_home_does_not_trigger_an_antigravity_warning() {
 #[test]
 fn stats_does_not_rule_out_an_agent_when_an_unsupported_one_is_detected() {
     let repo = TestRepo::new();
-    mark_kiro_installed(&repo);
+    mark_trae_installed(&repo);
 
     fs::write(repo.path().join("generated.rs"), "fn a() {}\nfn b() {}\n").unwrap();
     repo.stage_all_and_commit("edit made by an uncaptured agent")
@@ -116,7 +117,7 @@ fn stats_does_not_rule_out_an_agent_when_an_unsupported_one_is_detected() {
 #[test]
 fn range_stats_and_log_note_an_unsupported_agent() {
     let repo = TestRepo::new();
-    mark_kiro_installed(&repo);
+    mark_trae_installed(&repo);
 
     fs::write(repo.path().join("base.txt"), "base\n").unwrap();
     repo.stage_all_and_commit("base").unwrap();
@@ -138,7 +139,7 @@ fn range_stats_and_log_note_an_unsupported_agent() {
 
     let is_note = |line: &str| {
         let line = line.trim_start();
-        line.starts_with("Note: ") && line.contains("Kiro") && line.contains("capture")
+        line.starts_with("Note: ") && line.contains("Trae") && line.contains("capture")
     };
 
     let range = repo

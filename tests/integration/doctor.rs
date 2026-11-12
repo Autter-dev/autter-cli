@@ -336,6 +336,7 @@ fn doctor_agent_simulates_each_agents_hook_calls() {
         "droid",
         "firebender",
         "antigravity",
+        "kiro",
         "windsurf",
     ] {
         let raw = repo

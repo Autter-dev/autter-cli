@@ -70,6 +70,57 @@ Sources (checked 2026-10-08):
   and
   https://discuss.ai.google.dev/t/stop-and-posttooluse-hooks-in-agents-hooks-json-never-fire-antigravity-ide-1-107-0-windows/178288
 
+## Kiro
+
+**Status: supported through Kiro CLI v3 hooks; the hook payload fields and the
+Kiro IDE are not confirmed yet.**
+
+`autter install-hooks` writes one file, `~/.kiro/hooks/autter.json`, which Kiro CLI
+v3 loads as global hooks ("Kiro CLI V3 also loads global Hooks from
+`~/.kiro/hooks/`"). It registers `PreToolUse` and `PostToolUse` hooks with the
+`write` and `shell` matchers; each runs `autter checkpoint kiro --hook-input
+stdin`, prints nothing (Kiro adds a hook's output to the agent's context) and
+exits 0 (a failing `PreToolUse` hook would block the edit). Your own hook files in
+`~/.kiro/hooks/` are never touched, `autter uninstall-hooks` deletes only
+`autter.json`, and autter never writes `.kiro/hooks/` into a repository.
+
+Kiro is detected by any of: `kiro-cli` or `kiro` on `PATH`, `~/.local/bin/kiro-cli`,
+`Kiro.app` (macOS), a `Kiro` install folder (Windows), a `Kiro/User` editor
+settings folder, or `~/.kiro`.
+
+What works and what doesn't:
+
+| Surface | Captured? | Why |
+| --- | --- | --- |
+| Kiro CLI v3 | Yes, unless the payload differs from the assumptions below | Loads `~/.kiro/hooks/` |
+| Kiro CLI 2.x | No | Its hooks live inside each agent profile; there is no global hooks folder. Upgrade to v3 |
+| Kiro IDE | Only if it loads `~/.kiro/hooks/` (not documented) | Kiro's docs say the global folder is loaded by CLI v3; they do not say the IDE does. The autter VS Code extension (from Open VSX, which Kiro installs from) records your own typing in Kiro either way |
+
+Not confirmed yet, because no real hook payload has been captured (please send one,
+see [kiro-capture.md](kiro-capture.md)):
+
+- **Which `tool_input` field names the edited file.** autter reads `path`,
+  `file_path`, `filePath`, `target_file`, `targetFile` and lists in `paths` /
+  `file_paths`, and for a `PostToolUse` call with an empty `tool_input` it reads the
+  path from `tool_response` sentences such as "Created the … file" (seen in a
+  Kiro IDE capture published by AWS Labs). A write whose payload names no file is
+  not recorded, so its lines stay untracked.
+- **Tool names** in Kiro CLI v3. autter treats `fs_write` (and its aliases),
+  `str_replace`, `fs_append`, `create_file`, `edit_file`, `apply_patch` and
+  `delete_file` as file writes, and `execute_bash`, `execute_cmd`, `execute_pwsh`
+  and `code` as commands whose changed files are found by comparing the repository
+  before and after.
+- **The model.** No model field is documented; it is recorded as `unknown`.
+- **Prompts and transcripts.** Kiro's session store is not read yet.
+
+Sources (checked 2026-11-12):
+
+- Hooks: https://kiro.dev/docs/hooks/ and https://kiro.dev/docs/hooks/types/
+- Hook actions (stdout and exit codes): https://kiro.dev/docs/hooks/actions/
+- CLI v3 hook migration (matcher groups, CLI 2.x): https://kiro.dev/docs/cli/v3/hooks-migration/
+- Kiro IDE payload capture (AWS Labs):
+  https://awslabs.github.io/aidlc-workflows/reference/kiro-ide-hook-payload/
+
 ## Tools with no capture path
 
 These are detected so the missing attribution is explained, not captured. The
@@ -79,8 +130,7 @@ vendor's documentation. A miss only means no warning.
 
 | Tool | What would unblock capture |
 | --- | --- |
-| Kiro | Pre/post file-edit hooks with the edited paths, or an extension API that reports agent edits |
-| Trae | Same as Kiro |
+| Trae | Pre/post file-edit hooks with the edited paths, or an extension API that reports agent edits |
 | Zed (agent panel) | An agent-edit event or hook in Zed's extension/agent API |
 | Cline, Roo Code, Kilo Code (VS Code extensions) | Edit hooks in the extension, or a stable on-disk task log with per-edit file paths |
 | Aider | A hook around its edit step; today its commits arrive as ordinary git commits |
