@@ -4674,11 +4674,10 @@ fn checkpoint_reports_a_connection_the_service_dropped() {
     );
 
     // A hook run still exits 0 (it must never block the agent) and says the
-    // same on stderr. A hook only watches the connection for a few
-    // milliseconds, so on a loaded machine a run can miss the close: every
-    // run must exit 0, and one of a few must report the drop.
-    let mut hook_reported_drop = false;
-    for _ in 0..5 {
+    // same on stderr. A hook used to watch the connection for only 25 ms, so
+    // on a loaded machine a run could miss the close; it now waits for a
+    // receipt, so every run reports the drop.
+    for _ in 0..3 {
         let hook_run = checkpoint_command()
             .env("AUTTER_CHECKPOINT_HOOK", "1")
             .output()
@@ -4688,16 +4687,245 @@ fn checkpoint_reports_a_connection_the_service_dropped() {
             hook_run.status.success(),
             "a hook checkpoint must exit 0 even when the service dropped it:\n{hook_stderr}"
         );
-        if hook_stderr.contains("checkpoint dropped") {
-            hook_reported_drop = true;
-            break;
-        }
+        assert!(
+            hook_stderr.contains("checkpoint dropped"),
+            "a hook should still say the checkpoint was not recorded, got:\n{hook_stderr}"
+        );
     }
-    assert!(
-        hook_reported_drop,
-        "a hook should still say the checkpoint was not recorded"
-    );
 
     let _ = fs::remove_file(&control_socket_path);
     let _ = fs::remove_file(&trace_socket_path);
+}
+
+/// Stand-in sockets where a repository's background service would listen.
+/// Each control connection is handled on its own thread by `serve`, with the
+/// request line it sent (empty for a connection that sends none, such as the
+/// idle one every autter command keeps for telemetry).
+#[cfg(unix)]
+struct StandInService {
+    repo: TestRepo,
+    control_socket_path: PathBuf,
+    trace_socket_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl StandInService {
+    fn start(
+        file: &str,
+        serve: impl Fn(String, std::os::unix::net::UnixStream) + Send + Sync + 'static,
+    ) -> Self {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+
+        let repo = TestRepo::new_with_mode_and_daemon_scope(
+            GitTestMode::Daemon,
+            DaemonTestScope::NoDaemon,
+        );
+        fs::write(repo.path().join(file), "base\n").expect("failed to write base");
+        repo.git(&["add", file]).expect("add should succeed");
+        repo.git(&["commit", "-m", "base commit"])
+            .expect("base commit should succeed");
+        fs::write(repo.path().join(file), "base\nai line\n").expect("failed to write edit");
+
+        let control_socket_path = daemon_control_socket_path(&repo);
+        let trace_socket_path = daemon_trace_socket_path(&repo);
+        fs::create_dir_all(
+            control_socket_path
+                .parent()
+                .expect("control socket path should have a parent"),
+        )
+        .expect("failed to create socket directory");
+        let control =
+            UnixListener::bind(&control_socket_path).expect("bind stand-in control socket");
+        let trace = UnixListener::bind(&trace_socket_path).expect("bind stand-in trace socket");
+        let serve = Arc::new(serve);
+        thread::spawn(move || {
+            for connection in control.incoming().flatten() {
+                let serve = serve.clone();
+                thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(connection);
+                    let mut request = String::new();
+                    let _ = reader.read_line(&mut request);
+                    serve(request, reader.into_inner());
+                });
+            }
+        });
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for connection in trace.incoming() {
+                held.push(connection);
+            }
+        });
+        Self {
+            repo,
+            control_socket_path,
+            trace_socket_path,
+        }
+    }
+
+    fn checkpoint(&self, file: &str, hook: bool) -> (std::process::Output, Duration) {
+        let mut command = self.repo.autter_command(&["checkpoint", "mock_ai", file]);
+        configure_test_daemon_env(
+            &mut command,
+            &self.repo.daemon_home_path(),
+            &self.control_socket_path,
+            &self.trace_socket_path,
+        );
+        if hook {
+            command.env("AUTTER_CHECKPOINT_HOOK", "1");
+        }
+        let started = std::time::Instant::now();
+        let output = command.output().expect("spawn autter checkpoint");
+        (output, started.elapsed())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StandInService {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.control_socket_path);
+        let _ = fs::remove_file(&self.trace_socket_path);
+    }
+}
+
+#[cfg(unix)]
+fn write_stand_in_answer(stream: &mut std::os::unix::net::UnixStream, answer: &Value) {
+    let _ = stream.write_all(format!("{answer}\n").as_bytes());
+    let _ = stream.flush();
+}
+
+/// A background service that takes a checkpoint's connection and never
+/// answers (stuck, or the connection is queued behind others that do not
+/// finish) used to pass for one that took the checkpoint once the sender's
+/// short watch ended. Without a receipt the checkpoint is now reported as
+/// possibly not recorded.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn checkpoint_reports_a_service_that_never_confirms_it() {
+    let service = StandInService::start("unconfirmed.txt", |_request, stream| {
+        thread::sleep(Duration::from_secs(30));
+        drop(stream);
+    });
+
+    let (direct_run, _) = service.checkpoint("unconfirmed.txt", false);
+    let direct_stderr = String::from_utf8_lossy(&direct_run.stderr);
+    assert!(
+        !direct_run.status.success(),
+        "a direct checkpoint nobody confirmed must not exit 0:\n{direct_stderr}"
+    );
+    assert!(
+        direct_stderr.contains("may not have been recorded")
+            && direct_stderr.contains("did not confirm the checkpoint"),
+        "the failure should say the checkpoint may not have been recorded, got:\n{direct_stderr}"
+    );
+
+    // A hook exits 0 and says so, after a bounded wait: the receipt wait and
+    // a ping, then the same again for the one resend.
+    let (hook_run, took) = service.checkpoint("unconfirmed.txt", true);
+    let hook_stderr = String::from_utf8_lossy(&hook_run.stderr);
+    assert!(
+        hook_run.status.success(),
+        "a hook checkpoint must exit 0:\n{hook_stderr}"
+    );
+    assert!(
+        hook_stderr.contains("may not have been recorded"),
+        "a hook should say the checkpoint may not have been recorded, got:\n{hook_stderr}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "a hook waited {took:?} on a service that never answers"
+    );
+}
+
+/// A service from before receipts (protocol 0) says nothing about a
+/// checkpoint until it has processed it, and answers `ping` without a
+/// protocol version (or not at all, if it predates `ping`). A new `autter`
+/// must not report every checkpoint sent to it as lost.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn checkpoint_to_a_service_without_receipts_is_not_reported_lost() {
+    let receipt_asked = Arc::new(AtomicBool::new(false));
+    let saw_receipt_request = receipt_asked.clone();
+    let service = StandInService::start("older.txt", move |request, mut stream| {
+        if request.contains("\"checkpoint.run\"") {
+            if request.contains("\"receipt\":true") {
+                saw_receipt_request.store(true, Ordering::SeqCst);
+            }
+            // Processing takes longer than a hook waits for a receipt.
+            thread::sleep(Duration::from_millis(600));
+            write_stand_in_answer(&mut stream, &json!({ "ok": true }));
+        } else if request.contains("\"ping\"") {
+            write_stand_in_answer(
+                &mut stream,
+                &json!({ "ok": false, "error": "invalid control request: unknown variant `ping`" }),
+            );
+        } else {
+            thread::sleep(Duration::from_secs(30));
+        }
+    });
+
+    for hook in [true, false] {
+        let (run, took) = service.checkpoint("older.txt", hook);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "hook={hook}: a checkpoint an older service is processing was sent:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("may not have been recorded") && !stderr.contains("dropped"),
+            "hook={hook}: nothing was lost, got:\n{stderr}"
+        );
+        if hook {
+            assert!(
+                took < Duration::from_secs(3),
+                "a hook waited {took:?} on an older service"
+            );
+        }
+    }
+    assert!(
+        receipt_asked.load(Ordering::SeqCst),
+        "autter checkpoint should ask for a receipt"
+    );
+}
+
+/// Against a real background service the receipt arrives at once: a hook
+/// returns without a warning and the checkpoint is recorded.
+#[test]
+#[serial]
+fn hook_checkpoint_is_confirmed_by_the_service() {
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::Dedicated);
+    fs::write(repo.path().join("receipt.txt"), "base\n").expect("failed to write base");
+    repo.git(&["add", "receipt.txt"])
+        .expect("add should succeed");
+    repo.stage_all_and_commit("base commit")
+        .expect("base commit should succeed");
+    fs::write(repo.path().join("receipt.txt"), "base\nai line\n").expect("failed to write edit");
+    let completion_baseline = repo.daemon_total_completion_count();
+
+    let output = repo
+        .autter_command(&["checkpoint", "mock_ai", "receipt.txt"])
+        .env("AUTTER_CHECKPOINT_HOOK", "1")
+        .output()
+        .expect("spawn autter checkpoint");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("may not have been recorded") && !stderr.contains("dropped"),
+        "a running service confirms the checkpoint, got:\n{stderr}"
+    );
+
+    repo.wait_for_next_daemon_checkpoint_completion(completion_baseline);
+    let checkpoints = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .expect("checkpoints should be readable");
+    assert!(
+        checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == CheckpointKind::AiAgent),
+        "the confirmed checkpoint should be recorded"
+    );
 }
