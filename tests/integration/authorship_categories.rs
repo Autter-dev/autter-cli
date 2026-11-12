@@ -518,3 +518,60 @@ fn range_stats_call_lines_of_an_unrecorded_commit_unknown() {
     assert_eq!(json["lines"]["untracked"], 0, "{json}");
     assert_eq!(json["capture"]["status"], "nothing_captured", "{json}");
 }
+
+/// `blame --json` gives every line a category, named as `stats --json` names
+/// them, and a prompt's `accepted_lines` is the number in the commit's note.
+#[test]
+fn blame_json_gives_every_line_a_category() {
+    let history = mixed_history();
+    let repo = &history.repo;
+
+    let json = json_object(
+        &repo
+            .autter(&["blame", "--json", "mixed.txt"])
+            .expect("autter blame --json"),
+    );
+    assert_eq!(
+        json["line_categories"],
+        serde_json::json!({
+            "1": "untracked",
+            "2": "human",
+            "3-4": "ai",
+            "5": "untracked",
+            "6-7": "unknown",
+        }),
+        "{json}"
+    );
+    assert_eq!(
+        json["category_counts"],
+        serde_json::json!({"ai": 2, "human": 1, "untracked": 2, "unknown": 2}),
+        "{json}"
+    );
+
+    // The existing fields are unchanged: AI lines map to their prompt.
+    let lines = json["lines"].as_object().expect("lines");
+    assert_eq!(lines.len(), 1, "{json}");
+    let prompt_id = lines["3-4"].as_str().expect("prompt id for lines 3-4");
+    assert_eq!(json["schema_version"], 1, "{json}");
+
+    // accepted_lines agrees with the note of the commit that added the lines.
+    let note = repo
+        .read_authorship_note(&history.recorded)
+        .expect("the mixed commit has a note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("note parses");
+    let session = log
+        .metadata
+        .sessions
+        .get(prompt_id.split("::").next().unwrap())
+        .expect("the prompt's session is in the note");
+    let noted = session
+        .stats
+        .as_ref()
+        .expect("session stats")
+        .accepted_lines;
+    assert_eq!(noted, 2, "the note records two accepted lines");
+    assert_eq!(
+        json["prompts"][prompt_id]["accepted_lines"], noted,
+        "{json}"
+    );
+}

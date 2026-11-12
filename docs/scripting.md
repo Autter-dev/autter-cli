@@ -83,6 +83,40 @@ attribution are Untracked when it is recorded and Unknown when it is not.
 }
 ```
 
+### `blame --json`
+
+`lines` maps the AI lines to the prompt that wrote them, as `"<line>"` or
+`"<start>-<end>"` keys. `line_categories` covers every blamed line with the
+same keys and the label names above (`ai`, `human`, `untracked`, `unknown`),
+and `category_counts` has the number of lines under each label. In `prompts`,
+`accepted_lines` and the other line counts are the ones in the commit's
+authorship note.
+
+```json
+{
+  "schema_version": 1,
+  "lines": { "3-4": "s_405e2e0215c7c0::t_856b3232f4045d" },
+  "line_categories": { "1": "untracked", "2": "human", "3-4": "ai", "5": "untracked", "6-7": "unknown" },
+  "category_counts": { "ai": 2, "human": 1, "untracked": 2, "unknown": 2 },
+  "prompts": { "s_405e2e0215c7c0::t_856b3232f4045d": { "accepted_lines": 2, "…": "…" } },
+  "metadata": { "is_logged_in": false, "current_user": "Ada <ada@example.com>" }
+}
+```
+
+```json
+{
+  "schema_version": 1,
+  "commit": "3f2a…",
+  "human_additions": 1, "unknown_additions": 0, "ai_additions": 2, "ai_accepted": 2,
+  "git_diff_deleted_lines": 0, "git_diff_added_lines": 3,
+  "tool_model_breakdown": { "claude::claude-sonnet-4-5": { "ai_additions": 2, "ai_accepted": 2 } },
+  "lines": { "added": 3, "deleted": 0, "ai": 2, "human": 1, "untracked": 0, "unknown": 0 },
+  "percent": { "ai": 66.7, "human": 33.3, "untracked": 0.0, "unknown": 0.0 },
+  "capture": { "status": "captured", "note_present": true },
+  "record": { "status": "recorded" }
+}
+```
+
 ## Exit codes
 
 | Code | Meaning |

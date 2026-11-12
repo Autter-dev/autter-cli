@@ -369,15 +369,41 @@
       }
     },
     "blame": {
-      "description": "autter blame <file> --json (pretty-printed): AI line ranges mapped to the prompt that wrote them.",
+      "description": "autter blame <file> --json (pretty-printed): AI line ranges mapped to the prompt that wrote them, and the label of every blamed line.",
       "type": "object",
-      "required": ["schema_version", "lines", "prompts", "metadata"],
+      "required": [
+        "schema_version",
+        "lines",
+        "line_categories",
+        "category_counts",
+        "prompts",
+        "metadata"
+      ],
       "properties": {
         "schema_version": { "$ref": "#/$defs/schema_version" },
         "lines": {
-          "description": "\"<line>\" or \"<start>-<end>\" -> prompt id.",
+          "description": "AI lines only: \"<line>\" or \"<start>-<end>\" -> prompt id.",
           "type": "object",
           "additionalProperties": { "type": "string" }
+        },
+        "line_categories": {
+          "description": "Every blamed line: \"<line>\" or \"<start>-<end>\" -> its label, named as in `lines` of stats.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["ai", "human", "untracked", "unknown"]
+          }
+        },
+        "category_counts": {
+          "description": "Number of blamed lines under each label.",
+          "type": "object",
+          "required": ["ai", "human", "untracked", "unknown"],
+          "properties": {
+            "ai": { "type": "integer" },
+            "human": { "type": "integer" },
+            "untracked": { "type": "integer" },
+            "unknown": { "type": "integer" }
+          }
         },
         "prompts": { "type": "object", "additionalProperties": { "type": "object" } },
         "metadata": {
