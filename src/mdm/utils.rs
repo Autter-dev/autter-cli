@@ -70,6 +70,12 @@ pub fn get_binary_version(binary: &str) -> Result<String, AutterError> {
 
 /// Get version from an editor CLI command's --version output
 pub fn get_editor_version(cli: &EditorCliCommand) -> Result<String, AutterError> {
+    // A program that already answered `--version` with nothing is the
+    // editor's window: running it again opens another window. The VS Code
+    // and GitHub Copilot checks of one `install-hooks` each asked it.
+    if editor_cli_known_answer(&cli.program) == Some(false) {
+        return Err(editor_cli_silent_error(cli));
+    }
     let output = cli.command(&["--version"]).output().map_err(|e| {
         AutterError::Generic(format!("Failed to run {} --version: {}", cli.program, e))
     })?;
@@ -101,6 +107,14 @@ fn editor_cli_answers() -> &'static std::sync::Mutex<std::collections::HashMap<S
     ANSWERS.get_or_init(Default::default)
 }
 
+/// Whether `program` answered `--version` in this process, if it was asked.
+fn editor_cli_known_answer(program: &str) -> Option<bool> {
+    editor_cli_answers()
+        .lock()
+        .ok()
+        .and_then(|answers| answers.get(program).copied())
+}
+
 fn record_editor_cli_answer(program: &str, answered: bool) {
     if let Ok(mut answers) = editor_cli_answers().lock() {
         answers.insert(program.to_string(), answered);
@@ -109,7 +123,7 @@ fn record_editor_cli_answer(program: &str, answered: bool) {
 
 fn editor_cli_silent_error(cli: &EditorCliCommand) -> AutterError {
     AutterError::Generic(format!(
-        "`{} --version` printed nothing, so it is not the editor's command line (it may have opened the editor instead); autter will not call it again. Install the autter extension by hand: download the .vsix from https://open-vsx.org/extension/autter/autter-vscode and choose \"Extensions: Install from VSIX...\" in the editor's command palette",
+        "`{} --version` printed nothing, so it is not the editor's command line (it may have opened the editor instead); autter will not call it again. Install the autter extension manually: download the .vsix from https://open-vsx.org/extension/autter/autter-vscode and choose \"Extensions: Install from VSIX...\" in the editor's command palette",
         cli.program
     ))
 }
@@ -118,12 +132,7 @@ fn editor_cli_silent_error(cli: &EditorCliCommand) -> AutterError {
 /// that would open a window if it is not. Asks `--version` until the program
 /// has answered once in this process.
 pub fn ensure_editor_cli_answers(cli: &EditorCliCommand) -> Result<(), AutterError> {
-    let known = || {
-        editor_cli_answers()
-            .lock()
-            .ok()
-            .and_then(|answers| answers.get(&cli.program).copied())
-    };
+    let known = || editor_cli_known_answer(&cli.program);
     if known().is_none() {
         // Only a silent answer rules the program out. A `--version` that
         // fails outright (the editor CLI is flaky) is left to the caller's
@@ -2569,11 +2578,13 @@ mod tests {
         );
         assert!(!result.changed);
 
-        // `get_editor_version` asks each time it is called; nothing else ran.
-        assert_eq!(
-            fake_editor_calls(dir.path()),
-            vec!["--version".to_string(), "--version".to_string()]
-        );
+        // The first `--version` was the only call: a later version check
+        // (doctor and install-hooks ask from both the VS Code and the GitHub
+        // Copilot checks, which opened two windows per run on Windows) does
+        // not run it again.
+        let again = get_editor_version(&cli).unwrap_err().to_string();
+        assert!(again.contains("printed nothing"), "{again}");
+        assert_eq!(fake_editor_calls(dir.path()), vec!["--version".to_string()]);
     }
 
     /// Without a version check first (the install path), the extension calls
