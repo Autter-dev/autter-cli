@@ -311,14 +311,6 @@ fn cherry_pick_no_commit_onto_staged_ai_work_in_same_file_keeps_both() {
     ]);
 }
 
-/// An AI agent's edit of one file: the "before" checkpoint every agent preset
-/// takes, the write, and the "after" checkpoint.
-fn ai_edit(repo: &TestRepo, name: &str, contents: &str) {
-    repo.autter(&["checkpoint", "human", name]).unwrap();
-    fs::write(repo.path().join(name), contents).unwrap();
-    repo.autter(&["checkpoint", "mock_ai", name]).unwrap();
-}
-
 /// The rewrite events the background service recorded for the repository.
 fn rewrite_log(repo: &TestRepo) -> String {
     let git_dir = repo
