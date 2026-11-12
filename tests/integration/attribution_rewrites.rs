@@ -14,7 +14,13 @@
 //! - A rebase onto a branch that renamed the file moves attribution to the new
 //!   path.
 //! - A rebase of commits that rename the file themselves keeps attribution on
-//!   the commits before the rename.
+//!   the commits before the rename: also when the file is edited again after
+//!   the rename, renamed more than once, when its old path is reused by a new
+//!   file, and when an interactive rebase folds the rename into the AI commit.
+//!   So does an interactive rebase that drops the rename, and a second rebase
+//!   of the already rebased branch.
+//! - A rebase keeps an AI line attributed in the commit that added it when a
+//!   later commit on the branch rewrites the line.
 
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
@@ -22,6 +28,64 @@ use std::fs;
 
 fn head_sha(repo: &TestRepo) -> String {
     repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string()
+}
+
+/// An edit the way an agent makes it: a checkpoint for whatever changed before
+/// the agent touched the file, the write, then the AI checkpoint.
+fn ai_edit(repo: &TestRepo, file: &str, contents: &str) {
+    repo.autter(&["checkpoint", "human", file]).unwrap();
+    fs::write(repo.path().join(file), contents).unwrap();
+    repo.autter(&["checkpoint", "mock_ai", file]).unwrap();
+}
+
+/// The commits on HEAD that are not on `base`, oldest first.
+fn commits_since(repo: &TestRepo, base: &str) -> Vec<String> {
+    repo.git(&["rev-list", "--reverse", &format!("{}..HEAD", base)])
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Check out one rebased commit, so the usual helpers assert the files as that
+/// commit has them. Attribution has to be right in every commit of a rebased
+/// range, not only at its tip.
+fn checkout_detached(repo: &TestRepo, commit: &str) {
+    repo.git(&["checkout", "--detach", commit]).unwrap();
+}
+
+/// `a.txt` with two base lines on the default branch, and a `feature` branch
+/// checked out from it. Returns the default branch's name.
+fn base_file_and_feature_branch(repo: &TestRepo) -> String {
+    fs::write(repo.path().join("a.txt"), "Base line 1\nBase line 2\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    let main_branch = repo.current_branch();
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    main_branch
+}
+
+/// On the default branch, add a line at the top of `a.txt`: every line the
+/// feature commits touch moves down, so a rebase has to recompute their notes.
+/// Leaves `feature` checked out again.
+fn add_main_header_to_base_file(repo: &TestRepo, main_branch: &str) {
+    repo.git(&["checkout", main_branch]).unwrap();
+    fs::write(
+        repo.path().join("a.txt"),
+        "Main header\nBase line 1\nBase line 2\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Main edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    repo.git(&["checkout", "feature"]).unwrap();
 }
 
 #[test]
@@ -492,5 +556,618 @@ fn rebase_of_commits_that_rename_the_file_keeps_ai_attribution() {
         "Base line 1".unattributed_human(),
         "Base line 2".unattributed_human(),
         "AI added line".ai(),
+    ]);
+}
+
+#[test]
+fn rebase_keeps_ai_attribution_when_the_file_is_edited_again_after_its_rename() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    // The AI edits the file, a commit renames it, the AI edits it again.
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("AI edit after rename").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the rebase should replay three commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[1]);
+    assert!(!repo.path().join("a.txt").exists());
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+}
+
+#[test]
+fn rebase_keeps_ai_attribution_when_one_commit_renames_and_edits_the_file() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    // One commit both renames the file and carries an AI edit to it.
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("Rename and AI edit").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 2, "the rebase should replay two commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    assert!(!repo.path().join("a.txt").exists());
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+}
+
+#[test]
+fn rebase_keeps_ai_attribution_through_a_chain_of_renames() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    // a.txt -> b.txt -> c.txt, with an AI edit under each name.
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit 1").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename a to b").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("AI edit 2").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    repo.git(&["mv", "b.txt", "c.txt"]).unwrap();
+    repo.commit("Rename b to c").unwrap();
+    repo.filename("c.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    ai_edit(
+        &repo,
+        "c.txt",
+        "Base line 1\nBase line 2\nAI one\nAI two\nAI three\n",
+    );
+    repo.stage_all_and_commit("AI edit 3").unwrap();
+    repo.filename("c.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+        "AI three".ai(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 5, "the rebase should replay five commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[2]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[3]);
+    repo.filename("c.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[4]);
+    assert!(!repo.path().join("a.txt").exists());
+    assert!(!repo.path().join("b.txt").exists());
+    repo.filename("c.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+        "AI three".ai(),
+    ]);
+}
+
+#[test]
+fn rebase_keeps_ai_attribution_when_a_new_file_reuses_the_renamed_files_old_path() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    // A later commit creates a new, unrelated file at the old path. No
+    // checkpoint: nothing recorded who wrote it.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Brand new file\nat the old path\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Reuse the old path").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Brand new file".unattributed_human(),
+        "at the old path".unattributed_human(),
+    ]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the rebase should replay three commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[1]);
+    assert!(!repo.path().join("a.txt").exists());
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Brand new file".unattributed_human(),
+        "at the old path".unattributed_human(),
+    ]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+}
+
+#[test]
+fn interactive_rebase_that_folds_the_rename_into_the_ai_commit_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    // An edit nothing recorded a checkpoint for.
+    fs::write(
+        repo.path().join("b.txt"),
+        "Base line 1\nBase line 2\nAI one\nHuman tail\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Human edit").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "Human tail".unattributed_human(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+
+    // Make the rename commit a fixup of the AI commit: the commit that adds
+    // the AI line now also renames the file.
+    repo.git_with_env(
+        &["rebase", "-i", &main_branch],
+        &[
+            (
+                "GIT_SEQUENCE_EDITOR",
+                "perl -i -pe 's/^pick/fixup/ if $. == 2'",
+            ),
+            ("GIT_EDITOR", "true"),
+        ],
+        None,
+    )
+    .unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 2, "the fixup should leave two commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    assert!(
+        !repo.path().join("a.txt").exists(),
+        "the AI commit should now contain the rename"
+    );
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+    let note = repo
+        .read_authorship_note(&rebased[0])
+        .expect("the AI commit should have a note");
+    assert!(
+        note.lines().any(|line| line == "b.txt") && !note.lines().any(|line| line == "a.txt"),
+        "the note should attest the file under the name the commit gives it:\n{}",
+        note
+    );
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "Human tail".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn rebase_keeps_an_ai_line_attributed_in_its_commit_when_a_later_commit_rewrites_it() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    // A later commit rewrites the AI line. No checkpoint: nothing recorded who
+    // made the change.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Base line 1\nBase line 2\nRewritten by hand\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Rewrite the AI line").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Rewritten by hand".unattributed_human(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 2, "the rebase should replay two commits");
+
+    // The AI line is gone at the tip, but the commit that added it still has
+    // it, and it is still the AI's.
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Rewritten by hand".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn interactive_rebase_that_drops_the_rename_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("AI edit after rename").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+
+    // Drop the rename commit. Git applies the later AI edit to a.txt, so the
+    // rebased branch never has a b.txt, while every original note after the
+    // rename names b.txt.
+    repo.git_with_env(
+        &["rebase", "-i", &main_branch],
+        &[
+            ("GIT_SEQUENCE_EDITOR", "perl -i -ne 'print unless $. == 2'"),
+            ("GIT_EDITOR", "true"),
+        ],
+        None,
+    )
+    .unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(
+        rebased.len(),
+        2,
+        "dropping the rename should leave two commits"
+    );
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    assert!(
+        !repo.path().join("b.txt").exists(),
+        "without the rename the file keeps its old name"
+    );
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+}
+
+#[test]
+fn rebasing_a_renaming_branch_twice_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("AI edit after rename").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    // Main moves again; the second rebase starts from the notes the first one
+    // wrote.
+    repo.git(&["checkout", &main_branch]).unwrap();
+    fs::write(
+        repo.path().join("a.txt"),
+        "Main header 2\nMain header\nBase line 1\nBase line 2\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Second main edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header 2".unattributed_human(),
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    repo.git(&["checkout", "feature"]).unwrap();
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the rebase should replay three commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header 2".unattributed_human(),
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header 2".unattributed_human(),
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Main header 2".unattributed_human(),
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
     ]);
 }

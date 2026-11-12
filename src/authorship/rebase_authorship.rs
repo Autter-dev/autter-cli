@@ -1068,11 +1068,7 @@ fn try_reconstruct_attributions_from_notes_cached(
         // Step 0: A file this commit renamed keeps its attribution under the new
         // path. The commit's hunks for it are relative to the old content.
         if let Some(renames) = renames_by_commit.get(*commit) {
-            for (old_path, new_path) in renames {
-                if let Some(attrs) = file_attrs.remove(old_path) {
-                    file_attrs.insert(new_path.clone(), attrs);
-                }
-            }
+            move_renamed_entries(&mut file_attrs, renames);
         }
 
         // Step 1: Apply this commit's hunks to shift existing attributions.
@@ -1504,10 +1500,18 @@ pub fn rewrite_authorship_after_rebase_v2(
     // We concatenate both commit lists, get all results at once, then partition them.
     let diff_tree_start = std::time::Instant::now();
     let new_commit_set: HashSet<&str> = commits_to_process.iter().map(String::as_str).collect();
+    // Every original commit is diffed, not only the ones paired with a rebased
+    // commit: a squashed, fixed-up or dropped commit still shifts lines and
+    // renames files on the way to original_head.
     let mut combined_commits =
-        Vec::with_capacity(commits_to_process.len() + original_commits_for_processing.len());
+        Vec::with_capacity(commits_to_process.len() + original_commits.len());
     combined_commits.extend(commits_to_process.iter().cloned());
-    combined_commits.extend(original_commits_for_processing.iter().cloned());
+    combined_commits.extend(
+        original_commits
+            .iter()
+            .filter(|commit| !new_commit_set.contains(commit.as_str()))
+            .cloned(),
+    );
     let (mut combined_diff_tree_result, mut combined_hunks) = run_diff_tree_with_hunks(
         repo,
         &combined_commits,
@@ -1517,34 +1521,42 @@ pub fn rewrite_authorship_after_rebase_v2(
     )?;
 
     // A tracked file that disappears in one of these commits may have been
-    // renamed there. Track the paths it was renamed to and diff again with
-    // rename detection, so attribution follows the file instead of being
-    // dropped with the old path.
-    if combined_diff_tree_result.removes_a_tracked_file() {
-        let renamed_to = renamed_paths_within_commits(repo, &combined_commits, &pathspecs);
-        if !renamed_to.is_empty() {
-            pathspecs.extend(renamed_to);
-            let pathspecs_lookup: HashSet<&str> = pathspecs.iter().map(String::as_str).collect();
-            (combined_diff_tree_result, combined_hunks) = run_diff_tree_with_hunks(
-                repo,
-                &combined_commits,
-                &pathspecs_lookup,
-                &pathspecs,
-                true,
-            )?;
-        }
+    // renamed there. Ask git which of these commits rename a tracked file, and
+    // if any does, diff again with rename detection so attribution follows the
+    // file instead of being dropped with the old path. This holds whether or
+    // not the new path is already tracked: a file that is edited again after
+    // the rename is attested under both names.
+    if combined_diff_tree_result.removes_a_tracked_file()
+        && let Some(renamed_to) = renamed_paths_within_commits(repo, &combined_commits, &pathspecs)
+    {
+        pathspecs.extend(renamed_to);
+        let pathspecs_lookup: HashSet<&str> = pathspecs.iter().map(String::as_str).collect();
+        (combined_diff_tree_result, combined_hunks) =
+            run_diff_tree_with_hunks(repo, &combined_commits, &pathspecs_lookup, &pathspecs, true)?;
     }
 
-    // Renames made by the commits themselves, by commit, plus where each
-    // renamed path ends up. A path renamed later in the branch has no state of
-    // its own at original_head, so it reads the state of its final path.
+    // Renames made by the commits themselves, by commit.
     let renames_by_commit: HashMap<String, Vec<(String, String)>> = combined_diff_tree_result
         .commit_deltas
         .iter()
         .filter(|(_, delta)| !delta.renames.is_empty())
         .map(|(sha, delta)| (sha.clone(), delta.renames.clone()))
         .collect();
-    let renamed_path_targets = final_paths_for_renames(renames_by_commit.values().flatten());
+    // What each changed file is called once the rest of its branch has been
+    // applied, on the rebased side and on the original side. The attribution
+    // state loaded below is keyed by the paths at original_head, so a file
+    // that is renamed later has to be looked up under the name it ends with.
+    let (rebased_later_paths, original_later_paths) = {
+        let deltas: HashMap<&str, &CommitTrackedDelta> = combined_diff_tree_result
+            .commit_deltas
+            .iter()
+            .map(|(sha, delta)| (sha.as_str(), delta))
+            .collect();
+        (
+            later_paths_by_commit(&commits_to_process, &deltas),
+            later_paths_by_commit(original_commits, &deltas),
+        )
+    };
 
     // Partition diff-tree results: only new commits need DiffTreeResult metadata
     let new_commit_deltas: Vec<_> = combined_diff_tree_result
@@ -1584,7 +1596,7 @@ pub fn rewrite_authorship_after_rebase_v2(
         format!(
             "diff_tree_combined ({} new + {} original commits, {} changed files, {} blobs)",
             commits_to_process.len(),
-            original_commits_for_processing.len(),
+            combined_commits.len() - commits_to_process.len(),
             actually_changed_files.len(),
             diff_tree_result.all_blob_oids.len(),
         ),
@@ -1595,12 +1607,15 @@ pub fn rewrite_authorship_after_rebase_v2(
     // Only load file contents for files that actually change — skip unchanged files.
     let va_phase_start = std::time::Instant::now();
 
+    // Attribution and file contents as of original_head, keyed by the paths at
+    // original_head. Read-only once loaded: the replay loop below keeps its own
+    // state, keyed by the paths of the commit it is replaying.
     let (
-        mut current_attributions,
-        mut current_file_contents,
+        mut original_head_attributions,
+        mut original_head_contents,
         initial_prompts,
-        initial_humans,
-        initial_sessions,
+        mut initial_humans,
+        mut initial_sessions,
         _rebase_ts,
     ) = if let Some((attrs, contents, prompts, humans, sessions)) =
         try_reconstruct_attributions_from_notes_cached(
@@ -1674,24 +1689,29 @@ pub fn rewrite_authorship_after_rebase_v2(
     ));
 
     for (old_path, new_path) in &upstream_renames {
-        if current_attributions.contains_key(new_path) {
+        if original_head_attributions.contains_key(new_path) {
             continue;
         }
-        if let Some(attrs) = current_attributions.remove(old_path) {
-            current_attributions.insert(new_path.clone(), attrs);
+        if let Some(attrs) = original_head_attributions.remove(old_path) {
+            original_head_attributions.insert(new_path.clone(), attrs);
         }
-        if let Some(content) = current_file_contents.remove(old_path) {
-            current_file_contents.insert(new_path.clone(), content);
+        if let Some(content) = original_head_contents.remove(old_path) {
+            original_head_contents.insert(new_path.clone(), content);
         }
     }
+    let original_head_attributions = original_head_attributions;
+    let original_head_contents = original_head_contents;
 
     // Step 2c: Read blob contents — only for the FIRST commit that touches each file.
     // Subsequent commits use hunk-based transfer which doesn't need blob content.
+    // A renamed file is still the same file: its new path needs no blob if the
+    // old path was already read, and the old path is free to be created again.
     let blob_phase_start = std::time::Instant::now();
     let first_appearance_blobs = {
         let mut seen_files: HashSet<String> = HashSet::new();
         let mut needed_oids: HashSet<String> = HashSet::new();
         for (_, delta) in &diff_tree_result.commit_deltas {
+            move_renamed_members(&mut seen_files, &delta.renames);
             for (file_path, maybe_oid) in &delta.file_to_blob_oid {
                 if let Some(oid) = maybe_oid {
                     // File has content — only read blob on first appearance.
@@ -1723,13 +1743,12 @@ pub fn rewrite_authorship_after_rebase_v2(
     ));
 
     // Build original_head line-to-author maps for content restoration during transform.
-    // Built from current_attributions before the loop mutates them.
     // Used as a fallback for files with no previous content in the diff-based transfer.
     let original_head_line_to_author: HashMap<String, HashMap<String, String>> = {
         let mut maps = HashMap::new();
-        for (file_path, (_, line_attrs)) in &current_attributions {
+        for (file_path, (_, line_attrs)) in &original_head_attributions {
             let mut line_map = HashMap::new();
-            if let Some(content) = current_file_contents.get(file_path) {
+            if let Some(content) = original_head_contents.get(file_path) {
                 let lines: Vec<&str> = content.lines().collect();
                 for attr in line_attrs {
                     if attr.author_id
@@ -1755,7 +1774,8 @@ pub fn rewrite_authorship_after_rebase_v2(
     // No need to build VirtualAttributions wrapper — diff-based transfer replaces
     // transform_changed_files_to_final_state entirely, eliminating the need for VA in the loop.
     let mut current_prompts = initial_prompts.clone();
-    let prompt_line_metrics = build_prompt_line_metrics_from_attributions(&current_attributions);
+    let prompt_line_metrics =
+        build_prompt_line_metrics_from_attributions(&original_head_attributions);
     apply_prompt_line_metrics_to_prompts(&mut current_prompts, &prompt_line_metrics);
 
     // Bug fix: start existing_files EMPTY and build it up per-commit as files are
@@ -1773,7 +1793,7 @@ pub fn rewrite_authorship_after_rebase_v2(
         &current_prompts,
         &initial_humans,
         &initial_sessions,
-        &current_attributions,
+        &original_head_attributions,
         &existing_files,
     );
 
@@ -1821,10 +1841,24 @@ pub fn rewrite_authorship_after_rebase_v2(
     let mut total_files_diffed = 0usize;
     let mut total_lines_diffed = 0usize;
     let mut total_files_hunk_transferred = 0usize;
-    // Track files that have been processed via content-diff at least once.
-    // After the first content-diff, our accumulated attribution state matches the
-    // commit chain, so we can use hunk-based transfer for subsequent appearances.
-    let mut files_with_synced_state: HashSet<String> = HashSet::new();
+    // Replay state, keyed by the paths of the commit being replayed. A file gets
+    // an entry the first time a rebased commit touches it (via content-diff
+    // against the original_head state). From then on the entry matches the
+    // commit chain, so later commits use hunk-based transfer, and a commit that
+    // renames the file moves the entry to the new path.
+    let mut current_attributions: HashMap<
+        String,
+        (
+            Vec<crate::authorship::attribution_tracker::Attribution>,
+            Vec<crate::authorship::attribution_tracker::LineAttribution>,
+        ),
+    > = HashMap::new();
+    // For each replayed file, the original_head path its attribution came from.
+    let mut original_head_path_of: HashMap<String, String> = HashMap::new();
+    let upstream_rename_sources: HashMap<&str, &str> = upstream_renames
+        .iter()
+        .map(|(old_path, new_path)| (new_path.as_str(), old_path.as_str()))
+        .collect();
     // Cache the active prompt IDs + their accepted_lines values from the previous commit.
     // When BOTH the prompt ID set AND the accepted_lines counts are unchanged, the metadata
     // template is unchanged and we skip the serde_json serialization entirely.
@@ -1860,24 +1894,22 @@ pub fn rewrite_authorship_after_rebase_v2(
         let commit_hunks = hunks_by_commit.get(new_commit);
 
         // Files this commit renamed carry their state to the new path. Their
-        // hunks are relative to the old content, so a synced file stays synced.
-        if let Some(renames) = renames_by_commit.get(new_commit) {
-            for (old_path, new_path) in renames {
-                if let Some(attrs) = current_attributions.remove(old_path) {
-                    current_attributions.insert(new_path.clone(), attrs);
-                }
-                if let Some(content) = current_file_contents.remove(old_path) {
-                    current_file_contents.insert(new_path.clone(), content);
-                    if files_with_synced_state.remove(old_path.as_str()) {
-                        files_with_synced_state.insert(new_path.clone());
-                    } else {
-                        files_with_synced_state.remove(new_path.as_str());
-                    }
-                }
+        // hunks are relative to the old content, so the state stays in step.
+        let commit_renames = renames_by_commit
+            .get(new_commit)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if !commit_renames.is_empty() {
+            move_renamed_entries(&mut current_attributions, commit_renames);
+            move_renamed_entries(&mut original_head_path_of, commit_renames);
+            for (old_path, _) in commit_renames {
                 existing_files.remove(old_path);
                 cached_file_attestation_text.remove(old_path);
             }
         }
+        // The commit this one replays, and its note (parsed only if needed).
+        let original_commit = new_to_original.get(new_commit).map(String::as_str);
+        let original_note: std::cell::OnceCell<Option<AuthorshipLog>> = std::cell::OnceCell::new();
 
         // Only transform attributions for files that actually changed.
         if !changed_files_in_commit.is_empty() {
@@ -1902,21 +1934,19 @@ pub fn rewrite_authorship_after_rebase_v2(
 
                 if is_file_deleted {
                     // File deleted — clear all cached state so recreation uses a clean
-                    // content-diff instead of stale attributions/content from before deletion.
+                    // content-diff instead of stale attributions from before deletion.
                     cached_file_attestation_text.remove(file_path);
                     existing_files.remove(file_path);
-                    files_with_synced_state.remove(file_path.as_str());
-                    current_file_contents.remove(file_path);
                     current_attributions.remove(file_path);
+                    original_head_path_of.remove(file_path);
                     continue;
                 }
 
-                // Decide: use hunk-based transfer or content-diff?
-                let has_hunks = commit_hunks
-                    .and_then(|ch| ch.get(file_path.as_str()))
-                    .is_some();
-                let use_hunk_based =
-                    files_with_synced_state.contains(file_path.as_str()) && has_hunks;
+                // Decide: use hunk-based transfer or content-diff? A file the
+                // replay already holds state for only needs this commit's hunks
+                // (none at all for a pure rename or a mode change).
+                let file_hunks = commit_hunks.and_then(|ch| ch.get(file_path.as_str()));
+                let use_hunk_based = current_attributions.contains_key(file_path);
 
                 // Skip early if no data available (avoids wasted subtract+add cycle)
                 if !use_hunk_based && new_content.is_none() {
@@ -1925,10 +1955,10 @@ pub fn rewrite_authorship_after_rebase_v2(
 
                 // Metrics are updated after all files in this commit are processed (below).
 
-                let line_attrs = if use_hunk_based {
+                let mut line_attrs = if use_hunk_based {
                     // FAST PATH: Hunk-based attribution transfer
                     let thunk = std::time::Instant::now();
-                    let hunks = commit_hunks.unwrap().get(file_path.as_str()).unwrap();
+                    let hunks = file_hunks.map(Vec::as_slice).unwrap_or(&[]);
                     let old_attrs = current_attributions
                         .get(file_path)
                         .map(|(_, la)| la.as_slice())
@@ -1938,8 +1968,13 @@ pub fn rewrite_authorship_after_rebase_v2(
                     // content-matching against the original-HEAD line→author map.
                     // apply_hunks_to_line_attributions only shifts existing attributions;
                     // lines in Replace or Insert hunk regions get no attribution from it.
-                    // We recover those by looking up each added line's content.
-                    if let Some(file_author_map) = original_head_line_to_author.get(file_path) {
+                    // We recover those by looking up each added line's content. The
+                    // map is the one for the original_head file this file came from,
+                    // which has another name if the branch renames it later.
+                    let file_author_map = original_head_path_of
+                        .get(file_path)
+                        .and_then(|path| original_head_line_to_author.get(path));
+                    if let Some(file_author_map) = file_author_map {
                         for hunk in hunks.iter() {
                             if hunk.new_count > 0 {
                                 for (i, added_line) in hunk.added_lines.iter().enumerate() {
@@ -1968,33 +2003,125 @@ pub fn rewrite_authorship_after_rebase_v2(
                     total_files_diffed += 1;
                     let new_line_count = new_content.lines().count();
                     total_lines_diffed += new_line_count;
-                    // A path the branch renames later has no state of its own at
-                    // original_head (its content there reads as empty), so its
-                    // state is under the final path.
-                    let has_own_state = current_attributions.contains_key(file_path)
-                        || current_file_contents
-                            .get(file_path)
-                            .is_some_and(|content| !content.is_empty());
-                    let state_path = if has_own_state {
-                        file_path.as_str()
-                    } else {
-                        renamed_path_targets
-                            .get(file_path.as_str())
-                            .map(String::as_str)
-                            .unwrap_or(file_path.as_str())
+                    // The original_head state is keyed by the paths at
+                    // original_head. Follow the renames of the commits still to
+                    // be replayed to find what this file is called there. If
+                    // nothing is recorded under that name (an interactive rebase
+                    // can drop or reorder a rename), follow the renames of the
+                    // original branch from the commit whose note is being carried.
+                    let has_original_head_state = |path: &str| {
+                        original_head_attributions.contains_key(path)
+                            || original_head_contents
+                                .get(path)
+                                .is_some_and(|content| !content.is_empty())
                     };
+                    let rebased_path =
+                        path_after_later_commits(&rebased_later_paths, new_commit, file_path);
+                    let state_path = rebased_path
+                        .filter(|path| has_original_head_state(path))
+                        .or_else(|| {
+                            let original_commit = original_commit?;
+                            original_path_candidates(
+                                file_path,
+                                commit_renames,
+                                &upstream_rename_sources,
+                            )
+                            .into_iter()
+                            .filter_map(|candidate| {
+                                path_after_later_commits(
+                                    &original_later_paths,
+                                    original_commit,
+                                    candidate,
+                                )
+                            })
+                            .find(|path| has_original_head_state(path))
+                        })
+                        .or(rebased_path)
+                        .unwrap_or(file_path.as_str());
                     let result = compute_line_attrs_for_changed_file(
                         new_content,
-                        current_file_contents.get(state_path),
-                        current_attributions
+                        original_head_contents.get(state_path),
+                        original_head_attributions
                             .get(state_path)
                             .map(|(_, la)| la.as_slice()),
                         original_head_line_to_author.get(state_path),
                     );
+                    original_head_path_of.insert(file_path.clone(), state_path.to_string());
                     loop_diff_ms += tdiff.elapsed().as_micros();
-                    files_with_synced_state.insert(file_path.clone());
                     result
                 };
+
+                // The lines this commit adds are the lines the original commit
+                // added, and that commit's note says who wrote them. The
+                // original_head state cannot: a line a later commit rewrote or
+                // removed is not in it.
+                if let Some(original_commit) = original_commit
+                    && let Some(hunks) = file_hunks
+                    && let Some(original_hunks) = original_hunks_by_commit.get(original_commit)
+                    && let Some(note) = original_note
+                        .get_or_init(|| {
+                            let note = note_cache
+                                .original_note_contents
+                                .get(original_commit)
+                                .and_then(|content| {
+                                    AuthorshipLog::deserialize_from_string(content).ok()
+                                })?;
+                            // The rebased note has to be able to describe every
+                            // author this note names. The original_head state
+                            // does not know an author none of whose lines
+                            // survive to original_head.
+                            for (prompt_id, record) in &note.metadata.prompts {
+                                current_prompts
+                                    .entry(prompt_id.clone())
+                                    .or_default()
+                                    .entry(original_commit.to_string())
+                                    .or_insert_with(|| record.clone());
+                            }
+                            for (hash, record) in &note.metadata.humans {
+                                initial_humans
+                                    .entry(hash.clone())
+                                    .or_insert_with(|| record.clone());
+                            }
+                            for (session_id, record) in &note.metadata.sessions {
+                                initial_sessions
+                                    .entry(session_id.clone())
+                                    .or_insert_with(|| record.clone());
+                            }
+                            Some(note)
+                        })
+                        .as_ref()
+                {
+                    // The file under the name the original commit knew it by:
+                    // normally the same name, otherwise the file that ends up
+                    // at the same original_head path.
+                    let original_path = original_path_candidates(
+                        file_path,
+                        commit_renames,
+                        &upstream_rename_sources,
+                    )
+                    .into_iter()
+                    .find(|candidate| original_hunks.contains_key(*candidate))
+                    .or_else(|| {
+                        let original_head_path = original_head_path_of.get(file_path)?;
+                        original_hunks.keys().map(String::as_str).find(|path| {
+                            path_after_later_commits(&original_later_paths, original_commit, path)
+                                == Some(original_head_path.as_str())
+                        })
+                    });
+                    if let Some(original_path) = original_path
+                        && let Some(attestation) = note
+                            .attestations
+                            .iter()
+                            .find(|attestation| attestation.file_path == original_path)
+                    {
+                        carry_note_authors_for_added_lines(
+                            &mut line_attrs,
+                            hunks,
+                            &original_hunks[original_path],
+                            attestation,
+                        );
+                    }
+                }
 
                 let tatt = std::time::Instant::now();
                 if let Some(text) = serialize_attestation_from_line_attrs(file_path, &line_attrs) {
@@ -2005,9 +2132,6 @@ pub fn rewrite_authorship_after_rebase_v2(
                 loop_attestation_ms += tatt.elapsed().as_micros();
                 let tclone = std::time::Instant::now();
                 current_attributions.insert(file_path.clone(), (Vec::new(), line_attrs));
-                if !use_hunk_based && let Some(content) = new_content {
-                    current_file_contents.insert(file_path.clone(), content.clone());
-                }
                 loop_content_clone_ms += tclone.elapsed().as_micros();
             }
             loop_transform_ms += t0.elapsed().as_millis();
@@ -2391,14 +2515,15 @@ fn parse_name_status_renames(raw: &[u8], wanted: &HashSet<&str>) -> HashMap<Stri
 }
 
 /// Paths that tracked files are renamed to by `commits`, following chains of
-/// renames (a -> b, then b -> c). Returns only paths not already in `pathspecs`.
-/// Best effort: a git failure yields no renames, which is the previous
-/// behavior.
+/// renames (a -> b, then b -> c), as git reports them for each commit. Returns
+/// `None` when no commit renames a tracked file, otherwise the new paths that
+/// are not in `pathspecs` yet (none, when every new path is already tracked).
+/// Best effort: a git failure yields `None`, which is the previous behavior.
 fn renamed_paths_within_commits(
     repo: &Repository,
     commits: &[String],
     pathspecs: &[String],
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let mut args = repo.global_args_for_exec();
     args.extend([
         "diff-tree".to_string(),
@@ -2413,18 +2538,24 @@ fn renamed_paths_within_commits(
         Ok(output) => output,
         Err(error) => {
             tracing::debug!(%error, "rebase rename detection failed");
-            return Vec::new();
+            return None;
         }
     };
     let renames = parse_diff_tree_name_status_renames(&output.stdout);
+    untracked_rename_targets(&renames, pathspecs)
+}
 
-    let mut tracked: HashSet<String> = pathspecs.iter().cloned().collect();
+/// See `renamed_paths_within_commits`: the part that needs no git.
+fn untracked_rename_targets(
+    renames: &[(String, String)],
+    pathspecs: &[String],
+) -> Option<Vec<String>> {
+    let mut tracked: HashSet<&str> = pathspecs.iter().map(String::as_str).collect();
     let mut renamed_to = Vec::new();
     loop {
         let mut grew = false;
-        for (old_path, new_path) in &renames {
-            if tracked.contains(old_path) && !tracked.contains(new_path) {
-                tracked.insert(new_path.clone());
+        for (old_path, new_path) in renames {
+            if tracked.contains(old_path.as_str()) && tracked.insert(new_path.as_str()) {
                 renamed_to.push(new_path.clone());
                 grew = true;
             }
@@ -2433,7 +2564,10 @@ fn renamed_paths_within_commits(
             break;
         }
     }
-    renamed_to
+    renames
+        .iter()
+        .any(|(old_path, _)| tracked.contains(old_path.as_str()))
+        .then_some(renamed_to)
 }
 
 /// Rename pairs from `git diff-tree --stdin -r -M --name-status -z` output,
@@ -2470,28 +2604,224 @@ fn parse_diff_tree_name_status_renames(raw: &[u8]) -> Vec<(String, String)> {
     renames
 }
 
-/// For every path that is renamed, the path it ends up at after all renames.
-fn final_paths_for_renames<'a>(
-    renames: impl Iterator<Item = &'a (String, String)>,
-) -> HashMap<String, String> {
-    let next: HashMap<&str, &str> = renames
-        .map(|(old_path, new_path)| (old_path.as_str(), new_path.as_str()))
+/// Move the entries of `map` along the renames one commit makes (`(old path,
+/// new path)` pairs). Every old entry is taken before any is placed, so a swap
+/// (a -> b and b -> a in one commit) works. A new path whose old path had no
+/// entry loses its own: the file that used to be there has been replaced.
+fn move_renamed_entries<V>(map: &mut HashMap<String, V>, renames: &[(String, String)]) {
+    let taken: Vec<Option<V>> = renames
+        .iter()
+        .map(|(old_path, _)| map.remove(old_path))
         .collect();
-    let mut targets = HashMap::new();
-    for start in next.keys() {
-        let mut current = *start;
-        // Bounded walk, so a rename cycle (a -> b, b -> a) cannot loop forever.
-        for _ in 0..next.len() {
-            match next.get(current) {
-                Some(following) if *following != *start => current = *following,
-                _ => break,
+    for ((_, new_path), value) in renames.iter().zip(taken) {
+        match value {
+            Some(value) => {
+                map.insert(new_path.clone(), value);
+            }
+            None => {
+                map.remove(new_path);
             }
         }
-        if current != *start {
-            targets.insert(start.to_string(), current.to_string());
+    }
+}
+
+/// `move_renamed_entries` for a set of paths.
+fn move_renamed_members(set: &mut HashSet<String>, renames: &[(String, String)]) {
+    let taken: Vec<bool> = renames
+        .iter()
+        .map(|(old_path, _)| set.remove(old_path))
+        .collect();
+    for ((_, new_path), was_member) in renames.iter().zip(taken) {
+        if was_member {
+            set.insert(new_path.clone());
+        } else {
+            set.remove(new_path);
         }
     }
-    targets
+}
+
+/// What a file is called after the commits that follow, per commit.
+///
+/// For each of `commits` (oldest first) and each file it changes, this is the
+/// path the file has once the rest of `commits` is applied, following the
+/// renames git reports for every later commit. Only files that do not keep
+/// their name are stored: `Some(path)` for a file that is renamed later, `None`
+/// for one that a later commit deletes or renames another file over. Read it
+/// with `path_after_later_commits`.
+fn later_paths_by_commit(
+    commits: &[String],
+    deltas: &HashMap<&str, &CommitTrackedDelta>,
+) -> HashMap<String, HashMap<String, Option<String>>> {
+    let mut by_commit = HashMap::new();
+    // Path as of the commit being visited -> what becomes of that file in the
+    // newer commits. Walking newest to oldest keeps this a single pass.
+    let mut later: HashMap<String, Option<String>> = HashMap::new();
+    for commit in commits.iter().rev() {
+        let Some(delta) = deltas.get(commit.as_str()) else {
+            continue;
+        };
+        let changed_here: HashMap<String, Option<String>> = delta
+            .changed_files
+            .iter()
+            .filter_map(|path| later.get(path).map(|fate| (path.clone(), fate.clone())))
+            .collect();
+        if !changed_here.is_empty() {
+            by_commit.insert(commit.clone(), changed_here);
+        }
+
+        // Step back to the paths of this commit's parent.
+        let renamed_from: Vec<(String, Option<String>)> = delta
+            .renames
+            .iter()
+            .map(|(old_path, new_path)| {
+                let fate = later
+                    .get(new_path)
+                    .cloned()
+                    .unwrap_or_else(|| Some(new_path.clone()));
+                (old_path.clone(), fate)
+            })
+            .collect();
+        // Whatever was at a rename's new path, or at a deleted path, before
+        // this commit does not survive it.
+        for (_, new_path) in &delta.renames {
+            later.insert(new_path.clone(), None);
+        }
+        for (path, blob_oid) in &delta.file_to_blob_oid {
+            if blob_oid.is_none() {
+                later.insert(path.clone(), None);
+            }
+        }
+        for (old_path, fate) in renamed_from {
+            later.insert(old_path, fate);
+        }
+    }
+    by_commit
+}
+
+/// The path that `path`, as changed by `commit`, has after the commits that
+/// follow it; `None` if the file does not survive them.
+fn path_after_later_commits<'a>(
+    later_paths: &'a HashMap<String, HashMap<String, Option<String>>>,
+    commit: &str,
+    path: &'a str,
+) -> Option<&'a str> {
+    match later_paths.get(commit).and_then(|paths| paths.get(path)) {
+        Some(fate) => fate.as_deref(),
+        None => Some(path),
+    }
+}
+
+/// Names the commit a rebased commit replays may have known `file_path` by:
+/// the same name, the name this commit renames it from (a rename folded into
+/// the commit by a fixup or squash), or its name before the branch that was
+/// rebased onto renamed it.
+fn original_path_candidates<'a>(
+    file_path: &'a str,
+    commit_renames: &'a [(String, String)],
+    upstream_rename_sources: &HashMap<&'a str, &'a str>,
+) -> Vec<&'a str> {
+    let mut candidates = vec![file_path];
+    candidates.extend(
+        commit_renames
+            .iter()
+            .filter(|(_, new_path)| new_path == file_path)
+            .map(|(old_path, _)| old_path.as_str()),
+    );
+    candidates.extend(upstream_rename_sources.get(file_path).copied());
+    candidates
+}
+
+/// Give the lines a rebased commit adds to a file the authors that the note of
+/// the commit it replays records for the same lines.
+///
+/// `hunks` are the rebased commit's hunks for the file, `original_hunks` the
+/// original commit's, and `original_attestation` the original note's entry for
+/// it. This only applies when both commits add exactly the same lines in the
+/// same order, which is what replaying a commit does; then each rebased line
+/// takes the author of its original line. A commit whose added lines differ (a
+/// conflict resolved differently, commits squashed together) is left to the
+/// original_head state, as are lines the original note does not attest.
+fn carry_note_authors_for_added_lines(
+    line_attrs: &mut Vec<crate::authorship::attribution_tracker::LineAttribution>,
+    hunks: &[DiffHunk],
+    original_hunks: &[DiffHunk],
+    original_attestation: &crate::authorship::authorship_log_serialization::FileAttestation,
+) {
+    use crate::authorship::authorship_log::LineRange;
+
+    fn added_lines(hunks: &[DiffHunk]) -> impl Iterator<Item = (u32, &str)> {
+        hunks.iter().flat_map(|hunk| {
+            hunk.added_lines
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| (hunk.new_start + offset as u32, line.as_str()))
+        })
+    }
+    if !added_lines(original_hunks)
+        .map(|(_, text)| text)
+        .eq(added_lines(hunks).map(|(_, text)| text))
+    {
+        return;
+    }
+
+    // The note's ranges, sorted so each added line's range is a binary search
+    // away (a note's ranges do not overlap).
+    let mut attested: Vec<(u32, u32, &str)> = original_attestation
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            entry.line_ranges.iter().map(|range| match range {
+                LineRange::Single(line) => (*line, *line, entry.hash.as_str()),
+                LineRange::Range(start, end) => (*start, *end, entry.hash.as_str()),
+            })
+        })
+        .collect();
+    attested.sort_unstable_by_key(|(start, _, _)| *start);
+    let author_of = |line: u32| -> Option<&str> {
+        let index = attested.partition_point(|(start, _, _)| *start <= line);
+        let (_, end, author) = attested.get(index.checked_sub(1)?)?;
+        (line <= *end).then_some(*author)
+    };
+    // (rebased line number, author) for the added lines the original note
+    // attests, ascending by line number.
+    let wanted: Vec<(u32, &str)> = added_lines(original_hunks)
+        .zip(added_lines(hunks))
+        .filter_map(|((original_line, _), (line, _))| Some((line, author_of(original_line)?)))
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+
+    // Most lines already have the right author from the original_head state;
+    // find those in one pass so only the others are rewritten.
+    let mut already_attributed = vec![false; wanted.len()];
+    for attr in line_attrs.iter() {
+        let first = wanted.partition_point(|(line, _)| *line < attr.start_line);
+        for (offset, (line, author)) in wanted[first..].iter().enumerate() {
+            if *line > attr.end_line {
+                break;
+            }
+            if attr.author_id == *author {
+                already_attributed[first + offset] = true;
+            }
+        }
+    }
+    // Rewrite the others a run of consecutive lines at a time.
+    let mut runs: Vec<(u32, u32, &str)> = Vec::new();
+    for ((line, author), done) in wanted.into_iter().zip(already_attributed) {
+        if done {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, end, run_author)) if *end + 1 == line && *run_author == author => {
+                *end = line;
+            }
+            _ => runs.push((line, line, author)),
+        }
+    }
+    for (start, end, author) in runs {
+        overlay_attribution(line_attrs, start, end, author.to_string());
+    }
 }
 
 /// Rewrite authorship logs after cherry-pick using VirtualAttributions
@@ -4603,12 +4933,17 @@ fn serialize_attestation_from_line_attrs(
 
     let human_id = crate::authorship::working_log::CheckpointKind::Human.to_str();
 
-    // Collect runs of (author_id, start, end) merging adjacent lines
+    // Collect runs of (author_id, start, end) merging adjacent lines. The runs
+    // are built in line order whatever order the attributions arrive in: lines
+    // stamped after a hunk shift are appended to the list, and merging those
+    // as they come would swallow a line that sits above an earlier one.
+    let mut ordered: Vec<&crate::authorship::attribution_tracker::LineAttribution> = line_attrs
+        .iter()
+        .filter(|attr| attr.author_id != human_id)
+        .collect();
+    ordered.sort_by_key(|attr| attr.start_line);
     let mut runs: Vec<(&str, u32, u32)> = Vec::new();
-    for attr in line_attrs {
-        if attr.author_id == human_id {
-            continue;
-        }
+    for attr in ordered {
         match runs.last_mut() {
             Some((last_author, _, last_end))
                 if *last_author == attr.author_id.as_str() && attr.start_line <= *last_end + 1 =>
@@ -5317,11 +5652,50 @@ pub fn transform_attributions_to_final_state(
 }
 
 #[cfg(test)]
-mod upstream_rename_parse_tests {
+mod rename_tracking_tests {
     use super::{
-        final_paths_for_renames, parse_diff_tree_name_status_renames, parse_name_status_renames,
+        CommitTrackedDelta, DiffHunk, carry_note_authors_for_added_lines, later_paths_by_commit,
+        move_renamed_entries, move_renamed_members, parse_diff_tree_name_status_renames,
+        parse_name_status_renames, path_after_later_commits, serialize_attestation_from_line_attrs,
+        untracked_rename_targets,
     };
-    use std::collections::HashSet;
+    use crate::authorship::attribution_tracker::LineAttribution;
+    use crate::authorship::authorship_log::LineRange;
+    use crate::authorship::authorship_log_serialization::{AttestationEntry, FileAttestation};
+    use std::collections::{HashMap, HashSet};
+
+    fn rename(old_path: &str, new_path: &str) -> (String, String) {
+        (old_path.to_string(), new_path.to_string())
+    }
+
+    /// A commit's delta: files it changes or adds, files it deletes, renames.
+    fn delta(changed: &[&str], deleted: &[&str], renames: &[(&str, &str)]) -> CommitTrackedDelta {
+        let mut delta = CommitTrackedDelta::default();
+        for path in changed {
+            delta.changed_files.insert(path.to_string());
+            delta
+                .file_to_blob_oid
+                .insert(path.to_string(), Some("blob".to_string()));
+        }
+        for path in deleted {
+            delta.changed_files.insert(path.to_string());
+            delta.file_to_blob_oid.insert(path.to_string(), None);
+        }
+        delta.renames = renames
+            .iter()
+            .map(|(old_path, new_path)| rename(old_path, new_path))
+            .collect();
+        delta
+    }
+
+    fn later_paths(
+        commits: &[(&str, CommitTrackedDelta)],
+    ) -> HashMap<String, HashMap<String, Option<String>>> {
+        let order: Vec<String> = commits.iter().map(|(sha, _)| sha.to_string()).collect();
+        let deltas: HashMap<&str, &CommitTrackedDelta> =
+            commits.iter().map(|(sha, delta)| (*sha, delta)).collect();
+        later_paths_by_commit(&order, &deltas)
+    }
 
     #[test]
     fn diff_tree_renames_skip_commit_ids() {
@@ -5333,25 +5707,161 @@ mod upstream_rename_parse_tests {
     }
 
     #[test]
-    fn final_paths_follow_rename_chains() {
-        let renames = [
-            ("a.txt".to_string(), "b.txt".to_string()),
-            ("b.txt".to_string(), "c.txt".to_string()),
-        ];
-        let targets = final_paths_for_renames(renames.iter());
-        assert_eq!(targets.get("a.txt").map(String::as_str), Some("c.txt"));
-        assert_eq!(targets.get("b.txt").map(String::as_str), Some("c.txt"));
+    fn rename_of_a_tracked_file_is_reported_even_when_the_new_path_is_tracked() {
+        let renames = [rename("a.txt", "b.txt")];
+        let both_tracked = ["a.txt".to_string(), "b.txt".to_string()];
+        assert_eq!(
+            untracked_rename_targets(&renames, &both_tracked),
+            Some(Vec::new())
+        );
+        let old_tracked = ["a.txt".to_string()];
+        assert_eq!(
+            untracked_rename_targets(&renames, &old_tracked),
+            Some(vec!["b.txt".to_string()])
+        );
     }
 
     #[test]
-    fn final_paths_stop_on_rename_cycles() {
+    fn rename_targets_follow_chains_and_skip_untracked_files() {
         let renames = [
-            ("a.txt".to_string(), "b.txt".to_string()),
-            ("b.txt".to_string(), "a.txt".to_string()),
+            rename("b.txt", "c.txt"),
+            rename("a.txt", "b.txt"),
+            rename("other.txt", "moved.txt"),
         ];
-        let targets = final_paths_for_renames(renames.iter());
-        assert_eq!(targets.get("a.txt").map(String::as_str), Some("b.txt"));
-        assert_eq!(targets.get("b.txt").map(String::as_str), Some("a.txt"));
+        let tracked = ["a.txt".to_string()];
+        assert_eq!(
+            untracked_rename_targets(&renames, &tracked),
+            Some(vec!["b.txt".to_string(), "c.txt".to_string()])
+        );
+        let unrelated = ["unrelated.txt".to_string()];
+        assert_eq!(untracked_rename_targets(&renames, &unrelated), None);
+    }
+
+    #[test]
+    fn later_paths_follow_rename_chains_per_commit() {
+        let later = later_paths(&[
+            ("c1", delta(&["a.txt"], &[], &[])),
+            ("c2", delta(&["b.txt"], &[], &[("a.txt", "b.txt")])),
+            ("c3", delta(&["b.txt"], &[], &[])),
+            ("c4", delta(&["c.txt"], &[], &[("b.txt", "c.txt")])),
+            ("c5", delta(&["c.txt"], &[], &[])),
+        ]);
+        assert_eq!(
+            path_after_later_commits(&later, "c1", "a.txt"),
+            Some("c.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c2", "b.txt"),
+            Some("c.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c3", "b.txt"),
+            Some("c.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c4", "c.txt"),
+            Some("c.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c5", "c.txt"),
+            Some("c.txt")
+        );
+    }
+
+    #[test]
+    fn later_paths_tell_a_renamed_file_from_a_new_file_at_its_old_path() {
+        let later = later_paths(&[
+            ("c1", delta(&["a.txt"], &[], &[])),
+            ("c2", delta(&["b.txt"], &[], &[("a.txt", "b.txt")])),
+            ("c3", delta(&["a.txt"], &[], &[])),
+        ]);
+        assert_eq!(
+            path_after_later_commits(&later, "c1", "a.txt"),
+            Some("b.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c3", "a.txt"),
+            Some("a.txt")
+        );
+    }
+
+    #[test]
+    fn later_paths_end_at_a_deletion_or_an_overwriting_rename() {
+        let later = later_paths(&[
+            ("c1", delta(&["gone.txt", "kept.txt", "over.txt"], &[], &[])),
+            ("c2", delta(&[], &["gone.txt"], &[])),
+            ("c3", delta(&["over.txt"], &[], &[("kept.txt", "over.txt")])),
+            ("c4", delta(&["gone.txt"], &[], &[])),
+        ]);
+        assert_eq!(path_after_later_commits(&later, "c1", "gone.txt"), None);
+        assert_eq!(path_after_later_commits(&later, "c1", "over.txt"), None);
+        assert_eq!(
+            path_after_later_commits(&later, "c1", "kept.txt"),
+            Some("over.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c4", "gone.txt"),
+            Some("gone.txt")
+        );
+    }
+
+    #[test]
+    fn later_paths_follow_a_swap() {
+        let later = later_paths(&[
+            ("c1", delta(&["a.txt", "b.txt"], &[], &[])),
+            (
+                "c2",
+                delta(
+                    &["a.txt", "b.txt"],
+                    &[],
+                    &[("a.txt", "b.txt"), ("b.txt", "a.txt")],
+                ),
+            ),
+        ]);
+        assert_eq!(
+            path_after_later_commits(&later, "c1", "a.txt"),
+            Some("b.txt")
+        );
+        assert_eq!(
+            path_after_later_commits(&later, "c1", "b.txt"),
+            Some("a.txt")
+        );
+    }
+
+    #[test]
+    fn renamed_entries_move_swap_and_replace() {
+        let mut map: HashMap<String, u32> = [
+            ("a.txt".to_string(), 1),
+            ("b.txt".to_string(), 2),
+            ("stale.txt".to_string(), 3),
+        ]
+        .into_iter()
+        .collect();
+        move_renamed_entries(
+            &mut map,
+            &[
+                rename("a.txt", "b.txt"),
+                rename("b.txt", "a.txt"),
+                rename("untracked.txt", "stale.txt"),
+            ],
+        );
+        assert_eq!(map.get("a.txt"), Some(&2));
+        assert_eq!(map.get("b.txt"), Some(&1));
+        assert_eq!(map.get("stale.txt"), None);
+
+        let mut set: HashSet<String> = ["a.txt".to_string(), "stale.txt".to_string()]
+            .into_iter()
+            .collect();
+        move_renamed_members(
+            &mut set,
+            &[
+                rename("a.txt", "b.txt"),
+                rename("untracked.txt", "stale.txt"),
+            ],
+        );
+        assert!(set.contains("b.txt"));
+        assert!(!set.contains("a.txt"));
+        assert!(!set.contains("stale.txt"));
     }
 
     #[test]
@@ -5367,5 +5877,90 @@ mod upstream_rename_parse_tests {
     fn empty_output_has_no_renames() {
         let wanted: HashSet<&str> = ["old.txt"].into_iter().collect();
         assert!(parse_name_status_renames(b"", &wanted).is_empty());
+    }
+
+    fn attr(start_line: u32, end_line: u32, author_id: &str) -> LineAttribution {
+        LineAttribution {
+            start_line,
+            end_line,
+            author_id: author_id.to_string(),
+            overrode: None,
+        }
+    }
+
+    #[test]
+    fn attestation_text_does_not_depend_on_attribution_order() {
+        // A line stamped after a hunk shift is appended, above an earlier line
+        // from the same author.
+        let text =
+            serialize_attestation_from_line_attrs("a.txt", &[attr(5, 5, "ai"), attr(2, 2, "ai")])
+                .unwrap();
+        assert_eq!(text, "a.txt\n  ai 2,5\n");
+        let text =
+            serialize_attestation_from_line_attrs("a.txt", &[attr(5, 5, "ai"), attr(4, 4, "ai")])
+                .unwrap();
+        assert_eq!(text, "a.txt\n  ai 4-5\n");
+    }
+
+    fn hunk(new_start: u32, added_lines: &[&str]) -> DiffHunk {
+        DiffHunk {
+            old_start: new_start.saturating_sub(1),
+            old_count: 0,
+            new_start,
+            new_count: added_lines.len() as u32,
+            added_lines: added_lines.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    fn attestation(path: &str, entries: &[(&str, LineRange)]) -> FileAttestation {
+        let mut attestation = FileAttestation::new(path.to_string());
+        for (hash, range) in entries {
+            attestation
+                .entries
+                .push(AttestationEntry::new(hash.to_string(), vec![range.clone()]));
+        }
+        attestation
+    }
+
+    #[test]
+    fn added_lines_take_the_authors_of_the_original_note() {
+        // The original commit added lines 3-4; its note attests line 3 only.
+        let original_hunks = [hunk(3, &["ai line", "human line"])];
+        let note = attestation("a.txt", &[("ai_author", LineRange::Single(3))]);
+        // Rebased, the same lines land one lower and nothing else is attributed.
+        let rebased_hunks = [hunk(4, &["ai line", "human line"])];
+        let mut line_attrs = Vec::new();
+        carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
+        assert_eq!(line_attrs.len(), 1);
+        assert_eq!((line_attrs[0].start_line, line_attrs[0].end_line), (4, 4));
+        assert_eq!(line_attrs[0].author_id, "ai_author");
+    }
+
+    #[test]
+    fn added_lines_take_authors_only_where_they_are_missing_or_differ() {
+        let original_hunks = [hunk(1, &["one", "two", "three"])];
+        let note = attestation("a.txt", &[("ai_author", LineRange::Range(1, 3))]);
+        let rebased_hunks = [hunk(10, &["one"]), hunk(20, &["two", "three"])];
+        // Line 10 is already right, line 20 has another author, 21 has none.
+        let mut line_attrs = vec![attr(10, 10, "ai_author"), attr(20, 20, "other")];
+        carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
+        line_attrs.sort_by_key(|attr| attr.start_line);
+        let lines: Vec<(u32, u32, &str)> = line_attrs
+            .iter()
+            .map(|attr| (attr.start_line, attr.end_line, attr.author_id.as_str()))
+            .collect();
+        assert_eq!(lines, vec![(10, 10, "ai_author"), (20, 21, "ai_author")]);
+    }
+
+    #[test]
+    fn added_lines_are_left_alone_when_the_rebased_commit_adds_other_lines() {
+        // A squash or a conflict resolution: not the same patch any more.
+        let original_hunks = [hunk(1, &["one", "two", "three"])];
+        let note = attestation("a.txt", &[("ai_author", LineRange::Range(1, 3))]);
+        let rebased_hunks = [hunk(10, &["extra", "one", "two"])];
+        let mut line_attrs = vec![attr(11, 11, "ai_author")];
+        carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
+        assert_eq!(line_attrs.len(), 1);
+        assert_eq!((line_attrs[0].start_line, line_attrs[0].end_line), (11, 11));
     }
 }
