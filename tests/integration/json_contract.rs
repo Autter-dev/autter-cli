@@ -3,8 +3,9 @@
 //! `docs/schemas/autter-cli.schema.json`, carries `schema_version`, and exits
 //! with the documented codes (0 success, 1 runtime error, 2 usage error,
 //! 3 nothing captured, meaning autter has no record of the added lines, and
-//! 4 capture broken, the last two only with `--strict`). The shape of each document is snapshotted so a schema change
-//! is always deliberate.
+//! 4 capture broken, the last two only with `--strict`, 5 a note failed
+//! `autter verify`). The shape of each document is snapshotted so a schema
+//! change is always deliberate.
 
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
@@ -325,6 +326,7 @@ const REPORTING_COMMANDS: &[(&str, &str, &[&str], &[i32])] = &[
         &["sync", "status", "--json"],
         &[0, 1],
     ),
+    ("verify", "verify", &["verify", "HEAD", "--json"], &[0]),
 ];
 
 #[test]
@@ -850,6 +852,28 @@ fn json_errors_are_one_document_on_stdout_and_text_on_stderr() {
 }
 
 #[test]
+fn verify_failure_exits_5_and_keeps_the_report() {
+    let repo = repo_with_ai_commit();
+    let written_for = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.git_og(&["commit", "--allow-empty", "-m", "empty"])
+        .unwrap();
+    repo.git_og(&["notes", "--ref=ai", "copy", &written_for, "HEAD"])
+        .unwrap();
+    let result = run(&repo, &["verify", "HEAD", "--json"], &[]);
+    assert_eq!(result.code, 5, "{}\n{}", result.stdout, result.stderr);
+    let document = parse_document(&result, "verify_failed");
+    assert_valid(&document, "verify", "verify_failed");
+    assert_eq!(document["error"]["code"], "integrity_failed");
+    assert_eq!(document["error"]["exit_code"], 5);
+    assert_eq!(document["results"][0]["status"], "wrong_commit");
+    assert_eq!(document["failed"], 1);
+}
+
+#[test]
 fn help_documents_exit_codes_and_strict() {
     let repo = TestRepo::new();
     let result = run(&repo, &["--help"], &[]);
@@ -859,6 +883,7 @@ fn help_documents_exit_codes_and_strict() {
         "Exit codes:",
         "Nothing captured",
         "Capture is broken",
+        "integrity check",
         "--strict",
         "AUTTER_STRICT",
     ] {

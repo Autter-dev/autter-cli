@@ -43,6 +43,7 @@ pub mod sync;
 pub mod telemetry;
 pub mod upgrade;
 pub mod usage_hints;
+pub mod verify;
 pub mod whoami;
 pub mod wrapped;
 
@@ -76,6 +77,8 @@ pub const EXIT_RUNTIME_ERROR: i32 = 1;
 pub const EXIT_USAGE_ERROR: i32 = 2;
 /// `--strict`: capture is broken (`doctor`). See [`output`].
 pub use output::EXIT_CAPTURE_BROKEN;
+#[allow(unused_imports)]
+pub use output::EXIT_INTEGRITY_FAILED;
 /// `--strict`: nothing was captured. See [`output`] for the full contract.
 pub use output::EXIT_NOTHING_CAPTURED;
 

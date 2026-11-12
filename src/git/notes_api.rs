@@ -43,7 +43,8 @@ fn write_note_with_kind(
     match kind {
         NotesBackendKind::Http => {
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            http_write_note(commit_sha, content, repo_url.as_deref())
+            let stamped = stamp_one(repo, commit_sha, content);
+            http_write_note(commit_sha, &stamped, repo_url.as_deref())
         }
         NotesBackendKind::GitNotes => {
             let git_result = crate::git::refs::notes_add(repo, commit_sha, content);
@@ -56,13 +57,26 @@ fn write_note_with_kind(
             // note, and the cloud copy can be backfilled with notes-migrate.
             let git_result = crate::git::refs::notes_add(repo, commit_sha, content);
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            if let Err(e) = http_write_note(commit_sha, content, repo_url.as_deref()) {
+            let stamped = stamp_one(repo, commit_sha, content);
+            if let Err(e) = http_write_note(commit_sha, &stamped, repo_url.as_deref()) {
                 tracing::warn!(%e, commit_sha, "both backend: cloud note enqueue failed");
             }
             after_git_notes_write(repo, &git_result);
             git_result
         }
     }
+}
+
+/// The note as stamped for `commit_sha` (note_integrity.rs). Git-notes
+/// writes are stamped in `refs::notes_add_batch`; this covers the HTTP path.
+fn stamp_one(repo: &Repository, commit_sha: &str, content: &str) -> String {
+    crate::authorship::note_integrity::stamp_note_entries(
+        repo,
+        &[(commit_sha.to_string(), content.to_string())],
+    )
+    .pop()
+    .map(|(_, note)| note)
+    .unwrap_or_else(|| content.to_string())
 }
 
 /// After a successful git-notes write, copy into `refs/notes/ai` any notes this
@@ -84,7 +98,8 @@ pub fn write_notes_batch(
     match current_backend_kind() {
         NotesBackendKind::Http => {
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            http_write_batch(entries, repo_url.as_deref())
+            let stamped = crate::authorship::note_integrity::stamp_note_entries(repo, entries);
+            http_write_batch(&stamped, repo_url.as_deref())
         }
         NotesBackendKind::GitNotes => {
             let git_result = crate::git::refs::notes_add_batch(repo, entries);
@@ -94,7 +109,8 @@ pub fn write_notes_batch(
         NotesBackendKind::Both => {
             let git_result = crate::git::refs::notes_add_batch(repo, entries);
             let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            if let Err(e) = http_write_batch(entries, repo_url.as_deref()) {
+            let stamped = crate::authorship::note_integrity::stamp_note_entries(repo, entries);
+            if let Err(e) = http_write_batch(&stamped, repo_url.as_deref()) {
                 tracing::warn!(%e, count = entries.len(), "both backend: cloud notes enqueue failed");
             }
             after_git_notes_write(repo, &git_result);

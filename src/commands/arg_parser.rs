@@ -756,6 +756,35 @@ autter squash-authorship <base_branch> <new_sha> <old_sha>
         body: "autter git-path\n\n  Print the path to the underlying git executable.",
     },
     HelpEntry {
+        name: "verify",
+        aliases: &[],
+        summary: "Check that authorship notes belong to their commits (integrity check)",
+        body: "\
+autter verify [<rev|range>] [--json] [--strict]
+
+  Check that each commit's authorship note was written for that commit and
+  has not been changed since (default: HEAD; a range such as
+  origin/main..HEAD checks every commit in it). Statuses:
+    verified                 written for this commit and unchanged
+    legacy                   written before the integrity check (warning)
+    missing                  no note (warning)
+    pending_rewrite          copied by git during a rewrite, not yet rewritten
+    rebound_by_older_autter  moved here by an older autter (warning)
+    unavailable              commit or files not in this clone (warning)
+    wrong_commit             the note belongs to a different change
+    content_mismatch         the note does not describe this commit's files
+    range_out_of_bounds      lines past the end of a file, or a missing file
+    digest_mismatch          the note was changed after autter wrote it
+
+  Exits 5 when any note fails. Missing and legacy notes are warnings, also
+  with --strict for now; a later release will fail them under --strict.
+  This is an integrity check: someone who can rewrite the note can also
+  rewrite its integrity record.
+
+  --json     One JSON document with counts and a result per commit
+  --strict   Also list commits without a note (also AUTTER_STRICT=1)",
+    },
+    HelpEntry {
         name: "upgrade",
         aliases: &[],
         summary: "Check for updates and install if available",
@@ -1090,6 +1119,7 @@ pub const EXIT_CODES_HELP: &str = "Exit codes:
   3   Nothing captured: Autter has no record of the added lines
       (stats, status; only with --strict)
   4   Capture is broken (doctor; only with --strict)
+  5   A note failed the integrity check (verify)
 
 With --json, a failure prints {\"schema_version\":1,\"error\":{\"code\",\"message\",\"exit_code\"}}.
 In CI (CI=true) or when output is not a terminal: no color, prompts or spinners.

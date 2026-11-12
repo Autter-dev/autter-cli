@@ -58,6 +58,7 @@ can take are listed in the schema's `error` entry and below.
 | `runtime_error` | 1 | Anything else that went wrong (a file `blame` cannot find, a repository with no commits, a `-C` path that does not exist) |
 | `nothing_captured` | 3 | `--strict`: lines were added and autter has no record of them |
 | `capture_broken` | 4 | `--strict`: capture is broken (`doctor`) |
+| `integrity_failed` | 5 | `verify`: an authorship note belongs to another commit or was changed after autter wrote it |
 
 The exit code is the same with and without `--json`. `whoami`, `doctor` and
 `sync status` do not read a repository and do not need the background service,
@@ -154,6 +155,7 @@ authorship note.
 | 2 | Usage error (bad flags, outside a repository) |
 | 3 | Nothing captured: autter has no record of the added lines (`stats`, `status`; only with `--strict`) |
 | 4 | Capture is broken (`doctor`; only with `--strict`) |
+| 5 | A note failed the integrity check (`verify`) |
 
 `autter --help` prints the same table.
 
@@ -191,6 +193,60 @@ captured, and `doctor` exits 1 when any check fails. With `--strict` (or
 - `autter doctor --strict` exits **4** when a check that capture depends on
   fails (background service, git trace2, the end-to-end checkpoint, agent
   hooks), and 1 when only other checks fail. The report has `capture_ok`.
+
+## `autter verify`: the integrity check
+
+Authorship notes live in `refs/notes/ai`, which anyone who can push to the
+repository can change. Every note autter writes, including the notes it
+rewrites after a rebase, amend, cherry-pick, reset, stash or `autter ci`
+merge, records the commit it was written for, that commit's tree, the blob of
+each file it attests, and a SHA-256 digest of the note. `autter verify`
+checks them:
+
+```bash
+autter verify                      # HEAD
+autter verify <sha>                # one commit
+autter verify origin/main..HEAD    # every commit in a range
+autter verify origin/main..HEAD --json --strict
+```
+
+| Status | Exit | Meaning |
+|---|---|---|
+| `verified` | 0 | Written for this commit and unchanged since |
+| `legacy` | 0 (warning) | Written before the integrity check (autter 3.7.1 and earlier). Its commit and line ranges are still checked |
+| `missing` | 0 (warning) | The commit has no note |
+| `pending_rewrite` | 0 (warning) | Git copied another commit's note here during a rebase or amend and autter has not rewritten it yet (the background service was not running). The two commits carry the same patch |
+| `rebound_by_older_autter` | 0 (warning) | An autter release older than the integrity check moved the note here |
+| `unavailable` | 0 (warning) | The commit or its files are not in this clone (a shallow or partial clone), so the note could not be checked. This is not tampering |
+| `wrong_commit` | 5 | The note was written for another commit with a different change: it was copied or moved |
+| `content_mismatch` | 5 | The note's record of the commit's files does not match the commit |
+| `range_out_of_bounds` | 5 | The note attributes lines past the end of a file, or lines of a file the commit does not have |
+| `digest_mismatch` | 5 | The note was changed after autter wrote it |
+
+`--json` prints `{schema_version, range, commits, counts, failed, results}`,
+each result `{commit, status, detail, recorded_commit?}`; on exit 5 the same
+report comes with `error.code` = `integrity_failed`. `--strict` still passes
+`legacy` and `missing` notes, with a warning on stderr. **A later release will
+fail them under `--strict`**, once notes written before the integrity check
+have aged out of the ranges you check.
+
+`autter stats`, `autter blame` and the range stats do not trust a note that
+fails: its lines count as `unknown`, and they print one line naming the commit
+and pointing at `autter verify`.
+
+This is an integrity check, not tamper evidence. It catches notes copied to
+another commit, moved, or edited by hand. Someone who can write to the
+repository and recomputes every field of the note (the digest is not a
+signature) is not caught; a record kept outside the repository is planned for
+that.
+
+To fail a pull request whose notes do not belong to its commits, run it next
+to `autter ci` (or on its own after `autter fetch-notes origin`):
+
+```yaml
+      - name: Check authorship notes
+        run: autter verify origin/${{ github.base_ref }}..HEAD --strict
+```
 
 ## CI behaviour
 

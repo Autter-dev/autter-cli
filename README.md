@@ -206,12 +206,13 @@ Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `who
 | 2 | Usage error (bad flags, outside a repository) |
 | 3 | Nothing captured: autter has no record of the added lines (`stats`, `status`; only with `--strict`) |
 | 4 | Capture is broken (`doctor`; only with `--strict`) |
+| 5 | A note failed the integrity check (`verify`) |
 
 ```bash
 autter stats "$BASE..$HEAD" --json --strict | jq '.percent.ai'
 ```
 
-In CI (`CI=true`) or when output is not a terminal, autter prints no color, prompts or spinners. See [Scripting and CI](docs/scripting.md) for the JSON Schema, error codes and a GitHub Actions workflow that fails a pull request when nothing was captured or the AI share is too high.
+In CI (`CI=true`) or when output is not a terminal, autter prints no color, prompts or spinners. `autter verify origin/main..HEAD --strict` checks that each commit's authorship note was written for that commit and has not been changed since (an integrity check); stats and blame count the lines of a note that fails as unknown. See [Scripting and CI](docs/scripting.md) for the JSON Schema, error codes and a GitHub Actions workflow that fails a pull request when nothing was captured or the AI share is too high.
 
 For a year at a glance, `autter wrapped` draws a screenshot-ready card of your AI-assisted coding in the repository: AI share by month, top agent and model, most-prompted file, longest prompt, streak and busiest weekday. `--json` prints the same numbers, and `--share` publishes the card as a page with a share image. Prompt text never leaves the machine unless you pass `--include-prompt-text`.
 

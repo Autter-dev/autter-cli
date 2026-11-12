@@ -13,8 +13,9 @@
 //! * Exit codes: [`EXIT_SUCCESS`](super::EXIT_SUCCESS) `0`,
 //!   [`EXIT_RUNTIME_ERROR`](super::EXIT_RUNTIME_ERROR) `1`,
 //!   [`EXIT_USAGE_ERROR`](super::EXIT_USAGE_ERROR) `2` (bad flags, outside a
-//!   repository), [`EXIT_NOTHING_CAPTURED`] `3` and [`EXIT_CAPTURE_BROKEN`] `4`.
-//!   `3` and `4` only happen with `--strict` (or `AUTTER_STRICT=1`).
+//!   repository), [`EXIT_NOTHING_CAPTURED`] `3`, [`EXIT_CAPTURE_BROKEN`] `4`
+//!   and [`EXIT_INTEGRITY_FAILED`] `5`. `3` and `4` only happen with
+//!   `--strict` (or `AUTTER_STRICT=1`); `5` only from `verify`.
 //!
 //! The JSON Schemas for these documents live in `docs/schemas/` and the
 //! integration test `json_contract.rs` checks every command against them.
@@ -35,6 +36,10 @@ pub const EXIT_NOTHING_CAPTURED: i32 = 3;
 /// `--strict`: capture itself is broken (`doctor`: a background service,
 /// trace2, end-to-end checkpoint or agent hook check failed).
 pub const EXIT_CAPTURE_BROKEN: i32 = 4;
+
+/// `verify`: a note does not belong to its commit or was changed after
+/// autter wrote it (with or without `--strict`).
+pub const EXIT_INTEGRITY_FAILED: i32 = 5;
 
 /// Why a reporting command failed. Each kind has a stable `code` string for
 /// the JSON error object and a fixed process exit code.
@@ -61,6 +66,8 @@ pub enum ErrorKind {
     NothingCaptured,
     /// `--strict`: capture is broken.
     CaptureBroken,
+    /// `verify`: a note failed the integrity check.
+    IntegrityFailed,
     /// Anything else that went wrong at runtime.
     Runtime,
 }
@@ -78,6 +85,7 @@ impl ErrorKind {
             ErrorKind::CheckFailed => "check_failed",
             ErrorKind::NothingCaptured => "nothing_captured",
             ErrorKind::CaptureBroken => "capture_broken",
+            ErrorKind::IntegrityFailed => "integrity_failed",
             ErrorKind::Runtime => "runtime_error",
         }
     }
@@ -87,6 +95,7 @@ impl ErrorKind {
             ErrorKind::Usage | ErrorKind::NotARepository => super::EXIT_USAGE_ERROR,
             ErrorKind::NothingCaptured => EXIT_NOTHING_CAPTURED,
             ErrorKind::CaptureBroken => EXIT_CAPTURE_BROKEN,
+            ErrorKind::IntegrityFailed => EXIT_INTEGRITY_FAILED,
             ErrorKind::RevisionNotFound
             | ErrorKind::ServiceUnreachable
             | ErrorKind::NotePending
