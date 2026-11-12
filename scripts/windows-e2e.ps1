@@ -559,6 +559,54 @@ try {
     # A real console window: the probe runs autter with the console as its
     # output and copies the screen buffer to a file. Legacy console
     # (ForceV2=0) has no VT support; the default one has.
+    # Start a program in a console of its own (hidden window), the way a
+    # user's terminal runs autter, and wait for it.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class NewConsole {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SI {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+        public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags;
+        public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+        public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PI { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags,
+        IntPtr env, string cwd, ref SI si, out PI pi);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
+    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+
+    public static int Run(string app, string commandLine, string cwd, int timeoutMs) {
+        SI si = new SI();
+        si.cb = Marshal.SizeOf(typeof(SI));
+        si.dwFlags = 0x1;      // STARTF_USESHOWWINDOW
+        si.wShowWindow = 0;    // SW_HIDE
+        PI pi;
+        // CREATE_NEW_CONSOLE; no handles inherited, so the console is its stdio.
+        if (!CreateProcess(app, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0x10, IntPtr.Zero, cwd, ref si, out pi)) {
+            throw new Win32Exception();
+        }
+        uint code = 0;
+        if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) {
+            TerminateProcess(pi.hProcess, 1);
+            code = unchecked((uint)-1);
+        } else {
+            GetExitCodeProcess(pi.hProcess, out code);
+        }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        return unchecked((int)code);
+    }
+}
+'@
     $probe = Join-Path $script:Root 'console-probe.ps1'
     $probeSrc = @'
 param([string]$Autter, [string]$Repo, [string]$OutDir)
@@ -625,13 +673,19 @@ Save-Screen 'vtcheck.txt'
         }
         $out = Join-Path $script:LogDir ("console-" + $mode)
         New-Item -ItemType Directory -Force -Path $out | Out-Null
-        $proc = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $probe + '"'),
-            '-Autter', ('"' + $script:AutterExe + '"'), '-Repo', ('"' + $RepoDir + '"'), '-OutDir', ('"' + $out + '"'))
-        if (-not $proc.WaitForExit(300000)) { try { $proc.Kill() } catch { }; Fail ("{0} console probe timed out" -f $mode); continue }
+        $psExe = Join-Path $PSHOME 'powershell.exe'
+        $probeArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $probe, '-Autter', $script:AutterExe, '-Repo', $RepoDir, '-OutDir', $out)
+        $cmdLine = (@($psExe) + $probeArgs | ForEach-Object { [E2eRunner]::Quote($_) }) -join ' '
+        $exit = [NewConsole]::Run($psExe, $cmdLine, $RepoDir, 300000)
         $probeErrors = Join-Path $out 'error.txt'
         if (Test-Path -LiteralPath $probeErrors) { Write-Host ("  {0} console probe errors:`n{1}" -f $mode, [IO.File]::ReadAllText($probeErrors)) }
-        if (-not (Test-Path -LiteralPath (Join-Path $out 'done'))) { Fail ("{0} console probe did not finish (exit {1}, started: {2})" -f $mode, $proc.ExitCode, (Test-Path -LiteralPath (Join-Path $out 'started'))); continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $out 'done'))) {
+            Fail ("{0} console probe did not finish (exit {1}, started: {2})" -f $mode, $exit, (Test-Path -LiteralPath (Join-Path $out 'started')))
+            # The same probe with redirected output, to see why.
+            $diag = Invoke-Exe -File $psExe -Arguments $probeArgs -Cwd $RepoDir -TimeoutSec 120 -Label ('console probe redirected ' + $mode)
+            Write-Host ("  redirected probe: exit {0}`n{1}" -f $diag.ExitCode, (Show-Output $diag))
+            continue
+        }
         $vt = [IO.File]::ReadAllText((Join-Path $out 'vtcheck.txt'))
         $vtOn = -not $vt.Contains($esc)
         Write-Host ("  {0} console: VT processing {1}" -f $mode, $(if ($vtOn) { 'on' } else { 'off (raw ESC shows as text)' }))
@@ -719,6 +773,28 @@ public static class FilteredToken {
     static extern IntPtr OpenDesktop(string name, uint flags, bool inherit, uint access);
     [DllImport("advapi32.dll")]
     static extern uint SetSecurityInfo(IntPtr handle, int objectType, uint securityInfo, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, uint revision, out IntPtr sd, IntPtr size);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetSecurityDescriptorSacl(IntPtr sd, out bool present, out IntPtr sacl, out bool defaulted);
+
+    // Everyone may use the object, from any integrity level.
+    static void OpenUp(IntPtr handle) {
+        IntPtr sd;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptor("D:(A;;GA;;;WD)S:(ML;;NW;;;LW)", 1, out sd, IntPtr.Zero)) { throw new Win32Exception(); }
+        bool present, defaulted;
+        IntPtr dacl, sacl;
+        GetSecurityDescriptorDacl(sd, out present, out dacl, out defaulted);
+        GetSecurityDescriptorSacl(sd, out present, out sacl, out defaulted);
+        // DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION
+        uint rc = SetSecurityInfo(handle, 7, 0x4 | 0x10, IntPtr.Zero, IntPtr.Zero, dacl, sacl);
+        if (rc != 0) {
+            rc = SetSecurityInfo(handle, 7, 0x4, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+            if (rc != 0) { throw new Win32Exception((int)rc); }
+        }
+    }
 
     static string ObjectName(IntPtr obj) {
         System.Text.StringBuilder sb = new System.Text.StringBuilder(256);
@@ -735,15 +811,13 @@ public static class FilteredToken {
     static string OpenUpDesktop() {
         string winsta = ObjectName(GetProcessWindowStation());
         string desktop = ObjectName(GetThreadDesktop(GetCurrentThreadId()));
-        // READ_CONTROL | WRITE_DAC
-        IntPtr ws = OpenWindowStation(winsta, false, 0x00020000 | 0x00040000);
+        // READ_CONTROL | WRITE_DAC | WRITE_OWNER
+        IntPtr ws = OpenWindowStation(winsta, false, 0x00020000 | 0x00040000 | 0x00080000);
         if (ws == IntPtr.Zero) { throw new Win32Exception(); }
-        uint rc = SetSecurityInfo(ws, 7, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-        if (rc != 0) { throw new Win32Exception((int)rc); }
-        IntPtr dt = OpenDesktop(desktop, 0, false, 0x00020000 | 0x00040000);
+        OpenUp(ws);
+        IntPtr dt = OpenDesktop(desktop, 0, false, 0x00020000 | 0x00040000 | 0x00080000);
         if (dt == IntPtr.Zero) { throw new Win32Exception(); }
-        rc = SetSecurityInfo(dt, 7, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-        if (rc != 0) { throw new Win32Exception((int)rc); }
+        OpenUp(dt);
         return winsta + "\\" + desktop;
     }
 
@@ -754,8 +828,9 @@ public static class FilteredToken {
     }
 
     // Runs commandLine with a UAC-style filtered copy of this process's
-    // token and returns its exit code (-1 on timeout).
-    public static int Run(string commandLine, string cwd, int timeoutMs) {
+    // token and returns its exit code (-1 on timeout). mediumIntegrity
+    // also lowers the token to medium integrity, as UAC does.
+    public static int Run(string commandLine, string cwd, int timeoutMs, bool mediumIntegrity) {
         IntPtr token;
         // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID
         if (!OpenProcessToken(GetCurrentProcess(), 0x0001 | 0x0002 | 0x0008 | 0x0080 | 0x0100, out token)) { throw new Win32Exception(); }
@@ -774,7 +849,7 @@ public static class FilteredToken {
         tml.Attributes = 0x20; // SE_GROUP_INTEGRITY
         Marshal.StructureToPtr(tml, label, false);
         // TokenIntegrityLevel
-        if (!SetTokenInformation(filtered, 25, label, (uint)labelSize + GetLengthSid(medium))) { throw new Win32Exception(); }
+        if (mediumIntegrity && !SetTokenInformation(filtered, 25, label, (uint)labelSize + GetLengthSid(medium))) { throw new Win32Exception(); }
 
         STARTUPINFO si = new STARTUPINFO();
         si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
@@ -826,15 +901,25 @@ public static class FilteredToken {
         $lines += ('echo done > "{0}\done"' -f $elevDir)
         [IO.File]::WriteAllText($wrapper, (($lines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
 
-        $code = [FilteredToken]::Run(('cmd.exe /c "' + $wrapper + '"'), $RepoDir, 600000)
+        $mediumIl = $true
+        $code = [FilteredToken]::Run(('cmd.exe /c "' + $wrapper + '"'), $RepoDir, 600000, $true)
+        if ($code -eq -1073741502) {
+            # STATUS_DLL_INIT_FAILED: a medium-integrity process cannot use the
+            # service session's desktop on this runner. Keep the integrity
+            # level; Administrators stay deny-only, which is what decides
+            # access to the service's pipes and files.
+            $mediumIl = $false
+            Note 'a medium-integrity process cannot start on this runner''s service desktop (STATUS_DLL_INIT_FAILED); the standard-user token keeps high integrity, with Administrators deny-only and no privileges'
+            $code = [FilteredToken]::Run(('cmd.exe /c "' + $wrapper + '"'), $RepoDir, 600000, $false)
+        }
         Write-Host ("  standard-user commands finished with exit {0}" -f $code)
         function Read-Part([string]$name) {
             $p = Join-Path $elevDir $name
             if (Test-Path -LiteralPath $p) { return [IO.File]::ReadAllText($p) } else { return '' }
         }
         $groups = Read-Part 'whoami.txt'
-        $restricted = ($groups -match 'Medium Mandatory Level') -and ($groups -match 'S-1-5-32-544\s+Group used for deny only')
-        Check $restricted 'the standard-user token has Administrators deny-only at medium integrity' $groups
+        $restricted = ($groups -match 'S-1-5-32-544\s+Group used for deny only') -and (-not $mediumIl -or $groups -match 'Medium Mandatory Level')
+        Check $restricted 'the standard-user token has Administrators deny-only' $groups
         foreach ($s in $steps) {
             $c = (Read-Part ($s[0] + '.code')).Trim()
             $text = (Read-Part ($s[0] + '.out')) + (Read-Part ($s[0] + '.err'))
