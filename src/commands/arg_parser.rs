@@ -159,6 +159,23 @@ pub fn merge_global_flags(f: &GlobalFlags) {
     }
 }
 
+/// Record `--json` when it appears anywhere in `args` before a `--`
+/// separator. Called before a command's own parsing (and before the
+/// dispatcher contacts the background service), so a failure that happens
+/// first is still reported as a JSON document.
+pub fn merge_json_flag_from(args: &[String]) {
+    if args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--json")
+    {
+        merge_global_flags(&GlobalFlags {
+            json: true,
+            ..Default::default()
+        });
+    }
+}
+
 /// Whether `--strict` was given anywhere (leading or trailing). Use
 /// [`crate::commands::output::strict`], which also reads `AUTTER_STRICT`.
 pub fn strict_flag() -> bool {

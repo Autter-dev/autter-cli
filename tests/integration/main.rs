@@ -132,6 +132,7 @@ mod remote_squash_recovery;
 mod repo_storage_unit;
 mod repository_unit;
 mod reset;
+mod scripting_failure_modes;
 mod secrets_benchmark;
 mod service_down_attribution;
 mod session_event_repo_url;

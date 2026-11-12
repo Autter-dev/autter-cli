@@ -56,10 +56,16 @@ pub fn handle_sync(args: &[String]) {
         Some("retry") => retry_cli(&args[1..]),
         Some("open") => open_dashboard(),
         Some("--help") | Some("-h") | Some("help") => print_help(),
+        // `autter sync --json` is `autter sync status --json`.
+        Some(flag) if flag.starts_with('-') => print_status(args),
         Some(other) => {
-            eprintln!("Unknown sync subcommand: {other}");
+            // `autter sync bogus --json` still answers with one JSON document.
+            arg_parser::merge_json_flag_from(args);
             print_help();
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+            crate::commands::output::fail(
+                crate::commands::output::ErrorKind::Usage,
+                format!("Unknown sync subcommand: {other}"),
+            );
         }
     }
 }

@@ -207,6 +207,19 @@ pub fn handle_log(args: &[String]) -> ExitStatus {
         Err(LogError::Usage(message)) => {
             output::fail(ErrorKind::Usage, format!("autter log: {}", message))
         }
+        // git refused the arguments `autter log` passed through: an option
+        // it does not know is a usage error (exit 2), a revision that does
+        // not resolve is `revision_not_found`. git's own message is the
+        // error, with or without `--json`.
+        Err(LogError::GitLog { code, stderr }) => {
+            let kind = match output::git_error_kind(&stderr) {
+                ErrorKind::Runtime if code == Some(129) => ErrorKind::Usage,
+                kind => kind,
+            };
+            let detail = stderr.trim();
+            let detail = detail.strip_prefix("fatal: ").unwrap_or(detail);
+            output::fail(kind, format!("autter log: {}", detail))
+        }
         Err(error) if crate::commands::arg_parser::json() => {
             output::fail(ErrorKind::Runtime, format!("autter log: {}", error))
         }
@@ -627,6 +640,8 @@ impl LogRenderer {
 struct CommitStream {
     child: Option<Child>,
     stdout: BufReader<std::process::ChildStdout>,
+    /// Drains git's stderr while stdout is read, so git never blocks on it.
+    stderr: Option<std::thread::JoinHandle<String>>,
 }
 
 impl CommitStream {
@@ -653,10 +668,18 @@ impl CommitStream {
             .stdout
             .take()
             .ok_or_else(|| LogError::Message("failed to capture git log stdout".to_string()))?;
+        let stderr = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = io::Read::read_to_string(&mut stderr, &mut text);
+                text
+            })
+        });
 
         Ok(Self {
             child: Some(child),
             stdout: BufReader::new(stdout),
+            stderr,
         })
     }
 
@@ -699,13 +722,27 @@ impl CommitStream {
             return Ok(());
         };
         let status = child.wait().map_err(LogError::Io)?;
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
         if status.success() {
+            // Warnings git printed are still shown.
+            if !stderr.trim().is_empty() {
+                eprint!("{stderr}");
+            }
             Ok(())
-        } else {
+        } else if stderr.trim().is_empty() {
             Err(LogError::Message(format!(
                 "git log exited with status {}",
                 status
             )))
+        } else {
+            Err(LogError::GitLog {
+                code: status.code(),
+                stderr,
+            })
         }
     }
 }
@@ -1298,6 +1335,11 @@ enum LogError {
     Git(AutterError),
     /// Bad flags: exit 2.
     Usage(String),
+    /// `git log` failed and said why.
+    GitLog {
+        code: Option<i32>,
+        stderr: String,
+    },
     Io(io::Error),
     Message(String),
 }
@@ -1307,6 +1349,7 @@ impl std::fmt::Display for LogError {
         match self {
             LogError::Git(error) => write!(f, "{}", error),
             LogError::Usage(message) => write!(f, "{}", message),
+            LogError::GitLog { stderr, .. } => write!(f, "{}", stderr.trim()),
             LogError::Io(error) => write!(f, "{}", error),
             LogError::Message(message) => write!(f, "{}", message),
         }
