@@ -168,29 +168,46 @@ pub fn maybe_refresh_after_upgrade(args: &[String]) {
         return;
     }
     let Some(claim) = claim_path() else { return };
-    let now = now_secs();
-    if read_json::<RefreshClaim>(&claim)
-        .is_some_and(|c| c.version == current && now.saturating_sub(c.at) < CLAIM_TTL_SECS)
-    {
+    // Held until the worker is started, so a second command arriving in the
+    // same moment cannot also see no claim and start a second worker.
+    let Some(_claimed) = claim_refresh(&claim, current, now_secs()) else {
         return;
-    }
-    if write_json(
-        &claim,
-        &RefreshClaim {
-            version: current.to_string(),
-            at: now,
-        },
-    )
-    .is_err()
-    {
-        return;
-    }
+    };
     crate::utils::spawn_internal_autter_subcommand(
         "install-hooks",
         &[REFRESH_STALE_FLAG],
         WORKER_GUARD_ENV,
         &[],
     );
+}
+
+/// Claim the after-upgrade refresh for `version`, or `None` when another
+/// command already has (a fresh claim on disk, or one being written right
+/// now). The check and the write happen under an exclusive lock on a file
+/// next to the claim: two commands started at the same moment after an
+/// upgrade used to both read "no claim" and both start a worker, which then
+/// rewrote the same agent config files at the same time. The returned lock
+/// is held until the caller drops it.
+fn claim_refresh(claim: &Path, version: &str, now: u64) -> Option<crate::utils::LockFile> {
+    if let Some(dir) = claim.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    // Not blocking: whoever holds the lock is claiming it right now.
+    let lock = crate::utils::LockFile::try_acquire(&claim.with_extension("lock"))?;
+    if read_json::<RefreshClaim>(claim)
+        .is_some_and(|c| c.version == version && now.saturating_sub(c.at) < CLAIM_TTL_SECS)
+    {
+        return None;
+    }
+    write_json(
+        claim,
+        &RefreshClaim {
+            version: version.to_string(),
+            at: now,
+        },
+    )
+    .ok()?;
+    Some(lock)
 }
 
 /// Whether the agent's hook config is exactly what `install_hooks` would write
@@ -240,15 +257,14 @@ pub fn refresh_stale_hooks(
 }
 
 /// `autter install-hooks --refresh-stale`: refresh, record the result for
-/// `autter doctor`, and report on stderr. Returns false when an agent failed.
-pub fn run_refresh_command() -> bool {
-    let binary_path = match crate::mdm::utils::resolve_hook_binary_path() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("autter: could not locate the autter binary to refresh hooks: {e}");
-            return false;
-        }
-    };
+/// `autter doctor`, and report on stderr. Returns the agents refreshed, or an
+/// error naming the agents that could not be.
+pub fn run_refresh_command() -> Result<Vec<String>, AutterError> {
+    let binary_path = crate::mdm::utils::resolve_hook_binary_path().map_err(|e| {
+        AutterError::Generic(format!(
+            "could not locate the autter binary to refresh hooks: {e}"
+        ))
+    })?;
     let params = HookInstallerParams { binary_path };
     let outcome = refresh_stale_hooks(&crate::mdm::agents::get_all_installers(), &params);
     for name in &outcome.refreshed {
@@ -260,9 +276,16 @@ pub fn run_refresh_command() -> bool {
             failure.name, failure.error
         );
     }
-    let ok = outcome.failed.is_empty();
+    let failed: Vec<String> = outcome.failed.iter().map(|f| f.name.clone()).collect();
     record_refresh(outcome.failed);
-    ok
+    if failed.is_empty() {
+        Ok(outcome.refreshed)
+    } else {
+        Err(AutterError::Generic(format!(
+            "could not refresh autter hooks for {}",
+            failed.join(", ")
+        )))
+    }
 }
 
 /// After `autter upgrade` replaced the binary: run the refresh with the newly
@@ -543,6 +566,51 @@ mod tests {
         // Declined, absent and current agents, and the VS Code extension, are
         // never written to.
         assert_eq!(installed, vec!["stale"]);
+    }
+
+    #[test]
+    fn commands_started_together_claim_the_refresh_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = dir.path().join("internal").join("hooks_refresh_claim.json");
+        let racers = 8;
+        let start = Arc::new(std::sync::Barrier::new(racers));
+        let done = Arc::new(std::sync::Barrier::new(racers));
+        let handles: Vec<_> = (0..racers)
+            .map(|_| {
+                let (claim, start, done) = (claim.clone(), start.clone(), done.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let won = claim_refresh(&claim, "9.9.9", 1_000);
+                    // Hold any claim until every racer has tried, the way
+                    // the winner holds it while starting the worker.
+                    done.wait();
+                    won.is_some()
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one command may start the worker");
+
+        // Later commands see the claim on disk.
+        assert!(claim_refresh(&claim, "9.9.9", 1_000 + 60).is_none());
+        // A claim for another version, or one past its time, is replaced.
+        assert!(claim_refresh(&claim, "9.9.10", 1_000 + 60).is_some());
+        assert!(claim_refresh(&claim, "9.9.10", 1_000 + 60 + CLAIM_TTL_SECS).is_some());
+    }
+
+    #[test]
+    fn a_claim_being_written_blocks_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = dir.path().join("hooks_refresh_claim.json");
+        let held = claim_refresh(&claim, "1.0.0", 5).unwrap();
+        // Even a claim for another version waits for the one in progress.
+        assert!(claim_refresh(&claim, "2.0.0", 5).is_none());
+        drop(held);
+        assert!(claim_refresh(&claim, "2.0.0", 5).is_some());
     }
 
     #[test]
