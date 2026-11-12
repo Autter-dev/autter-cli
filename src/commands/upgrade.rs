@@ -2378,15 +2378,44 @@ mod tests {
             UpdateChannel::Latest
         )));
 
+        // Start from no CI variable at all, so the test also passes on a CI
+        // runner (GitHub Actions sets GITHUB_ACTIONS as well as CI), and put
+        // the runner's values back at the end.
+        let ci_vars = [
+            "CI",
+            "GITHUB_ACTIONS",
+            "GITLAB_CI",
+            "JENKINS_URL",
+            "BUILDKITE",
+            "CIRCLECI",
+            "TEAMCITY_VERSION",
+            "TF_BUILD",
+        ];
+        let saved_ci: Vec<_> = ci_vars
+            .iter()
+            .map(|var| (*var, std::env::var_os(var)))
+            .collect();
+        for var in ci_vars {
+            unsafe { std::env::remove_var(var) };
+        }
+
         unsafe { std::env::set_var("CI", "1") };
-        assert!(!update_prompt_context_allows_interaction());
+        let in_ci = update_prompt_context_allows_interaction();
         unsafe { std::env::remove_var("CI") };
 
         unsafe { std::env::set_var(ENV_BACKGROUND_UPGRADE_WORKER, "1") };
-        assert!(!update_prompt_context_allows_interaction());
+        let in_worker = update_prompt_context_allows_interaction();
         unsafe { std::env::remove_var(ENV_BACKGROUND_UPGRADE_WORKER) };
 
-        assert!(update_prompt_context_allows_interaction());
+        let plain = update_prompt_context_allows_interaction();
+        for (var, value) in saved_ci {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(var, value) };
+            }
+        }
+        assert!(!in_ci);
+        assert!(!in_worker);
+        assert!(plain);
 
         unsafe { std::env::remove_var("AUTTER_TEST_CONFIG_PATCH") };
         clear_test_cache_dir();
