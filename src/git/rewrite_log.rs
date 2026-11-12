@@ -1,6 +1,6 @@
 use crate::error::AutterError;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 /// Simple case classes for rewrite events
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,22 +195,12 @@ pub struct MergeSquashEvent {
     /// `source_head` alone does not cover them. `source_head` is the last one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub picked_commits: Vec<String>,
-    /// Files a `git cherry-pick -n` left conflicted, by path, with what the
-    /// index held for each side when the pick stopped.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub conflicted_files: BTreeMap<String, ConflictedFileStages>,
-}
-
-/// The three sides of a conflicted file as blob ids: the index stages 1, 2 and
-/// 3. A side is missing when the file did not exist there.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConflictedFileStages {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ours: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theirs: Option<String>,
+    /// Every commit one `git cherry-pick -n` applied, in the order it applied
+    /// them, including commits `picked_commits` leaves out because a later pick
+    /// descends from them. What the pick put in the tree is worked out from
+    /// these commits alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_commits: Vec<String>,
 }
 
 impl MergeSquashEvent {
@@ -229,7 +219,7 @@ impl MergeSquashEvent {
             staged_file_blobs,
             preserve_working_log: false,
             picked_commits: Vec::new(),
-            conflicted_files: BTreeMap::new(),
+            applied_commits: Vec::new(),
         }
     }
 
@@ -246,13 +236,20 @@ impl MergeSquashEvent {
         self
     }
 
-    /// The files the pick left conflicted.
-    pub fn with_conflicted_files(
-        mut self,
-        conflicted_files: BTreeMap<String, ConflictedFileStages>,
-    ) -> Self {
-        self.conflicted_files = conflicted_files;
+    /// Every commit a `git cherry-pick -n` applied, in order.
+    pub fn with_applied_commits(mut self, applied_commits: Vec<String>) -> Self {
+        self.applied_commits = applied_commits;
         self
+    }
+
+    /// The commits whose changes this pick applied, in order. Older events
+    /// only list the picked commits.
+    pub fn applied_commits(&self) -> Vec<String> {
+        if self.applied_commits.is_empty() {
+            self.source_commits()
+        } else {
+            self.applied_commits.clone()
+        }
     }
 
     /// The commits this event brings in, in the order they were applied.
@@ -376,11 +373,25 @@ impl CherryPickCompleteEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CherryPickAbortEvent {
     pub original_head: String,
+    /// Set when a `git stash` took away everything a pending `git cherry-pick
+    /// -n` had applied: the stash it went into. Applying that stash again on
+    /// the same commit brings the pick back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stashed_as: Option<String>,
 }
 
 impl CherryPickAbortEvent {
     pub fn new(original_head: String) -> Self {
-        Self { original_head }
+        Self {
+            original_head,
+            stashed_as: None,
+        }
+    }
+
+    /// The pick was not thrown away but stashed, as `stash_sha`.
+    pub fn stashed_as(mut self, stash_sha: String) -> Self {
+        self.stashed_as = Some(stash_sha);
+        self
     }
 }
 

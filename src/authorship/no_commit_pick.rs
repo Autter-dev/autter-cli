@@ -3,10 +3,18 @@
 //!
 //! One pick can apply several commits, and it can stop on a conflict. Every
 //! picked commit contributes its attribution, oldest pick first; a later pick
-//! only fills lines no earlier pick and no live work already claims. In a file
-//! the pick left conflicted, the picked attribution is kept only for lines that
-//! merged cleanly: whatever was written to resolve the conflict belongs to
-//! whoever resolved it, which the working log's own checkpoints say.
+//! only fills lines no earlier pick and no live work already claims.
+//!
+//! What the pick put in the tree is worked out from the commits alone: the
+//! base commit's version of each file, with every applied commit merged in
+//! (`git merge-file`, settling each conflict for the side that was there before
+//! the pick). That does not depend on when this runs, on the index or on what
+//! the working tree holds by then. Picked attribution is kept only on committed
+//! lines that came out of that merge unchanged; lines written to resolve a
+//! conflict, or typed again after the pick was thrown away, belong to whoever
+//! wrote them, which the working log's own checkpoints say. A file the person
+//! resolved with `git checkout --theirs` also keeps the picked attribution of
+//! the lines it took from the picked side.
 
 use crate::authorship::attribution_tracker::{
     LineAttribution, attributions_to_line_attributions, line_attributions_to_attributions,
@@ -18,8 +26,14 @@ use crate::authorship::rebase_authorship::{
 use crate::error::AutterError;
 use crate::git::repo_storage::PersistedWorkingLog;
 use crate::git::repository::{Repository, exec_git_allow_nonzero};
-use crate::git::rewrite_log::{ConflictedFileStages, MergeSquashEvent};
+use crate::git::rewrite_log::MergeSquashEvent;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
+
+/// File in the base commit's working log listing the paths resolved with
+/// `git checkout --theirs` (or `git restore --theirs`) while a pick was
+/// pending.
+const PICKED_SIDE_PATHS_FILE: &str = "no_commit_pick_picked_side_paths.json";
 
 /// Brings the attribution of the commits picked by one `git cherry-pick -n`
 /// into the working log of `base_commit`, lined up with `final_state` (the
@@ -37,20 +51,37 @@ pub fn carry_no_commit_pick_into_working_log(
     replace_working_log: bool,
 ) -> Result<(), AutterError> {
     let working_log = repo.storage.working_log_for_base_commit(base_commit)?;
+    let applied = AppliedPick::new(repo, pick, base_commit);
+    let picked_side_paths = read_picked_side_paths(&working_log);
 
-    // What the pick merged cleanly into each conflicted file, and what the
-    // working log already said about those files before the pick's attribution
-    // goes in.
-    let mut conflicted: Vec<ConflictedFile<'_>> = Vec::new();
-    for (path, stages) in &pick.conflicted_files {
-        let Some(final_content) = final_state.get(path) else {
-            continue;
-        };
-        conflicted.push(ConflictedFile {
+    // Every committed file, not only the ones the pick changed: the picked
+    // commits' attribution is read from their whole line of history, and must
+    // not land on lines the pick never applied.
+    let mut committed: Vec<(&String, &String)> = final_state.iter().collect();
+    committed.sort();
+    let mut files: Vec<PickedFile<'_>> = Vec::new();
+    for (path, final_content) in committed {
+        let taken_from_picked_side = path_matches_any(path, &picked_side_paths);
+        let Some(origins) = applied.line_origins(
+            repo,
+            &working_log,
             path,
             final_content,
-            cleanly_merged: cleanly_merged_content(repo, &working_log, stages),
-            tracked_before: tracked_line_attributions(&working_log, path, final_content),
+            taken_from_picked_side,
+        ) else {
+            continue;
+        };
+        let tracked_before = release_known_human_claims_on_picked_lines(
+            &working_log,
+            path,
+            final_content,
+            &origins,
+        )?;
+        files.push(PickedFile {
+            path,
+            final_content,
+            origins,
+            tracked_before,
         });
     }
 
@@ -76,30 +107,308 @@ pub fn carry_no_commit_pick_into_working_log(
         }
     }
 
-    for file in &conflicted {
-        drop_picked_attribution_outside_clean_merge(&working_log, file)?;
+    for file in &files {
+        keep_picked_attribution_where_the_pick_put_lines(
+            repo,
+            pick,
+            base_commit,
+            &working_log,
+            file,
+        )?;
     }
 
     Ok(())
 }
 
-struct ConflictedFile<'a> {
-    path: &'a str,
-    final_content: &'a str,
-    /// The file as the pick merged it, with every conflicted hunk left as it
-    /// was before the pick. `None` when that could not be worked out.
-    cleanly_merged: Option<String>,
-    /// The working log's attribution for the file before the pick's went in,
-    /// lined up with `final_content`. `None` when it could not be read.
-    tracked_before: Option<Vec<LineAttribution>>,
+/// Whether the content `read_content` gives for the files a pending pick
+/// changed still holds any line the pick brought. `read_content` returns
+/// `None` for a file that is not there.
+pub fn no_commit_pick_lines_remain(
+    repo: &Repository,
+    pick: &MergeSquashEvent,
+    base_commit: &str,
+    read_content: impl Fn(&str) -> Option<String>,
+) -> Result<bool, AutterError> {
+    let working_log = repo.storage.working_log_for_base_commit(base_commit)?;
+    let applied = AppliedPick::new(repo, pick, base_commit);
+    let picked_side_paths = read_picked_side_paths(&working_log);
+    for path in &applied.changed_files {
+        let content = read_content(path).unwrap_or_default();
+        let taken_from_picked_side = path_matches_any(path, &picked_side_paths);
+        match applied.line_origins(repo, &working_log, path, &content, taken_from_picked_side) {
+            Some(origins) => {
+                if origins.values().any(|origin| *origin == LineOrigin::Picked) {
+                    return Ok(true);
+                }
+            }
+            // A file that cannot be read as text: assume the pick is still
+            // there rather than forget it.
+            None => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
-/// After the pick's attribution was merged into a conflicted file, removes it
-/// from every line that did not come out of the clean part of the merge.
-/// Attribution the working log already had is left alone.
-fn drop_picked_attribution_outside_clean_merge(
+/// Records that `pathspecs` (relative to the repository root, `.` for all of
+/// it) were resolved by taking the picked side, for the pick pending on
+/// `base_commit`.
+pub fn record_paths_taken_from_picked_side(
+    repo: &Repository,
+    base_commit: &str,
+    pathspecs: &[String],
+) -> Result<(), AutterError> {
+    if pathspecs.is_empty() {
+        return Ok(());
+    }
+    let working_log = repo.storage.working_log_for_base_commit(base_commit)?;
+    let mut paths = read_picked_side_paths(&working_log);
+    paths.extend(pathspecs.iter().cloned());
+    let json = serde_json::to_string(&paths)?;
+    std::fs::write(working_log.dir.join(PICKED_SIDE_PATHS_FILE), json)?;
+    Ok(())
+}
+
+/// Forgets the paths [`record_paths_taken_from_picked_side`] recorded for
+/// `base_commit`: the pick they belong to was committed or thrown away.
+pub fn forget_paths_taken_from_picked_side(repo: &Repository, base_commit: &str) {
+    if !repo.storage.has_working_log(base_commit) {
+        return;
+    }
+    let path = repo
+        .storage
+        .working_logs
+        .join(base_commit)
+        .join(PICKED_SIDE_PATHS_FILE);
+    let _ = std::fs::remove_file(path);
+}
+
+fn read_picked_side_paths(working_log: &PersistedWorkingLog) -> BTreeSet<String> {
+    std::fs::read_to_string(working_log.dir.join(PICKED_SIDE_PATHS_FILE))
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn path_matches_any(path: &str, pathspecs: &BTreeSet<String>) -> bool {
+    pathspecs.iter().any(|spec| {
+        let spec = spec.trim_start_matches("./").trim_end_matches('/');
+        spec.is_empty()
+            || spec == "."
+            || path == spec
+            || path
+                .strip_prefix(spec)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Where a line of some content came from, as far as a pick is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineOrigin {
+    /// A line the pick brought: it is in what the pick put in the tree and
+    /// not in the base commit.
+    Picked,
+    /// A line of the base commit the pick left alone.
+    Base,
+}
+
+/// The commits one pick applied, read once for all of its files.
+struct AppliedPick {
+    /// The tree of the commit the pick was made on; `None` when unreadable.
+    base_tree: Option<String>,
+    /// `(parent tree, tree)` of each applied commit, in the order applied. A
+    /// root commit has no parent tree.
+    commits: Vec<(Option<String>, String)>,
+    /// Every file an applied commit changed.
+    changed_files: BTreeSet<String>,
+}
+
+impl AppliedPick {
+    fn new(repo: &Repository, pick: &MergeSquashEvent, base_commit: &str) -> Self {
+        let tree_of =
+            |commit: &crate::git::repository::Commit<'_>| commit.tree().ok().map(|tree| tree.id());
+        let base_tree = repo
+            .find_commit(base_commit.to_string())
+            .ok()
+            .and_then(|commit| tree_of(&commit));
+        let mut commits = Vec::new();
+        let mut changed_files = BTreeSet::new();
+        for commit_sha in pick.applied_commits() {
+            let Ok(commit) = repo.find_commit(commit_sha.clone()) else {
+                continue;
+            };
+            let Some(tree) = tree_of(&commit) else {
+                continue;
+            };
+            let parent = commit.parent(0).ok();
+            if let Some(parent) = parent.as_ref()
+                && let Ok(files) = repo.diff_changed_files(&parent.id(), &commit_sha)
+            {
+                changed_files.extend(files);
+            }
+            let parent_tree = match parent {
+                Some(parent) => match tree_of(&parent) {
+                    Some(parent_tree) => Some(parent_tree),
+                    None => continue,
+                },
+                None => None,
+            };
+            commits.push((parent_tree, tree));
+        }
+        Self {
+            base_tree,
+            commits,
+            changed_files,
+        }
+    }
+
+    /// The origin of each line of `content` that the pick accounts for, by
+    /// line number. Lines missing from the map are neither the pick's nor
+    /// the base commit's. `None` when a version of the file is not text.
+    fn line_origins(
+        &self,
+        repo: &Repository,
+        working_log: &PersistedWorkingLog,
+        path: &str,
+        content: &str,
+        taken_from_picked_side: bool,
+    ) -> Option<BTreeMap<u32, LineOrigin>> {
+        let base = text_at_tree(repo, self.base_tree.as_deref()?, path)?;
+        if !self.changed_files.contains(path) {
+            return Some(line_origins_through(&base, &base, content));
+        }
+        let mut merged = base.clone();
+        let mut picked_versions = Vec::new();
+        for (parent_tree, tree) in &self.commits {
+            let before = match parent_tree {
+                Some(parent_tree) => text_at_tree(repo, parent_tree, path)?,
+                None => String::new(),
+            };
+            let after = text_at_tree(repo, tree, path)?;
+            if before == after {
+                continue;
+            }
+            merged = merge_file_favoring_ours(repo, working_log, &merged, &before, &after)?;
+            picked_versions.push(after);
+        }
+
+        let mut origins = line_origins_through(&base, &merged, content);
+        if taken_from_picked_side {
+            for version in &picked_versions {
+                for (line, origin) in line_origins_through(&base, version, content) {
+                    let known = origins.entry(line).or_insert(origin);
+                    if origin == LineOrigin::Picked {
+                        *known = LineOrigin::Picked;
+                    }
+                }
+            }
+        }
+        Some(origins)
+    }
+}
+
+/// The lines of `content` that are unchanged lines of `version`, each marked
+/// with whether `version` has it from `base` or brought it.
+fn line_origins_through(base: &str, version: &str, content: &str) -> BTreeMap<u32, LineOrigin> {
+    const BASE: &str = "base";
+    const PICKED: &str = "picked";
+    let from_base = lines_carried_over(base, version);
+    let version_lines: Vec<LineAttribution> = (1..=version.lines().count() as u32)
+        .map(|line| LineAttribution {
+            start_line: line,
+            end_line: line,
+            author_id: if from_base.contains(&line) {
+                BASE
+            } else {
+                PICKED
+            }
+            .to_string(),
+            overrode: None,
+        })
+        .collect();
+    diff_based_line_attribution_transfer(version, content, &version_lines)
+        .into_iter()
+        .flat_map(|attr| {
+            let origin = if attr.author_id == BASE {
+                LineOrigin::Base
+            } else {
+                LineOrigin::Picked
+            };
+            (attr.start_line..=attr.end_line).map(move |line| (line, origin))
+        })
+        .collect()
+}
+
+/// `path` as `tree` has it: empty when there is no such file, `None` when it
+/// is not text.
+fn text_at_tree(repo: &Repository, tree: &str, path: &str) -> Option<String> {
+    match repo.read_file_blob_at_tree(tree, Path::new(path)) {
+        Ok(bytes) => String::from_utf8(bytes).ok(),
+        Err(_) => Some(String::new()),
+    }
+}
+
+struct PickedFile<'a> {
+    path: &'a str,
+    final_content: &'a str,
+    origins: BTreeMap<u32, LineOrigin>,
+    /// The working log's attribution for the file before the pick's went in,
+    /// by line of `final_content`. `None` when it could not be read.
+    tracked_before: Option<BTreeMap<u32, String>>,
+}
+
+/// A known-human checkpoint of a file the pick changed, taken while the pick
+/// was pending and with no checkpoint of the file before it, compared the file
+/// with the base commit: it claimed every line the pick brought along with the
+/// ones the person actually wrote. Takes those claims back from the lines the
+/// pick brought, unchanged, so the picked attribution fills them.
+///
+/// Returns what the working log tracks for the file afterwards, by line, with
+/// untracked (`human`) lines left out since they claim nothing.
+fn release_known_human_claims_on_picked_lines(
     working_log: &PersistedWorkingLog,
-    file: &ConflictedFile<'_>,
+    path: &str,
+    content: &str,
+    origins: &BTreeMap<u32, LineOrigin>,
+) -> Result<Option<BTreeMap<u32, String>>, AutterError> {
+    let Some(tracked) = tracked_line_attributions(working_log, path, content) else {
+        return Ok(None);
+    };
+    let mut by_line = author_by_line(&tracked);
+    let tracked_lines = by_line.len();
+    by_line.retain(|line, author_id| {
+        !(is_known_human(author_id) && origins.get(line) == Some(&LineOrigin::Picked))
+    });
+    if by_line.len() != tracked_lines {
+        write_tracked_line_attributions(
+            working_log,
+            path,
+            content,
+            line_attributions_from(&by_line),
+        )?;
+    }
+    by_line.retain(|_, author_id| author_id != "human");
+    Ok(Some(by_line))
+}
+
+fn is_known_human(author_id: &str) -> bool {
+    author_id.starts_with("h_")
+}
+
+/// After the pick's attribution went in, settles every line the working log
+/// did not already track:
+/// - a line the pick brought gets the picked commits' own attribution. The
+///   squash merge favours the base commit, which can hand a resolved line the
+///   attribution of the base line it replaced;
+/// - a base line the pick left alone keeps what the merge gave it;
+/// - any other line, written after the pick, gets nothing from it.
+///
+/// Attribution the working log already had is left alone.
+fn keep_picked_attribution_where_the_pick_put_lines(
+    repo: &Repository,
+    pick: &MergeSquashEvent,
+    base_commit: &str,
+    working_log: &PersistedWorkingLog,
+    file: &PickedFile<'_>,
 ) -> Result<(), AutterError> {
     let (Some(before), Some(after)) = (
         file.tracked_before.as_ref(),
@@ -108,19 +417,32 @@ fn drop_picked_attribution_outside_clean_merge(
         return Ok(());
     };
 
-    // Without the clean merge there is no telling picked lines from resolved
-    // ones, so none of the file's lines keep picked attribution.
-    let clean_lines = file
-        .cleanly_merged
-        .as_deref()
-        .map(|clean| lines_carried_over(clean, file.final_content))
-        .unwrap_or_default();
+    let after = author_by_line(&after);
+    let picked_lines: Vec<u32> = file
+        .origins
+        .iter()
+        .filter(|(line, origin)| **origin == LineOrigin::Picked && !before.contains_key(line))
+        .map(|(line, _)| *line)
+        .collect();
+    let picked_authors = if picked_lines.is_empty() {
+        BTreeMap::new()
+    } else {
+        picked_commits_attribution(repo, pick, base_commit, file.path, file.final_content)
+    };
 
-    let before = author_by_line(before);
-    let mut kept = author_by_line(&after);
-    let tracked_lines = kept.len();
-    kept.retain(|line, _| before.contains_key(line) || clean_lines.contains(line));
-    if kept.len() == tracked_lines {
+    let mut kept = BTreeMap::new();
+    for (line, author_id) in &after {
+        if before.contains_key(line) || file.origins.get(line) == Some(&LineOrigin::Base) {
+            kept.insert(*line, author_id.clone());
+        }
+    }
+    for line in picked_lines {
+        match picked_authors.get(&line) {
+            Some(author_id) => kept.insert(line, author_id.clone()),
+            None => kept.remove(&line),
+        };
+    }
+    if kept == after {
         return Ok(());
     }
 
@@ -130,6 +452,52 @@ fn drop_picked_attribution_outside_clean_merge(
         file.final_content,
         line_attributions_from(&kept),
     )
+}
+
+/// The attribution the picked commits themselves give the lines of `content`,
+/// read the way the squash reads it (blame from where each picked commit's
+/// line of history left the base), earlier picks first.
+fn picked_commits_attribution(
+    repo: &Repository,
+    pick: &MergeSquashEvent,
+    base_commit: &str,
+    path: &str,
+    content: &str,
+) -> BTreeMap<u32, String> {
+    use crate::authorship::virtual_attribution::VirtualAttributions;
+
+    let mut by_line = BTreeMap::new();
+    for source in pick.source_commits() {
+        let merge_base = repo
+            .merge_base(source.clone(), base_commit.to_string())
+            .ok()
+            .flatten();
+        let Ok(source_va) = smol::block_on(VirtualAttributions::new_for_base_commit(
+            repo.clone(),
+            source,
+            &[path.to_string()],
+            merge_base,
+        )) else {
+            continue;
+        };
+        let (Some(attrs), Some(source_content)) = (
+            source_va.get_line_attributions(path),
+            source_va.get_file_content(path),
+        ) else {
+            continue;
+        };
+        for attr in diff_based_line_attribution_transfer(source_content, content, attrs) {
+            if attr.author_id == "human" {
+                continue;
+            }
+            for line in attr.start_line..=attr.end_line {
+                by_line
+                    .entry(line)
+                    .or_insert_with(|| attr.author_id.clone());
+            }
+        }
+    }
+    by_line
 }
 
 /// The line numbers of `new_content` that are unchanged lines of `old_content`.
@@ -268,37 +636,8 @@ fn entry_tracks_file(entry: &crate::authorship::working_log::WorkingLogEntry, pa
     entry.file == path && !(entry.line_attributions.is_empty() && entry.attributions.is_empty())
 }
 
-/// The content a conflicted file would have had if only the hunks that merged
-/// cleanly had been applied: a three-way merge of the index stages with every
-/// conflict settled for "ours", the side that was there before the pick.
-fn cleanly_merged_content(
-    repo: &Repository,
-    working_log: &PersistedWorkingLog,
-    stages: &ConflictedFileStages,
-) -> Option<String> {
-    let Some(ours) = stages.ours.as_deref() else {
-        // Deleted on our side: nothing of the pick merged into it.
-        return Some(String::new());
-    };
-    let ours = blob_text(repo, ours)?;
-    let Some(theirs) = stages.theirs.as_deref() else {
-        // Deleted by the pick: it brought no lines.
-        return Some(ours);
-    };
-    let theirs = blob_text(repo, theirs)?;
-    let base = match stages.base.as_deref() {
-        Some(base) => blob_text(repo, base)?,
-        None => String::new(),
-    };
-    merge_file_favoring_ours(repo, working_log, &ours, &base, &theirs)
-}
-
-fn blob_text(repo: &Repository, oid: &str) -> Option<String> {
-    let bytes = repo.find_blob(oid.to_string()).ok()?.content().ok()?;
-    String::from_utf8(bytes).ok()
-}
-
-/// `git merge-file --ours` over three contents. Uses files rather than
+/// `git merge-file --ours` over three contents: what merges cleanly is
+/// applied, and every conflict keeps "ours". Uses files rather than
 /// `--object-id` so it works with every git version.
 fn merge_file_favoring_ours(
     repo: &Repository,
@@ -384,5 +723,34 @@ mod tests {
     fn line_attributions_round_trip_through_the_line_map() {
         let attrs = vec![attr(1, 2, "a"), attr(3, 3, "b"), attr(5, 6, "a")];
         assert_eq!(line_attributions_from(&author_by_line(&attrs)), attrs);
+    }
+
+    #[test]
+    fn line_origins_tell_picked_lines_from_base_lines_and_new_ones() {
+        let base = "one\ntwo\n";
+        let picked = "one\ntwo\npicked\n";
+        let committed = "typed\none\ntwo\npicked\n";
+
+        assert_eq!(
+            line_origins_through(base, picked, committed),
+            BTreeMap::from([
+                (2, LineOrigin::Base),
+                (3, LineOrigin::Base),
+                (4, LineOrigin::Picked),
+            ])
+        );
+    }
+
+    #[test]
+    fn picked_side_pathspecs_match_files_and_directories() {
+        let specs = BTreeSet::from(["src/".to_string(), "a.txt".to_string()]);
+        assert!(path_matches_any("a.txt", &specs));
+        assert!(path_matches_any("src/lib.rs", &specs));
+        assert!(!path_matches_any("srcx/lib.rs", &specs));
+        assert!(!path_matches_any("b.txt", &specs));
+        assert!(path_matches_any(
+            "b.txt",
+            &BTreeSet::from([".".to_string()])
+        ));
     }
 }
