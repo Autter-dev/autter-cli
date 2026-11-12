@@ -580,7 +580,7 @@ autter config [<key> | set <key> <value> | unset <key>]
         name: "doctor",
         aliases: &[],
         summary: "Validate the autter setup end-to-end",
-        body: "autter doctor [--json] [--strict] [--skip-trace2-checks]
+        body: "autter doctor [--json] [--strict] [--skip-trace2-checks] [--report <file>]
 
   Run setup validation checks: git and config, the background service,
   trace2 capture, a real end-to-end checkpoint round-trip, AI agent hooks,
@@ -593,7 +593,12 @@ autter config [<key> | set <key> <value> | unset <key>]
   --json                 Machine-readable single-line JSON report
                          (capture_ok, and an error object when it fails)
   --strict               Exit 4 when capture is broken (also AUTTER_STRICT=1)
-  --skip-trace2-checks   Skip the trace2 event-capture self-check",
+  --skip-trace2-checks   Skip the trace2 event-capture self-check
+  --report <file>        Also write a support report to <file>: these
+                         results, service start timings, the lock file,
+                         the last 200 lines of the service log, git and OS
+                         versions, and whether this runs elevated. No
+                         source code, file contents or tokens.",
     },
     HelpEntry {
         name: "sync",

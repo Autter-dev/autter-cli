@@ -268,3 +268,50 @@ fn doctor_leaves_foreign_trace2_targets_alone() {
         .expect("trace2.eventTarget is still set");
     assert_eq!(actual.trim(), foreign);
 }
+
+/// `autter doctor --report <file>` writes one support file with the results,
+/// the service and lock-file state, and the end of the service log, and
+/// still prints the normal report.
+#[test]
+fn doctor_report_writes_a_support_file() {
+    let repo = TestRepo::new();
+    write_trace2_global_config(&repo);
+    let report_path = repo.test_home_path().join("autter-report.txt");
+    let report_arg = report_path.to_string_lossy().to_string();
+
+    let raw = repo
+        .autter(&["doctor", "--json", "--report", &report_arg])
+        .unwrap_or_else(|output| output);
+    let report = parse_doctor_json(&raw);
+    assert_eq!(
+        check(&report, "background service")["status"],
+        "passed",
+        "{raw}"
+    );
+    assert!(raw.contains("Report written to"), "{raw}");
+
+    let text = std::fs::read_to_string(&report_path).expect("report file written");
+    for section in [
+        "autter doctor report",
+        "== system",
+        "elevated (root / Administrator): ",
+        "configured git: ",
+        "== doctor results",
+        "background service: background service is running",
+        "== background service",
+        "control socket: ",
+        "accepting, answers requests",
+        "timings measured by this doctor run:",
+        "service health probe: Healthy",
+        "== lock file",
+        "state: held",
+        "== service log",
+    ] {
+        assert!(text.contains(section), "missing {section:?} in:\n{text}");
+    }
+
+    let err = repo
+        .autter(&["doctor", "--report"])
+        .expect_err("--report without a path is a usage error");
+    assert!(err.contains("--report needs a file path"), "{err}");
+}
