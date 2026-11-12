@@ -319,6 +319,13 @@ fn exchange_pat(token: &str) -> Result<StoredCredentials, String> {
 }
 
 /// Sign in with a Personal Access Token instead of the interactive device flow.
+/// A failed `autter login --token` with what to do next.
+fn pat_login_failure_message(error: &str) -> String {
+    format!(
+        "{error}\nCheck that the token was copied whole (Org Settings -> Access Tokens), then run `autter login --token <token>` again, or run `autter login` to sign in in the browser."
+    )
+}
+
 pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
     let creds = exchange_pat(token)?;
 
@@ -522,7 +529,7 @@ pub fn handle_login(args: &[String]) {
 
     if let Some(token) = parse_token_arg(args) {
         if let Err(e) = run_pat_login(&token) {
-            eprintln!("{}", e);
+            eprintln!("{}", pat_login_failure_message(&e));
             std::process::exit(1);
         }
         return;
@@ -584,6 +591,14 @@ fn open_browser(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_token_login_says_what_to_do_next() {
+        let text = pat_login_failure_message("Token sign-in failed: 401");
+        assert!(text.starts_with("Token sign-in failed: 401"), "{text}");
+        assert!(text.contains("autter login --token"), "{text}");
+        assert!(text.contains("autter login`"), "{text}");
+    }
 
     #[test]
     fn parse_token_arg_supports_space_and_equals() {

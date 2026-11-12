@@ -27,10 +27,7 @@ pub fn handle_daemon(args: &[String]) {
     match args[0].as_str() {
         "start" => {
             if let Err(e) = handle_start(&args[1..]) {
-                eprintln!(
-                    "Failed to start: {}",
-                    explain_service_error(cfg!(windows), &e)
-                );
+                eprintln!("{}", service_failure_message("start", cfg!(windows), &e));
                 std::process::exit(1);
             }
         }
@@ -50,18 +47,15 @@ pub fn handle_daemon(args: &[String]) {
         "shutdown" => {
             if let Err(e) = handle_shutdown(&args[1..]) {
                 eprintln!(
-                    "Failed to shut down: {}",
-                    explain_service_error(cfg!(windows), &e)
+                    "{}",
+                    service_failure_message("shut down", cfg!(windows), &e)
                 );
                 std::process::exit(1);
             }
         }
         "restart" => {
             if let Err(e) = handle_restart(&args[1..]) {
-                eprintln!(
-                    "Failed to restart: {}",
-                    explain_service_error(cfg!(windows), &e)
-                );
+                eprintln!("{}", service_failure_message("restart", cfg!(windows), &e));
                 std::process::exit(1);
             }
         }
@@ -583,6 +577,19 @@ pub(crate) fn explain_service_error(windows: bool, error: &str) -> String {
         Some(hint) => format!("{hint} [{error}]"),
         None => error.to_string(),
     }
+}
+
+/// What `autter bg start|restart|shutdown` prints when it fails: the error
+/// (with the Windows cause and fix in front when there is one) and, when that
+/// names no fix, the one command that does.
+pub(crate) fn service_failure_message(verb: &str, windows: bool, error: &str) -> String {
+    let explained = explain_service_error(windows, error);
+    if explained != error {
+        return format!("Failed to {verb}: {explained}");
+    }
+    format!(
+        "Failed to {verb}: {error}\nNext: run `autter doctor`; it checks the background service and prints the fix. Its log is in ~/.autter/internal/daemon/logs/."
+    )
 }
 
 /// Canonical restart suggestion. See [`restart_command!`].
@@ -1770,5 +1777,24 @@ mod health_tests {
             concat!("run `", restart_command!(), "`"),
             "run `autter bg restart`"
         );
+    }
+}
+
+#[cfg(test)]
+mod service_failure_message_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_start_says_what_to_run_next() {
+        let text = service_failure_message("start", false, "daemon failed to start: boom");
+        assert!(
+            text.starts_with("Failed to start: daemon failed to start: boom"),
+            "{text}"
+        );
+        assert!(text.contains("autter doctor"), "{text}");
+        // A Windows cause that names its own fix is not followed by another.
+        let text = service_failure_message("restart", true, "Access is denied. (os error 5)");
+        assert!(text.contains("Run as administrator"), "{text}");
+        assert!(!text.contains("Next:"), "{text}");
     }
 }

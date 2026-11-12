@@ -737,7 +737,7 @@ fn run_impl_with_url(
     let release = match fetch_release_for_channel(api_base_url, channel) {
         Ok(release) => release,
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{}", upgrade_failure_message(&err));
             std::process::exit(1);
         }
     };
@@ -815,7 +815,10 @@ fn run_impl_with_url(
                 checksums
             }
             Err(err) => {
-                eprintln!("Failed to fetch/verify checksums: {}", err);
+                eprintln!(
+                    "{}",
+                    upgrade_failure_message(&format!("Failed to fetch/verify checksums: {err}"))
+                );
                 std::process::exit(1);
             }
         };
@@ -831,7 +834,12 @@ fn run_impl_with_url(
                 content
             }
             Err(err) => {
-                eprintln!("Failed to fetch/verify install script: {}", err);
+                eprintln!(
+                    "{}",
+                    upgrade_failure_message(&format!(
+                        "Failed to fetch/verify install script: {err}"
+                    ))
+                );
                 std::process::exit(1);
             }
         };
@@ -868,7 +876,7 @@ fn run_impl_with_url(
             );
         }
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{}", upgrade_failure_message(&err));
             std::process::exit(1);
         }
     }
@@ -1023,6 +1031,14 @@ pub const INSTALLED_BY_ENV: &str = "AUTTER_INSTALLED_BY";
 pub const NPM_INSTALL_MARKER: &str = "npm-install.json";
 /// What an npm user runs to move to the newest release.
 pub const NPM_UPGRADE_COMMAND: &str = "npm install -g @autter/cli@latest";
+
+/// An `autter upgrade` failure with what to do next. Nothing was installed
+/// when any of these happen, so the current version keeps working.
+fn upgrade_failure_message(error: &str) -> String {
+    format!(
+        "{error}\nNothing was changed. Run `autter upgrade` again in a few minutes; if it keeps failing, reinstall with the installer from INSTALL.md (curl -fsSL https://api.autter.dev/install.sh | bash)."
+    )
+}
 
 fn npm_install_marker_path() -> PathBuf {
     crate::mdm::utils::home_dir()
@@ -1569,6 +1585,18 @@ mod tests {
             self_update_hold(false, None, None, true),
             Some("installed with npm")
         );
+    }
+
+    #[test]
+    fn upgrade_failures_say_what_to_do_next() {
+        let text = upgrade_failure_message("Failed to check for updates: timed out");
+        assert!(
+            text.starts_with("Failed to check for updates: timed out"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(text.contains("autter upgrade"), "{text}");
+        assert!(text.contains("install.sh"), "{text}");
     }
 
     #[test]
