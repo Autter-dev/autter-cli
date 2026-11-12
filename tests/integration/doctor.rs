@@ -315,3 +315,94 @@ fn doctor_report_writes_a_support_file() {
         .expect_err("--report without a path is a usage error");
     assert!(err.contains("--report needs a file path"), "{err}");
 }
+
+/// `autter doctor --agent <name>` sends the agent's own pre- and post-edit
+/// hook payloads through `autter checkpoint <preset> --hook-input stdin` in a
+/// throwaway repository and passes only when the background service recorded
+/// an AI checkpoint for the edited file. Every agent with hooks is covered,
+/// so verifying one no longer needs a real agent session.
+#[test]
+fn doctor_agent_simulates_each_agents_hook_calls() {
+    let repo = TestRepo::new();
+    for agent in [
+        "claude",
+        "codex",
+        "cursor",
+        "copilot",
+        "amp",
+        "opencode",
+        "pi",
+        "gemini",
+        "droid",
+        "firebender",
+        "antigravity",
+        "windsurf",
+    ] {
+        let raw = repo
+            .autter(&["doctor", "--agent", agent, "--json"])
+            .unwrap_or_else(|output| output);
+        let report = parse_doctor_json(&raw);
+        for name in [
+            "detected",
+            "hook files",
+            "hook commands",
+            "background service",
+        ] {
+            check(&report, name);
+        }
+        assert_eq!(
+            check(&report, "pre-edit hook")["status"],
+            "passed",
+            "{agent}: {raw}"
+        );
+        let post = check(&report, "post-edit hook");
+        assert_eq!(post["status"], "passed", "{agent}: {raw}");
+        assert!(
+            post["summary"]
+                .as_str()
+                .unwrap()
+                .contains("recorded an AI checkpoint"),
+            "{agent}: {raw}"
+        );
+    }
+    // A simulated Copilot call is not Copilot capture working: doctor's
+    // Copilot heartbeat must stay untouched.
+    let heartbeat = repo
+        .test_home_path()
+        .join(".autter/internal/hook_heartbeats/github-copilot.json");
+    assert!(
+        !heartbeat.exists(),
+        "simulated hook calls wrote a heartbeat"
+    );
+}
+
+#[test]
+fn doctor_agent_for_an_editor_extension_skips_the_simulation() {
+    let repo = TestRepo::new();
+    let raw = repo
+        .autter(&["doctor", "--agent", "jetbrains", "--json"])
+        .unwrap_or_else(|output| output);
+    let report = parse_doctor_json(&raw);
+    let sim = check(&report, "simulated edit");
+    assert_eq!(sim["status"], "skipped", "{raw}");
+    assert!(
+        sim["summary"].as_str().unwrap().contains("extension"),
+        "{raw}"
+    );
+}
+
+#[test]
+fn doctor_agent_names_the_agents_it_knows() {
+    let repo = TestRepo::new();
+    let err = repo
+        .autter(&["doctor", "--agent", "notepad"])
+        .expect_err("an unknown agent is a usage error");
+    assert!(err.contains("unknown agent 'notepad'"), "{err}");
+    assert!(err.contains("claude-code"), "{err}");
+    assert!(err.contains("docs/agents.md"), "{err}");
+
+    let err = repo
+        .autter(&["doctor", "--agent"])
+        .expect_err("--agent needs a name");
+    assert!(err.contains("--agent needs an agent name"), "{err}");
+}

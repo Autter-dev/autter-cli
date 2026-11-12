@@ -254,6 +254,8 @@ autter upgrade
 
 Run `autter help` for the full command list.
 
+Which agents and editors are supported, how each is hooked, and what is captured: [docs/agents.md](docs/agents.md). To check one agent end to end without starting an agent session, run `autter doctor --agent <name>` (for example `autter doctor --agent claude-code`): it simulates that agent's hook calls and confirms an AI checkpoint was recorded.
+
 ## Open source, extensible, and local-first
 
 The CLI and the [Autter authorship standard](specs/autter_standard_v3.0.0.md) are open source. The platform is an optional collaboration layer, not a requirement for attribution. You can build and run your own solution on the standard, keep it local, or connect Autter to the tools your organization already uses.
@@ -334,6 +336,7 @@ When an agent with hook support is installed after onboarding, the next everyday
 
 ```bash
 autter install-hooks
+autter doctor --agent <name>   # e.g. claude-code: checks that agent end to end
 ```
 
 ### Browser onboarding fails

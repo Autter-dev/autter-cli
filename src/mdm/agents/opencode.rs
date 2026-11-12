@@ -42,6 +42,10 @@ impl HookInstaller for OpenCodeInstaller {
         vec!["opencode"]
     }
 
+    fn managed_files(&self) -> Vec<PathBuf> {
+        vec![Self::plugin_path()]
+    }
+
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_binary = binary_exists("opencode");
         let has_global_config = home_dir().join(".config").join("opencode").exists();

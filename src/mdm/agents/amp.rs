@@ -42,6 +42,10 @@ impl HookInstaller for AmpInstaller {
         vec!["amp"]
     }
 
+    fn managed_files(&self) -> Vec<PathBuf> {
+        vec![Self::plugin_path()]
+    }
+
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_binary = binary_exists("amp");
         let has_global_config = home_dir().join(".config").join("amp").exists();
