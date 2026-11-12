@@ -149,6 +149,7 @@ mod stale_hooks;
 mod stale_prompt_carry;
 mod stash_attribution;
 mod stash_hooks_unit;
+mod stash_stack_targets;
 mod stats;
 mod stats_unit;
 mod status_ignore;
