@@ -8944,7 +8944,6 @@ const HANDOFF_FAILURE_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
 /// within that time; 5 seconds more means the threads are held by requests
 /// that are not finishing. Refusals are not counted: a flood refuses hundreds
 /// of connections in a moment and must not restart the service.
-#[cfg(not(windows))]
 const AT_CAPACITY_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
     max_consecutive: None,
     max_duration: Duration::from_secs(15),
@@ -9008,15 +9007,29 @@ impl ListenerFailureStreak {
 
 /// Record that `listener` could not hand a connection to a handler thread.
 /// Returns `true` when the listener must stop, which shuts the service down;
-/// otherwise backs off and lets it keep accepting.
+/// otherwise backs off and lets it keep accepting. (The control listener
+/// counts through [`ControlConnectionGate`].)
+#[cfg(not(windows))]
 fn listener_handoff_failed(
     listener: &str,
     streak: &mut ListenerFailureStreak,
     what: &str,
     error: &dyn std::fmt::Display,
 ) -> bool {
+    let verdict = record_handoff_failure(listener, streak, what, error);
+    finish_handoff_failure(verdict)
+}
+
+/// Count and log one connection `listener` could not hand to a handler.
+fn record_handoff_failure(
+    listener: &str,
+    streak: &mut ListenerFailureStreak,
+    what: &str,
+    error: &dyn std::fmt::Display,
+) -> ListenerFailureVerdict {
     let now = std::time::Instant::now();
-    match streak.record_failure(HANDOFF_FAILURE_LIMITS, now) {
+    let verdict = streak.record_failure(HANDOFF_FAILURE_LIMITS, now);
+    match verdict {
         ListenerFailureVerdict::KeepServing => {
             tracing::error!(
                 consecutive = streak.consecutive,
@@ -9025,8 +9038,6 @@ fn listener_handoff_failed(
                 listener,
                 what
             );
-            std::thread::sleep(LISTENER_FAILURE_BACKOFF);
-            false
         }
         ListenerFailureVerdict::ShutDown => {
             tracing::error!(
@@ -9038,8 +9049,20 @@ fn listener_handoff_failed(
                 listener,
                 what
             );
-            true
         }
+    }
+    verdict
+}
+
+/// `true` when the listener must stop; otherwise back off before it accepts
+/// again.
+fn finish_handoff_failure(verdict: ListenerFailureVerdict) -> bool {
+    match verdict {
+        ListenerFailureVerdict::KeepServing => {
+            std::thread::sleep(LISTENER_FAILURE_BACKOFF);
+            false
+        }
+        ListenerFailureVerdict::ShutDown => true,
     }
 }
 
@@ -9118,13 +9141,13 @@ fn control_connection_idle_timeout() -> Duration {
 /// Most control handler threads alive at once. Far above real use (a client
 /// holds a connection for one short request) and far below the per-process
 /// thread limit (about 4,096 on macOS), so connections left open on the
-/// control socket cannot starve the rest of the service of threads.
-#[cfg(not(windows))]
+/// control socket cannot starve the rest of the service of threads. The same
+/// on Windows, where each one also holds a pipe instance.
 const CONTROL_MAX_HANDLER_THREADS: usize = 512;
 
 /// Each handler holds one file descriptor, so stay within half of what this
-/// process may open (macOS starts processes with 256).
-#[cfg(not(windows))]
+/// process may open (macOS starts processes with 256). Windows has no such
+/// limit to read (`None`).
 fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
     match open_file_limit {
         Some(limit) => usize::try_from(limit / 2)
@@ -9134,7 +9157,6 @@ fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
     }
 }
 
-#[cfg(not(windows))]
 fn control_handler_limit() -> usize {
     #[cfg(feature = "test-support")]
     if let Some(limit) = std::env::var("AUTTER_TEST_CONTROL_MAX_HANDLERS")
@@ -9144,6 +9166,18 @@ fn control_handler_limit() -> usize {
     {
         return limit;
     }
+    #[cfg(windows)]
+    {
+        control_handler_limit_for(None)
+    }
+    #[cfg(not(windows))]
+    {
+        control_handler_limit_for(process_open_file_limit())
+    }
+}
+
+#[cfg(not(windows))]
+fn process_open_file_limit() -> Option<u64> {
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -9152,22 +9186,18 @@ fn control_handler_limit() -> usize {
     let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0;
     // `rlim_t` is not 64 bits wide on every platform.
     #[allow(clippy::unnecessary_cast)]
-    let open_file_limit = ok.then_some(limits.rlim_cur as u64);
-    control_handler_limit_for(open_file_limit)
+    ok.then_some(limits.rlim_cur as u64)
 }
 
 /// Counts live control handler threads against a fixed limit.
-#[cfg(not(windows))]
 struct HandlerSlots {
     live: Arc<AtomicUsize>,
     limit: usize,
 }
 
 /// One handler thread's place in [`HandlerSlots`], given back when dropped.
-#[cfg(not(windows))]
 struct HandlerSlot(Arc<AtomicUsize>);
 
-#[cfg(not(windows))]
 impl HandlerSlots {
     fn new(limit: usize) -> Self {
         Self {
@@ -9186,10 +9216,94 @@ impl HandlerSlots {
     }
 }
 
-#[cfg(not(windows))]
 impl Drop for HandlerSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What to do with a control connection that was just accepted.
+enum ControlAdmission {
+    /// Serve it on a handler thread, which holds this slot.
+    Serve(HandlerSlot),
+    /// Every handler thread is busy: refuse it. `shut_down` once they have
+    /// all been busy for so long that they are stuck.
+    Refuse { shut_down: bool },
+}
+
+/// The control listener's limits, shared by every thread that accepts
+/// control connections: the one Unix listener, or all the Windows pipe
+/// workers, which together are one listener (one failure count, one handler
+/// limit), not one each.
+struct ControlConnectionGate {
+    slots: HandlerSlots,
+    /// Connections refused since the last one served.
+    at_capacity: Mutex<ListenerFailureStreak>,
+    /// Connections that could not be handed to a handler since the last one
+    /// served.
+    handoff_failures: Mutex<ListenerFailureStreak>,
+}
+
+impl ControlConnectionGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            slots: HandlerSlots::new(limit),
+            at_capacity: Mutex::new(ListenerFailureStreak::default()),
+            handoff_failures: Mutex::new(ListenerFailureStreak::default()),
+        }
+    }
+
+    fn admit(&self, now: std::time::Instant) -> ControlAdmission {
+        if let Some(slot) = self.slots.try_acquire() {
+            return ControlAdmission::Serve(slot);
+        }
+        let mut at_capacity = self
+            .at_capacity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
+        if verdict == ListenerFailureVerdict::ShutDown {
+            tracing::error!(
+                limit = self.slots.limit,
+                refused = at_capacity.consecutive,
+                failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
+                "control listener: every handler thread has been busy since the first \
+                 refusal; shutting the background service down so it is started again"
+            );
+            return ControlAdmission::Refuse { shut_down: true };
+        }
+        if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
+            tracing::warn!(
+                limit = self.slots.limit,
+                refused = at_capacity.consecutive,
+                "control listener: every handler thread is busy; refusing connections"
+            );
+        }
+        ControlAdmission::Refuse { shut_down: false }
+    }
+
+    /// A connection was handed to its handler thread.
+    fn handoff_succeeded(&self) {
+        for streak in [&self.at_capacity, &self.handoff_failures] {
+            streak
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_success();
+        }
+    }
+
+    /// A connection could not be handed to a handler thread (or could not be
+    /// accepted). `true` when the listener must stop; otherwise this has
+    /// backed off and the caller keeps accepting.
+    fn handoff_failed(&self, what: &str, error: &dyn std::fmt::Display) -> bool {
+        let verdict = {
+            let mut streak = self
+                .handoff_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            record_handoff_failure("control", &mut streak, what, error)
+        };
+        finish_handoff_failure(verdict)
     }
 }
 
@@ -9217,9 +9331,7 @@ fn control_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding control socket: {}", e)))?;
         set_socket_owner_only(&control_socket_path)?;
-        let slots = HandlerSlots::new(control_handler_limit());
-        let mut handoff_failures = ListenerFailureStreak::default();
-        let mut at_capacity = ListenerFailureStreak::default();
+        let gate = ControlConnectionGate::new(control_handler_limit());
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
                 if let Ok(stream) = stream {
@@ -9234,44 +9346,28 @@ fn control_listener_loop_actor(
                     // Out of file descriptors, most likely. Retrying at once
                     // would spin: the connection stays queued and `accept`
                     // fails again until something frees a descriptor.
-                    if listener_handoff_failed(
-                        "control",
-                        &mut handoff_failures,
-                        "failed to accept a connection, which stays queued",
-                        &error,
-                    ) {
+                    if gate
+                        .handoff_failed("failed to accept a connection, which stays queued", &error)
+                    {
                         coordinator.request_shutdown_unhealthy();
                         break;
                     }
                     continue;
                 }
             };
-            let Some(slot) = slots.try_acquire() else {
-                refuse_control_connection(
-                    stream,
-                    "the background service is at its connection limit",
-                );
-                let now = std::time::Instant::now();
-                let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
-                if verdict == ListenerFailureVerdict::ShutDown {
-                    tracing::error!(
-                        limit = slots.limit,
-                        refused = at_capacity.consecutive,
-                        failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
-                        "control listener: every handler thread has been busy since the first \
-                         refusal; shutting the background service down so it is started again"
+            let slot = match gate.admit(std::time::Instant::now()) {
+                ControlAdmission::Serve(slot) => slot,
+                ControlAdmission::Refuse { shut_down } => {
+                    refuse_control_connection(
+                        stream,
+                        "the background service is at its connection limit",
                     );
-                    coordinator.request_shutdown_unhealthy();
-                    break;
+                    if shut_down {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
                 }
-                if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
-                    tracing::warn!(
-                        limit = slots.limit,
-                        refused = at_capacity.consecutive,
-                        "control listener: every handler thread is busy; refusing connections"
-                    );
-                }
-                continue;
             };
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
@@ -9281,18 +9377,13 @@ fn control_listener_loop_actor(
                     tracing::debug!(%e, "control connection error");
                 }
             }) {
-                Ok(()) => {
-                    handoff_failures.record_success();
-                    at_capacity.record_success();
-                }
+                Ok(()) => gate.handoff_succeeded(),
                 Err(error) => {
                     // Usually a transient resource limit on a busy machine, so
                     // one failure must not take the whole service down. The
                     // connection is gone though, and nothing resends it, so a
                     // service that keeps failing has to stop and be restarted.
-                    if listener_handoff_failed(
-                        "control",
-                        &mut handoff_failures,
+                    if gate.handoff_failed(
                         "failed to spawn handler thread, so its connection was dropped",
                         &error,
                     ) {
@@ -9309,14 +9400,21 @@ fn control_listener_loop_actor(
     {
         let mut workers = Vec::new();
         let worker_count = windows_control_pipe_worker_count();
+        let gate = Arc::new(ControlConnectionGate::new(control_handler_limit()));
         let first_connecting = windows_pipe_connecting_server(&control_socket_path, true)?;
         {
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
+            let gate = gate.clone();
             workers.push(std::thread::spawn(move || {
-                let result =
-                    windows_control_pipe_worker_loop(path, first_connecting, coord.clone(), handle);
+                let result = windows_control_pipe_worker_loop(
+                    path,
+                    first_connecting,
+                    coord.clone(),
+                    handle,
+                    gate,
+                );
                 if let Err(error) = &result {
                     tracing::error!(%error, "control worker error");
                     coord.request_shutdown();
@@ -9328,10 +9426,11 @@ fn control_listener_loop_actor(
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
+            let gate = gate.clone();
             let connecting = windows_pipe_connecting_server(&path, false)?;
             workers.push(std::thread::spawn(move || {
                 let result =
-                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle);
+                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle, gate);
                 if let Err(error) = &result {
                     tracing::error!(%error, "control worker error");
                     coord.request_shutdown();
@@ -9401,8 +9500,8 @@ fn windows_control_pipe_worker_loop(
     mut connecting: WindowsConnectingServer,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
+    gate: Arc<ControlConnectionGate>,
 ) -> Result<(), AutterError> {
-    let mut handoff_failures = ListenerFailureStreak::default();
     loop {
         let server = connecting.wait().map_err(|e| {
             AutterError::Generic(format!(
@@ -9419,19 +9518,34 @@ fn windows_control_pipe_worker_loop(
 
         connecting = windows_pipe_connecting_server(&control_socket_path, false)?;
 
+        let slot = match gate.admit(std::time::Instant::now()) {
+            ControlAdmission::Serve(slot) => slot,
+            ControlAdmission::Refuse { shut_down } => {
+                // Closed without a refusal message: closing a pipe instance
+                // waits (FlushFileBuffers) until the client has read what
+                // was written to it, and a client that never reads would
+                // hold this worker. The client sees the connection closed
+                // unanswered, which `autter` reports the same way.
+                drop(server);
+                if shut_down {
+                    coordinator.request_shutdown_unhealthy();
+                    break;
+                }
+                continue;
+            }
+        };
         let coord = coordinator.clone();
         let handle = runtime_handle.clone();
         match spawn_connection_handler(move || {
+            let _slot = slot;
             handle_windows_control_pipe_connection(server, coord, handle);
         }) {
-            Ok(()) => handoff_failures.record_success(),
+            Ok(()) => gate.handoff_succeeded(),
             Err(e) => {
-                // Same policy as the Unix listener: drop this connection and
-                // keep accepting, and stop only when it keeps failing. Each
-                // worker counts its own failures.
-                if listener_handoff_failed(
-                    "control",
-                    &mut handoff_failures,
+                // Same policy as the Unix listener, counted across all the
+                // workers: drop this connection and keep accepting, and stop
+                // only when it keeps failing.
+                if gate.handoff_failed(
                     "failed to spawn handler thread, so its connection was dropped",
                     &e,
                 ) {
@@ -11093,6 +11207,72 @@ mod tests {
         });
         send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
             .expect("a handled request is sent");
+    }
+
+    #[test]
+    fn control_gate_refuses_past_the_limit_and_shuts_down_when_stuck() {
+        let gate = ControlConnectionGate::new(2);
+        let start = std::time::Instant::now();
+        let ControlAdmission::Serve(first) = gate.admit(start) else {
+            panic!("first connection must be served");
+        };
+        let ControlAdmission::Serve(second) = gate.admit(start) else {
+            panic!("second connection must be served");
+        };
+        // At the limit: refused, and a flood of refusals is no reason to stop.
+        for millis in [0, 1_000, 14_000] {
+            assert!(matches!(
+                gate.admit(start + Duration::from_millis(millis)),
+                ControlAdmission::Refuse { shut_down: false }
+            ));
+        }
+        // Every handler still busy 15 s after the first refusal: stuck.
+        assert!(matches!(
+            gate.admit(start + Duration::from_secs(15)),
+            ControlAdmission::Refuse { shut_down: true }
+        ));
+        // A freed handler serves the next connection, and serving one ends
+        // the run of refusals.
+        drop(first);
+        let ControlAdmission::Serve(third) = gate.admit(start + Duration::from_secs(16)) else {
+            panic!("a freed slot must serve the next connection");
+        };
+        gate.handoff_succeeded();
+        let later = start + Duration::from_secs(17);
+        assert!(matches!(
+            gate.admit(later),
+            ControlAdmission::Refuse { shut_down: false }
+        ));
+        assert!(matches!(
+            gate.admit(later + Duration::from_secs(14)),
+            ControlAdmission::Refuse { shut_down: false }
+        ));
+        drop((second, third));
+        assert_eq!(gate.slots.live.load(Ordering::SeqCst), 0);
+    }
+
+    /// The Windows pipe workers share one gate. Each used to count its own
+    /// handoff failures, so with 8 workers it took 8 times as many failures
+    /// to stop a service that could not serve anyone.
+    #[test]
+    fn control_gate_counts_handoff_failures_across_workers() {
+        let gate = Arc::new(ControlConnectionGate::new(4));
+        let error = std::io::Error::other("injected");
+        let max = HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        for failure in 1..=max {
+            // Alternate between two "workers".
+            let worker_gate = gate.clone();
+            let message = error.to_string();
+            let stop = std::thread::spawn(move || {
+                worker_gate.handoff_failed("failed to spawn handler thread", &message)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(stop, failure == max, "failure {failure} of {max}");
+        }
+        // One connection served resets the count for every worker.
+        gate.handoff_succeeded();
+        assert!(!gate.handoff_failed("failed to spawn handler thread", &error));
     }
 
     #[cfg(unix)]
