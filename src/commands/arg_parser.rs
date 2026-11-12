@@ -775,6 +775,7 @@ autter verify [<rev|range>] [--json] [--strict]
     content_mismatch         the note does not describe this commit's files
     range_out_of_bounds      lines past the end of a file, or a missing file
     digest_mismatch          the note was changed after autter wrote it
+    carried_failure          a rewrite carried it from a note that failed
 
   Exits 5 when any note fails. Missing and legacy notes are warnings, also
   with --strict for now; a later release will fail them under --strict.

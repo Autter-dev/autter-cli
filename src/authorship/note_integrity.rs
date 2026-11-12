@@ -33,6 +33,17 @@
 //! note is [`IntegrityStatus::PendingRewrite`], not tampering. Every note
 //! autter writes, including its rewrites, is stamped again for the commit it
 //! is written to (see [`stamp_note_entries`]).
+//!
+//! **Carrying a failing note.** Stamping a rewritten note again must not turn
+//! a note that fails into one that verifies. Before a rewrite carries
+//! attribution from source notes to new commits (rebase, amend, cherry-pick,
+//! `autter ci` merges) it checks the source notes in one pass
+//! ([`check_rewrite_sources`]). A new commit derived from a failing note gets
+//! a `carried_failure` field in its stamp, naming the source commit, and reads
+//! as [`IntegrityStatus::CarriedFailure`]. Rewrites that rebuild a working log
+//! instead (reset, `cherry-pick -n`, `merge --squash`) read attribution
+//! through blame, which already skips a failing note, so its lines are not
+//! carried at all.
 
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -41,6 +52,7 @@ use crate::git::repository::{Repository, exec_git_stdin};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 /// Version of the `integrity` member's own format.
 pub const INTEGRITY_FORMAT_VERSION: u32 = 1;
@@ -59,8 +71,21 @@ pub struct NoteIntegrity {
     pub commit: String,
     pub tree: String,
     pub files: BTreeMap<String, Option<String>>,
+    /// Set when autter derived this note, during a rewrite, from a note that
+    /// failed the check. Covered by the digest like the other fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_failure: Option<CarriedFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+}
+
+/// The failing note a rewritten note was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedFailure {
+    /// The commit whose note autter carried attribution from.
+    pub commit: String,
+    /// That note's status when autter carried it (`digest_mismatch`, ...).
+    pub status: String,
 }
 
 /// Result of checking one commit's note.
@@ -94,6 +119,10 @@ pub enum IntegrityStatus {
     RangeOutOfBounds,
     /// The note was changed after autter wrote it.
     DigestMismatch,
+    /// Autter derived this note during a rewrite (rebase, amend, cherry-pick,
+    /// `autter ci` merge) from a note that failed the check. The note names
+    /// the source commit; its lines are no more trusted than the source's.
+    CarriedFailure,
 }
 
 impl IntegrityStatus {
@@ -109,11 +138,13 @@ impl IntegrityStatus {
             IntegrityStatus::ContentMismatch => "content_mismatch",
             IntegrityStatus::RangeOutOfBounds => "range_out_of_bounds",
             IntegrityStatus::DigestMismatch => "digest_mismatch",
+            IntegrityStatus::CarriedFailure => "carried_failure",
         }
     }
 
-    /// The note does not belong to this commit or was changed: its lines are
-    /// not trusted and `autter verify` exits non-zero.
+    /// The note does not belong to this commit, was changed, or was derived
+    /// from a note that failed: its lines are not trusted and `autter verify`
+    /// exits non-zero.
     pub fn is_failure(self) -> bool {
         matches!(
             self,
@@ -121,6 +152,7 @@ impl IntegrityStatus {
                 | IntegrityStatus::ContentMismatch
                 | IntegrityStatus::RangeOutOfBounds
                 | IntegrityStatus::DigestMismatch
+                | IntegrityStatus::CarriedFailure
         )
     }
 
@@ -143,7 +175,9 @@ pub struct CommitIntegrity {
     pub commit: String,
     pub status: IntegrityStatus,
     pub detail: String,
-    /// The commit the note says it was written for, when that is another one.
+    /// The commit the note says it was written for, when that is another one;
+    /// for [`IntegrityStatus::CarriedFailure`], the commit whose failing note
+    /// it was derived from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recorded_commit: Option<String>,
 }
@@ -332,6 +366,10 @@ fn path_query(commit: &str, path: &str) -> String {
 /// repository, are written as they are (without an integrity member, so they
 /// read as legacy rather than as tampered). Never fails the write: on any
 /// error the notes are returned unstamped.
+///
+/// A note for a commit that [`check_rewrite_sources`] found derived from a
+/// failing note is stamped with `carried_failure`, also when its objects
+/// cannot be looked up, so it never reads as legacy or verified.
 pub fn stamp_note_entries(
     repo: &Repository,
     entries: &[(String, String)],
@@ -342,7 +380,7 @@ pub fn stamp_note_entries(
             tracing::debug!("note integrity: stamping skipped: {e}");
             entries
                 .iter()
-                .map(|(c, n)| (c.clone(), strip_integrity_if_note(n)))
+                .map(|(c, n)| (c.clone(), strip_integrity_if_note(c, n)))
                 .collect()
         }
     }
@@ -350,13 +388,52 @@ pub fn stamp_note_entries(
 
 /// Remove a stale integrity member (one written for another commit) when the
 /// note cannot be stamped again, so it reads as legacy, not as tampering.
-fn strip_integrity_if_note(note: &str) -> String {
+/// A note carried from a failing note keeps saying so instead.
+fn strip_integrity_if_note(commit: &str, note: &str) -> String {
     let split = split_note(note);
+    if let Some(stamped) = stamp_carried_without_objects(commit, &split.body) {
+        return stamped;
+    }
     if split.integrity.is_some() {
         split.body
     } else {
         note.to_string()
     }
+}
+
+/// `body` stamped with only its carried failure, for when the commit's tree
+/// and files cannot be looked up. `None` when `commit` carries no failure or
+/// `body` is not a note.
+fn stamp_carried_without_objects(commit: &str, body: &str) -> Option<String> {
+    let carried = carried_failure_for(commit)?;
+    AuthorshipLog::deserialize_from_string(body).ok()?;
+    insert_integrity(
+        body,
+        &NoteIntegrity {
+            v: INTEGRITY_FORMAT_VERSION,
+            commit: commit.to_string(),
+            tree: String::new(),
+            files: BTreeMap::new(),
+            carried_failure: Some(carried),
+            digest: None,
+        },
+    )
+}
+
+/// New commit -> the failing note it is being derived from, for the rewrites
+/// in progress in this process. Filled by [`check_rewrite_sources`] and read
+/// when the rewritten notes are stamped. Keyed by commit SHA, so rewrites in
+/// several repositories at once (the background service) do not mix.
+fn carried_failures() -> &'static Mutex<HashMap<String, CarriedFailure>> {
+    static CARRIED: OnceLock<Mutex<HashMap<String, CarriedFailure>>> = OnceLock::new();
+    CARRIED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn carried_failure_for(commit: &str) -> Option<CarriedFailure> {
+    carried_failures()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(commit).cloned())
 }
 
 fn try_stamp_note_entries(
@@ -402,7 +479,8 @@ fn try_stamp_note_entries(
             continue;
         };
         let Some((_, tree)) = objects.get(&tree_query(commit)) else {
-            out.push((commit.clone(), p.body));
+            let note = stamp_carried_without_objects(commit, &p.body).unwrap_or(p.body);
+            out.push((commit.clone(), note));
             continue;
         };
         let files = p
@@ -421,6 +499,7 @@ fn try_stamp_note_entries(
             commit: commit.clone(),
             tree: tree.clone(),
             files,
+            carried_failure: carried_failure_for(commit),
             digest: None,
         };
         match insert_integrity(&p.body, &integrity) {
@@ -621,11 +700,36 @@ fn check_one(
             None,
         ),
         Some(Ok(integrity)) => {
+            let digest_holds = integrity.digest.as_deref()
+                == Some(compute_digest(&split.body, integrity).as_str());
+            let changed = || {
+                result(
+                    IntegrityStatus::DigestMismatch,
+                    "the note was changed after autter wrote it".to_string(),
+                    None,
+                )
+            };
+            let carried = |carried: &CarriedFailure| {
+                result(
+                    IntegrityStatus::CarriedFailure,
+                    format!(
+                        "autter derived this note from the note of {}, which failed the check ({}) when autter rewrote it",
+                        short(&carried.commit),
+                        carried.status
+                    ),
+                    Some(carried.commit.clone()),
+                )
+            };
             if integrity.commit != commit {
                 if recorded == commit {
                     let rangecheck = range_check(commit, log, objects, line_counts);
                     if let Some(r) = rangecheck {
                         return r;
+                    }
+                    // An older autter rewrote the text and kept the stamp: a
+                    // failure the stamp records still stands.
+                    if let Some(c) = &integrity.carried_failure {
+                        return carried(c);
                     }
                     return result(
                         IntegrityStatus::ReboundByOlderAutter,
@@ -636,15 +740,26 @@ fn check_one(
                         Some(integrity.commit.clone()),
                     );
                 }
-                return moved(&integrity.commit);
+                // Git copies a note byte for byte, so a copy's digest still
+                // holds: one that does not was changed, before or after the copy.
+                if !digest_holds {
+                    return changed();
+                }
+                let copied = moved(&integrity.commit);
+                if copied.status == IntegrityStatus::PendingRewrite
+                    && let Some(c) = &integrity.carried_failure
+                {
+                    return carried(c);
+                }
+                return copied;
             }
-            let expected = compute_digest(&split.body, integrity);
-            if integrity.digest.as_deref() != Some(expected.as_str()) {
-                return result(
-                    IntegrityStatus::DigestMismatch,
-                    "the note was changed after autter wrote it".to_string(),
-                    None,
-                );
+            if !digest_holds {
+                return changed();
+            }
+            // Checked before the commit's files: a carried failure is what
+            // the stamp says about this note, whatever else is wrong with it.
+            if let Some(c) = &integrity.carried_failure {
+                return carried(c);
             }
             // The stamp names this commit and its digest holds, so autter wrote
             // the note for this commit: a `base_commit_sha` naming another one
@@ -853,10 +968,132 @@ pub fn failure_notice(result: &CommitIntegrity) -> String {
             IntegrityStatus::WrongCommit => "belongs to another commit",
             IntegrityStatus::RangeOutOfBounds => "does not match this commit's files",
             IntegrityStatus::ContentMismatch => "does not match this commit's files",
+            IntegrityStatus::CarriedFailure => "was carried from a note that failed the check",
             _ => "was changed after autter wrote it",
         },
         short(&result.commit)
     )
+}
+
+// ---------------------------------------------------------------------------
+// Rewrites: checking the notes attribution is carried from
+// ---------------------------------------------------------------------------
+
+/// The failing source notes of one rewrite, recorded until the rewrite has
+/// written its notes. Dropping it forgets them.
+#[must_use = "the record lasts only as long as this value"]
+pub struct RewriteSourceCheck {
+    commits: Vec<String>,
+}
+
+impl Drop for RewriteSourceCheck {
+    fn drop(&mut self) {
+        if self.commits.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = carried_failures().lock() {
+            for commit in &self.commits {
+                map.remove(commit);
+            }
+        }
+    }
+}
+
+/// Check the notes a rewrite carries attribution from, before it writes the
+/// new commits' notes. `derived_from` lists each new commit with the source
+/// commits its note is built from (a squash has several). `source_notes`
+/// holds the source notes when the caller already read them (commit -> raw
+/// note, every source with a note); otherwise they are read here.
+///
+/// All sources are checked in one pass ([`verify_notes`]: a fixed number of
+/// git processes however many commits the rewrite has). A new commit with a
+/// source that fails is recorded, and its note is stamped with
+/// `carried_failure` naming that source when the rewrite writes it, so it
+/// fails `autter verify` instead of being stamped valid.
+///
+/// Sources that are `verified`, `legacy`, `missing`, `pending_rewrite` (git
+/// copied the note during this very rebase or amend) or
+/// `rebound_by_older_autter` are carried and stamped as before. So is a
+/// source that is `unavailable`: its commit or files are not in this clone
+/// (a shallow clone), so it could be checked only partly, and nothing found
+/// shows it was changed. If the check itself cannot run, the rewrite carries
+/// the notes as before, as readers do.
+pub fn check_rewrite_sources(
+    repo: &Repository,
+    derived_from: &[(String, Vec<String>)],
+    source_notes: Option<&HashMap<String, String>>,
+) -> RewriteSourceCheck {
+    let mut check = RewriteSourceCheck {
+        commits: Vec::new(),
+    };
+    let mut sources: Vec<String> = derived_from
+        .iter()
+        .flat_map(|(_, sources)| sources.iter().cloned())
+        .collect();
+    sources.sort();
+    sources.dedup();
+    if sources.is_empty() {
+        return check;
+    }
+    let read;
+    let notes = match source_notes {
+        Some(notes) => notes,
+        None => match crate::git::notes_api::read_notes_batch(repo, &sources) {
+            Ok(notes) => {
+                read = notes;
+                &read
+            }
+            Err(e) => {
+                tracing::debug!("note integrity: rewrite sources not checked: {e}");
+                return check;
+            }
+        },
+    };
+    let with_notes: Vec<String> = sources
+        .into_iter()
+        .filter(|commit| notes.contains_key(commit))
+        .collect();
+    if with_notes.is_empty() {
+        return check;
+    }
+    let results = match verify_notes(repo, &with_notes, notes) {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::debug!("note integrity: rewrite sources not checked: {e}");
+            return check;
+        }
+    };
+    let failed: HashMap<&str, &CommitIntegrity> = results
+        .iter()
+        .filter(|r| r.status.is_failure())
+        .map(|r| (r.commit.as_str(), r))
+        .collect();
+    if failed.is_empty() {
+        return check;
+    }
+    let Ok(mut map) = carried_failures().lock() else {
+        return check;
+    };
+    for (new_commit, sources) in derived_from {
+        let Some(source) = sources.iter().find_map(|s| failed.get(s.as_str())) else {
+            continue;
+        };
+        tracing::debug!(
+            "note integrity: {} is derived from the failing note of {} ({}); its note will say so",
+            new_commit,
+            source.commit,
+            source.status.as_str()
+        );
+        map.insert(
+            new_commit.clone(),
+            CarriedFailure {
+                commit: source.commit.clone(),
+                status: source.status.as_str().to_string(),
+            },
+        );
+        check.commits.push(new_commit.clone());
+    }
+    check
 }
 
 // ---------------------------------------------------------------------------
@@ -917,6 +1154,7 @@ mod tests {
             commit: "c0ffee".to_string(),
             tree: "7ree".to_string(),
             files: BTreeMap::from([("src/main.rs".to_string(), Some("b10b".to_string()))]),
+            carried_failure: None,
             digest: None,
         }
     }
@@ -966,6 +1204,26 @@ mod tests {
     }
 
     #[test]
+    fn a_carried_failure_is_covered_by_the_digest() {
+        // Notes stamped without the field serialize as before, so their
+        // digests still hold.
+        let fields = serde_json::to_string(&integrity()).unwrap();
+        assert!(!fields.contains("carried_failure"), "{fields}");
+        let mut carried = integrity();
+        carried.carried_failure = Some(CarriedFailure {
+            commit: "bad".to_string(),
+            status: "digest_mismatch".to_string(),
+        });
+        assert_ne!(
+            compute_digest(NOTE, &integrity()),
+            compute_digest(NOTE, &carried)
+        );
+        let stamped = insert_integrity(NOTE, &carried).unwrap();
+        let parsed = split_note(&stamped).integrity.unwrap().unwrap();
+        assert_eq!(parsed.carried_failure, carried.carried_failure);
+    }
+
+    #[test]
     fn a_reformatted_integrity_member_is_noticed() {
         let stamped = insert_integrity(NOTE, &integrity()).unwrap();
         let reformatted = stamped.replace("  \"integrity\": ", "    \"integrity\":  ");
@@ -997,6 +1255,7 @@ mod tests {
             ContentMismatch,
             RangeOutOfBounds,
             DigestMismatch,
+            CarriedFailure,
         ] {
             assert!(!(s.is_failure() && s.is_warning()), "{}", s.as_str());
             assert_eq!(s == Verified, !s.is_failure() && !s.is_warning());
