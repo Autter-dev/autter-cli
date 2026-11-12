@@ -12,10 +12,14 @@ const {
   assetName,
   binaryDest,
   ensureBinary,
+  installMarkerPath,
+  launcherNeedsInstall,
+  readInstallMarker,
   releaseTag,
   resolveLatestTag,
   spawnFailureHelp,
   verifyChecksum,
+  writeInstallMarker,
 } = require('./install');
 
 const RELEASES = 'https://github.com/autter-dev/autter-cli/releases';
@@ -211,3 +215,64 @@ test('other platforms get no Windows advice', () => {
     assert.match(denied[0], /chmod \+x "\/home\/dev\/\.autter\/bin\/autter"/);
   }
 });
+
+test('the npm install marker is written to ~/.autter and read back', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'autter-npm-marker-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  // The path the Rust side reads (NPM_INSTALL_MARKER in src/commands/upgrade.rs).
+  assert.equal(installMarkerPath(home), path.join(home, '.autter', 'npm-install.json'));
+  assert.equal(readInstallMarker(home), null);
+
+  assert.ok(writeInstallMarker({ home, packageVersion: '3.8.0' }));
+  assert.deepEqual(readInstallMarker(home), {
+    installer: 'npm',
+    package: '@autter/cli',
+    package_version: '3.8.0',
+  });
+
+  // A marker that is not JSON reads as absent rather than crashing the launcher.
+  fs.writeFileSync(installMarkerPath(home), 'not json');
+  assert.equal(readInstallMarker(home), null);
+});
+
+test('the launcher installs when npm skipped the postinstall of a new version', () => {
+  // No binary yet: always install.
+  assert.equal(launcherNeedsInstall({ binaryExists: false, marker: null, packageVersion: '3.8.0' }), true);
+  assert.equal(launcherNeedsInstall({ binaryExists: false, marker: null, packageVersion: DEV_VERSION }), true);
+  // `npm install -g @autter/cli@3.8.0` with scripts off: the binary is still
+  // the one from before, and no marker names 3.8.0.
+  assert.equal(launcherNeedsInstall({ binaryExists: true, marker: null, packageVersion: '3.8.0' }), true);
+  assert.equal(
+    launcherNeedsInstall({ binaryExists: true, marker: { package_version: '3.7.0' }, packageVersion: '3.8.0' }),
+    true,
+  );
+  // This version already installed its binary: the fast path.
+  assert.equal(
+    launcherNeedsInstall({ binaryExists: true, marker: { package_version: '3.8.0' }, packageVersion: '3.8.0' }),
+    false,
+  );
+  // A checkout (the dev placeholder) never re-downloads an existing binary.
+  assert.equal(launcherNeedsInstall({ binaryExists: true, marker: null, packageVersion: DEV_VERSION }), false);
+});
+
+test(
+  'the launcher runs the installed binary with its arguments and exit code',
+  { skip: process.platform === 'win32' ? 'the stand-in binary is a shell script' : false },
+  (t) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'autter-npm-launcher-'));
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const bin = path.join(home, '.autter', 'bin', 'autter');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.writeFileSync(bin, '#!/bin/sh\necho "args: $*"\nexit 3\n', { mode: 0o755 });
+    const { spawnSync } = require('node:child_process');
+    const run = spawnSync(process.execPath, [path.join(__dirname, 'bin', 'autter.js'), 'doctor', '--json'], {
+      env: { ...process.env, HOME: home, USERPROFILE: home, AUTTER_NO_INSTALL_PING: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(run.status, 3, run.stderr);
+    assert.equal(run.stdout.trim(), 'args: doctor --json');
+    // A checkout's launcher with a binary already there downloads nothing
+    // and leaves no npm marker behind.
+    assert.equal(readInstallMarker(home), null);
+  },
+);

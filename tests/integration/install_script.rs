@@ -249,8 +249,14 @@ fn fake_autter(dir: &Path) -> PathBuf {
 /// Install the stand-in binary with no controlling terminal (a new session),
 /// so the installer takes its no-terminal path wherever the tests run.
 fn install_without_a_terminal(envs: &[(&str, &str)]) -> (Output, Vec<String>) {
+    install_without_a_terminal_in(&home_with_zshrc(), envs)
+}
+
+fn install_without_a_terminal_in(
+    home: &tempfile::TempDir,
+    envs: &[(&str, &str)],
+) -> (Output, Vec<String>) {
     use std::os::unix::process::CommandExt;
-    let home = home_with_zshrc();
     let tools = tempfile::tempdir().unwrap();
     let binary = fake_autter(tools.path());
     let mut command = Command::new("bash");
@@ -317,4 +323,24 @@ fn install_token_exchange_that_works_or_is_absent_stays_quiet() {
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("sign you in"), "{stderr}");
     assert_eq!(calls, vec!["onboard"]);
+}
+
+/// Installing with this script over an npm install hands the binary to the
+/// script: the npm package's marker goes, so the background service updates
+/// the binary again and `autter upgrade` no longer points at npm.
+#[test]
+fn installing_over_an_npm_install_removes_the_npm_marker() {
+    let home = home_with_zshrc();
+    let marker = home.path().join(".autter").join("npm-install.json");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, r#"{"installer":"npm","package_version":"3.7.0"}"#).unwrap();
+
+    let (output, _) = install_without_a_terminal_in(&home, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(home.path().join(".autter/bin/autter").is_file());
+    assert!(!marker.exists(), "the npm marker must be removed");
 }
