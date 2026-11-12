@@ -271,6 +271,25 @@ pub fn copy_missing_notes_for_commits_from_ref(
 }
 
 pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Result<(), AutterError> {
+    write_notes_batch(repo, entries, true)
+}
+
+/// [`notes_add_batch`] without stamping: each note is written exactly as
+/// given. For notes autter copies from elsewhere rather than writes (the
+/// notes-database backfill), so a note that fails the integrity check, or
+/// predates it, is not turned into one that verifies.
+pub fn notes_add_batch_unstamped(
+    repo: &Repository,
+    entries: &[(String, String)],
+) -> Result<(), AutterError> {
+    write_notes_batch(repo, entries, false)
+}
+
+fn write_notes_batch(
+    repo: &Repository,
+    entries: &[(String, String)],
+    stamp: bool,
+) -> Result<(), AutterError> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -299,9 +318,13 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
     // Bind every note to the commit it is written for (note_integrity.rs).
     // This is the one place every git-notes write goes through, including
     // rewrites after rebase, amend and cherry-pick, so each is stamped again
-    // for its new commit.
-    let deduped_entries =
-        crate::authorship::note_integrity::stamp_note_entries(repo, &deduped_entries);
+    // for its new commit. Only notes copied as they are (the notes-database
+    // backfill) are written without a new stamp.
+    let deduped_entries = if stamp {
+        crate::authorship::note_integrity::stamp_note_entries(repo, &deduped_entries)
+    } else {
+        deduped_entries
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

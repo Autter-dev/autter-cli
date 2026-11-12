@@ -582,7 +582,7 @@
       }
     },
     "integrity_status": {
-      "description": "Result of the integrity check of one commit's authorship note. verified: written for this commit and unchanged. legacy: written before the integrity check (no integrity member); its commit and line ranges were still checked. missing: no note. pending_rewrite: git copied another commit's note here during a rebase or amend and autter has not rewritten it yet (same patch). rebound_by_older_autter: an autter release older than the check moved the note here. unavailable: the commit or its files are not in this clone (a shallow or partial clone). wrong_commit, content_mismatch, range_out_of_bounds, digest_mismatch and carried_failure are failures: the note belongs to another commit, was changed after autter wrote it, or (carried_failure) was derived by a rebase, amend, cherry-pick or autter ci merge from a note that failed; recorded_commit names that source commit. New statuses may be added; treat one you do not know as a warning.",
+      "description": "Result of the integrity check of one commit's authorship note. verified: written for this commit and unchanged. legacy: written before the integrity check (no integrity member); its commit and line ranges were still checked. missing: no note. pending_rewrite: git copied another commit's note here during a rebase or amend and autter has not rewritten it yet (same patch). rebound_by_older_autter: an autter release older than the check moved the note here and kept the old stamp, so the digest cannot be checked (a failure under --strict); the stamp's tree and blobs are checked against the commit it names when that commit is in the clone. unavailable: the commit or its files are not in this clone (a shallow or partial clone). wrong_commit, content_mismatch, range_out_of_bounds, digest_mismatch and carried_failure are failures: the note belongs to another commit, was changed after autter wrote it, or (carried_failure) was derived by a rebase, amend, cherry-pick or autter ci merge, or rebound by an older autter, from a note that failed; recorded_commit names that source commit. content_mismatch on a note that looks rebound means its stamp does not describe the commit it names (recorded_commit). New statuses may be added; treat one you do not know as a warning.",
       "type": "string",
       "enum": [
         "verified",
@@ -599,7 +599,7 @@
       ]
     },
     "verify": {
-      "description": "autter verify [<rev|range>] --json: the integrity check of authorship notes. Exits 5 (integrity_failed) when a note fails, with this report next to error. Warnings exit 0, also with --strict for now (a later release will fail legacy and missing notes under --strict).",
+      "description": "autter verify [<rev|range>] --json: the integrity check of authorship notes. Exits 5 (integrity_failed) when a note fails, with this report next to error. With --strict, rebound_by_older_autter also fails (exit 5, counted in failed; its status is unchanged). Other warnings exit 0, also with --strict for now (a later release will fail legacy and missing notes under --strict).",
       "type": "object",
       "required": ["schema_version", "range", "commits", "counts", "failed", "results"],
       "properties": {
@@ -611,7 +611,7 @@
           "description": "Number of commits per status; statuses with no commit are left out.",
           "additionalProperties": { "type": "integer" }
         },
-        "failed": { "type": "integer" },
+        "failed": { "type": "integer", "description": "Commits that fail: every failure status, and with --strict rebound_by_older_autter." },
         "results": {
           "type": "array",
           "items": {

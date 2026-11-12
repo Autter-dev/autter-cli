@@ -44,6 +44,24 @@
 //! instead (reset, `cherry-pick -n`, `merge --squash`) read attribution
 //! through blame, which already skips a failing note, so its lines are not
 //! carried at all.
+//!
+//! **Notes rebound by an older autter.** An autter older than the integrity
+//! check that rewrites a note keeps the old stamp, so the digest cannot hold
+//! and the note reads as [`IntegrityStatus::ReboundByOlderAutter`], a warning
+//! (a failure under `autter verify --strict`). Anyone can make a note look
+//! rebound, so what can still be checked is: the stamp's tree and blobs must
+//! describe the commit it names when that commit is in this clone
+//! ([`IntegrityStatus::ContentMismatch`] otherwise), and when that commit's
+//! own note fails, the rebound note is [`IntegrityStatus::CarriedFailure`].
+//!
+//! **Stash notes.** `git stash` saves the working log as a note in
+//! `refs/notes/ai-stash`, stamped for the stash commit
+//! ([`seal_stash_note`]); `stash pop`/`apply` checks it
+//! ([`check_stash_note`]) and does not restore one that fails.
+//!
+//! **Notes copied from the notes database** (`autter notes backfill`) are
+//! written as stored, without a new stamp, so a failing or legacy note is not
+//! turned into a verified one (`git::notes_backfill`).
 
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -104,7 +122,9 @@ pub enum IntegrityStatus {
     PendingRewrite,
     /// A note rewritten by an autter release older than the integrity check:
     /// it names this commit but its integrity member still names the commit
-    /// it was first written for.
+    /// it was first written for. Its digest cannot be checked; what its stamp
+    /// says about that commit was checked when the commit is in this clone.
+    /// A warning, but a failure under `autter verify --strict`.
     ReboundByOlderAutter,
     /// The commit or the files the note describes are not in this clone
     /// (a shallow clone, for example), so the note could not be checked.
@@ -120,7 +140,8 @@ pub enum IntegrityStatus {
     /// The note was changed after autter wrote it.
     DigestMismatch,
     /// Autter derived this note during a rewrite (rebase, amend, cherry-pick,
-    /// `autter ci` merge) from a note that failed the check. The note names
+    /// `autter ci` merge) from a note that failed the check, or an older
+    /// autter rebound it from a note that fails the check. The result names
     /// the source commit; its lines are no more trusted than the source's.
     CarriedFailure,
 }
@@ -522,6 +543,18 @@ pub fn verify_notes(
     commits: &[String],
     notes: &HashMap<String, String>,
 ) -> Result<Vec<CommitIntegrity>, AutterError> {
+    let mut results = verify_notes_once(repo, commits, notes)?;
+    check_rebound_sources(repo, &mut results);
+    Ok(results)
+}
+
+/// [`verify_notes`] without looking at the notes of the commits that
+/// rebound notes name.
+fn verify_notes_once(
+    repo: &Repository,
+    commits: &[String],
+    notes: &HashMap<String, String>,
+) -> Result<Vec<CommitIntegrity>, AutterError> {
     struct Parsed {
         split: SplitNote,
         log: Option<AuthorshipLog>,
@@ -549,6 +582,16 @@ pub fn verify_notes(
         if let Some(log) = &log {
             for a in &log.attestations {
                 push(path_query(commit, &a.file_path), &mut queries);
+            }
+        }
+        // A stamp naming another commit: what it claims about that commit is
+        // checked when the note turns out to be rebound by an older autter.
+        if let Some(Ok(integrity)) = &split.integrity
+            && integrity.commit != *commit
+        {
+            push(tree_query(&integrity.commit), &mut queries);
+            for path in integrity.files.keys() {
+                push(path_query(&integrity.commit, path), &mut queries);
             }
         }
         parsed.insert(
@@ -731,10 +774,26 @@ fn check_one(
                     if let Some(c) = &integrity.carried_failure {
                         return carried(c);
                     }
+                    // The text changed, so the digest cannot hold. What the
+                    // stamp says about the commit it names still can be
+                    // checked, when that commit is in this clone.
+                    let checked = match stamp_claims_hold(integrity, objects) {
+                        Some(Err(detail)) => {
+                            return result(
+                                IntegrityStatus::ContentMismatch,
+                                detail,
+                                Some(integrity.commit.clone()),
+                            );
+                        }
+                        Some(Ok(())) => "",
+                        None => {
+                            " (that commit is not in this clone, so the record could not be checked against it)"
+                        }
+                    };
                     return result(
                         IntegrityStatus::ReboundByOlderAutter,
                         format!(
-                            "an autter release older than the integrity check moved this note from {}; run a newer autter over the range to stamp it again",
+                            "an autter release older than the integrity check moved this note from {}{checked}; run a newer autter over the range to stamp it again",
                             short(&integrity.commit)
                         ),
                         Some(integrity.commit.clone()),
@@ -823,6 +882,100 @@ fn check_one(
                 None,
             )
         }
+    }
+}
+
+/// Whether what `integrity` records about the commit it names (its tree and
+/// the blob of each file) is true of that commit. `None` when that commit is
+/// not in this clone; `Some(Err(detail))` when a claim is false.
+fn stamp_claims_hold(
+    integrity: &NoteIntegrity,
+    objects: &HashMap<String, (String, String)>,
+) -> Option<Result<(), String>> {
+    let named = &integrity.commit;
+    let (_, tree) = objects.get(&tree_query(named))?;
+    if *tree != integrity.tree {
+        return Some(Err(format!(
+            "the note's integrity record names {}, but does not describe that commit's tree",
+            short(named)
+        )));
+    }
+    for (path, recorded) in &integrity.files {
+        let actual = objects
+            .get(&path_query(named, path))
+            .filter(|(kind, _)| kind == "blob")
+            .map(|(_, oid)| oid.clone());
+        if actual != *recorded {
+            return Some(Err(format!(
+                "the note's integrity record names {}, but describes a different version of {} than that commit has",
+                short(named),
+                path
+            )));
+        }
+    }
+    Some(Ok(()))
+}
+
+/// A note rebound by an older autter keeps the stamp of the note it was
+/// derived from, and git keeps that note on the commit the stamp names. When
+/// that note is still there and fails the check, the rebound note was derived
+/// from a failing note: it fails as [`IntegrityStatus::CarriedFailure`], as a
+/// rewrite by this autter would have recorded. Never fails: when the notes
+/// cannot be read or checked, the results stay as they are.
+fn check_rebound_sources(repo: &Repository, results: &mut [CommitIntegrity]) {
+    let mut named: Vec<String> = results
+        .iter()
+        .filter(|r| r.status == IntegrityStatus::ReboundByOlderAutter)
+        .filter_map(|r| r.recorded_commit.clone())
+        .collect();
+    named.sort();
+    named.dedup();
+    if named.is_empty() {
+        return;
+    }
+    let notes = match crate::git::notes_api::read_notes_batch(repo, &named) {
+        Ok(notes) => notes,
+        Err(e) => {
+            tracing::debug!("note integrity: notes of rebound sources not read: {e}");
+            return;
+        }
+    };
+    let with_notes: Vec<String> = named
+        .into_iter()
+        .filter(|c| notes.contains_key(c))
+        .collect();
+    if with_notes.is_empty() {
+        return;
+    }
+    let sources = match verify_notes_once(repo, &with_notes, &notes) {
+        Ok(sources) => sources,
+        Err(e) => {
+            tracing::debug!("note integrity: rebound sources not checked: {e}");
+            return;
+        }
+    };
+    let failed: HashMap<&str, &CommitIntegrity> = sources
+        .iter()
+        .filter(|r| r.status.is_failure())
+        .map(|r| (r.commit.as_str(), r))
+        .collect();
+    for r in results.iter_mut() {
+        if r.status != IntegrityStatus::ReboundByOlderAutter {
+            continue;
+        }
+        let Some(source) = r
+            .recorded_commit
+            .as_deref()
+            .and_then(|c| failed.get(c).copied())
+        else {
+            continue;
+        };
+        r.status = IntegrityStatus::CarriedFailure;
+        r.detail = format!(
+            "an autter release older than the integrity check moved this note from {}, whose note fails the check ({})",
+            short(&source.commit),
+            source.status.as_str()
+        );
     }
 }
 
@@ -1094,6 +1247,181 @@ pub fn check_rewrite_sources(
         check.commits.push(new_commit.clone());
     }
     check
+}
+
+// ---------------------------------------------------------------------------
+// Stash notes (refs/notes/ai-stash)
+// ---------------------------------------------------------------------------
+//
+// `git stash` saves the working log's attribution as a note on the stash
+// commit, and `stash pop`/`apply` puts it back into the working log, where
+// the next commit stamps it. A stash note is bound to its stash commit the
+// same way a note is bound to its commit: `commit` is the stash commit,
+// `tree` its tree, `files` the blob of each attested file in the stash (the
+// stash commit's tree, or its untracked-files parent for `stash -u`), and
+// the digest covers the note.
+
+/// The places a stashed file's content is: the stash commit's tree (tracked
+/// files), then its third parent (untracked files, `git stash -u`).
+fn stash_path_queries(stash_sha: &str, path: &str) -> [String; 2] {
+    [
+        path_query(stash_sha, path),
+        path_query(&format!("{stash_sha}^3"), path),
+    ]
+}
+
+fn stash_blob(
+    objects: &HashMap<String, (String, String)>,
+    stash_sha: &str,
+    path: &str,
+) -> Option<String> {
+    stash_path_queries(stash_sha, path).iter().find_map(|q| {
+        objects
+            .get(q)
+            .filter(|(kind, _)| kind == "blob")
+            .map(|(_, oid)| oid.clone())
+    })
+}
+
+fn stash_objects(
+    repo: &Repository,
+    stash_sha: &str,
+    log: &AuthorshipLog,
+    extra_paths: impl Iterator<Item = String>,
+) -> Result<HashMap<String, (String, String)>, AutterError> {
+    let mut queries = vec![tree_query(stash_sha)];
+    let mut seen = HashSet::new();
+    for path in log
+        .attestations
+        .iter()
+        .map(|a| a.file_path.clone())
+        .chain(extra_paths)
+    {
+        if seen.insert(path.clone()) {
+            queries.extend(stash_path_queries(stash_sha, &path));
+        }
+    }
+    batch_check(repo, &queries)
+}
+
+/// `note` (a stash's authorship log) stamped for the stash commit
+/// `stash_sha`. Never fails the stash: on any error the note is returned
+/// as it is, and it restores as a note written before stash notes were
+/// stamped.
+pub fn seal_stash_note(repo: &Repository, stash_sha: &str, note: &str) -> String {
+    let body = split_note(note).body;
+    let Ok(log) = AuthorshipLog::deserialize_from_string(&body) else {
+        return note.to_string();
+    };
+    let objects = match stash_objects(repo, stash_sha, &log, std::iter::empty()) {
+        Ok(objects) => objects,
+        Err(e) => {
+            tracing::debug!("note integrity: stash note not stamped: {e}");
+            return note.to_string();
+        }
+    };
+    let Some((_, tree)) = objects.get(&tree_query(stash_sha)) else {
+        return note.to_string();
+    };
+    let files = log
+        .attestations
+        .iter()
+        .map(|a| {
+            (
+                a.file_path.clone(),
+                stash_blob(&objects, stash_sha, &a.file_path),
+            )
+        })
+        .collect();
+    let integrity = NoteIntegrity {
+        v: INTEGRITY_FORMAT_VERSION,
+        commit: stash_sha.to_string(),
+        tree: tree.clone(),
+        files,
+        carried_failure: None,
+        digest: None,
+    };
+    insert_integrity(&body, &integrity).unwrap_or_else(|| note.to_string())
+}
+
+/// Result of checking a stash note before restoring it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashNoteCheck {
+    /// Stamped for this stash and unchanged since.
+    Verified,
+    /// No integrity member: written by an autter older than stash-note
+    /// stamping (3.8.1 and earlier). Restored as before; a stamped note with
+    /// its member removed looks the same, which this check cannot tell apart.
+    Legacy,
+    /// The note does not belong to this stash or was changed after autter
+    /// wrote it; the reason completes "its record ...".
+    Failed(String),
+}
+
+/// Check the stash note `note` of the stash commit `stash_sha` before its
+/// attribution is restored into the working log.
+pub fn check_stash_note(repo: &Repository, stash_sha: &str, note: &str) -> StashNoteCheck {
+    let split = split_note(note);
+    if split.integrity_moved {
+        return StashNoteCheck::Failed(
+            "has an integrity record that was moved or reformatted after autter wrote it"
+                .to_string(),
+        );
+    }
+    let integrity = match split.integrity {
+        None => return StashNoteCheck::Legacy,
+        Some(Err(e)) => {
+            return StashNoteCheck::Failed(format!("has an unreadable integrity record ({e})"));
+        }
+        Some(Ok(integrity)) => integrity,
+    };
+    if integrity.commit != stash_sha {
+        return StashNoteCheck::Failed(format!(
+            "was written for {}, not for this stash",
+            short(&integrity.commit)
+        ));
+    }
+    if integrity.digest.as_deref() != Some(compute_digest(&split.body, &integrity).as_str()) {
+        return StashNoteCheck::Failed("was changed after autter wrote it".to_string());
+    }
+    if integrity.carried_failure.is_some() {
+        return StashNoteCheck::Failed("was derived from a note that failed the check".to_string());
+    }
+    let Ok(log) = AuthorshipLog::deserialize_from_string(&split.body) else {
+        return StashNoteCheck::Failed("is not a readable authorship record".to_string());
+    };
+    let objects = match stash_objects(repo, stash_sha, &log, integrity.files.keys().cloned()) {
+        Ok(objects) => objects,
+        // The digest holds; only the comparison with the stash could not run.
+        Err(e) => {
+            tracing::debug!("note integrity: stash note compared by digest only: {e}");
+            return StashNoteCheck::Verified;
+        }
+    };
+    match objects.get(&tree_query(stash_sha)) {
+        Some((_, tree)) if *tree == integrity.tree => {}
+        _ => {
+            return StashNoteCheck::Failed("does not describe this stash's tree".to_string());
+        }
+    }
+    for a in &log.attestations {
+        match integrity.files.get(&a.file_path) {
+            Some(recorded) if *recorded == stash_blob(&objects, stash_sha, &a.file_path) => {}
+            Some(_) => {
+                return StashNoteCheck::Failed(format!(
+                    "describes a different version of {} than the stash has",
+                    a.file_path
+                ));
+            }
+            None => {
+                return StashNoteCheck::Failed(format!(
+                    "attributes lines in {}, which its integrity record does not cover",
+                    a.file_path
+                ));
+            }
+        }
+    }
+    StashNoteCheck::Verified
 }
 
 // ---------------------------------------------------------------------------

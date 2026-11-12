@@ -3,7 +3,8 @@
 //!
 //! Exit codes: 0 when no note fails; [`EXIT_INTEGRITY_FAILED`] (5) when a note
 //! belongs to another commit, was changed, or was carried by a rewrite from a
-//! note that failed. Missing and legacy notes are
+//! note that failed. With `--strict`, a note rebound by an older autter (whose
+//! digest cannot be checked) also exits 5. Missing and legacy notes are
 //! warnings, also with `--strict` for now (a later release will fail them
 //! under `--strict`).
 
@@ -76,8 +77,8 @@ pub fn handle_verify(args: &[String]) {
     for r in &results {
         *counts.entry(r.status.as_str()).or_default() += 1;
     }
-    let failed = results.iter().filter(|r| r.status.is_failure()).count();
     let strict = output::strict();
+    let failed = results.iter().filter(|r| fails(r.status, strict)).count();
     let unproven = results
         .iter()
         .filter(|r| matches!(r.status, IntegrityStatus::Legacy | IntegrityStatus::Missing))
@@ -117,6 +118,13 @@ pub fn handle_verify(args: &[String]) {
     }
 }
 
+/// Whether `status` fails `autter verify`: every failure, and under
+/// `--strict` a note rebound by an older autter, whose digest cannot be
+/// checked (anyone can make a note look rebound).
+fn fails(status: IntegrityStatus, strict: bool) -> bool {
+    status.is_failure() || (strict && status == IntegrityStatus::ReboundByOlderAutter)
+}
+
 fn failure_summary(failed: usize, total: usize) -> String {
     format!(
         "{failed} of {total} {} failed the integrity check",
@@ -152,7 +160,7 @@ fn print_human(target: &str, results: &[CommitIntegrity], strict: bool) {
         return;
     }
     for r in results {
-        let marker = if r.status.is_failure() {
+        let marker = if fails(r.status, strict) {
             "FAIL"
         } else if r.status == IntegrityStatus::Verified {
             "ok  "
@@ -172,7 +180,7 @@ fn print_human(target: &str, results: &[CommitIntegrity], strict: bool) {
         );
     }
     let count = |s: IntegrityStatus| results.iter().filter(|r| r.status == s).count();
-    let failed = results.iter().filter(|r| r.status.is_failure()).count();
+    let failed = results.iter().filter(|r| fails(r.status, strict)).count();
     println!();
     println!(
         "{} {} checked: {} verified, {} legacy, {} without a note, {} failed",
@@ -187,5 +195,10 @@ fn print_human(target: &str, results: &[CommitIntegrity], strict: bool) {
         eprintln!(
             "A failed note does not belong to its commit, was changed after autter wrote it, or was carried by a rewrite from a note that failed; stats and blame count its lines as unknown."
         );
+        if strict && count(IntegrityStatus::ReboundByOlderAutter) > 0 {
+            eprintln!(
+                "--strict: a note rebound by an older autter cannot be checked against its digest, so it fails; run a newer autter over the range (rebase or `autter ci`) to stamp it again."
+            );
+        }
     }
 }

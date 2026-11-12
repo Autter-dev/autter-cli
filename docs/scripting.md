@@ -216,20 +216,28 @@ autter verify origin/main..HEAD --json --strict
 | `legacy` | 0 (warning) | Written before the integrity check (autter 3.7.1 and earlier). Its commit and line ranges are still checked |
 | `missing` | 0 (warning) | The commit has no note |
 | `pending_rewrite` | 0 (warning) | Git copied another commit's note here during a rebase or amend and autter has not rewritten it yet (the background service was not running). The two commits carry the same patch |
-| `rebound_by_older_autter` | 0 (warning) | An autter release older than the integrity check moved the note here |
+| `rebound_by_older_autter` | 0 (warning); 5 with `--strict` | An autter release older than the integrity check moved the note here and kept the old stamp, so the digest cannot be checked. The stamp's tree and blobs are checked against the commit it names (`recorded_commit`) when that commit is in this clone |
 | `unavailable` | 0 (warning) | The commit or its files are not in this clone (a shallow or partial clone), so the note could not be checked. This is not tampering |
 | `wrong_commit` | 5 | The note was written for another commit with a different change: it was copied or moved |
-| `content_mismatch` | 5 | The note's record of the commit's files does not match the commit |
+| `content_mismatch` | 5 | The note's record of the commit's files does not match the commit; for a note that looks rebound, its stamp does not describe the commit it names (`recorded_commit`) |
 | `range_out_of_bounds` | 5 | The note attributes lines past the end of a file, or lines of a file the commit does not have |
 | `digest_mismatch` | 5 | The note was changed after autter wrote it |
-| `carried_failure` | 5 | Autter derived the note, during a rebase, amend, cherry-pick or `autter ci` merge, from a note that failed the check. `recorded_commit` names that source commit |
+| `carried_failure` | 5 | Autter derived the note, during a rebase, amend, cherry-pick or `autter ci` merge, from a note that failed the check, or an older autter rebound it from a note that fails the check. `recorded_commit` names that source commit |
 
 `--json` prints `{schema_version, range, commits, counts, failed, results}`,
 each result `{commit, status, detail, recorded_commit?}`; on exit 5 the same
-report comes with `error.code` = `integrity_failed`. `--strict` still passes
-`legacy` and `missing` notes, with a warning on stderr. **A later release will
-fail them under `--strict`**, once notes written before the integrity check
-have aged out of the ranges you check.
+report comes with `error.code` = `integrity_failed`, and `failed` counts the
+commits that made it fail.
+
+`--strict` fails `rebound_by_older_autter` (exit 5; the status stays
+`rebound_by_older_autter` and the human report marks it `FAIL`): its digest
+cannot be checked, so anyone who can write notes could otherwise turn a
+failure into a warning by making a note look rebound. To
+clear it, rewrite the commits with this autter (a rebase or `autter ci`
+merge), which stamps them again. `--strict` still passes `legacy` and
+`missing` notes, with a warning on stderr. **A later release will fail them
+under `--strict`**, once notes written before the integrity check have aged
+out of the ranges you check.
 
 `autter stats`, `autter blame` and the range stats do not trust a note that
 fails: its lines count as `unknown`, and they print one line naming the commit
@@ -246,11 +254,35 @@ put attribution back into the working tree (`reset`, `cherry-pick -n`,
 lines are committed again as unknown. A source note that is `unavailable`
 (objects missing from a shallow clone) is carried as before.
 
+The same holds for the other ways attribution comes back:
+
+- **`git stash`.** The attribution saved with a stash (`refs/notes/ai-stash`)
+  is stamped for the stash commit. `stash pop`/`apply` checks it first; a note
+  written for another stash, or changed after autter wrote it, is not restored
+  (those lines count as untracked, as any edit autter has no record of) and
+  autter prints one warning line naming the stash (in the background service's
+  log when the service handles the stash). A stash note without a stamp,
+  written by autter 3.8.1 or earlier, is restored as before, so stashes made
+  before an upgrade keep their AI lines; a stamped note with its stamp removed
+  looks the same and is restored too.
+- **`autter notes backfill`** (and the automatic backfill when a machine moves
+  off the `http` notes backend) copies notes from the local notes database
+  into `refs/notes/ai` as stored, without a new stamp. A note changed in the
+  database still fails `autter verify` after the copy, and the command lists
+  it on stderr; a note written before the integrity check stays `legacy`.
+
 This is an integrity check, not tamper evidence. It catches notes copied to
-another commit, moved, or edited by hand. Someone who can write to the
-repository and recomputes every field of the note (the digest is not a
-signature) is not caught; a record kept outside the repository is planned for
-that.
+another commit, moved, or edited by hand. Not caught:
+
+- someone who can write to the repository and recomputes every field of the
+  note (the digest is not a signature), including a stash note; a record kept
+  outside the repository is planned for that;
+- a note made to look rebound with a genuine stamp copied from another note
+  whose commit is not in the clone, or whose claims hold: it is a warning
+  without `--strict`, and a rewrite by this autter carries it like any other
+  warning;
+- edits to the working log in `.git/ai/`, which the next commit records as
+  they are.
 
 To fail a pull request whose notes do not belong to its commits, run it next
 to `autter ci` (or on its own after `autter fetch-notes origin`):

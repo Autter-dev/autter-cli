@@ -1,3 +1,4 @@
+use crate::authorship::note_integrity::{self, StashNoteCheck};
 use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::error::AutterError;
 use crate::git::cli_parser::ParsedGitInvocation;
@@ -52,11 +53,13 @@ pub(crate) fn save_stash_authorship_log(
         .attestations
         .retain(|a| filtered_files.contains(&a.file_path));
 
-    // Save as git note at refs/notes/ai-stash
+    // Save as git note at refs/notes/ai-stash, bound to the stash commit so
+    // that a note edited or moved before it is restored is not restored.
     let json = authorship_log
         .serialize_to_string()
         .map_err(|e| AutterError::Generic(format!("Failed to serialize authorship log: {}", e)))?;
-    save_stash_note(repo, stash_sha, &json)?;
+    let sealed = note_integrity::seal_stash_note(repo, stash_sha, &json);
+    save_stash_note(repo, stash_sha, &sealed)?;
 
     tracing::debug!(
         "Saved authorship log to refs/notes/ai-stash for stash {}",
@@ -89,6 +92,27 @@ pub(crate) fn restore_stash_attributions(
             return Ok(());
         }
     };
+
+    // A note that does not belong to this stash, or was changed after autter
+    // wrote it, is not restored: its lines count as untracked, like any edit
+    // autter has no record of. A note without an integrity member was written
+    // by an autter older than stash-note stamping and restores as before.
+    match note_integrity::check_stash_note(repo, stash_sha, &note_content) {
+        StashNoteCheck::Verified => {}
+        StashNoteCheck::Legacy => {
+            tracing::debug!("stash note for {} predates stash-note stamping", stash_sha);
+        }
+        StashNoteCheck::Failed(reason) => {
+            let warning = format!(
+                "warning: autter did not restore AI attribution from stash {}: its record in refs/notes/ai-stash {}; those lines count as untracked.",
+                &stash_sha[..stash_sha.len().min(8)],
+                reason
+            );
+            tracing::warn!("{}", warning);
+            eprintln!("{}", warning);
+            return Ok(());
+        }
+    }
 
     // Parse the authorship log
     let authorship_log = match crate::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(&note_content) {
@@ -191,19 +215,27 @@ where
     Ok(file_contents)
 }
 
-/// Save a note to refs/notes/ai-stash
+/// Save a note to refs/notes/ai-stash, byte for byte: the note is written as
+/// a blob first and attached with `-C`, so git's message cleanup cannot change
+/// the text its digest covers.
 fn save_stash_note(repo: &Repository, stash_sha: &str, content: &str) -> Result<(), AutterError> {
+    // Use stdin to provide the note content to avoid command line length limits
+    let mut args = repo.global_args_for_exec();
+    args.push("hash-object".to_string());
+    args.push("-w".to_string());
+    args.push("--stdin".to_string());
+    let output = exec_git_stdin(&args, content.as_bytes())?;
+    let blob = String::from_utf8(output.stdout)?.trim().to_string();
+
     let mut args = repo.global_args_for_exec();
     args.push("notes".to_string());
     args.push("--ref=ai-stash".to_string());
     args.push("add".to_string());
     args.push("-f".to_string()); // Force overwrite if exists
-    args.push("-F".to_string());
-    args.push("-".to_string()); // Read note content from stdin
+    args.push("-C".to_string());
+    args.push(blob);
     args.push(stash_sha.to_string());
-
-    // Use stdin to provide the note content to avoid command line length limits
-    exec_git_stdin(&args, content.as_bytes())?;
+    exec_git(&args)?;
     Ok(())
 }
 
