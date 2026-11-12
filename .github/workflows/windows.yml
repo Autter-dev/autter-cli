@@ -8,9 +8,11 @@ name: Windows
 #   profile directory: background service start/status/shutdown/restart and a
 #   stale lock, a commit captured through git's trace2 pipe and blamed as AI,
 #   `doctor --json` and `--report`, the VS Code PATH order that used to open
-#   editor windows, the npm launcher against a broken autter.exe, no raw
-#   escape codes in a console without ANSI support, and a service started
-#   elevated seen from a standard-user token.
+#   editor windows, the npm launcher against a broken autter.exe, and no
+#   raw escape codes in redirected output or in a real console (screen buffer
+#   read back). It also tries a service started elevated seen from a
+#   filtered, non-elevated token; on this runner (a service, UAC off) no
+#   process can start with such a token, which the script reports as a NOTE.
 
 on:
   pull_request:
@@ -21,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-${{ github.sha }}
+  group: windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
