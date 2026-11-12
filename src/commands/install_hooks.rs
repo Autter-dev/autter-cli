@@ -475,12 +475,14 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
     // Internal: rewrite only out-of-date hooks of agents already set up. Started
     // in the background on the first command after an upgrade, and by
     // `autter upgrade` with the newly installed binary.
+    // A failure goes back to the caller like every other path here (it is
+    // printed and the command exits 1); this used to exit from inside `run`.
     if args.len() == 1 && args[0] == crate::mdm::hook_refresh::REFRESH_STALE_FLAG {
-        let ok = crate::mdm::hook_refresh::run_refresh_command();
-        std::process::exit(if ok {
-            crate::commands::EXIT_SUCCESS
-        } else {
-            crate::commands::EXIT_RUNTIME_ERROR
+        return crate::mdm::hook_refresh::run_refresh_command().map(|refreshed| {
+            refreshed
+                .into_iter()
+                .map(|name| (name, "refreshed".to_string()))
+                .collect()
         });
     }
     let mut options = parse_install_options(args).map_err(AutterError::Usage)?;

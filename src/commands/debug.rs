@@ -1499,7 +1499,7 @@ fn collect_platform_info() -> PlatformInfo {
     }
 }
 
-fn collect_kernel_details() -> Option<String> {
+pub(crate) fn collect_kernel_details() -> Option<String> {
     #[cfg(unix)]
     {
         run_command_capture("uname", &["-srm"]).ok()
@@ -1814,6 +1814,53 @@ fn should_redact_key_value(key: &str, value: &str) -> bool {
         .any(|marker| value_lower.contains(marker))
 }
 
+/// Redact secrets from a line of free text (a log line, an error), for
+/// reports people send to support: everything after a sensitive word
+/// (`token`, `password`, `authorization`, ...) and the credentials in a
+/// `scheme://user:pass@host` URL. Same markers as the git config redaction.
+pub(crate) fn redact_free_text(line: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "oauth",
+        "authorization",
+        "bearer",
+        "apikey",
+        "api_key",
+        "api-key",
+        "extraheader",
+        "cookie",
+    ];
+    // ASCII lowercasing keeps byte offsets, so they index `line` too.
+    let lower = line.to_ascii_lowercase();
+    let mut out = match MARKERS
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|at| at + marker.len()))
+        .min()
+    {
+        Some(end) => format!("{}[REDACTED]", &line[..end]),
+        None => line.to_string(),
+    };
+    // user:pass@ in URLs.
+    let mut search_from = 0;
+    while let Some(scheme) = out[search_from..].find("://").map(|i| i + search_from + 3) {
+        let rest = &out[scheme..];
+        let host_end = rest
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        match rest[..host_end].rfind('@') {
+            Some(at) => {
+                out.replace_range(scheme..scheme + at, "[REDACTED]");
+                search_from = scheme + "[REDACTED]".len();
+            }
+            None => search_from = scheme,
+        }
+    }
+    out
+}
+
 fn collect_autter_config_dump() -> Result<String, String> {
     let runtime = config::Config::get();
     let mut out = String::new();
@@ -1921,6 +1968,28 @@ mod tests {
                 "[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Seconds 60",
             ],
         )
+    }
+
+    #[test]
+    fn free_text_redaction_drops_secrets_and_url_credentials() {
+        assert_eq!(
+            redact_free_text("upload failed: Authorization: Bearer abc.def"),
+            "upload failed: Authorization[REDACTED]"
+        );
+        assert_eq!(
+            redact_free_text("refresh_token=xyz retrying"),
+            "refresh_token[REDACTED]"
+        );
+        assert_eq!(
+            redact_free_text("fetch https://me:hunter2@example.com/repo.git failed"),
+            "fetch https://[REDACTED]@example.com/repo.git failed"
+        );
+        let plain = "2026-11-12T10:00:00Z INFO commit abc123 applied in /home/dev/repo";
+        assert_eq!(redact_free_text(plain), plain);
+        assert_eq!(
+            redact_free_text("ünïcode TOKEN: x"),
+            "ünïcode TOKEN[REDACTED]"
+        );
     }
 
     #[test]

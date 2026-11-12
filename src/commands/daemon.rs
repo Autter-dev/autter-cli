@@ -87,22 +87,10 @@ fn handle_start(args: &[String]) -> Result<(), String> {
 }
 
 fn daemon_startup_timeout() -> Duration {
-    #[cfg(windows)]
-    {
-        if std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
-            || std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
-            || std::env::var_os("CI").is_some()
-        {
-            return Duration::from_secs(12);
-        }
-
-        Duration::from_secs(5)
-    }
-
-    #[cfg(not(windows))]
-    {
-        Duration::from_secs(2)
-    }
+    first_readiness_timeout(
+        cfg!(windows),
+        std::env::var_os("AUTTER_TEST_DB_PATH").is_some() || std::env::var_os("CI").is_some(),
+    )
 }
 
 /// Spawn a daemon and wait for it to become healthy. Used by explicit CLI
@@ -120,10 +108,8 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
     remove_stale_daemon_files(&config);
 
     if daemon_startup_is_blocked(&config) {
-        return Err(format!(
-            "daemon startup blocked: lock held at {}",
-            config.lock_path.display()
-        ));
+        // Takes over a stale lock, or says who holds it.
+        resolve_held_lock(&config)?;
     }
 
     #[cfg(not(windows))]
@@ -154,12 +140,7 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
                 _ => {}
             }
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {:?} waiting for daemon sockets {} and {}",
-                    timeout,
-                    config.control_socket_path.display(),
-                    config.trace_socket_path.display()
-                ));
+                return attached_start_timed_out(config, timeout);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -171,12 +152,26 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
         if wait_for_daemon_up(&config, timeout) {
             return Ok(config);
         }
-        Err(format!(
-            "timed out after {:?} waiting for daemon sockets {} and {}",
-            timeout,
-            config.control_socket_path.display(),
-            config.trace_socket_path.display()
-        ))
+        attached_start_timed_out(config, timeout)
+    }
+}
+
+/// `bg start` / `bg restart` ran out of time waiting for the sockets. A
+/// service that holds its lock is running and still getting ready: say so and
+/// do not call it a failed start (UNVERIFIED ON WINDOWS, where this was
+/// reported). One that does not is a failed start.
+fn attached_start_timed_out(
+    config: DaemonConfig,
+    timeout: Duration,
+) -> Result<DaemonConfig, String> {
+    let outcome = startup_wait_outcome(daemon_is_up(&config), daemon_startup_is_blocked(&config));
+    match outcome {
+        StartWait::Ready => Ok(config),
+        StartWait::StartedNotReady => {
+            eprintln!("{}", startup_wait_message(outcome, timeout, &config));
+            Ok(config)
+        }
+        StartWait::NotStarted => Err(startup_wait_message(outcome, timeout, &config)),
     }
 }
 
@@ -288,6 +283,256 @@ fn daemon_startup_is_blocked(config: &DaemonConfig) -> bool {
     }
 }
 
+/// Whether a process still exists, as far as this user can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProcessState {
+    Alive,
+    Gone,
+    Unknown,
+}
+
+#[cfg(unix)]
+pub(crate) fn process_state(pid: u32) -> ProcessState {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return ProcessState::Unknown;
+    }
+    // kill(pid, 0) checks existence without sending a signal.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return ProcessState::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessState::Gone,
+        // It exists but belongs to someone else (root).
+        Some(libc::EPERM) => ProcessState::Alive,
+        _ => ProcessState::Unknown,
+    }
+}
+
+/// UNVERIFIED ON WINDOWS: written on macOS, where it is neither compiled nor
+/// run (Windows CI only compiles it). An exited
+/// process can still be opened while a handle to it is open, so the exit
+/// code decides; a process this user may not open (elevated, another user)
+/// exists.
+#[cfg(windows)]
+pub(crate) fn process_state(pid: u32) -> ProcessState {
+    type Handle = *mut std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return match GetLastError() {
+                ERROR_INVALID_PARAMETER => ProcessState::Gone,
+                ERROR_ACCESS_DENIED => ProcessState::Alive,
+                _ => ProcessState::Unknown,
+            };
+        }
+        let mut code: u32 = 0;
+        let read = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        match (read, code) {
+            (0, _) => ProcessState::Unknown,
+            (_, STILL_ACTIVE) => ProcessState::Alive,
+            _ => ProcessState::Gone,
+        }
+    }
+}
+
+/// What a service lock that cannot be taken means, when the service does not
+/// answer on its sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HeldLock {
+    /// The process named in the pid file is gone, yet the lock file cannot
+    /// be opened. Taken over: the file is removed and the lock taken again.
+    Stale,
+    /// The holder is alive and Windows denies this user its pipes: it runs
+    /// elevated (started from an Administrator window).
+    Elevated,
+    /// Alive, or not known to be gone: still starting, busy or hung.
+    Busy,
+}
+
+/// UNVERIFIED ON WINDOWS (best guess from a "lock held" report, one of them
+/// after an install from an Administrator window).
+///
+/// On macOS and Linux the lock is an `flock`, which the kernel releases when
+/// its holder dies, so a held lock always has a live holder (or one that is
+/// starting and has not written its pid yet) and is never stale. On Windows
+/// the lock is the file opened without sharing; a crash closes that handle
+/// too, but the file can still be unopenable afterwards (left by an elevated
+/// service with permissions a normal window lacks, or held by a scanner),
+/// which used to read as "lock held" forever. `pipe_access_denied` is whether
+/// connecting to the service's pipe failed with "Access is denied".
+pub(crate) fn classify_held_lock(
+    windows: bool,
+    holder: ProcessState,
+    pipe_access_denied: bool,
+) -> HeldLock {
+    match holder {
+        _ if windows && pipe_access_denied => HeldLock::Elevated,
+        ProcessState::Gone if windows => HeldLock::Stale,
+        _ => HeldLock::Busy,
+    }
+}
+
+/// The service lock as `autter doctor --report` and the start path see it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LockInspection {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub free: bool,
+    pub holder_pid: Option<u32>,
+    pub holder: Option<ProcessState>,
+    /// Why the lock file could not be opened, when it could not.
+    pub open_error: Option<String>,
+    pub pipe_error: Option<String>,
+    pub verdict: Option<HeldLock>,
+}
+
+pub(crate) fn inspect_lock(config: &DaemonConfig) -> LockInspection {
+    // Taken and released at once (the `Ok` lock is dropped by `err()`).
+    let open = LockFile::try_acquire_or_error(&config.lock_path);
+    let free = open.is_ok();
+    let open_error = open.err().map(|e| e.to_string());
+    let holder_pid = read_daemon_pid(config).ok();
+    let holder = holder_pid.map(process_state);
+    let pipe_error = (!free)
+        .then(|| {
+            local_socket_connects_with_timeout(
+                &config.control_socket_path,
+                Duration::from_millis(500),
+            )
+            .err()
+            .map(|e| e.to_string())
+        })
+        .flatten();
+    let pipe_access_denied = pipe_error
+        .as_deref()
+        .is_some_and(|e| windows_service_failure_hint(e) == Some(WINDOWS_ELEVATED_SERVICE_HINT));
+    LockInspection {
+        path: config.lock_path.clone(),
+        exists: config.lock_path.exists(),
+        free,
+        holder_pid,
+        holder,
+        open_error,
+        // Held by a service that answers on its pipe is the normal case.
+        verdict: (!free && pipe_error.is_some()).then(|| {
+            classify_held_lock(
+                cfg!(windows),
+                holder.unwrap_or(ProcessState::Unknown),
+                pipe_access_denied,
+            )
+        }),
+        pipe_error,
+    }
+}
+
+/// The lock is held and the service does not answer: take over a stale lock
+/// (`Ok`), or say what is holding it (`Err`, the message for the user).
+fn resolve_held_lock(config: &DaemonConfig) -> Result<(), String> {
+    let lock = inspect_lock(config);
+    match lock.verdict {
+        None => Ok(()),
+        Some(HeldLock::Stale) => {
+            tracing::warn!(
+                "taking over a stale background service lock at {} (pid {:?} is gone)",
+                config.lock_path.display(),
+                lock.holder_pid
+            );
+            let _ = std::fs::remove_file(&config.lock_path);
+            if daemon_startup_is_blocked(config) {
+                Err(format!(
+                    "daemon startup blocked: lock held at {} (its previous holder, pid {}, is gone, but the file could not be removed: {})",
+                    config.lock_path.display(),
+                    lock.holder_pid.map(|p| p.to_string()).unwrap_or_default(),
+                    lock.open_error.unwrap_or_default()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Some(HeldLock::Elevated) => Err(format!(
+            "{WINDOWS_ELEVATED_SERVICE_HINT} [lock held at {}{}]",
+            config.lock_path.display(),
+            lock.holder_pid
+                .map(|pid| format!(" by pid {pid}"))
+                .unwrap_or_default()
+        )),
+        Some(HeldLock::Busy) => Err(format!(
+            "daemon startup blocked: lock held at {}{}",
+            config.lock_path.display(),
+            match (lock.holder_pid, lock.holder) {
+                (Some(pid), Some(ProcessState::Alive)) =>
+                    format!(" by pid {pid}, which is running but not answering"),
+                _ => String::new(),
+            }
+        )),
+    }
+}
+
+/// How long a fresh start may take before both sockets accept connections.
+///
+/// UNVERIFIED ON WINDOWS: Windows 10 users saw the start time out while
+/// `autter bg status` called the service running. Creating the named pipes
+/// and starting the first git.exe children, each scanned by antivirus, can
+/// take several seconds there, so Windows gets 15s (20s in CI and tests)
+/// where it had 5s (12s).
+pub(crate) fn first_readiness_timeout(windows: bool, test_or_ci: bool) -> Duration {
+    match (windows, test_or_ci) {
+        (true, true) => Duration::from_secs(20),
+        (true, false) => Duration::from_secs(15),
+        (false, _) => Duration::from_secs(2),
+    }
+}
+
+/// Where a start stands when its wait for the sockets runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartWait {
+    /// Both sockets accept connections.
+    Ready,
+    /// The new service holds its lock (so it is running) but its sockets do
+    /// not accept connections yet. Not a start failure: it is still starting.
+    StartedNotReady,
+    /// No service holds the lock: it did not start, or exited.
+    NotStarted,
+}
+
+pub(crate) fn startup_wait_outcome(sockets_up: bool, lock_held: bool) -> StartWait {
+    match (sockets_up, lock_held) {
+        (true, _) => StartWait::Ready,
+        (false, true) => StartWait::StartedNotReady,
+        (false, false) => StartWait::NotStarted,
+    }
+}
+
+fn startup_wait_message(outcome: StartWait, timeout: Duration, config: &DaemonConfig) -> String {
+    match outcome {
+        StartWait::Ready => "background service is running".to_string(),
+        StartWait::StartedNotReady => format!(
+            "the background service started, but its sockets were not ready after {:.0?}; it is still starting. Check with `{STATUS_COMMAND}` in a few seconds",
+            timeout
+        ),
+        StartWait::NotStarted => format!(
+            "timed out after {:?} waiting for daemon sockets {} and {}",
+            timeout,
+            config.control_socket_path.display(),
+            config.trace_socket_path.display()
+        ),
+    }
+}
+
 /// The one command every user-facing message suggests for a background
 /// service that is stopped, unresponsive, or running an outdated binary.
 /// `bg restart` also starts a service that is not running, so it covers every
@@ -352,6 +597,10 @@ pub const STATUS_COMMAND: &str = "autter bg status";
 /// call a working service broken.
 const HEALTH_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// How long [`probe_daemon_health`] waits for the reply to its `ping` on the
+/// control socket. The service's own health check allows the same.
+const HEALTH_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Health of the background service, as reported by both `autter doctor` and
 /// `autter bg status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -363,7 +612,8 @@ pub enum DaemonHealthState {
     /// written, so it runs old code.
     Outdated,
     /// A service holds the lock or has one socket up, but does not accept
-    /// connections on both sockets.
+    /// connections on both sockets, or accepts them on its control socket
+    /// without answering a request.
     Unresponsive,
     /// No service process and no sockets.
     NotRunning,
@@ -374,6 +624,9 @@ pub enum DaemonHealthState {
 pub struct DaemonHealth {
     pub state: DaemonHealthState,
     pub control_socket: bool,
+    /// The control socket answered a `ping`: requests are served, not just
+    /// connections accepted.
+    pub control_answers: bool,
     pub trace_socket: bool,
     pub lock_held: bool,
     pub pid: Option<u32>,
@@ -394,10 +647,10 @@ impl DaemonHealth {
             format!(
                 "control socket: {} ({})",
                 config.control_socket_path.display(),
-                if self.control_socket {
-                    "accepting"
-                } else {
-                    "not accepting"
+                match (self.control_socket, self.control_answers) {
+                    (true, true) => "accepting, answers requests",
+                    (true, false) => "accepting, but did not answer a request",
+                    (false, _) => "not accepting",
                 }
             ),
             format!(
@@ -427,11 +680,14 @@ impl DaemonHealth {
 /// Pure classification behind [`probe_daemon_health`].
 pub(crate) fn classify_daemon_health(
     control_socket: bool,
+    control_answers: bool,
     trace_socket: bool,
     lock_held: bool,
     binary_outdated: bool,
 ) -> DaemonHealthState {
     match (control_socket, trace_socket) {
+        // Accepting connections and dropping them is not serving.
+        (true, true) if !control_answers => DaemonHealthState::Unresponsive,
         (true, true) if binary_outdated => DaemonHealthState::Outdated,
         (true, true) => DaemonHealthState::Healthy,
         (false, false) if !lock_held => DaemonHealthState::NotRunning,
@@ -439,11 +695,14 @@ pub(crate) fn classify_daemon_health(
     }
 }
 
-fn daemon_health_summary(state: DaemonHealthState) -> &'static str {
+fn daemon_health_summary(state: DaemonHealthState, accepts_but_silent: bool) -> &'static str {
     match state {
         DaemonHealthState::Healthy => "background service is running",
         DaemonHealthState::Outdated => {
             "background service is running an older autter binary than the one installed"
+        }
+        DaemonHealthState::Unresponsive if accepts_but_silent => {
+            "background service accepts connections but does not answer requests"
         }
         DaemonHealthState::Unresponsive => {
             "background service is not accepting connections on both of its sockets"
@@ -455,30 +714,70 @@ fn daemon_health_summary(state: DaemonHealthState) -> &'static str {
 /// Read-only health probe shared by `autter doctor` and `autter bg status`,
 /// so the two always reach the same verdict. Never starts, stops or restarts
 /// anything.
+///
+/// On the control socket it sends a `ping` and waits for the reply, so a
+/// service that accepts connections but serves none reads as unresponsive.
+/// The start-up and shutdown polling loops keep using the connect-only
+/// [`daemon_is_up`]: a round trip there could time out on a service that is
+/// merely busy and trigger a restart.
 pub fn probe_daemon_health(config: &DaemonConfig) -> DaemonHealth {
+    probe_daemon_health_within(
+        config,
+        HEALTH_PROBE_CONNECT_TIMEOUT,
+        HEALTH_PROBE_RESPONSE_TIMEOUT,
+    )
+}
+
+/// [`probe_daemon_health`] with explicit budgets, for `autter doctor`'s
+/// slower confirmation probes before it restarts a service.
+pub(crate) fn probe_daemon_health_within(
+    config: &DaemonConfig,
+    connect_timeout: Duration,
+    response_timeout: Duration,
+) -> DaemonHealth {
     let socket_accepts = |path: &std::path::Path| {
-        path.exists()
-            && local_socket_connects_with_timeout(path, HEALTH_PROBE_CONNECT_TIMEOUT).is_ok()
+        path.exists() && local_socket_connects_with_timeout(path, connect_timeout).is_ok()
     };
-    let control_socket = socket_accepts(&config.control_socket_path);
+    let control_answers = config.control_socket_path.exists()
+        && control_socket_answers(&config.control_socket_path, response_timeout);
+    let control_socket = control_answers || socket_accepts(&config.control_socket_path);
     let trace_socket = socket_accepts(&config.trace_socket_path);
     let lock_held = daemon_startup_is_blocked(config);
     let binary_outdated = control_socket
         && trace_socket
         && crate::diagnostics::daemon_binary_is_stale(config).unwrap_or(false);
     let pid = read_daemon_pid(config).ok();
-    let state = classify_daemon_health(control_socket, trace_socket, lock_held, binary_outdated);
+    let state = classify_daemon_health(
+        control_socket,
+        control_answers,
+        trace_socket,
+        lock_held,
+        binary_outdated,
+    );
     DaemonHealth {
         state,
         control_socket,
+        control_answers,
         trace_socket,
         lock_held,
         pid,
         binary_outdated,
-        summary: daemon_health_summary(state).to_string(),
+        summary: daemon_health_summary(state, control_socket && !control_answers).to_string(),
         remediation: (state != DaemonHealthState::Healthy)
             .then(|| format!("run `{RESTART_COMMAND}`")),
     }
+}
+
+/// Send a `ping` on the control socket and wait for any reply that is not a
+/// refusal. A service too old to know `ping` answers with an error, which
+/// proves the same thing: it reads and answers requests.
+fn control_socket_answers(control_socket_path: &std::path::Path, timeout: Duration) -> bool {
+    crate::daemon::send_control_request_with_timeout(
+        control_socket_path,
+        &ControlRequest::Ping,
+        timeout,
+    )
+    .is_ok_and(|response| !response.is_refusal())
 }
 
 pub(crate) fn daemon_is_up(config: &DaemonConfig) -> bool {
@@ -523,6 +822,16 @@ fn start_daemon_detached_with_config(
         if wait_for_daemon_up(&config, timeout) {
             return Ok(config);
         }
+        // A stale lock is taken over and a fresh service started below; an
+        // elevated holder cannot be restarted from here, so say so.
+        let lock = inspect_lock(&config);
+        if matches!(
+            lock.verdict,
+            Some(HeldLock::Stale) | Some(HeldLock::Elevated)
+        ) {
+            resolve_held_lock(&config)?;
+            return spawn_and_wait(config, timeout);
+        }
         // Still silent: it is hung. Restart it in the background so this
         // command isn't held up, and so the next one finds a working service.
         let scheduled = schedule_hung_daemon_restart(&config);
@@ -537,17 +846,19 @@ fn start_daemon_detached_with_config(
         ));
     }
 
+    spawn_and_wait(config, timeout)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn spawn_and_wait(config: DaemonConfig, timeout: Duration) -> Result<DaemonConfig, String> {
     spawn_daemon_run_detached(&config)?;
     if wait_for_daemon_up(&config, timeout) {
         return Ok(config);
     }
-
-    Err(format!(
-        "timed out after {:?} waiting for daemon sockets {} and {}",
-        timeout,
-        config.control_socket_path.display(),
-        config.trace_socket_path.display()
-    ))
+    // Callers need working sockets, so a service that is still starting is
+    // still an error here, but one that says what is going on.
+    let outcome = startup_wait_outcome(false, daemon_startup_is_blocked(&config));
+    Err(startup_wait_message(outcome, timeout, &config))
 }
 
 fn daemon_runtime_dir(config: &DaemonConfig) -> Result<PathBuf, String> {
@@ -1075,7 +1386,7 @@ pub(crate) fn restart_daemon(config: &DaemonConfig) -> Result<(), String> {
     if was_running {
         stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)?;
     }
-    ensure_daemon_running(Duration::from_secs(5)).map(|_| ())
+    ensure_daemon_running(Duration::from_secs(5).max(daemon_startup_timeout())).map(|_| ())
 }
 
 fn parse_repo_arg(args: &[String]) -> Option<String> {
@@ -1202,26 +1513,204 @@ mod health_tests {
     #[test]
     fn classify_daemon_health_covers_every_state() {
         use DaemonHealthState::*;
-        assert_eq!(classify_daemon_health(true, true, true, false), Healthy);
-        assert_eq!(classify_daemon_health(true, true, true, true), Outdated);
         assert_eq!(
-            classify_daemon_health(false, false, false, false),
+            classify_daemon_health(true, true, true, true, false),
+            Healthy
+        );
+        assert_eq!(
+            classify_daemon_health(true, true, true, true, true),
+            Outdated
+        );
+        assert_eq!(
+            classify_daemon_health(false, false, false, false, false),
             NotRunning
         );
         // Lock held but no socket accepts: a hung or half-started service.
         assert_eq!(
-            classify_daemon_health(false, false, true, false),
+            classify_daemon_health(false, false, false, true, false),
             Unresponsive
         );
         // Only one socket accepting (e.g. the trace2 socket is wedged): the
         // old `bg status` reported this as healthy while doctor failed it.
         assert_eq!(
-            classify_daemon_health(true, false, true, false),
+            classify_daemon_health(true, true, false, true, false),
             Unresponsive
         );
         assert_eq!(
-            classify_daemon_health(false, true, true, false),
+            classify_daemon_health(false, false, true, true, false),
             Unresponsive
+        );
+        // Both sockets accept, but the control socket drops every request:
+        // a connect-only probe called this healthy.
+        assert_eq!(
+            classify_daemon_health(true, false, true, true, false),
+            Unresponsive
+        );
+        assert_eq!(
+            classify_daemon_health(true, false, true, true, true),
+            Unresponsive
+        );
+    }
+
+    // Items below are best guesses for Windows reports that cannot be
+    // reproduced here; the tests pin the decisions, not Windows behaviour.
+
+    #[test]
+    fn a_held_lock_is_stale_only_on_windows_with_its_holder_gone() {
+        use ProcessState::*;
+        assert_eq!(classify_held_lock(true, Gone, false), HeldLock::Stale);
+        // flock is released by the kernel when its holder dies: a held lock
+        // with no pid holder is a service that is starting.
+        assert_eq!(classify_held_lock(false, Gone, false), HeldLock::Busy);
+        // A live holder, or one we cannot see, is never taken over.
+        assert_eq!(classify_held_lock(true, Alive, false), HeldLock::Busy);
+        assert_eq!(classify_held_lock(true, Unknown, false), HeldLock::Busy);
+        // Its pipe refuses this user: an elevated service, with the fix.
+        assert_eq!(classify_held_lock(true, Alive, true), HeldLock::Elevated);
+        assert_eq!(classify_held_lock(true, Unknown, true), HeldLock::Elevated);
+        assert_eq!(classify_held_lock(false, Alive, true), HeldLock::Busy);
+    }
+
+    #[test]
+    fn windows_waits_longer_for_a_fresh_start() {
+        assert_eq!(
+            first_readiness_timeout(false, false),
+            Duration::from_secs(2)
+        );
+        assert_eq!(first_readiness_timeout(false, true), Duration::from_secs(2));
+        assert!(first_readiness_timeout(true, false) >= Duration::from_secs(15));
+        assert!(first_readiness_timeout(true, true) >= first_readiness_timeout(true, false));
+    }
+
+    #[test]
+    fn a_started_service_that_is_not_ready_is_not_a_failed_start() {
+        assert_eq!(startup_wait_outcome(true, true), StartWait::Ready);
+        assert_eq!(startup_wait_outcome(true, false), StartWait::Ready);
+        assert_eq!(
+            startup_wait_outcome(false, true),
+            StartWait::StartedNotReady
+        );
+        assert_eq!(startup_wait_outcome(false, false), StartWait::NotStarted);
+
+        let config = DaemonConfig::from_home(std::path::Path::new("/home/dev"));
+        let starting =
+            startup_wait_message(StartWait::StartedNotReady, Duration::from_secs(15), &config);
+        assert!(starting.contains("still starting"), "{starting}");
+        assert!(!starting.contains("timed out"), "{starting}");
+        let failed = startup_wait_message(StartWait::NotStarted, Duration::from_secs(15), &config);
+        assert!(failed.starts_with("timed out after 15s"), "{failed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_state_tells_a_live_process_from_a_gone_one() {
+        assert_eq!(process_state(std::process::id()), ProcessState::Alive);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_state(pid), ProcessState::Gone);
+        assert_eq!(process_state(0), ProcessState::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_lock_reports_a_free_lock_and_a_held_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig {
+            internal_dir: dir.path().join("internal"),
+            lock_path: dir.path().join("daemon.lock"),
+            trace_socket_path: dir.path().join("t.sock"),
+            control_socket_path: dir.path().join("c.sock"),
+        };
+        let free = inspect_lock(&config);
+        assert!(free.free && free.verdict.is_none(), "{free:?}");
+
+        let held = LockFile::try_acquire(&config.lock_path).unwrap();
+        let busy = inspect_lock(&config);
+        assert!(!busy.free, "{busy:?}");
+        assert!(busy.open_error.is_some(), "{busy:?}");
+        // Nothing answers on the pipe and this is not Windows: busy, never
+        // taken over.
+        assert_eq!(busy.verdict, Some(HeldLock::Busy));
+        let message = resolve_held_lock(&config).unwrap_err();
+        assert!(message.contains("lock held at"), "{message}");
+        assert!(LockFile::try_acquire(&config.lock_path).is_none());
+        drop(held);
+    }
+
+    /// A stand-in service: both sockets listen; the control socket either
+    /// answers each request with `reply` or, with `None`, drops it unread.
+    #[cfg(unix)]
+    fn fake_service(reply: Option<&'static str>) -> (tempfile::TempDir, DaemonConfig) {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig {
+            internal_dir: dir.path().join("internal"),
+            lock_path: dir.path().join("daemon.lock"),
+            trace_socket_path: dir.path().join("t.sock"),
+            control_socket_path: dir.path().join("c.sock"),
+        };
+        let control = UnixListener::bind(&config.control_socket_path).unwrap();
+        let trace = UnixListener::bind(&config.trace_socket_path).unwrap();
+        std::thread::spawn(move || {
+            for stream in control.incoming().flatten() {
+                if let Some(reply) = reply {
+                    let mut reader = std::io::BufReader::new(&stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    let _ = (&stream).write_all(reply.as_bytes());
+                }
+            }
+        });
+        std::thread::spawn(move || for _ in trace.incoming() {});
+        (dir, config)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_probe_needs_a_reply_on_the_control_socket() {
+        let (_dir, config) = fake_service(None);
+        let health = probe_daemon_health_within(
+            &config,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        assert!(health.control_socket && health.trace_socket, "{health:?}");
+        assert!(!health.control_answers, "{health:?}");
+        assert_eq!(health.state, DaemonHealthState::Unresponsive);
+        assert!(
+            health.summary.contains("does not answer requests"),
+            "{health:?}"
+        );
+        assert!(
+            health.details(&config)[0].contains("did not answer a request"),
+            "{:?}",
+            health.details(&config)
+        );
+
+        let (_dir, config) = fake_service(Some("{\"ok\":true}\n"));
+        let health = probe_daemon_health(&config);
+        assert_eq!(health.state, DaemonHealthState::Healthy, "{health:?}");
+        assert_eq!(health.summary, "background service is running");
+
+        // An older service that does not know `ping` answers with an error:
+        // that still proves it serves requests.
+        let (_dir, config) = fake_service(Some(
+            "{\"ok\":false,\"error\":\"unknown variant `ping`\"}\n",
+        ));
+        assert_eq!(
+            probe_daemon_health(&config).state,
+            DaemonHealthState::Healthy
+        );
+
+        // A refusal (the service is turning requests away) is not serving.
+        let (_dir, config) = fake_service(Some(
+            "{\"ok\":false,\"error\":\"busy\",\"data\":{\"refused\":true}}\n",
+        ));
+        assert_eq!(
+            probe_daemon_health(&config).state,
+            DaemonHealthState::Unresponsive
         );
     }
 

@@ -43,4 +43,6 @@ Start with `autter doctor`. It checks that the service is running, that a git co
 | The service and the CLI report different versions | an upgrade replaced the binary while the old service was still running | `autter bg restart` |
 | Doctor times out on a slow machine | time limits too short for this machine | `AUTTER_DOCTOR_TIMEOUT_SCALE=5 autter doctor` |
 
+If it still fails, run `autter doctor --report autter-report.txt` and send that file with your report. It holds doctor's results, the service's start timings and lock-file state, the end of its log, and your git and OS versions, but no source code, file contents or tokens.
+
 To remove it along with the rest of Autter's setup, run `autter uninstall`.
