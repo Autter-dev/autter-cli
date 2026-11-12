@@ -3,11 +3,14 @@ use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::labels::LineCategory;
 use crate::authorship::record_status::{DEFAULT_PENDING_WAIT, RecordClassifier, RecordStatus};
 use crate::authorship::stats::{
-    stats_for_commit_stats_with_parent_and_authorship, write_stats_to_terminal_with,
+    CommitStatsReport, stats_for_commit_stats_with_parent_and_authorship, unsupported_agent_notice,
+    untracked_share_warrants_agent_check, write_stats_to_terminal_with,
 };
+use crate::commands::output::{self, ErrorKind};
 use crate::config::Config;
 use crate::error::AutterError;
 use crate::git::repository::Repository;
+use crate::mdm::unsupported_agents::{UnsupportedAgent, detect_unsupported_agents};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode},
@@ -18,6 +21,7 @@ use crossterm::{
         enable_raw_mode,
     },
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -168,6 +172,7 @@ fn extract_git_global_args(args: &[String]) -> (Vec<String>, Vec<String>) {
 struct ParsedLogArgs {
     git_log_args: Vec<String>,
     plain: bool,
+    json: bool,
     show_raw_notes: bool,
     oneline: bool,
     show_decorations: bool,
@@ -179,6 +184,7 @@ impl Default for ParsedLogArgs {
         Self {
             git_log_args: Vec::new(),
             plain: false,
+            json: false,
             show_raw_notes: false,
             oneline: false,
             show_decorations: true,
@@ -199,6 +205,25 @@ pub fn handle_log(args: &[String]) -> ExitStatus {
         Err(LogError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
             status_from_code(0)
         }
+        Err(LogError::Usage(message)) => {
+            output::fail(ErrorKind::Usage, format!("autter log: {}", message))
+        }
+        // git refused the arguments `autter log` passed through: an option
+        // it does not know is a usage error (exit 2), a revision that does
+        // not resolve is `revision_not_found`. git's own message is the
+        // error, with or without `--json`.
+        Err(LogError::GitLog { code, stderr }) => {
+            let kind = match output::git_error_kind(&stderr) {
+                ErrorKind::Runtime if code == Some(129) => ErrorKind::Usage,
+                kind => kind,
+            };
+            let detail = stderr.trim();
+            let detail = detail.strip_prefix("fatal: ").unwrap_or(detail);
+            output::fail(kind, format!("autter log: {}", detail))
+        }
+        Err(error) if crate::commands::arg_parser::json() => {
+            output::fail(ErrorKind::Runtime, format!("autter log: {}", error))
+        }
         Err(error) => {
             eprintln!("autter log: {}", error);
             status_from_code(1)
@@ -208,11 +233,46 @@ pub fn handle_log(args: &[String]) -> ExitStatus {
 
 fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
     let (global_args, log_args) = extract_git_global_args(args);
-    let parsed = parse_log_args(&log_args).map_err(LogError::Message)?;
+    // Record `--json` before any argument error, so that error is JSON too.
+    if !contains_plain_flag(&log_args)
+        && log_args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--json")
+    {
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                json: true,
+                ..Default::default()
+            },
+        );
+    }
+    let parsed = parse_log_args(&log_args).map_err(LogError::Usage)?;
 
     if parsed.help {
         print_log_help();
         return Ok(status_from_code(0));
+    }
+
+    if parsed.json || crate::commands::arg_parser::json() {
+        if parsed.plain {
+            return Err(LogError::Usage(
+                "--json and --plain cannot be combined".to_string(),
+            ));
+        }
+        crate::commands::arg_parser::merge_global_flags(
+            &crate::commands::arg_parser::GlobalFlags {
+                json: true,
+                ..Default::default()
+            },
+        );
+        let repo =
+            match crate::git::repository::find_repository(&repository_global_args(&global_args)) {
+                Ok(repo) => repo,
+                Err(e) => crate::commands::exit_repository_error("log", &e),
+            };
+        exit_if_nothing_to_log(&repo);
+        return run_json_log(repo, parsed);
     }
 
     if parsed.plain {
@@ -232,6 +292,10 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
         Ok(repo) => repo,
         Err(e) => crate::commands::exit_repository_error("log", &e),
     };
+    // A fresh `git init`: say there are no commits yet, as `status` and
+    // `stats` do, instead of git's "does not have any commits yet" plus
+    // "git log exited with status 128".
+    exit_if_nothing_to_log(&repo);
     let use_pager = should_use_pager(&global_args);
     let renderer = LogRenderer::new(repo, parsed)?;
 
@@ -241,6 +305,29 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
         stream_to_stdout(renderer)?;
     }
     Ok(status_from_code(0))
+}
+
+/// Stop with the no-commits message when the repository has no commit on any
+/// ref. With HEAD on a branch that has no commits while other refs do,
+/// `autter log <ref>` still has something to show, so git decides.
+fn exit_if_nothing_to_log(repo: &Repository) {
+    if !crate::commands::repository_has_no_commits(repo) {
+        return;
+    }
+    let mut args = repo.global_args_for_exec();
+    args.extend(
+        ["rev-list", "--all", "--max-count=1"]
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
+    let any_commit = crate::git::repository::exec_git(&args)
+        .is_ok_and(|output| !output.stdout.iter().all(u8::is_ascii_whitespace));
+    if !any_commit {
+        output::fail(
+            ErrorKind::Runtime,
+            crate::commands::no_commits_message("log"),
+        );
+    }
 }
 
 fn run_plain_log(global_args: &[String], git_log_args: &[String]) -> Result<ExitStatus, LogError> {
@@ -296,6 +383,11 @@ fn parse_log_args(args: &[String]) -> Result<ParsedLogArgs, String> {
 
         if arg == "--plain" {
             parsed.plain = true;
+            continue;
+        }
+
+        if arg == "--json" {
+            parsed.json = true;
             continue;
         }
 
@@ -374,12 +466,108 @@ fn print_log_help() {
     println!("  --raw, --notes    Include raw authorship note data after the stats");
     println!("  --show-notes      Alias for --notes");
     println!("  --plain           Run git log --notes=ai directly (git_notes backend only)");
+    println!("  --json            One JSON document: every commit with its authorship stats");
     println!("  --oneline         Compact commit header");
     println!("  --no-decorate     Hide ref decorations");
     println!("  --no-pager        Stream output instead of opening the pager");
     println!();
     println!("Common git log filters such as -n, --max-count, --author, --grep,");
     println!("--since, --until, revisions, and pathspecs are passed through to git.");
+}
+
+/// `autter log --json`: every commit git lists, in git's order. `stats` has
+/// the same fields as `autter stats --json` (without `schema_version`); it is
+/// null for merge commits and commits too large to compute here, with the
+/// reason in `stats_skipped`.
+#[derive(Serialize)]
+struct LogReport {
+    commits: Vec<LogCommit>,
+}
+
+#[derive(Serialize)]
+struct LogCommit {
+    commit: String,
+    parents: Vec<String>,
+    author: LogAuthor,
+    date: String,
+    subject: String,
+    body: String,
+    refs: Vec<String>,
+    note_present: bool,
+    stats: Option<CommitStatsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats_skipped: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LogAuthor {
+    name: String,
+    email: String,
+}
+
+fn run_json_log(repo: Repository, options: ParsedLogArgs) -> Result<ExitStatus, LogError> {
+    let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
+    let mut stream = CommitStream::spawn(&repo, &options.git_log_args, true)?;
+    let mut records = Vec::new();
+    while let Some(commit) = stream.next_commit()? {
+        records.push(commit);
+    }
+    let shas: Vec<String> = records.iter().map(|commit| commit.sha.clone()).collect();
+    let notes = if shas.is_empty() {
+        Default::default()
+    } else {
+        crate::git::notes_api::read_notes_batch(&repo, &shas)?
+    };
+
+    let commits = records
+        .into_iter()
+        .map(|commit| {
+            let raw_note = notes.get(&commit.sha).map(String::as_str);
+            let authorship_log =
+                raw_note.and_then(|note| AuthorshipLog::deserialize_from_string(note).ok());
+            let (stats, stats_skipped) = match commit_stats(
+                &repo,
+                &commit.sha,
+                &commit.parents,
+                authorship_log.as_ref(),
+                &ignore_patterns,
+            ) {
+                Ok(stats) => (
+                    Some(CommitStatsReport::new(
+                        commit.sha.clone(),
+                        stats,
+                        authorship_log.is_some(),
+                    )),
+                    None,
+                ),
+                Err(reason) => (None, Some(reason)),
+            };
+            LogCommit {
+                note_present: raw_note.is_some_and(|note| !note.trim().is_empty()),
+                refs: commit
+                    .decorations
+                    .split(", ")
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                author: LogAuthor {
+                    name: commit.author_name,
+                    email: commit.author_email,
+                },
+                date: commit.author_date,
+                subject: commit.subject,
+                body: commit.body.trim_end_matches('\n').to_string(),
+                parents: commit.parents,
+                commit: commit.sha,
+                stats,
+                stats_skipped,
+            }
+        })
+        .collect();
+
+    output::print_json(&LogReport { commits });
+    Ok(status_from_code(0))
 }
 
 struct LogRenderer {
@@ -390,6 +578,30 @@ struct LogRenderer {
     eof: bool,
     classifier: RecordClassifier,
     head_sha: Option<String>,
+    agent_note: UnsupportedAgentNote,
+}
+
+/// The note `autter stats` prints under a mostly untracked commit when an AI
+/// tool Autter cannot capture is installed. `autter log` prints it once, under
+/// the first such commit, not under every one.
+#[derive(Default)]
+struct UnsupportedAgentNote {
+    shown: bool,
+    /// Detected once per run, and only if some commit is mostly untracked.
+    agents: Option<Vec<UnsupportedAgent>>,
+}
+
+impl UnsupportedAgentNote {
+    /// The note for a recorded commit with these stats, if it is due.
+    fn for_commit(&mut self, stats: &crate::authorship::stats::CommitStats) -> Option<String> {
+        if self.shown || !untracked_share_warrants_agent_check(stats, stats.unknown_additions) {
+            return None;
+        }
+        let agents = self.agents.get_or_insert_with(detect_unsupported_agents);
+        let notice = unsupported_agent_notice(agents)?;
+        self.shown = true;
+        Some(notice)
+    }
 }
 
 impl LogRenderer {
@@ -406,6 +618,7 @@ impl LogRenderer {
             eof: false,
             classifier,
             head_sha,
+            agent_note: UnsupportedAgentNote::default(),
         })
     }
 
@@ -457,20 +670,20 @@ impl LogRenderer {
             records.insert(commit.sha.clone(), status);
         }
 
-        Ok(commits
-            .iter()
-            .map(|commit| {
-                let note = notes.get(&commit.sha).map(String::as_str);
-                render_commit(
-                    &self.repo,
-                    commit,
-                    note,
-                    records.get(&commit.sha),
-                    &self.options,
-                    &self.ignore_patterns,
-                )
-            })
-            .collect())
+        let mut rendered = Vec::with_capacity(commits.len());
+        for commit in &commits {
+            let note = notes.get(&commit.sha).map(String::as_str);
+            rendered.push(render_commit(
+                &self.repo,
+                commit,
+                note,
+                records.get(&commit.sha),
+                &self.options,
+                &self.ignore_patterns,
+                &mut self.agent_note,
+            ));
+        }
+        Ok(rendered)
     }
 
     fn is_eof(&self) -> bool {
@@ -481,6 +694,8 @@ impl LogRenderer {
 struct CommitStream {
     child: Option<Child>,
     stdout: BufReader<std::process::ChildStdout>,
+    /// Drains git's stderr while stdout is read, so git never blocks on it.
+    stderr: Option<std::thread::JoinHandle<String>>,
 }
 
 impl CommitStream {
@@ -507,10 +722,18 @@ impl CommitStream {
             .stdout
             .take()
             .ok_or_else(|| LogError::Message("failed to capture git log stdout".to_string()))?;
+        let stderr = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = io::Read::read_to_string(&mut stderr, &mut text);
+                text
+            })
+        });
 
         Ok(Self {
             child: Some(child),
             stdout: BufReader::new(stdout),
+            stderr,
         })
     }
 
@@ -553,13 +776,27 @@ impl CommitStream {
             return Ok(());
         };
         let status = child.wait().map_err(LogError::Io)?;
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
         if status.success() {
+            // Warnings git printed are still shown.
+            if !stderr.trim().is_empty() {
+                eprint!("{stderr}");
+            }
             Ok(())
-        } else {
+        } else if stderr.trim().is_empty() {
             Err(LogError::Message(format!(
                 "git log exited with status {}",
                 status
             )))
+        } else {
+            Err(LogError::GitLog {
+                code: status.code(),
+                stderr,
+            })
         }
     }
 }
@@ -608,6 +845,7 @@ fn render_commit(
     missing_record: Option<&RecordStatus>,
     options: &ParsedLogArgs,
     ignore_patterns: &[String],
+    agent_note: &mut UnsupportedAgentNote,
 ) -> String {
     let authorship_log =
         raw_note.and_then(|note| AuthorshipLog::deserialize_from_string(note).ok());
@@ -677,16 +915,20 @@ fn render_commit(
     } else {
         LineCategory::Untracked
     };
-    match render_stats(
+    let stats = commit_stats(
         repo,
         &commit.sha,
         &commit.parents,
         authorship_log.as_ref(),
         ignore_patterns,
-        unattributed,
-    ) {
-        Ok(stats) => append_indented_block(&mut out, &stats, 6),
-        Err(message) => append_indented_line(&mut out, &message, 6),
+    );
+    match &stats {
+        Ok(stats) => append_indented_block(
+            &mut out,
+            &write_stats_to_terminal_with(stats, false, unattributed),
+            6,
+        ),
+        Err(message) => append_indented_line(&mut out, message, 6),
     }
     if let Some(record) = missing_record {
         append_indented_line(
@@ -694,6 +936,12 @@ fn render_commit(
             &format!("no Autter record: {}", record.short_reason()),
             6,
         );
+    } else if let Ok(stats) = &stats
+        && let Some(notice) = agent_note.for_commit(stats)
+    {
+        // Untracked lines in a recorded commit may have been written by an AI
+        // tool Autter cannot capture; say so once, as `autter stats` does.
+        append_indented_block(&mut out, &notice, 6);
     }
 
     if options.show_raw_notes {
@@ -709,14 +957,14 @@ fn render_commit(
     out
 }
 
-fn render_stats(
+/// A commit's stats for `autter log`, or why they were skipped.
+fn commit_stats(
     repo: &Repository,
     commit_sha: &str,
     parents: &[String],
     authorship_log: Option<&AuthorshipLog>,
     ignore_patterns: &[String],
-    unattributed: LineCategory,
-) -> Result<String, String> {
+) -> Result<crate::authorship::stats::CommitStats, String> {
     if parents.len() > 1 {
         return Err("stats skipped for merge commit".to_string());
     }
@@ -739,15 +987,14 @@ fn render_stats(
         ));
     }
 
-    let stats = stats_for_commit_stats_with_parent_and_authorship(
+    stats_for_commit_stats_with_parent_and_authorship(
         repo,
         commit_sha,
         parents.first().map(String::as_str),
         ignore_patterns,
         authorship_log,
     )
-    .map_err(|e| format!("stats unavailable: {}", e))?;
-    Ok(write_stats_to_terminal_with(&stats, false, unattributed))
+    .map_err(|e| format!("stats unavailable: {}", e))
 }
 
 fn append_indented_line(out: &mut String, line: &str, spaces: usize) {
@@ -1139,6 +1386,13 @@ impl Drop for TerminalGuard {
 #[derive(Debug)]
 enum LogError {
     Git(AutterError),
+    /// Bad flags: exit 2.
+    Usage(String),
+    /// `git log` failed and said why.
+    GitLog {
+        code: Option<i32>,
+        stderr: String,
+    },
     Io(io::Error),
     Message(String),
 }
@@ -1147,6 +1401,8 @@ impl std::fmt::Display for LogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LogError::Git(error) => write!(f, "{}", error),
+            LogError::Usage(message) => write!(f, "{}", message),
+            LogError::GitLog { stderr, .. } => write!(f, "{}", stderr.trim()),
             LogError::Io(error) => write!(f, "{}", error),
             LogError::Message(message) => write!(f, "{}", message),
         }

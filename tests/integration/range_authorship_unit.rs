@@ -223,9 +223,10 @@ fn test_range_authorship_mixed_commits() {
     // Range authorship merges attributions from start to end, filtering to commits in range
     // The exact AI/human split depends on the merge attribution logic
     assert_eq!(stats.range_stats.ai_additions, 2);
-    // range_authorship passes known_human_accepted=0, so human lines appear as unknown_additions
-    assert_eq!(stats.range_stats.human_additions, 0);
-    assert_eq!(stats.range_stats.unknown_additions, 1);
+    // The known-human line counts as human, as in `autter stats <commit>`;
+    // every commit has a record, so nothing is unknown.
+    assert_eq!(stats.range_stats.human_additions, 1);
+    assert_eq!(stats.range_stats.unknown_additions, 0);
     assert_eq!(stats.range_stats.git_diff_added_lines, 3);
 }
 
@@ -451,8 +452,10 @@ fn test_range_authorship_mixed_lockfile_and_source() {
     assert!(stats.range_stats.git_diff_added_lines < 100);
     // Verify that some AI work is detected and unattested lines exist
     assert!(stats.range_stats.ai_additions > 0);
-    // range_authorship passes known_human_accepted=0, so human lines show as unknown_additions
-    assert!(stats.range_stats.unknown_additions > 0);
+    // The known-human line counts as human; both commits have a record.
+    assert_eq!(stats.range_stats.ai_additions, 2);
+    assert_eq!(stats.range_stats.human_additions, 1);
+    assert_eq!(stats.range_stats.unknown_additions, 0);
 }
 
 #[test]

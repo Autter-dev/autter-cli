@@ -67,6 +67,38 @@ pub fn detect_tools() -> Vec<DetectedTool> {
         .collect()
 }
 
+/// The next step after an agent's hooks or extension could not be changed.
+pub(crate) fn hook_error_fix(name: &str, id: &str, error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("access is denied") {
+        format!(
+            "  Fix: make sure your user can write {name}'s settings (they may be owned by root after `sudo`), then run `autter install-hooks` again."
+        )
+    } else if lower.contains("parse") || lower.contains("invalid") || lower.contains("expected") {
+        format!(
+            "  Fix: {name}'s settings file could not be read; correct it (or move it aside), then run `autter install-hooks` again."
+        )
+    } else {
+        format!(
+            "  Fix: run `autter install-hooks` again, then `autter doctor --agent {id}` to check {name}."
+        )
+    }
+}
+
+/// The next step after removing an agent's hooks or extension failed.
+pub(crate) fn uninstall_error_fix(name: &str, error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("access is denied") {
+        format!(
+            "  Fix: make sure your user can write {name}'s settings, then run the same command again."
+        )
+    } else {
+        format!(
+            "  Fix: run the same command again; if it fails again, remove autter's entry from {name}'s settings by hand (`autter uninstall --dry-run` lists them)."
+        )
+    }
+}
+
 /// Install hooks for `tool_ids` (from [`detect_tools`]; `None` for every
 /// detected tool), plus the global git trace2 config and background service
 /// when `system` is set. Output hangs off onboarding's step rail.
@@ -475,12 +507,14 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
     // Internal: rewrite only out-of-date hooks of agents already set up. Started
     // in the background on the first command after an upgrade, and by
     // `autter upgrade` with the newly installed binary.
+    // A failure goes back to the caller like every other path here (it is
+    // printed and the command exits 1); this used to exit from inside `run`.
     if args.len() == 1 && args[0] == crate::mdm::hook_refresh::REFRESH_STALE_FLAG {
-        let ok = crate::mdm::hook_refresh::run_refresh_command();
-        std::process::exit(if ok {
-            crate::commands::EXIT_SUCCESS
-        } else {
-            crate::commands::EXIT_RUNTIME_ERROR
+        return crate::mdm::hook_refresh::run_refresh_command().map(|refreshed| {
+            refreshed
+                .into_iter()
+                .map(|name| (name, "refreshed".to_string()))
+                .collect()
         });
     }
     let mut options = parse_install_options(args).map_err(AutterError::Usage)?;
@@ -704,7 +738,84 @@ fn confirm_full_uninstall() -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// Whether the global git config has a `[trace2]` section to remove.
+/// What `autter uninstall` changes in the global `[trace2]` section: only what
+/// `autter install` put there. The user's own trace2 settings (`normalTarget`,
+/// `perfTarget`, their own `envVars` names, an event target that is not
+/// autter's) stay. Uninstall used to delete the whole section.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Trace2Removal {
+    /// Keys to unset outright.
+    unset: Vec<&'static str>,
+    /// `trace2.envVars` without autter's names, when the user has names of
+    /// their own left.
+    env_vars: Option<String>,
+}
+
+impl Trace2Removal {
+    fn is_empty(&self) -> bool {
+        self.unset.is_empty() && self.env_vars.is_none()
+    }
+}
+
+fn plan_trace2_removal(
+    event_targets: &[String],
+    event_nesting: &[String],
+    env_vars: &[String],
+    autter_target: Option<&str>,
+) -> Trace2Removal {
+    let mut removal = Trace2Removal::default();
+    // The event target is ours when it is the one this install writes, or
+    // names an autter socket or pipe (an older install's). One the user
+    // pointed somewhere else after installing is theirs, and so is the
+    // nesting that goes with it.
+    let target_is_ours = event_targets
+        .iter()
+        .any(|t| Some(t.as_str()) == autter_target || t.contains("autter"));
+    let target_is_theirs = !event_targets.is_empty() && !target_is_ours;
+    if target_is_ours {
+        removal.unset.push(TRACE2_EVENT_TARGET_KEY);
+    }
+    if !event_nesting.is_empty() && !target_is_theirs {
+        removal.unset.push(TRACE2_EVENT_NESTING_KEY);
+    }
+    if !env_vars.is_empty() {
+        let remaining = crate::authorship::background_agent::strip_trace2_env_vars(env_vars);
+        match remaining {
+            None => removal.unset.push(TRACE2_ENV_VARS_KEY),
+            Some(value) if env_vars != [value.clone()] => removal.env_vars = Some(value),
+            Some(_) => {}
+        }
+    }
+    removal
+}
+
+fn global_trace2_removal(git_cmd: &str) -> Trace2Removal {
+    let autter_target = DaemonConfig::from_env_or_default_paths()
+        .ok()
+        .map(|config| config.trace2_event_target());
+    plan_trace2_removal(
+        &global_git_config_values(git_cmd, TRACE2_EVENT_TARGET_KEY),
+        &global_git_config_values(git_cmd, TRACE2_EVENT_NESTING_KEY),
+        &global_git_config_values(git_cmd, TRACE2_ENV_VARS_KEY),
+        autter_target.as_deref(),
+    )
+}
+
+fn apply_trace2_removal(git_cmd: &str, removal: &Trace2Removal) -> Result<(), AutterError> {
+    for key in &removal.unset {
+        unset_global_git_config_key(git_cmd, key)?;
+    }
+    if let Some(value) = &removal.env_vars {
+        replace_global_git_config_value(git_cmd, TRACE2_ENV_VARS_KEY, value)?;
+    }
+    // Drop the `[trace2]` header when nothing of the user's is left under it.
+    if !global_git_config_has_section(git_cmd, "trace2") {
+        remove_global_git_config_section(git_cmd, "trace2")?;
+    }
+    Ok(())
+}
+
+/// Whether the global git config has any key in a section.
 fn global_git_config_has_section(git_cmd: &str, section: &str) -> bool {
     Command::new(git_cmd)
         .args([
@@ -755,7 +866,8 @@ pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, Au
     let statuses = run_uninstall(&hook_args)?;
 
     let git_cmd = config::Config::fresh().git_cmd().to_string();
-    let had_trace2 = global_git_config_has_section(&git_cmd, "trace2");
+    let trace2_removal = global_trace2_removal(&git_cmd);
+    let had_trace2 = !trace2_removal.is_empty();
     let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths().ok();
     let daemon_running = daemon_config
         .as_ref()
@@ -771,7 +883,9 @@ pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, Au
 
     if options.dry_run {
         if had_trace2 {
-            eprintln!("[dry-run] would remove the global git trace2 config");
+            eprintln!(
+                "[dry-run] would remove autter's settings from the global git trace2 config (your own trace2 settings stay)"
+            );
         }
         if daemon_running {
             eprintln!("[dry-run] would stop the background service");
@@ -780,8 +894,8 @@ pub fn run_full_uninstall(args: &[String]) -> Result<HashMap<String, String>, Au
     }
 
     if had_trace2 {
-        match remove_global_git_config_section(&git_cmd, "trace2") {
-            Ok(()) => removed.push("global git trace2 config"),
+        match apply_trace2_removal(&git_cmd, &trace2_removal) {
+            Ok(()) => removed.push("autter's settings in the global git trace2 config"),
             Err(e) => eprintln!("Warning: could not remove global trace2 config: {e}"),
         }
     }
@@ -1057,6 +1171,7 @@ async fn async_run_install(
                             let error_msg = e.to_string();
                             spinner.error(&format!("{}: Failed to update hooks", name));
                             eprintln!("  Error: {}", error_msg);
+                            eprintln!("{}", hook_error_fix(name, id, &error_msg));
                             statuses.insert(id.to_string(), InstallStatus::Failed);
                             detailed_results
                                 .push((id.to_string(), InstallResult::failed(error_msg)));
@@ -1128,6 +1243,7 @@ async fn async_run_install(
                     }
                     Err(e) => {
                         eprintln!("  Error installing extras for {}: {}", name, e);
+                        eprintln!("{}", hook_error_fix(name, id, &e.to_string()));
                         // Capture extras error as a warning on the tool's result
                         if let Some((_, detail)) = detailed_results
                             .iter_mut()
@@ -1463,6 +1579,7 @@ async fn async_run_uninstall(
                         Err(e) => {
                             spinner.error(&format!("{}: Failed to remove hooks", name));
                             eprintln!("  Error: {}", e);
+                            eprintln!("{}", uninstall_error_fix(name, &e.to_string()));
                             statuses.insert(id.to_string(), InstallStatus::NotFound);
                         }
                     }
@@ -1500,11 +1617,13 @@ async fn async_run_uninstall(
                     }
                     Err(e) => {
                         eprintln!("  Error uninstalling extras for {}: {}", name, e);
+                        eprintln!("{}", uninstall_error_fix(name, &e.to_string()));
                     }
                 }
             }
             Err(e) => {
                 eprintln!("  Error checking {}: {}", name, e);
+                eprintln!("{}", uninstall_error_fix(name, &e.to_string()));
                 statuses.insert(id.to_string(), InstallStatus::NotFound);
             }
         }
@@ -1551,8 +1670,83 @@ fn cleanup_legacy_envelope_logs() {
 }
 
 #[cfg(test)]
+mod error_fix_tests {
+    use super::*;
+
+    #[test]
+    fn hook_errors_name_the_next_step() {
+        let fix = hook_error_fix("Cursor", "cursor", "Permission denied (os error 13)");
+        assert!(fix.contains("autter install-hooks"), "{fix}");
+        assert!(fix.contains("root"), "{fix}");
+        let fix = hook_error_fix("Codex", "codex", "TOML parse error at line 3");
+        assert!(fix.contains("settings file could not be read"), "{fix}");
+        let fix = hook_error_fix("Gemini", "gemini", "something else");
+        assert!(fix.contains("autter doctor --agent gemini"), "{fix}");
+        for fix in [
+            uninstall_error_fix("Cursor", "Permission denied"),
+            uninstall_error_fix("Cursor", "boom"),
+        ] {
+            assert!(fix.trim_start().starts_with("Fix:"), "{fix}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uninstall_removes_only_autters_trace2_settings() {
+        let ours = crate::authorship::background_agent::trace2_env_vars_value();
+        let target = "af_unix:stream:/tmp/autter-d-1234/trace.sock";
+
+        // What install writes, nothing of the user's: everything goes.
+        let removal = plan_trace2_removal(
+            &strings(&[target]),
+            &strings(&["10"]),
+            std::slice::from_ref(&ours),
+            None,
+        );
+        assert_eq!(
+            removal.unset,
+            vec![
+                TRACE2_EVENT_TARGET_KEY,
+                TRACE2_EVENT_NESTING_KEY,
+                TRACE2_ENV_VARS_KEY
+            ]
+        );
+        assert_eq!(removal.env_vars, None);
+
+        // The user's own envVars names stay; ours are taken out.
+        let merged =
+            crate::authorship::background_agent::merge_trace2_env_vars(&strings(&["MY_VAR"]));
+        let removal = plan_trace2_removal(&strings(&[target]), &strings(&["10"]), &[merged], None);
+        assert_eq!(
+            removal.unset,
+            vec![TRACE2_EVENT_TARGET_KEY, TRACE2_EVENT_NESTING_KEY]
+        );
+        assert_eq!(removal.env_vars, Some("MY_VAR".to_string()));
+
+        // An event target the user pointed elsewhere is theirs, with its nesting.
+        let removal = plan_trace2_removal(
+            &strings(&["/var/log/git-events.json"]),
+            &strings(&["3"]),
+            &strings(&["MY_VAR"]),
+            Some(target),
+        );
+        assert!(removal.is_empty(), "{removal:?}");
+
+        // A custom socket path without "autter" in it is still ours when it is
+        // the one this install writes.
+        let custom = "af_unix:stream:/srv/sockets/t.sock";
+        let removal = plan_trace2_removal(&strings(&[custom]), &[], &[], Some(custom));
+        assert_eq!(removal.unset, vec![TRACE2_EVENT_TARGET_KEY]);
+
+        // Nesting left behind without a target is removed; nothing set is nothing to do.
+        let removal = plan_trace2_removal(&[], &strings(&["5"]), &[], Some(target));
+        assert_eq!(removal.unset, vec![TRACE2_EVENT_NESTING_KEY]);
+        assert!(plan_trace2_removal(&[], &[], &[], Some(target)).is_empty());
+    }
     use serial_test::serial;
     use std::path::PathBuf;
     use tempfile::tempdir;

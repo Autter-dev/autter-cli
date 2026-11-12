@@ -319,3 +319,67 @@ pub fn send_wrapper_post_state(
     };
     send_via_daemon(&request).map(|_| ())
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The service closes a control connection that has been idle for a few
+    /// seconds. This handle is the one client that keeps a connection open
+    /// across a whole command (a git command can run for minutes between the
+    /// wrapper's pre and post state), so its next request must go through on
+    /// a fresh connection instead of being lost.
+    #[test]
+    fn send_reconnects_after_the_service_closed_an_idle_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sock");
+        let listener = ListenerOptions::new()
+            .name(path.as_path().to_fs_name::<GenericFilePath>().unwrap())
+            .create_sync()
+            .unwrap();
+        let answered = Arc::new(AtomicUsize::new(0));
+        let answered_by_server = answered.clone();
+        std::thread::spawn(move || {
+            for (index, stream) in listener.incoming().flatten().enumerate() {
+                if index == 0 {
+                    // The idle timeout: closed without a word.
+                    drop(stream);
+                    continue;
+                }
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    answered_by_server.fetch_add(1, Ordering::SeqCst);
+                    let _ = reader.get_mut().write_all(b"{\"ok\":true}\n");
+                    line.clear();
+                }
+            }
+        });
+
+        let mut stream =
+            open_local_socket_stream_with_timeout(&path, Duration::from_secs(2)).unwrap();
+        DaemonTelemetryHandle::apply_socket_timeouts(&mut stream, &path);
+        let mut handle = DaemonTelemetryHandle {
+            socket_path: path.clone(),
+            conn: BufReader::new(stream),
+        };
+        // Let the service close the first connection, as it does to one that
+        // sat idle.
+        std::thread::sleep(Duration::from_millis(100));
+
+        for _ in 0..2 {
+            let response = handle
+                .send(&ControlRequest::FlushNotes)
+                .expect("request after an idle close should be resent on a new connection");
+            assert!(response.ok);
+        }
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            2,
+            "each request should reach the service exactly once"
+        );
+    }
+}

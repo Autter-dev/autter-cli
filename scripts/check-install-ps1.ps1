@@ -79,10 +79,74 @@ if (-not $wrapped) {
     $failures.Add(("expected the whole script to be a single '& {{ ... }}' scriptblock, found {0} top-level statement(s)" -f $statements.Count))
 }
 
+# 4. Behaviour pinned by the text. The end-to-end test runs the dry run, a
+#    failed checksum download and the progress download for real; these checks
+#    cover what it cannot reach (the other failure messages) and keep the
+#    pieces from being removed by accident. Single-quoted strings throughout:
+#    they hold installer variable names that must not expand here.
+$lines = @($text -split "`n")
+
+# The dry run is an environment variable (iex cannot pass arguments) and its
+# block comes before anything that makes a request.
+if (-not $text.Contains('$env:AUTTER_INSTALL_DRY_RUN -eq ''1''')) {
+    $failures.Add('no dry run switch: expected $env:AUTTER_INSTALL_DRY_RUN -eq ''1''')
+}
+$dryRunAt = $text.IndexOf('Dry run: nothing is downloaded, written or started.')
+$dryRunEndAt = -1
+if ($dryRunAt -ge 0) { $dryRunEndAt = $text.IndexOf('return', $dryRunAt) }
+if ($dryRunAt -lt 0 -or $dryRunEndAt -lt 0) {
+    $failures.Add('no dry run block: expected the plan to be printed, followed by return')
+} else {
+    foreach ($needle in @('Invoke-WebRequest -Uri', 'Invoke-RestMethod -Uri', '[System.Net.WebRequest]::Create')) {
+        $requestAt = $text.IndexOf($needle)
+        if ($requestAt -ge 0 -and $requestAt -lt $dryRunEndAt) {
+            $failures.Add(('the dry run must return before the first ''{0}'', so a dry run makes no request' -f $needle))
+        }
+    }
+}
+
+# Every failed download names the URL and the npm route.
+$hintLines = @($lines | Where-Object { $_.StartsWith('$NpmFallbackHint = ') })
+if ($hintLines.Count -ne 1) {
+    $failures.Add('expected exactly one line that starts with $NpmFallbackHint = ')
+} else {
+    foreach ($needle in @('npm install -g @autter/cli', 'autter onboard')) {
+        if (-not $hintLines[0].Contains($needle)) {
+            $failures.Add(('$NpmFallbackHint does not mention ''{0}''' -f $needle))
+        }
+    }
+}
+foreach ($needle in @('Failed to resolve the latest release from ${latestReleaseUrl}', 'Failed to download release checksums from ${checksumsUrl}')) {
+    $failureLines = @($lines | Where-Object { $_.Contains($needle) })
+    if ($failureLines.Count -ne 1) {
+        $failures.Add(('expected exactly one error line containing ''{0}''' -f $needle))
+    } elseif (-not $failureLines[0].Contains('$NpmFallbackHint')) {
+        $failures.Add(('the error ''{0}'' does not include $NpmFallbackHint' -f $needle))
+    }
+}
+$binaryHintLines = @($lines | Where-Object { $_.Contains('$message +=') -and $_.Contains('$NpmFallbackHint') })
+if ($binaryHintLines.Count -lt 1) {
+    $failures.Add('the failed binary download message does not include $NpmFallbackHint')
+}
+# Windows PowerShell 5.1 cannot run `a && b`, so never print it as a command.
+if ($text.Contains('@autter/cli &&')) {
+    $failures.Add('prints npm install -g @autter/cli followed by &&: Windows PowerShell 5.1 has no &&; print the two commands on two lines')
+}
+
+# The download stays fast: Invoke-WebRequest's own progress bar is never
+# turned on (5.1 redraws it per chunk), and progress comes from
+# Save-UrlWithProgress instead.
+if ($text.Contains('$ProgressPreference = ''Continue''')) {
+    $failures.Add('$ProgressPreference is set to Continue: Invoke-WebRequest progress makes Windows PowerShell 5.1 downloads many times slower')
+}
+if (-not $text.Contains('function Save-UrlWithProgress')) {
+    $failures.Add('no Save-UrlWithProgress function: the binary download shows no progress')
+}
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     Write-Host ("install.ps1 failed {0} check(s):" -f $failures.Count) -ForegroundColor Red
     foreach ($f in $failures) { Write-Host "  $f" -ForegroundColor Red }
     exit 1
 }
-Write-Host 'install.ps1: ASCII-only, parses cleanly, iex-safe structure.' -ForegroundColor Green
+Write-Host 'install.ps1: ASCII-only, parses cleanly, iex-safe structure, dry run and npm route in place.' -ForegroundColor Green

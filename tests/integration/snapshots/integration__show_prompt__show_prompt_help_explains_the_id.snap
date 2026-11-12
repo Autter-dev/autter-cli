@@ -35,4 +35,6 @@ autter show-prompt <id> [--commit <rev> | --offset <n>]
 
   --commit <rev>   Look in that commit's note only
   --offset <n>     Skip n occurrences, newest first (0 = most recent);
-                   cannot be combined with --commit
+                   cannot be combined with --commit. Commits made in the
+                   same second are ordered by history (a commit before its
+                   ancestors); unrelated ones by ascending commit SHA

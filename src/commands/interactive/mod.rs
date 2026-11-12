@@ -21,7 +21,9 @@ use crate::ui::theme::{Charset, ColorLevel};
 
 /// Whether a full-screen view can run here.
 pub fn available() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && !crate::commands::output::ci_mode()
 }
 
 /// A full-screen view: drawn every frame, fed keys, and polled for

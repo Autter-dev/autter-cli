@@ -457,7 +457,7 @@ impl HookInstaller for ClaudeCodeInstaller {
         Self::all_settings_paths()
     }
 
-    fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
+    fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_binary = binary_exists("claude");
         let has_dotfiles = claude_config_dir().exists();
         // Harnesses built on the Claude Agent SDK count as an installation
@@ -495,6 +495,10 @@ impl HookInstaller for ClaudeCodeInstaller {
         let content = fs::read_to_string(&settings_path)?;
         let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
         let (hooks_installed, hooks_up_to_date) = Self::hook_status(&existing);
+        // `hook_status` finds an autter command without reading which binary
+        // it runs; the installer's dry run does.
+        let hooks_up_to_date = hooks_up_to_date
+            && crate::mdm::hook_refresh::install_would_change_nothing(self, params);
 
         Ok(HookCheckResult {
             tool_installed: true,

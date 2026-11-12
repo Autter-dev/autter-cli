@@ -1,14 +1,16 @@
 use crate::authorship::ignore::{
     IgnoreMatcher, build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
-use crate::authorship::stats::{CommitStats, stats_from_authorship_log, write_stats_to_terminal};
+use crate::authorship::stats::{
+    CaptureStatus, CommitStats, StatsSummary, stats_from_authorship_log, write_stats_to_terminal,
+};
 use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::authorship::working_log::CheckpointKind;
+use crate::commands::output::{self, ErrorKind};
 use crate::error::AutterError;
 use crate::git::find_repository;
 use crate::git::repo_storage::InitialAttributions;
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
-use crate::git::status::MAX_PATHSPEC_ARGS;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::io::IsTerminal;
@@ -23,9 +25,18 @@ struct CheckpointInfo {
     is_human: bool,
 }
 
+/// `autter status --json`. `lines`/`percent`/`capture` describe every
+/// uncommitted change: edits to tracked files and new files git does not
+/// track yet (ignored files excluded), whether or not a checkpoint saw them.
+/// Lines no checkpoint attributes are Untracked; with no checkpoints at all
+/// and the background service not running they are Unknown, because a commit
+/// made now would get no record.
 #[derive(Serialize)]
 struct StatusOutput {
+    head: String,
     stats: CommitStats,
+    #[serde(flatten)]
+    summary: StatsSummary,
     checkpoints: Vec<CheckpointInfo>,
     /// Checkpoints the background service has received but not yet written.
     pending_checkpoints: usize,
@@ -37,28 +48,36 @@ pub fn handle_status(args: &[String]) {
 
     let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         arg_parser::print_command_help("status");
         return;
     }
     arg_parser::merge_global_flags(&pp.flags);
-
-    if let Err(e) = run_status(arg_parser::json()) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    if let Some(arg) = pp.rest.first() {
+        arg_parser::exit_unknown_option("status", arg);
     }
-}
 
-fn run_status(json: bool) -> Result<(), AutterError> {
     let repo = match find_repository(&[]) {
         Ok(repo) => repo,
         Err(e) => crate::commands::exit_repository_error("status", &e),
     };
+    match run_status(&repo, arg_parser::json(), output::strict()) {
+        Ok(()) => {}
+        Err(_) if crate::commands::repository_has_no_commits(&repo) => output::fail(
+            ErrorKind::Runtime,
+            crate::commands::no_commits_message("status"),
+        ),
+        Err(e) => output::fail(ErrorKind::Runtime, format!("Error: {}", e)),
+    }
+}
+
+/// The `--strict` failure for `status`.
+const STATUS_NOTHING_CAPTURED: &str = "nothing captured: there are uncommitted changes, no checkpoint was recorded for them, and the background service is not running, so a commit made now would get no Autter record (--strict). Run `autter doctor` to check capture.";
+
+fn run_status(repo: &Repository, json: bool, strict: bool) -> Result<(), AutterError> {
+    let repo = repo.clone();
     let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
     let ignore_matcher = build_ignore_matcher(&ignore_patterns);
 
@@ -82,15 +101,39 @@ fn run_status(json: bool) -> Result<(), AutterError> {
     let has_initial = !initial_attributions.files.is_empty();
 
     if !has_checkpoints && !has_initial {
+        // Nothing was checkpointed. Only the line counts are needed, for
+        // --json and --strict.
+        let (added, deleted) = if json || strict {
+            working_tree_line_stats(&repo, &ignore_matcher)?
+        } else {
+            (0, 0)
+        };
+        let stats = stats_from_authorship_log(None, added, deleted, 0, 0, &BTreeMap::new());
+        // Lines typed with no agent and no editor extension are Untracked
+        // while the background service is running: the commit they go into
+        // gets a record that says so. With the service down that commit gets
+        // no record, so the lines are Unknown and `--strict` fails.
+        let recording = added > 0 && crate::authorship::record_status::service_is_running(&repo);
+        let unknown_lines = if recording { 0 } else { added };
+        let summary = StatsSummary::with_unknown_lines(&stats, unknown_lines, false);
+        let nothing_captured = strict && summary.capture.status == CaptureStatus::NothingCaptured;
         if json {
-            let output = StatusOutput {
-                stats: CommitStats::default(),
+            let report = StatusOutput {
+                head: head_sha.clone(),
+                stats,
+                summary,
                 checkpoints: vec![],
                 pending_checkpoints,
                 cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
             };
-            let json_str = serde_json::to_string(&output)?;
-            println!("{}", json_str);
+            if nothing_captured {
+                output::fail_with(
+                    ErrorKind::NothingCaptured,
+                    STATUS_NOTHING_CAPTURED,
+                    Some(&report),
+                );
+            }
+            output::print_json(&report);
         } else if !crate::commands::arg_parser::quiet() {
             eprint!("{}", no_checkpoints_message(&head_sha, pending_checkpoints));
             if pending_checkpoints == 0 && std::io::stderr().is_terminal() {
@@ -105,6 +148,9 @@ fn run_status(json: bool) -> Result<(), AutterError> {
             && let Some(line) = crate::auth::notice::format_cloud_sync_status_line()
         {
             eprintln!("{line}");
+        }
+        if nothing_captured {
+            output::fail(ErrorKind::NothingCaptured, STATUS_NOTHING_CAPTURED);
         }
         return Ok(());
     }
@@ -158,9 +204,11 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         None,
     )?;
 
-    // Get actual git diff stats between HEAD and working directory (like post_commit does)
-    let (total_additions, total_deletions) =
-        get_working_dir_diff_stats(&repo, Some(&pathspecs), &ignore_matcher)?;
+    // Every uncommitted line, as a commit of the whole working tree would
+    // count it: not only the files a checkpoint touched, and including new
+    // files git does not track yet. A hand edit no checkpoint saw is part of
+    // the total and shows as untracked.
+    let (total_additions, total_deletions) = working_tree_line_stats(&repo, &ignore_matcher)?;
 
     // For status (uncommitted changes), the AI attributions are in `initial` (uncommitted),
     // not in authorship_log.attestations (which is for committed changes).
@@ -175,20 +223,33 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         known_human,
         &BTreeMap::new(),
     );
+    let summary = StatsSummary::from_stats(&stats, true);
+    let nothing_captured = strict && summary.capture.status == CaptureStatus::NothingCaptured;
 
     if json {
-        let output = StatusOutput {
+        let report = StatusOutput {
+            head: head_sha.clone(),
             stats,
+            summary,
             checkpoints: checkpoint_infos,
             pending_checkpoints,
             cloud_sync: crate::auth::notice::collect_cloud_sync_status(),
         };
-        let json_str = serde_json::to_string(&output)?;
-        println!("{}", json_str);
+        if nothing_captured {
+            output::fail_with(
+                ErrorKind::NothingCaptured,
+                STATUS_NOTHING_CAPTURED,
+                Some(&report),
+            );
+        }
+        output::print_json(&report);
         return Ok(());
     }
 
     if crate::commands::arg_parser::quiet() {
+        if nothing_captured {
+            output::fail(ErrorKind::NothingCaptured, STATUS_NOTHING_CAPTURED);
+        }
         return Ok(());
     }
     write_stats_to_terminal(&stats, true);
@@ -225,6 +286,9 @@ fn run_status(json: bool) -> Result<(), AutterError> {
         }
     }
 
+    if nothing_captured {
+        output::fail(ErrorKind::NothingCaptured, STATUS_NOTHING_CAPTURED);
+    }
     Ok(())
 }
 
@@ -254,41 +318,90 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Get git diff statistics between HEAD and the working directory
-/// This mirrors the logic in stats.rs get_git_diff_stats but for uncommitted changes
-fn get_working_dir_diff_stats(
+/// Added and deleted lines of every uncommitted change: tracked files against
+/// HEAD, plus the lines of files git does not track yet.
+fn working_tree_line_stats(
     repo: &Repository,
-    pathspecs: Option<&HashSet<String>>,
+    ignore_matcher: &IgnoreMatcher,
+) -> Result<(u32, u32), AutterError> {
+    let (added, deleted) = tracked_file_diff_stats(repo, ignore_matcher)?;
+    Ok((
+        added + untracked_file_added_lines(repo, ignore_matcher)?,
+        deleted,
+    ))
+}
+
+/// A new file larger than this is not read for its line count.
+const MAX_UNTRACKED_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Lines in files git does not track yet and does not ignore. `git diff HEAD`
+/// leaves these files out, but committing them adds every one of their lines.
+/// Binary files count no lines, as in `git diff --numstat`.
+fn untracked_file_added_lines(
+    repo: &Repository,
+    ignore_matcher: &IgnoreMatcher,
+) -> Result<u32, AutterError> {
+    // `ls-files --others` lists only what is under git's working directory,
+    // relative to it, so run it from the top of the work tree: `status` may
+    // have been started in a subdirectory.
+    let workdir = repo.workdir()?;
+    let mut args = repo.global_args_for_exec();
+    args.push("-C".to_string());
+    args.push(workdir.to_string_lossy().into_owned());
+    args.extend(
+        ["ls-files", "--others", "--exclude-standard", "-z"]
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
+    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
+
+    let mut added_lines = 0u32;
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(raw_path);
+        if should_ignore_file_with_matcher(&path, ignore_matcher) {
+            continue;
+        }
+        let abs_path = workdir.join(path.as_ref());
+        let is_small_regular_file = std::fs::symlink_metadata(&abs_path)
+            .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_UNTRACKED_FILE_BYTES);
+        if !is_small_regular_file {
+            continue;
+        }
+        if let Ok(content) = std::fs::read(&abs_path) {
+            added_lines += text_line_count(&content);
+        }
+    }
+    Ok(added_lines)
+}
+
+/// Lines git would report as added for a new file with this content: none for
+/// a binary file (a NUL byte in the first 8000 bytes, git's own test), and a
+/// last line without a newline still counts.
+fn text_line_count(content: &[u8]) -> u32 {
+    if content.is_empty() || content[..content.len().min(8000)].contains(&0) {
+        return 0;
+    }
+    let newlines = content.iter().filter(|byte| **byte == b'\n').count() as u32;
+    if content.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
+/// Added and deleted lines between HEAD and the working directory, for the
+/// files git tracks (staged or not).
+fn tracked_file_diff_stats(
+    repo: &Repository,
     ignore_matcher: &IgnoreMatcher,
 ) -> Result<(u32, u32), AutterError> {
     let mut args = repo.global_args_for_exec();
     args.push("diff".to_string());
     args.push("--numstat".to_string());
     args.push("HEAD".to_string());
-
-    // Add pathspecs if provided to scope the diff to specific files
-    // Only pass as CLI args when under threshold to avoid E2BIG
-    let needs_post_filter = if let Some(paths) = pathspecs {
-        if paths.is_empty() {
-            return Ok((0, 0));
-        }
-        if paths.len() > MAX_PATHSPEC_ARGS {
-            // Disable rename detection so git reports renames as separate
-            // delete + add entries with clean filenames. Without this,
-            // numstat outputs "old => new" arrow notation in the filename
-            // field, which won't match pathspec entries.
-            args.push("--no-renames".to_string());
-            true
-        } else {
-            args.push("--".to_string());
-            for path in paths {
-                args.push(path.clone());
-            }
-            false
-        }
-    } else {
-        false
-    };
 
     let output = exec_git_with_profile(&args, InternalGitProfile::NumstatParse)?;
     let stdout = String::from_utf8(output.stdout)?;
@@ -305,14 +418,6 @@ fn get_working_dir_diff_stats(
         // Parse numstat format: "added\tdeleted\tfilename"
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 3 {
-            // Post-filter by pathspec when we couldn't pass them as CLI args
-            if needs_post_filter
-                && let Some(paths) = pathspecs
-                && !paths.contains(parts[2])
-            {
-                continue;
-            }
-
             let file_path = parts[2];
             if should_ignore_file_with_matcher(file_path, ignore_matcher) {
                 continue;
@@ -405,6 +510,19 @@ fn no_checkpoints_message(head_sha: &str, pending: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_file_lines_are_counted_like_git_counts_them() {
+        assert_eq!(text_line_count(b""), 0);
+        assert_eq!(text_line_count(b"one\n"), 1);
+        assert_eq!(text_line_count(b"one\ntwo\n"), 2);
+        assert_eq!(text_line_count(b"one\ntwo"), 2, "no trailing newline");
+        assert_eq!(
+            text_line_count(b"bin\0ary\n"),
+            0,
+            "binary files add no lines"
+        );
+    }
 
     #[test]
     fn quiet_working_tree_gets_no_install_advice() {

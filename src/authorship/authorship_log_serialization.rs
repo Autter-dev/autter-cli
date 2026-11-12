@@ -282,18 +282,11 @@ impl AuthorshipLog {
                     // Extract session key from "s_<14hex>::t_<14hex>" format
                     let session_key = entry.hash.split("::").next().unwrap_or(&entry.hash);
                     if let Some(session_record) = self.metadata.sessions.get(session_key) {
-                        // Create a PromptRecord-like structure from SessionRecord for compatibility
-                        // Note: sessions don't have message transcripts or detailed stats
-                        let prompt_record = PromptRecord {
-                            agent_id: session_record.agent_id.clone(),
-                            human_author: session_record.human_author.clone(),
-                            total_additions: 0, // Sessions don't track detailed stats
-                            total_deletions: 0,
-                            accepted_lines: 0,
-                            overriden_lines: 0,
-                            custom_attributes: session_record.custom_attributes.clone(),
-                            messages_url: session_record.messages_url.clone(),
-                        };
+                        // A PromptRecord view of the session, for callers that
+                        // predate sessions. It carries the session's line
+                        // counts as the note records them, so `accepted_lines`
+                        // here is the note's, not zero.
+                        let prompt_record = session_record.to_prompt_record();
                         return Some((
                             Author {
                                 username: session_record.agent_id.tool.clone(),

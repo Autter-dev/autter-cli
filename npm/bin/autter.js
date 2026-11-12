@@ -8,17 +8,31 @@
 
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
-const { binaryDest, ensureBinary } = require('../install.js');
+const {
+  binaryDest,
+  ensureBinary,
+  launcherNeedsInstall,
+  readInstallMarker,
+  spawnFailureHelp,
+  writeInstallMarker,
+} = require('../install.js');
 
 async function main() {
   let bin = binaryDest();
-  if (!fs.existsSync(bin)) {
+  const binaryExists = fs.existsSync(bin);
+  if (launcherNeedsInstall({ binaryExists, marker: readInstallMarker() })) {
     try {
       bin = (await ensureBinary()).bin;
+      writeInstallMarker();
     } catch (err) {
-      console.error(`autter: could not install the native binary: ${err.message}`);
-      console.error('autter: alternative installer: curl -fsSL https://api.autter.dev/install.sh | bash');
-      process.exit(1);
+      if (binaryExists) {
+        // The binary from before still runs; install this version next time.
+        console.error(`autter: could not install this package's version of the binary (${err.message}); running the one already installed`);
+      } else {
+        console.error(`autter: could not install the native binary: ${err.message}`);
+        console.error('autter: alternative installer: curl -fsSL https://api.autter.dev/install.sh | bash');
+        process.exit(1);
+      }
     }
   }
 
@@ -31,6 +45,9 @@ async function main() {
   const result = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
   if (result.error) {
     console.error(`autter: failed to run ${bin}: ${result.error.message}`);
+    for (const line of spawnFailureHelp(result.error, { bin })) {
+      console.error(`autter: ${line}`);
+    }
     process.exit(1);
   }
   if (result.signal) {

@@ -3,7 +3,8 @@ use crate::authorship::working_log::Checkpoint;
 use crate::error::AutterError;
 use crate::git::repository::{Repository, exec_git, exec_git_stdin};
 use serde_json;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 // Modern refspecs without force to enable proper merging
 pub const AI_AUTHORSHIP_REFNAME: &str = "ai";
@@ -791,9 +792,61 @@ pub fn copy_ref(repo: &Repository, source_ref: &str, dest_ref: &str) -> Result<(
     Ok(())
 }
 
-/// Search AI notes for a pattern and return matching commit SHAs ordered by commit date (newest first)
-/// Uses git grep to search through refs/notes/ai
+/// Search AI notes for a pattern and return the matching commit SHAs, newest
+/// commit first.
+///
+/// The order is fully determined by the repository:
+///
+/// 1. Later commit time first.
+/// 2. Commit times have one-second resolution, so commits made in the same
+///    second (a rebase, a script) tie. Within a tie a commit always comes
+///    before its ancestors, including across a merge and through commits that
+///    have no matching note.
+/// 3. Commits in a tie that are not related by ancestry are listed in ascending
+///    SHA order: of the commits whose tied descendants are all listed, the
+///    smallest SHA goes next.
+///
+/// Uses git grep to search through refs/notes/ai. Ordering costs one
+/// `git log --no-walk` for the whole result plus at most two git processes per
+/// group of tied commits, however large the group.
 pub fn grep_ai_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, AutterError> {
+    let commits = noted_commits_newest_first(repo, pattern)?;
+    let mut ordered = Vec::with_capacity(commits.len());
+    for group in commits.chunk_by(|a, b| a.time == b.time) {
+        ordered.extend(order_tied_commits(repo, group));
+    }
+    Ok(ordered)
+}
+
+/// The first commit [`grep_ai_notes`] would return, without ordering the rest:
+/// only the newest group of tied commits is sorted.
+pub fn grep_ai_notes_latest(
+    repo: &Repository,
+    pattern: &str,
+) -> Result<Option<String>, AutterError> {
+    let commits = noted_commits_newest_first(repo, pattern)?;
+    let Some(newest) = commits.chunk_by(|a, b| a.time == b.time).next() else {
+        return Ok(None);
+    };
+    Ok(order_tied_commits(repo, newest).into_iter().next())
+}
+
+/// A commit whose note matched, with what ordering needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotedCommit {
+    sha: String,
+    /// Commit time, seconds since the epoch.
+    time: i64,
+    parents: Vec<String>,
+}
+
+/// Commits whose note matches `pattern`, sorted by commit time (newest first)
+/// and then by SHA, so the result does not depend on the order git or a hash
+/// set happened to produce.
+fn noted_commits_newest_first(
+    repo: &Repository,
+    pattern: &str,
+) -> Result<Vec<NotedCommit>, AutterError> {
     let mut args = repo.global_args_for_exec();
     args.push("--no-pager".to_string());
     args.push("grep".to_string());
@@ -807,7 +860,7 @@ pub fn grep_ai_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, Au
 
     // Parse output format: refs/notes/ai:ab/cdef123...:line_number:matched_content
     // Extract the commit SHA from the path
-    let mut shas = HashSet::new();
+    let mut shas = BTreeSet::new();
     for line in stdout.lines() {
         if let Some(path_and_rest) = line.strip_prefix("refs/notes/ai:")
             && let Some(path_end) = path_and_rest.find(':')
@@ -819,71 +872,303 @@ pub fn grep_ai_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, Au
         }
     }
 
-    // Newest first. Commit dates have one-second resolution, so commits made in
-    // the same second (a rebase, a script) tie and git orders them arbitrarily;
-    // within a tie a descendant goes before its ancestor, so "latest" and
-    // `show-prompt --offset` follow history.
-    if shas.len() > 1 {
-        let sha_vec: Vec<String> = shas.into_iter().collect();
-        let mut args = repo.global_args_for_exec();
-        args.push("log".to_string());
-        args.push("--format=%H %ct".to_string());
-        args.push("--no-walk".to_string());
-        for sha in &sha_vec {
-            args.push(sha.clone());
-        }
-
-        let output = exec_git(&args)?;
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|_| AutterError::Generic("Failed to parse git log output".to_string()))?;
-
-        let mut dated: Vec<(String, i64)> = stdout
-            .lines()
-            .filter_map(|line| {
-                let (sha, time) = line.split_once(' ')?;
-                Some((sha.to_string(), time.trim().parse().ok()?))
+    if shas.len() < 2 {
+        return Ok(shas
+            .into_iter()
+            .map(|sha| NotedCommit {
+                sha,
+                time: 0,
+                parents: Vec::new(),
             })
-            .collect();
-        dated.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut start = 0;
-        while start < dated.len() {
-            let mut end = start + 1;
-            while end < dated.len() && dated[end].1 == dated[start].1 {
-                end += 1;
-            }
-            order_descendants_first(repo, &mut dated[start..end]);
-            start = end;
-        }
-        Ok(dated.into_iter().map(|(sha, _)| sha).collect())
-    } else {
-        Ok(shas.into_iter().collect())
+            .collect());
     }
-}
 
-/// Reorder commits that share a commit time so each one comes before its
-/// ancestors.
-fn order_descendants_first(repo: &Repository, tied: &mut [(String, i64)]) {
-    for i in 1..tied.len() {
-        let mut j = i;
-        while j > 0 && is_ancestor(repo, &tied[j - 1].0, &tied[j].0) {
-            tied.swap(j - 1, j);
-            j -= 1;
-        }
-    }
-}
-
-fn is_ancestor(repo: &Repository, ancestor: &str, descendant: &str) -> bool {
     let mut args = repo.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-    exec_git(&args).is_ok()
+    args.push("log".to_string());
+    args.push("--format=%H %ct %P".to_string());
+    args.push("--no-walk".to_string());
+    args.extend(shas.iter().cloned());
+
+    let output = exec_git(&args)?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| AutterError::Generic("Failed to parse git log output".to_string()))?;
+
+    let mut commits: Vec<NotedCommit> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next()?.to_string();
+            let time = fields.next()?.parse().ok()?;
+            Some(NotedCommit {
+                sha,
+                time,
+                parents: fields.map(str::to_string).collect(),
+            })
+        })
+        .collect();
+    commits.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| a.sha.cmp(&b.sha)));
+    Ok(commits)
+}
+
+/// Order commits that share a commit time: each one before its ancestors,
+/// unrelated ones by ascending SHA. `tied` is sorted by SHA.
+///
+/// Ancestry comes from one bounded `git rev-list --parents` over the group
+/// (plus one `git merge-base` when the group has more than one lowest commit),
+/// not from a git process per pair. If git fails, the SHA order stands.
+fn order_tied_commits(repo: &Repository, tied: &[NotedCommit]) -> Vec<String> {
+    let members: Vec<String> = tied.iter().map(|commit| commit.sha.clone()).collect();
+    if members.len() < 2 {
+        return members;
+    }
+    let parents = history_between_tied_commits(repo, tied).unwrap_or_default();
+    descendants_first(&members, &parents)
+}
+
+/// Parents of every commit on a path between two of `tied`, keyed by commit.
+///
+/// The walk starts at the tied commits and stops below a commit that is an
+/// ancestor of all of them, so it reads the history between them and not the
+/// history of the repository.
+fn history_between_tied_commits(
+    repo: &Repository,
+    tied: &[NotedCommit],
+) -> Result<HashMap<String, Vec<String>>, AutterError> {
+    let members: HashSet<&str> = tied.iter().map(|commit| commit.sha.as_str()).collect();
+
+    // A commit whose parents are all in the group has another group member
+    // below it. The rest are the candidates for the lowest commit.
+    let lowest: Vec<&NotedCommit> = tied
+        .iter()
+        .filter(|commit| {
+            commit.parents.is_empty()
+                || commit
+                    .parents
+                    .iter()
+                    .any(|parent| !members.contains(parent.as_str()))
+        })
+        .collect();
+
+    // A commit every group member descends from (or is). Nothing below it can
+    // lie between two members.
+    let common_ancestor: Option<String> = match lowest.as_slice() {
+        [] => None,
+        [only] => Some(only.sha.clone()),
+        several => {
+            let mut args = repo.global_args_for_exec();
+            args.push("merge-base".to_string());
+            args.push("--octopus".to_string());
+            args.extend(several.iter().map(|commit| commit.sha.clone()));
+            // Exit 1 means the commits share no history: walk without a bound.
+            exec_git(&args).ok().and_then(|output| {
+                String::from_utf8(output.stdout)
+                    .ok()?
+                    .lines()
+                    .next()
+                    .map(|line| line.trim().to_string())
+                    .filter(|sha| !sha.is_empty())
+            })
+        }
+    };
+
+    // The common ancestor itself stays in the walk when it is a group member.
+    let excluded: Vec<String> = match &common_ancestor {
+        Some(sha) => match tied.iter().find(|commit| &commit.sha == sha) {
+            Some(member) => member.parents.clone(),
+            None => vec![sha.clone()],
+        },
+        None => Vec::new(),
+    };
+
+    let mut args = repo.global_args_for_exec();
+    args.push("rev-list".to_string());
+    args.push("--parents".to_string());
+    args.push("--stdin".to_string());
+    let mut revisions = String::new();
+    for commit in tied {
+        revisions.push_str(&commit.sha);
+        revisions.push('\n');
+    }
+    for sha in &excluded {
+        revisions.push('^');
+        revisions.push_str(sha);
+        revisions.push('\n');
+    }
+
+    let output = exec_git_stdin(&args, revisions.as_bytes())?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| AutterError::Generic("Failed to parse git rev-list output".to_string()))?;
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next()?.to_string();
+            Some((sha, fields.map(str::to_string).collect()))
+        })
+        .collect())
+}
+
+/// Topological order of `members` (sorted by SHA): every commit before its
+/// ancestors, and where ancestry leaves a choice, the smallest SHA first.
+///
+/// `parents` holds the history between the members; it may include commits
+/// that are not members, and members missing from it are treated as unrelated
+/// to the rest.
+fn descendants_first(members: &[String], parents: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let member_set: HashSet<&str> = members.iter().map(String::as_str).collect();
+
+    // Children not yet listed, per commit of the walked history.
+    let mut pending_children: HashMap<&str, usize> = HashMap::new();
+    for commit in members
+        .iter()
+        .map(String::as_str)
+        .chain(parents.keys().map(String::as_str))
+    {
+        pending_children.entry(commit).or_insert(0);
+    }
+    for commit_parents in parents.values() {
+        for parent in commit_parents {
+            if let Some(count) = pending_children.get_mut(parent.as_str()) {
+                *count += 1;
+            }
+        }
+    }
+
+    // Members ready to be listed, smallest SHA first, and commits that only
+    // connect members, which are passed through as soon as they are ready.
+    let mut ready_members: BinaryHeap<Reverse<&str>> = BinaryHeap::new();
+    let mut ready_connectors: Vec<&str> = Vec::new();
+    for (commit, count) in &pending_children {
+        if *count == 0 {
+            if member_set.contains(commit) {
+                ready_members.push(Reverse(commit));
+            } else {
+                ready_connectors.push(commit);
+            }
+        }
+    }
+
+    let mut ordered: Vec<String> = Vec::with_capacity(members.len());
+    loop {
+        let commit = match ready_connectors.pop() {
+            Some(connector) => connector,
+            None => match ready_members.pop() {
+                Some(Reverse(member)) => {
+                    ordered.push(member.to_string());
+                    member
+                }
+                None => break,
+            },
+        };
+        let Some(commit_parents) = parents.get(commit) else {
+            continue;
+        };
+        for parent in commit_parents {
+            let parent = parent.as_str();
+            if let Some(count) = pending_children.get_mut(parent)
+                && *count > 0
+            {
+                *count -= 1;
+                if *count == 0 {
+                    if member_set.contains(parent) {
+                        ready_members.push(Reverse(parent));
+                    } else {
+                        ready_connectors.push(parent);
+                    }
+                }
+            }
+        }
+    }
+
+    // History is acyclic, so every member has been listed. Keep the function
+    // total anyway: nothing is ever dropped from the result.
+    if ordered.len() < members.len() {
+        let listed: HashSet<&str> = ordered.iter().map(String::as_str).collect();
+        let missing: Vec<String> = members
+            .iter()
+            .filter(|sha| !listed.contains(sha.as_str()))
+            .cloned()
+            .collect();
+        ordered.extend(missing);
+    }
+    ordered
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history(edges: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        edges
+            .iter()
+            .map(|(commit, parents)| {
+                (
+                    commit.to_string(),
+                    parents.iter().map(|parent| parent.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn ordered(members: &[&str], edges: &[(&str, &[&str])]) -> Vec<String> {
+        let mut members: Vec<String> = members.iter().map(|sha| sha.to_string()).collect();
+        members.sort();
+        descendants_first(&members, &history(edges))
+    }
+
+    #[test]
+    fn tied_commits_list_a_child_before_its_parent_whatever_the_shas() {
+        // "a" is the child of "b": SHA order alone would list the parent first.
+        assert_eq!(
+            ordered(&["a", "b"], &[("a", &["b"]), ("b", &[])]),
+            ["a", "b"]
+        );
+        assert_eq!(
+            ordered(&["a", "b"], &[("b", &["a"]), ("a", &[])]),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn tied_commit_on_another_branch_does_not_disturb_ancestry_order() {
+        // c is the child of d; a, x and z sit on unrelated branches. An
+        // insertion sort over "is ancestor" gets this wrong for some input
+        // orders, because unrelated commits compare as neither before nor after.
+        let edges: &[(&str, &[&str])] = &[
+            ("c", &["d"]),
+            ("d", &[]),
+            ("a", &[]),
+            ("x", &[]),
+            ("z", &[]),
+        ];
+        assert_eq!(
+            ordered(&["z", "d", "x", "c", "a"], edges),
+            ["a", "c", "d", "x", "z"]
+        );
+        // The parent has the smaller SHA: it still waits for its child.
+        let edges: &[(&str, &[&str])] = &[("y", &["b"]), ("b", &[]), ("m", &[])];
+        assert_eq!(ordered(&["b", "m", "y"], edges), ["m", "y", "b"]);
+    }
+
+    #[test]
+    fn tied_merge_commit_comes_before_both_parents() {
+        // m merges f and g, which both descend from a.
+        let edges: &[(&str, &[&str])] =
+            &[("a", &[]), ("f", &["a"]), ("g", &["a"]), ("m", &["g", "f"])];
+        assert_eq!(ordered(&["a", "f", "g", "m"], edges), ["m", "f", "g", "a"]);
+    }
+
+    #[test]
+    fn tied_commits_are_related_through_commits_without_a_matching_note() {
+        // a <- k <- b, where k matched nothing: b is still a's descendant.
+        let edges: &[(&str, &[&str])] = &[("a", &[]), ("k", &["a"]), ("b", &["k"])];
+        assert_eq!(ordered(&["a", "b"], edges), ["b", "a"]);
+    }
+
+    #[test]
+    fn tied_commits_without_history_fall_back_to_sha_order() {
+        assert_eq!(ordered(&["c", "a", "b"], &[]), ["a", "b", "c"]);
+    }
 
     #[test]
     fn test_parse_batch_check_blob_oid_accepts_sha1_and_sha256() {

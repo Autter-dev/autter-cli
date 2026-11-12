@@ -1,0 +1,5 @@
+---
+source: tests/integration/json_contract.rs
+expression: "{\n    let mut keys: Vec<&String> = report.as_object().unwrap().keys().collect();\n    keys.retain(|k| k.as_str() != \"error\" && k.as_str() != \"next_step\");\n    format!(\"{keys:?}\")\n}"
+---
+["autter_version", "capture_ok", "checks", "ok", "schema_version", "summary"]

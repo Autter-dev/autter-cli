@@ -18,6 +18,8 @@ use serde::Serialize;
 use std::io::IsTerminal;
 use std::time::Duration;
 
+mod agent;
+
 const SKIP_TRACE2_CHECKS_FLAG: &str = "--skip-trace2-checks";
 const DOCTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const DOCTOR_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -75,24 +77,34 @@ struct DoctorOutput {
     checks: Vec<DoctorCheck>,
     summary: DoctorSummary,
     ok: bool,
+    /// No check that capture depends on failed (background service, trace2,
+    /// end-to-end checkpoint, agent hooks). `--strict` exits 4 when false.
+    capture_ok: bool,
     /// The one command to run next: the first failed check's remediation, or
     /// the first warning when nothing failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     next_step: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct DoctorOptions {
     skip_trace2_checks: bool,
+    /// `--report <file>`: also write a support report to this file.
+    report: Option<std::path::PathBuf>,
+    /// `--agent <name>`: check one agent's integration end to end instead.
+    agent: Option<String>,
 }
+
+const REPORT_FLAG: &str = "--report";
+const AGENT_FLAG: &str = "--agent";
 
 pub fn handle_doctor(args: &[String]) {
     let pp = match arg_parser::pre_parse(args, ScanMode::Full, false) {
         Ok(pp) => pp,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
+        Err(e) => crate::commands::output::fail(
+            crate::commands::output::ErrorKind::Usage,
+            format!("error: {}", e),
+        ),
     };
     if pp.flags.help {
         arg_parser::print_command_help("doctor");
@@ -101,24 +113,153 @@ pub fn handle_doctor(args: &[String]) {
     arg_parser::merge_global_flags(&pp.flags);
 
     let mut options = DoctorOptions::default();
-    for arg in &pp.rest {
+    let mut rest = pp.rest.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(path) = arg.strip_prefix("--report=") {
+            options.report = Some(path.into());
+            continue;
+        }
+        if let Some(name) = arg.strip_prefix("--agent=") {
+            options.agent = Some(name.to_string());
+            continue;
+        }
         match arg.as_str() {
+            AGENT_FLAG => match rest.next() {
+                Some(name) => options.agent = Some(name.clone()),
+                None => crate::commands::output::fail(
+                    crate::commands::output::ErrorKind::Usage,
+                    format!(
+                        "error: --agent needs an agent name, e.g. `autter doctor --agent claude-code`. Agents: {}",
+                        agent_names()
+                    ),
+                ),
+            },
             SKIP_TRACE2_CHECKS_FLAG => options.skip_trace2_checks = true,
+            REPORT_FLAG => match rest.next() {
+                Some(path) => options.report = Some(path.into()),
+                None => crate::commands::output::fail(
+                    crate::commands::output::ErrorKind::Usage,
+                    "error: --report needs a file path, e.g. `autter doctor --report autter-report.txt`",
+                ),
+            },
             "help" => {
                 arg_parser::print_command_help("doctor");
                 return;
             }
             unknown => {
-                eprintln!("error: unknown doctor argument: {}", unknown);
                 arg_parser::print_command_help("doctor");
-                std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                crate::commands::output::fail(
+                    crate::commands::output::ErrorKind::Usage,
+                    format!("error: unknown doctor argument: {}", unknown),
+                );
             }
         }
     }
 
-    let output = run_doctor(&options);
-    if output.summary.failed > 0 {
-        std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+    let output = match &options.agent {
+        Some(name) => run_agent_doctor(name),
+        None => run_doctor(&options),
+    };
+    if let Some(path) = &options.report {
+        match std::fs::write(
+            path,
+            build_report(
+                &output,
+                crate::daemon::DaemonConfig::from_env_or_default_paths().ok(),
+            ),
+        ) {
+            Ok(()) => eprintln!(
+                "Report written to {}. It has no source code, file contents or tokens; attach it to your support request.",
+                path.display()
+            ),
+            Err(err) => {
+                eprintln!(
+                    "error: could not write the report to {}: {err}",
+                    path.display()
+                );
+                std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+            }
+        }
+    }
+    if let Some((kind, _)) = doctor_failure(&output, crate::commands::output::strict()) {
+        std::process::exit(kind.exit_code());
+    }
+}
+
+fn agent_names() -> String {
+    agent::known_agents()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `autter doctor --agent <name>`.
+fn run_agent_doctor(name: &str) -> DoctorOutput {
+    let known = agent::known_agents();
+    let Some(id) = agent::resolve_agent_id(name, &known) else {
+        crate::commands::output::fail(
+            crate::commands::output::ErrorKind::Usage,
+            format!(
+                "error: unknown agent '{name}'. Agents: {}. Which agents autter supports and how: docs/agents.md",
+                agent_names()
+            ),
+        );
+    };
+    let installer = crate::mdm::agents::get_all_installers()
+        .into_iter()
+        .find(|i| i.id() == id)
+        .expect("resolved agent ids come from the installers");
+    agent::run(installer.as_ref(), arg_parser::json())
+}
+
+/// Sections whose failures mean authorship is not being captured.
+const CAPTURE_SECTIONS: &[&str] = &[
+    SECTION_SERVICE,
+    SECTION_TRACE2,
+    SECTION_E2E,
+    SECTION_AGENTS,
+    agent::SECTION_AGENT,
+    agent::SECTION_SIMULATION,
+];
+
+fn capture_ok(checks: &[DoctorCheck]) -> bool {
+    !checks
+        .iter()
+        .any(|c| c.status == DoctorStatus::Failed && CAPTURE_SECTIONS.contains(&c.section))
+}
+
+/// How a doctor run fails, if it does. Any failed check exits 1; with
+/// `--strict`, a failed capture check exits 4 instead.
+fn doctor_failure(
+    output: &DoctorOutput,
+    strict: bool,
+) -> Option<(crate::commands::output::ErrorKind, String)> {
+    use crate::commands::output::ErrorKind;
+    if output.summary.failed == 0 {
+        return None;
+    }
+    let first_failed = output
+        .checks
+        .iter()
+        .find(|c| {
+            c.status == DoctorStatus::Failed
+                && (!strict || output.capture_ok || CAPTURE_SECTIONS.contains(&c.section))
+        })
+        .map(|c| format!("{}: {}", c.name, c.summary))
+        .unwrap_or_default();
+    let failed = output.summary.failed;
+    let checks = if failed == 1 { "check" } else { "checks" };
+    if strict && !output.capture_ok {
+        Some((
+            ErrorKind::CaptureBroken,
+            format!("capture is broken (--strict): {first_failed}"),
+        ))
+    } else {
+        Some((
+            ErrorKind::CheckFailed,
+            format!("{failed} doctor {checks} failed: {first_failed}"),
+        ))
     }
 }
 
@@ -174,7 +315,14 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         "background service",
         crate::diagnostics::ensure_daemon_ready_for_self_checks(),
     );
+    // Only when doctor actually started or restarted it: a slow service that
+    // answered when doctor waited was left alone and says so in its summary.
+    let doctor_fixed_service = daemon_check
+        .details
+        .iter()
+        .any(|d| d.starts_with(crate::diagnostics::DOCTOR_FIX_DETAIL_PREFIX));
     if daemon_check.status == DoctorStatus::Passed
+        && doctor_fixed_service
         && let Some(initial) = initial_service_state.as_ref()
         && matches!(
             initial.state,
@@ -438,7 +586,7 @@ fn git_version_of(program: &str) -> Result<GitVersionProbe, String> {
         program,
         &["--version"],
         None,
-        DOCTOR_COMMAND_TIMEOUT,
+        crate::diagnostics::check_timeout(DOCTOR_COMMAND_TIMEOUT),
         DOCTOR_COMMAND_POLL_INTERVAL,
         &[],
     )?;
@@ -598,6 +746,16 @@ fn check_repository() -> DoctorCheck {
         );
     };
 
+    if let Ok(path) = repo.workdir()
+        && let Some(check) = home_folder_repository_check(
+            &name,
+            &path,
+            Some(crate::mdm::utils::home_dir().as_path()),
+        )
+    {
+        return check;
+    }
+
     let workdir = repo
         .workdir()
         .map(|p| p.display().to_string())
@@ -639,6 +797,60 @@ fn check_repository() -> DoctorCheck {
             ),
         }
     }
+}
+
+/// A JetBrains IDE without the autter plugin. A warning, not a failure: the
+/// plugin is an optional integration the user installs from inside the IDE,
+/// and capture for every other tool works without it. Reporting it as a
+/// failure made a healthy setup fail `autter doctor` for anyone who merely
+/// has a JetBrains IDE installed.
+fn jetbrains_plugin_missing_check(name: String) -> DoctorCheck {
+    DoctorCheck {
+        section: SECTION_AGENTS,
+        name,
+        status: DoctorStatus::Warning,
+        summary: "detected, but the optional autter JetBrains plugin is not installed -- edits made in JetBrains IDEs are not captured (other tools are unaffected)"
+            .to_string(),
+        details: Vec::new(),
+        remediation: Some(
+            "if you use an AI assistant in a JetBrains IDE: run `autter install-hooks`, then install/enable the `autter` plugin from JetBrains Settings > Plugins and restart the IDE; otherwise ignore this"
+                .to_string(),
+        ),
+    }
+}
+
+/// A repository whose top level is the user's home folder: usually a stray
+/// `git init` in `~` or a dotfiles repo. Every folder under home counts as
+/// inside it, so commands run "outside any project" land in this repository
+/// and capture is attributed to it.
+fn home_folder_repository_check(
+    name: &str,
+    workdir: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<DoctorCheck> {
+    let home = home?;
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        let canon =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canon(a) == canon(b)
+    };
+    if !same(workdir, home) {
+        return None;
+    }
+    Some(DoctorCheck {
+        section: SECTION_SETUP,
+        name: name.to_string(),
+        status: DoctorStatus::Warning,
+        summary: "this repository is your home folder -- every folder under it counts as part of this one repository".to_string(),
+        details: vec![
+            format!("workdir: {}", workdir.display()),
+            "a `.git` directory in your home folder makes git (and autter) treat everything below it as one project, unless a folder has its own repository".to_string(),
+        ],
+        remediation: Some(format!(
+            "if you meant to check a project, `cd` into it and re-run `autter doctor`; if `{}` was created by accident, move it away (for example `mv ~/.git ~/.git.bak`)",
+            workdir.join(".git").display()
+        )),
+    })
 }
 
 /// Per-agent hook status from the same installers `autter install-hooks`
@@ -694,19 +906,9 @@ fn agent_hook_checks() -> Vec<DoctorCheck> {
                     });
                 }
             }
-            Ok(result) if !result.hooks_installed && installer.id() == "jetbrains" => checks.push(DoctorCheck {
-                section: SECTION_AGENTS,
-                name: name.clone(),
-                status: DoctorStatus::Failed,
-                summary:
-                    "detected, but the autter JetBrains plugin is not installed -- edits are not captured"
-                        .to_string(),
-                details: Vec::new(),
-                remediation: Some(
-                    "run `autter install-hooks`, then install/enable the `autter` plugin from JetBrains Settings > Plugins and restart the IDE"
-                        .to_string(),
-                ),
-            }),
+            Ok(result) if !result.hooks_installed && installer.id() == "jetbrains" => {
+                checks.push(jetbrains_plugin_missing_check(name.clone()))
+            }
             Ok(result) if !result.hooks_installed => checks.push(DoctorCheck {
                 section: SECTION_AGENTS,
                 name: name.clone(),
@@ -1183,20 +1385,55 @@ fn check_auth() -> (DoctorCheck, bool) {
             true,
         ),
         AuthState::LoggedOut => (
-            DoctorCheck {
-                section: SECTION_ACCOUNT,
-                name,
-                status: DoctorStatus::Warning,
-                summary: "not logged in -- attribution is captured locally but never syncs"
-                    .to_string(),
-                details,
-                remediation: Some(
-                    "run `autter login` to enable cloud sync (ignore this if you use autter locally only)"
-                        .to_string(),
-                ),
-            },
+            logged_out_check(name, !Config::fresh().platform_sync_enabled(), details),
             false,
         ),
+    }
+}
+
+/// The sign-in verdict when nobody is signed in. Local mode needs no account,
+/// so it is not a warning there: a machine that keeps everything local used to
+/// finish doctor with "not logged in" and "no usable login" warnings and fixes
+/// that told it to log in.
+fn logged_out_check(name: String, local_mode: bool, details: Vec<String>) -> DoctorCheck {
+    if local_mode {
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Skipped,
+            summary: "local mode -- no sign-in needed; attribution stays on this machine (`autter onboard --connect` turns on cloud sync)"
+                .to_string(),
+            details: Vec::new(),
+            remediation: None,
+        };
+    }
+    DoctorCheck {
+        section: SECTION_ACCOUNT,
+        name,
+        status: DoctorStatus::Warning,
+        summary: "not logged in -- attribution is captured locally but never syncs".to_string(),
+        details,
+        remediation: Some("run `autter login` to enable cloud sync".to_string()),
+    }
+}
+
+/// The data-plane verdict when there is no usable login to probe with. In
+/// local mode nothing is uploaded, so there is nothing to probe.
+fn data_plane_without_login_check(name: String, local_mode: bool, reason: String) -> DoctorCheck {
+    if local_mode {
+        return skipped_check(
+            SECTION_ACCOUNT,
+            name,
+            "local mode -- nothing is uploaded, so the upload API is not checked",
+        );
+    }
+    DoctorCheck {
+        section: SECTION_ACCOUNT,
+        name,
+        status: DoctorStatus::Warning,
+        summary: "data-plane probe skipped because no usable login is available".to_string(),
+        details: vec![format!("reason: {reason}")],
+        remediation: Some("run `autter login`, then re-run `autter doctor`".to_string()),
     }
 }
 
@@ -1254,14 +1491,11 @@ fn check_org_data_plane() -> DoctorCheck {
             .auth_issue()
             .map(ToString::to_string)
             .unwrap_or_else(|| "no access token".to_string());
-        return DoctorCheck {
-            section: SECTION_ACCOUNT,
+        return data_plane_without_login_check(
             name,
-            status: DoctorStatus::Warning,
-            summary: "data-plane probe skipped because no usable login is available".to_string(),
-            details: vec![format!("reason: {reason}")],
-            remediation: Some("run `autter login`, then re-run `autter doctor`".to_string()),
-        };
+            !Config::fresh().platform_sync_enabled(),
+            reason,
+        );
     }
 
     match client.check_data_plane() {
@@ -1444,6 +1678,18 @@ fn usage_metrics_check(
             String::new()
         }
     );
+    // Events the server failed on every time are kept out of the queue. Say
+    // how many, why, and how to queue or delete them.
+    let set_aside_details = || {
+        let mut lines = Vec::new();
+        if status.set_aside > 0 {
+            lines.push(crate::metrics::sync_state::set_aside_text(status.set_aside));
+            if let Some(reason) = &status.set_aside_reason {
+                lines.push(format!("set aside after: {reason}"));
+            }
+        }
+        lines
+    };
 
     if !sync_enabled {
         return DoctorCheck {
@@ -1474,6 +1720,7 @@ fn usage_metrics_check(
             "attribution is not affected: authorship notes upload through their own queue"
                 .to_string(),
         );
+        details.extend(set_aside_details());
         return DoctorCheck {
             section: SECTION_ACCOUNT,
             name,
@@ -1495,6 +1742,30 @@ fn usage_metrics_check(
     } else {
         "no usage metrics waiting".to_string()
     };
+    if status.set_aside > 0 {
+        let mut details = vec![counts];
+        details.extend(set_aside_details());
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: format!(
+                "{} usage-metrics {} set aside after repeated server errors; {}",
+                status.set_aside,
+                if status.set_aside == 1 {
+                    "event is"
+                } else {
+                    "events are"
+                },
+                summary
+            ),
+            details,
+            remediation: Some(format!(
+                "nothing is lost: the set-aside events are kept on this computer and the rest of the queue uploads. `{}` queues them again; if they are set aside again, send this output to autter support",
+                crate::metrics::sync_state::RETRY_COMMAND
+            )),
+        };
+    }
     DoctorCheck {
         section: SECTION_ACCOUNT,
         name,
@@ -1582,7 +1853,52 @@ fn version_string() -> String {
 /// First failed check that names a fix, otherwise the first warning that does.
 /// Checks are already in dependency order (git, hooks, trace2, daemon, agents,
 /// account, checkpoint), so the first failure is the one to fix before the rest.
+/// One cause that explains several failed checks at once.
+struct RootCause {
+    what: String,
+    fix: String,
+}
+
+/// A machine where autter is installed but setup never ran: the background
+/// service has not been started and nothing is configured, so the git capture
+/// checks and every agent's hook check fail together. Doctor used to list
+/// each of them with its own fix (`autter install --system`, `autter
+/// install-hooks`, ...), which reads as many separate problems; the one thing
+/// to do is run setup.
+fn root_cause_from_checks(checks: &[DoctorCheck]) -> Option<RootCause> {
+    let never_set_up = checks.iter().any(|check| {
+        check.name == "background service"
+            && check.status == DoctorStatus::Skipped
+            && check.summary.contains("starts after setup")
+    });
+    if !never_set_up {
+        return None;
+    }
+    let explained = checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Failed)
+        .filter(|check| {
+            check.section == SECTION_TRACE2
+                || (check.section == SECTION_AGENTS && check.summary.contains("NOT installed"))
+        })
+        .count();
+    if explained == 0 {
+        return None;
+    }
+    Some(RootCause {
+        what: format!(
+            "autter is installed, but this machine has not been set up yet. That explains {explained} of the failed checks above (git capture and agent hooks)."
+        ),
+        fix:
+            "run `autter onboard` (it asks before it changes anything), then re-run `autter doctor`"
+                .to_string(),
+    })
+}
+
 fn next_step_from_checks(checks: &[DoctorCheck]) -> Option<String> {
+    if let Some(root) = root_cause_from_checks(checks) {
+        return Some(root.fix);
+    }
     for check in checks {
         if check.status == DoctorStatus::Failed
             && let Some(step) = &check.remediation
@@ -1689,16 +2005,20 @@ impl Reporter {
         }
         let summary = summarize(&self.checks);
         let next_step = next_step_from_checks(&self.checks);
+        let capture_ok = capture_ok(&self.checks);
         let output = DoctorOutput {
             autter_version: version_string(),
             checks: self.checks,
             summary,
             ok: summary.failed == 0,
+            capture_ok,
             next_step,
         };
 
         if self.json {
-            match serde_json::to_string(&output) {
+            let error = doctor_failure(&output, crate::commands::output::strict())
+                .map(|(kind, message)| crate::commands::output::ErrorBody::new(kind, message));
+            match crate::commands::output::document(Some(&output), error.as_ref()) {
                 Ok(serialized) => println!("{}", serialized),
                 Err(err) => {
                     eprintln!("Error: failed to serialize doctor report: {}", err);
@@ -1746,6 +2066,9 @@ impl Reporter {
         } else {
             println!("All checks passed -- autter is capturing and attributing correctly.");
         }
+        if let Some(root) = root_cause_from_checks(&output.checks) {
+            println!("Root cause: {}", root.what);
+        }
         if let Some(step) = &output.next_step {
             println!("Next step: {}", step);
         }
@@ -1779,9 +2102,297 @@ fn print_human_check(check: &DoctorCheck, glyphs: &crate::ui::theme::Glyphs) {
     }
 }
 
+// ===========================================================================
+// `--report`: one text file for support
+// ===========================================================================
+
+/// Lines of the service log kept in the report.
+const REPORT_LOG_LINES: usize = 200;
+/// At most this much of the log's end is read to find them.
+const REPORT_LOG_TAIL_BYTES: u64 = 512 * 1024;
+
+/// The support report for `autter doctor --report`: doctor's results, the
+/// service's start timings, pid and lock-file state, the end of its log, and
+/// the git and OS versions and elevation. Built to be sent to support, and
+/// made for the Windows start-up failures that cannot be reproduced
+/// elsewhere. Holds no source code or file contents; every free-text line
+/// goes through the same secret redaction as `autter debug`.
+fn build_report(output: &DoctorOutput, config: Option<crate::daemon::DaemonConfig>) -> String {
+    use std::fmt::Write as _;
+    let redact = crate::commands::debug::redact_free_text;
+    let mut out = String::new();
+    let _ = writeln!(out, "autter doctor report");
+    let _ = writeln!(out, "generated: {}", chrono::Utc::now().to_rfc3339());
+    let _ = writeln!(out, "autter: {}", output.autter_version);
+
+    let _ = writeln!(out, "\n== system");
+    let _ = writeln!(
+        out,
+        "os: {} {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        crate::commands::debug::collect_kernel_details()
+            .map(|v| redact(v.trim()))
+            .unwrap_or_else(|| "version unknown".to_string())
+    );
+    let _ = writeln!(
+        out,
+        "elevated (root / Administrator): {}",
+        if crate::utils::is_running_as_superuser() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    let git_cmd = Config::get().git_cmd().to_string();
+    for (label, program) in [
+        ("configured git", git_cmd.as_str()),
+        ("terminal git", "git"),
+    ] {
+        let version = match git_version_of(program) {
+            Ok((raw, _)) => raw,
+            Err(err) => format!("not runnable: {err}"),
+        };
+        let _ = writeln!(out, "{label}: {program} -> {}", redact(&version));
+    }
+    let _ = writeln!(
+        out,
+        "doctor time scale: {:.1}x",
+        crate::diagnostics::machine_timeout_scale()
+    );
+
+    let _ = writeln!(out, "\n== doctor results");
+    let _ = writeln!(
+        out,
+        "summary: {} passed, {} warnings, {} failed, {} skipped",
+        output.summary.passed,
+        output.summary.warnings,
+        output.summary.failed,
+        output.summary.skipped
+    );
+    for check in &output.checks {
+        let _ = writeln!(
+            out,
+            "[{:?}] {} / {}: {}",
+            check.status,
+            check.section,
+            check.name,
+            redact(&check.summary)
+        );
+        if let Some(fix) = &check.remediation {
+            let _ = writeln!(out, "    fix: {}", redact(fix));
+        }
+        for detail in &check.details {
+            let _ = writeln!(out, "    {}", redact(detail));
+        }
+    }
+
+    let _ = writeln!(out, "\n== background service");
+    match &config {
+        None => {
+            let _ = writeln!(out, "paths: unavailable");
+        }
+        Some(config) => {
+            let health = crate::commands::daemon::probe_daemon_health(config);
+            let _ = writeln!(out, "state: {:?}: {}", health.state, health.summary);
+            for line in health.details(config) {
+                let _ = writeln!(out, "{line}");
+            }
+            let pid_meta = crate::diagnostics::daemon_pid_metadata_path(config);
+            match std::fs::read_to_string(&pid_meta) {
+                Ok(text) => {
+                    let _ = writeln!(out, "pid metadata: {}", redact(&text.replace('\n', " ")));
+                }
+                Err(err) => {
+                    let _ = writeln!(out, "pid metadata: {} ({err})", pid_meta.display());
+                }
+            }
+        }
+    }
+    let _ = writeln!(out, "timings measured by this doctor run:");
+    let timings = crate::diagnostics::recorded_timings();
+    if timings.is_empty() {
+        let _ = writeln!(out, "    (none)");
+    }
+    for line in timings {
+        let _ = writeln!(out, "    {line}");
+    }
+
+    let _ = writeln!(out, "\n== lock file");
+    if let Some(config) = &config {
+        let lock = crate::commands::daemon::inspect_lock(config);
+        let _ = writeln!(out, "path: {}", lock.path.display());
+        let _ = writeln!(out, "exists: {}", lock.exists);
+        let _ = writeln!(
+            out,
+            "state: {}",
+            if lock.free {
+                "free (no service holds it)"
+            } else {
+                "held"
+            }
+        );
+        if let Some(err) = &lock.open_error {
+            let _ = writeln!(out, "open error: {}", redact(err));
+        }
+        let _ = writeln!(
+            out,
+            "holder: pid {} ({})",
+            lock.holder_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            lock.holder
+                .map(|h| format!("{h:?}").to_lowercase())
+                .unwrap_or_else(|| "no pid file".to_string())
+        );
+        if let Some(err) = &lock.pipe_error {
+            let _ = writeln!(out, "control pipe: {}", redact(err));
+        }
+        if let Some(verdict) = lock.verdict {
+            let _ = writeln!(out, "verdict: {verdict:?}");
+        }
+    }
+
+    let log = config.as_ref().and_then(service_log_path);
+    match &log {
+        Some(path) => {
+            let _ = writeln!(
+                out,
+                "\n== service log (last {REPORT_LOG_LINES} lines of {})",
+                path.display()
+            );
+            match tail_lines(path, REPORT_LOG_LINES) {
+                Ok(lines) => {
+                    for line in lines {
+                        let _ = writeln!(out, "{}", redact(&line));
+                    }
+                }
+                Err(err) => {
+                    let _ = writeln!(out, "(could not read it: {err})");
+                }
+            }
+        }
+        None => {
+            let _ = writeln!(out, "\n== service log\n(no log file found)");
+        }
+    }
+    out
+}
+
+/// The running service's log, or the newest one when none is running.
+fn service_log_path(config: &crate::daemon::DaemonConfig) -> Option<std::path::PathBuf> {
+    if let Ok(path) = crate::daemon::daemon_log_file_path(config)
+        && path.is_file()
+    {
+        return Some(path);
+    }
+    std::fs::read_dir(config.internal_dir.join("daemon").join("logs"))
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "log"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+/// The last `n` lines of a file, reading at most its last
+/// [`REPORT_LOG_TAIL_BYTES`].
+fn tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(REPORT_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // A read that starts mid-file starts mid-line.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let from = lines.len().saturating_sub(n);
+    Ok(lines[from..].iter().map(|l| l.to_string()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_mode_needs_no_sign_in() {
+        let details = vec!["credential backend: file".to_string()];
+
+        // Local mode: not a warning, and no fix that says to log in.
+        let local = logged_out_check("authentication".to_string(), true, details.clone());
+        assert_eq!(local.status, DoctorStatus::Skipped);
+        assert!(local.summary.contains("local mode"), "{}", local.summary);
+        assert!(
+            local.summary.contains("autter onboard --connect"),
+            "{}",
+            local.summary
+        );
+        assert_eq!(local.remediation, None);
+
+        let plane = data_plane_without_login_check(
+            "organization data plane".to_string(),
+            true,
+            "no stored credentials".to_string(),
+        );
+        assert_eq!(plane.status, DoctorStatus::Skipped);
+        assert_eq!(plane.remediation, None);
+
+        // Connected mode without a login is still worth a warning.
+        let connected = logged_out_check("authentication".to_string(), false, details);
+        assert_eq!(connected.status, DoctorStatus::Warning);
+        assert_eq!(
+            connected.remediation.as_deref(),
+            Some("run `autter login` to enable cloud sync")
+        );
+        let plane = data_plane_without_login_check(
+            "organization data plane".to_string(),
+            false,
+            "no stored credentials".to_string(),
+        );
+        assert_eq!(plane.status, DoctorStatus::Warning);
+        assert!(plane.details[0].contains("no stored credentials"));
+    }
+
+    #[test]
+    fn jetbrains_without_the_plugin_is_a_warning() {
+        let check = jetbrains_plugin_missing_check("JetBrains IDEs".to_string());
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(check.summary.contains("optional"), "{}", check.summary);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("otherwise ignore this")
+        );
+    }
+
+    #[test]
+    fn a_repository_rooted_at_the_home_folder_is_a_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("code").join("app");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let check = home_folder_repository_check("repository", home.path(), Some(home.path()))
+            .expect("the home folder as a repository must be flagged");
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(check.summary.contains("home folder"), "{}", check.summary);
+        assert!(
+            check.remediation.as_deref().unwrap().contains(".git"),
+            "{:?}",
+            check.remediation
+        );
+
+        // A project under home is an ordinary repository.
+        assert!(home_folder_repository_check("repository", &project, Some(home.path())).is_none());
+        // No known home folder: nothing to compare with.
+        assert!(home_folder_repository_check("repository", home.path(), None).is_none());
+    }
 
     fn make_check(status: DoctorStatus) -> DoctorCheck {
         DoctorCheck {
@@ -1892,14 +2503,22 @@ mod tests {
         let next_step = next_step_from_checks(&checks);
         let output = DoctorOutput {
             autter_version: "test".to_string(),
+            capture_ok: capture_ok(&checks),
             checks,
             summary,
             ok: summary.failed == 0,
             next_step,
         };
         let value: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
+            serde_json::from_str(&crate::commands::output::document(Some(&output), None).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["schema_version"],
+            crate::commands::output::SCHEMA_VERSION
+        );
         assert!(!value["ok"].as_bool().unwrap());
+        // The failed check is in Setup, which capture does not depend on.
+        assert!(value["capture_ok"].as_bool().unwrap());
         assert_eq!(value["summary"]["passed"], 1);
         assert_eq!(value["summary"]["failed"], 1);
         assert_eq!(value["checks"][0]["status"], "passed");
@@ -1908,6 +2527,107 @@ mod tests {
         assert_eq!(value["next_step"], "do the thing");
         // Passed checks with no remediation omit the key entirely.
         assert!(value["checks"][0].get("remediation").is_none());
+    }
+
+    fn output_for(checks: Vec<DoctorCheck>) -> DoctorOutput {
+        let summary = summarize(&checks);
+        DoctorOutput {
+            autter_version: "test".to_string(),
+            capture_ok: capture_ok(&checks),
+            next_step: next_step_from_checks(&checks),
+            ok: summary.failed == 0,
+            summary,
+            checks,
+        }
+    }
+
+    #[test]
+    fn report_has_every_section_and_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config = crate::daemon::DaemonConfig {
+            internal_dir: home.join(".autter").join("internal"),
+            lock_path: dir.path().join("daemon.lock"),
+            trace_socket_path: dir.path().join("t.sock"),
+            control_socket_path: dir.path().join("c.sock"),
+        };
+        let logs = config.internal_dir.join("daemon").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut log = String::new();
+        for i in 0..250 {
+            log.push_str(&format!("line {i} INFO applied\n"));
+        }
+        log.push_str("WARN upload failed: Authorization: Bearer sk-live-123\n");
+        std::fs::write(logs.join("4242.log"), log).unwrap();
+
+        let mut check = make_check(DoctorStatus::Failed);
+        check.name = "trace2 ingestion".to_string();
+        check.details = vec!["probe saw api_key=abc123".to_string()];
+        check.remediation = Some("run `autter bg restart`".to_string());
+        let report = build_report(&output_for(vec![check]), Some(config));
+
+        for section in [
+            "== system",
+            "elevated (root / Administrator): ",
+            "configured git: ",
+            "== doctor results",
+            "[Failed] Setup / trace2 ingestion: summary",
+            "    fix: run `autter bg restart`",
+            "== background service",
+            "timings measured by this doctor run:",
+            "== lock file",
+            "state: free (no service holds it)",
+            "== service log (last 200 lines of ",
+            "line 51 INFO applied",
+        ] {
+            assert!(report.contains(section), "missing {section:?}:\n{report}");
+        }
+        // Only the last 200 lines of the log.
+        assert!(!report.contains("line 50 INFO"), "{report}");
+        assert!(!report.contains("sk-live-123"), "{report}");
+        assert!(!report.contains("abc123"), "{report}");
+        assert!(report.contains("Authorization[REDACTED]"), "{report}");
+    }
+
+    #[test]
+    fn tail_lines_reads_only_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        assert_eq!(tail_lines(&path, 2).unwrap(), vec!["b", "c"]);
+        assert_eq!(tail_lines(&path, 10).unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn strict_exits_4_only_when_a_capture_check_fails() {
+        use crate::commands::output::ErrorKind;
+
+        let all_passed = output_for(vec![make_check(DoctorStatus::Passed)]);
+        assert!(doctor_failure(&all_passed, true).is_none());
+        assert!(doctor_failure(&all_passed, false).is_none());
+
+        // A setup failure is a failed check (1) with or without --strict.
+        let setup_failed = output_for(vec![make_check(DoctorStatus::Failed)]);
+        assert_eq!(
+            doctor_failure(&setup_failed, true).unwrap().0,
+            ErrorKind::CheckFailed
+        );
+
+        // A trace2 failure is a failed check by default and broken capture
+        // (4) under --strict.
+        let mut trace2 = make_check(DoctorStatus::Failed);
+        trace2.section = SECTION_TRACE2;
+        trace2.name = "trace2 config".to_string();
+        let capture_failed = output_for(vec![make_check(DoctorStatus::Failed), trace2]);
+        assert!(!capture_failed.capture_ok);
+        assert_eq!(
+            doctor_failure(&capture_failed, false).unwrap().0,
+            ErrorKind::CheckFailed
+        );
+        let (kind, message) = doctor_failure(&capture_failed, true).unwrap();
+        assert_eq!(kind, ErrorKind::CaptureBroken);
+        assert_eq!(kind.exit_code(), 4);
+        assert!(message.contains("trace2 config"), "{message}");
     }
 
     #[test]
@@ -2017,6 +2737,27 @@ mod tests {
     }
 
     #[test]
+    fn usage_metrics_set_aside_events_are_a_warning_that_says_how_many_and_what_to_do() {
+        let status = metrics_status_after(&[], 0)
+            .with_set_aside(2, Some("HTTP 500: Data-plane operation failed".to_string()));
+        let check = usage_metrics_check(&status, true);
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(
+            check
+                .summary
+                .contains("2 usage-metrics events are set aside")
+        );
+        let fix = check.remediation.as_deref().unwrap();
+        assert!(fix.contains("autter sync retry"), "{fix}");
+        assert!(!fix.contains("bg restart"), "{fix}");
+        insta::assert_snapshot!(render_check(&check));
+
+        // Nothing set aside: no mention of it.
+        let check = usage_metrics_check(&metrics_status_after(&[], 0), true);
+        assert!(!render_check(&check).contains("set aside"));
+    }
+
+    #[test]
     fn usage_metrics_in_local_mode_pass() {
         let timeout = crate::api::metrics::MetricsUploadFailure::Timeout {
             after_secs: Some(30),
@@ -2029,6 +2770,87 @@ mod tests {
     #[test]
     fn trace2_remediations_never_send_people_back_to_onboard() {
         assert!(!REMEDIATION_TRACE2_THEN_ATTRIBUTION.contains("onboard"));
+    }
+
+    #[test]
+    fn a_machine_that_was_never_set_up_gets_one_root_cause() {
+        let check =
+            |section: &'static str, name: &str, status, summary: &str, fix: Option<&str>| {
+                DoctorCheck {
+                    section,
+                    name: name.to_string(),
+                    status,
+                    summary: summary.to_string(),
+                    details: Vec::new(),
+                    remediation: fix.map(str::to_string),
+                }
+            };
+        let fresh_install = vec![
+            check(
+                SECTION_SERVICE,
+                "background service",
+                DoctorStatus::Skipped,
+                "not running; starts after setup (`autter onboard`)",
+                None,
+            ),
+            check(
+                SECTION_TRACE2,
+                "trace2 config (configured git)",
+                DoctorStatus::Failed,
+                "trace2 global config is not configured",
+                Some("run `autter install --system`"),
+            ),
+            check(
+                SECTION_TRACE2,
+                "trace2 config (terminal git)",
+                DoctorStatus::Failed,
+                "trace2 global config is not configured",
+                Some("run `autter install --system`"),
+            ),
+            check(
+                SECTION_AGENTS,
+                "Claude Code",
+                DoctorStatus::Failed,
+                "detected, but autter hooks are NOT installed -- its edits are not captured",
+                Some("run `autter install-hooks`, then restart Claude Code"),
+            ),
+        ];
+        let root = root_cause_from_checks(&fresh_install).expect("one root cause");
+        assert!(
+            root.what.contains("has not been set up yet"),
+            "{}",
+            root.what
+        );
+        assert!(
+            root.what.contains("3 of the failed checks"),
+            "{}",
+            root.what
+        );
+        // The next step is setup, not the first failed check's own fix.
+        let step = next_step_from_checks(&fresh_install).unwrap();
+        assert!(step.contains("autter onboard"), "{step}");
+        assert!(!step.contains("install --system"), "{step}");
+
+        // Once set up (the service check ran), the same failures keep their
+        // own fixes: onboarding is done and would not repair them.
+        let mut set_up = fresh_install;
+        set_up[0].status = DoctorStatus::Passed;
+        set_up[0].summary = "running".to_string();
+        assert!(root_cause_from_checks(&set_up).is_none());
+        assert_eq!(
+            next_step_from_checks(&set_up).as_deref(),
+            Some("run `autter install --system`")
+        );
+
+        // Never set up but nothing failing: no root cause to name.
+        let quiet = vec![check(
+            SECTION_SERVICE,
+            "background service",
+            DoctorStatus::Skipped,
+            "not running; starts after setup (`autter onboard`)",
+            None,
+        )];
+        assert!(root_cause_from_checks(&quiet).is_none());
     }
 
     #[test]

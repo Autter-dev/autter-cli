@@ -106,7 +106,9 @@ const ASCII_GLYPHS: Glyphs = Glyphs {
 impl TermCaps {
     /// Detect the capabilities of stderr in this process.
     pub fn detect() -> Self {
-        let tty = std::io::stderr().is_terminal();
+        // CI logs may be attached to a pseudo-terminal; treat them as plain
+        // output all the same (no prompts, spinners or full-screen layouts).
+        let tty = std::io::stderr().is_terminal() && !crate::commands::output::ci_mode();
         let colors_on = crate::commands::arg_parser::use_color_stderr();
         let width = console::Term::stderr()
             .size_checked()

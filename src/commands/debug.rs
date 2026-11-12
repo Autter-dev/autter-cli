@@ -440,7 +440,11 @@ fn collect_agent_capture_info() -> Vec<String> {
 
     let mut lines = Vec::new();
 
-    let binary_path = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("autter"));
+    // The binary `autter install-hooks` writes into hook commands, as `autter
+    // doctor` uses, so both report the same hooks as current.
+    let binary_path = crate::mdm::utils::resolve_hook_binary_path()
+        .or_else(|_| env::current_exe())
+        .unwrap_or_else(|_| std::path::PathBuf::from("autter"));
     let params = HookInstallerParams { binary_path };
 
     lines.push("Hooks status by agent (managed by `autter install-hooks`):".to_string());
@@ -547,6 +551,14 @@ fn collect_vscode_native_hooks_chain() -> Vec<String> {
     inspect_vscode_native_hooks_chain().lines
 }
 
+/// Whether this `code --version` output is a build with native agent hooks
+/// (>= [`crate::mdm::utils::MIN_VSCODE_NATIVE_HOOKS_VERSION`]); `None` when
+/// it holds no version number.
+fn vscode_uses_native_hooks(version_output: &str) -> Option<bool> {
+    crate::mdm::utils::parse_version_triple(version_output)
+        .map(|version| version >= crate::mdm::utils::MIN_VSCODE_NATIVE_HOOKS_VERSION)
+}
+
 /// Walk the chain VS Code's built-in Copilot agent needs for AI edits to
 /// checkpoint on VS Code >= 1.109.3: the autter extension stands down there
 /// and capture only happens if VS Code loads ~/.copilot/hooks/autter.json.
@@ -581,9 +593,18 @@ pub(crate) fn inspect_vscode_native_hooks_chain() -> VsCodeNativeHooksChain {
     lines.push(format!("  VS Code version: {}", first_line));
 
     let (min_major, min_minor, min_patch) = MIN_VSCODE_NATIVE_HOOKS_VERSION;
-    let native_mode = parse_version_triple(&version_str)
-        .map(|v| v >= MIN_VSCODE_NATIVE_HOOKS_VERSION)
-        .unwrap_or(false);
+    // A version that cannot be read is unknown, not old: saying it "predates
+    // native agent hooks" sent users of current VS Code builds down the
+    // wrong path.
+    let Some(native_mode) = vscode_uses_native_hooks(&version_str) else {
+        lines.push(
+            "  Capture mode: unknown (that is not a version number autter can read)".to_string(),
+        );
+        return VsCodeNativeHooksChain {
+            outcome: VsCodeChainOutcome::VersionUnknown,
+            lines,
+        };
+    };
 
     if !native_mode {
         lines.push(format!(
@@ -1478,7 +1499,7 @@ fn collect_platform_info() -> PlatformInfo {
     }
 }
 
-fn collect_kernel_details() -> Option<String> {
+pub(crate) fn collect_kernel_details() -> Option<String> {
     #[cfg(unix)]
     {
         run_command_capture("uname", &["-srm"]).ok()
@@ -1793,6 +1814,53 @@ fn should_redact_key_value(key: &str, value: &str) -> bool {
         .any(|marker| value_lower.contains(marker))
 }
 
+/// Redact secrets from a line of free text (a log line, an error), for
+/// reports people send to support: everything after a sensitive word
+/// (`token`, `password`, `authorization`, ...) and the credentials in a
+/// `scheme://user:pass@host` URL. Same markers as the git config redaction.
+pub(crate) fn redact_free_text(line: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "oauth",
+        "authorization",
+        "bearer",
+        "apikey",
+        "api_key",
+        "api-key",
+        "extraheader",
+        "cookie",
+    ];
+    // ASCII lowercasing keeps byte offsets, so they index `line` too.
+    let lower = line.to_ascii_lowercase();
+    let mut out = match MARKERS
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|at| at + marker.len()))
+        .min()
+    {
+        Some(end) => format!("{}[REDACTED]", &line[..end]),
+        None => line.to_string(),
+    };
+    // user:pass@ in URLs.
+    let mut search_from = 0;
+    while let Some(scheme) = out[search_from..].find("://").map(|i| i + search_from + 3) {
+        let rest = &out[scheme..];
+        let host_end = rest
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        match rest[..host_end].rfind('@') {
+            Some(at) => {
+                out.replace_range(scheme..scheme + at, "[REDACTED]");
+                search_from = scheme + "[REDACTED]".len();
+            }
+            None => search_from = scheme,
+        }
+    }
+    out
+}
+
 fn collect_autter_config_dump() -> Result<String, String> {
     let runtime = config::Config::get();
     let mut out = String::new();
@@ -1862,6 +1930,26 @@ fn redact_env_value(key: &str, value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn vscode_version_decides_native_hooks_and_unreadable_is_unknown() {
+        // `code --version` prints the version, the commit and the arch.
+        assert_eq!(
+            vscode_uses_native_hooks("1.144.1\n4e71e1d1a2a2f1b3c0d9\nx64"),
+            Some(true)
+        );
+        assert_eq!(vscode_uses_native_hooks("1.109.3"), Some(true));
+        assert_eq!(vscode_uses_native_hooks("1.110.0-insider"), Some(true));
+        assert_eq!(vscode_uses_native_hooks("1.109.2"), Some(false));
+        assert_eq!(vscode_uses_native_hooks("1.99.0"), Some(false));
+        // No version number: unknown, never "predates native agent hooks".
+        assert_eq!(vscode_uses_native_hooks(""), None);
+        assert_eq!(vscode_uses_native_hooks("Code.exe"), None);
+        assert_eq!(
+            vscode_uses_native_hooks("Warning: 'sandbox' is not in the list of known options"),
+            None
+        );
+    }
+
     #[cfg(not(windows))]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
         (
@@ -1880,6 +1968,28 @@ mod tests {
                 "[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Seconds 60",
             ],
         )
+    }
+
+    #[test]
+    fn free_text_redaction_drops_secrets_and_url_credentials() {
+        assert_eq!(
+            redact_free_text("upload failed: Authorization: Bearer abc.def"),
+            "upload failed: Authorization[REDACTED]"
+        );
+        assert_eq!(
+            redact_free_text("refresh_token=xyz retrying"),
+            "refresh_token[REDACTED]"
+        );
+        assert_eq!(
+            redact_free_text("fetch https://me:hunter2@example.com/repo.git failed"),
+            "fetch https://[REDACTED]@example.com/repo.git failed"
+        );
+        let plain = "2026-11-12T10:00:00Z INFO commit abc123 applied in /home/dev/repo";
+        assert_eq!(redact_free_text(plain), plain);
+        assert_eq!(
+            redact_free_text("ünïcode TOKEN: x"),
+            "ünïcode TOKEN[REDACTED]"
+        );
     }
 
     #[test]

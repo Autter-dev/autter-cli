@@ -214,7 +214,7 @@ impl HookInstaller for WindsurfInstaller {
         vec!["Windsurf", "windsurf"]
     }
 
-    fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
+    fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_cli = resolve_editor_cli("windsurf").is_some();
         let has_dotfiles =
             home_dir().join(".codeium").exists() || home_dir().join(".windsurf").exists();
@@ -262,10 +262,15 @@ impl HookInstaller for WindsurfInstaller {
             }
         }
 
+        // The loop above finds an autter command without reading which
+        // binary it runs; the installer's dry run does.
+        let hooks_up_to_date =
+            all_installed && crate::mdm::hook_refresh::install_would_change_nothing(self, params);
+
         Ok(HookCheckResult {
             tool_installed: true,
             hooks_installed: any_installed,
-            hooks_up_to_date: all_installed,
+            hooks_up_to_date,
         })
     }
 

@@ -1,7 +1,7 @@
 use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
-use crate::authorship::stats::stats_command;
+use crate::authorship::stats::{CaptureStatus, commit_stats_report, print_commit_stats_report};
 use crate::commands;
 use crate::config;
 use crate::daemon::ControlRequest;
@@ -50,17 +50,29 @@ pub fn handle_autter(args: &[String]) {
             if invoked_by_agent_hook(args) {
                 exit_stale_hook(&e.to_string());
             }
-            eprintln!("error: {}", e);
-            std::process::exit(2);
+            // The leading flags could not be parsed, so `--json` among them
+            // was never recorded: look for it, so the error is JSON too.
+            commands::arg_parser::merge_json_flag_from(args);
+            commands::output::fail(commands::output::ErrorKind::Usage, format!("error: {}", e));
         }
     };
+    commands::arg_parser::merge_global_flags(&leading.flags);
+    // A reporting command takes `--json` after its name as well. Record it
+    // here, before anything the dispatcher itself can fail on (`-C`, the
+    // background service), so those failures print a JSON document too.
+    if let Some(command) = leading.rest.first()
+        && is_reporting_command(command)
+    {
+        commands::arg_parser::merge_json_flag_from(&leading.rest[1..]);
+    }
     if let Some(path) = leading.flags.change_dir.as_deref()
         && let Err(e) = std::env::set_current_dir(path)
     {
-        eprintln!("error: cannot change to '{}': {}", path, e);
-        std::process::exit(1);
+        commands::output::fail(
+            commands::output::ErrorKind::Runtime,
+            format!("error: cannot change to '{}': {}", path, e),
+        );
     }
-    commands::arg_parser::merge_global_flags(&leading.flags);
 
     // `-h`/`--help` before any subcommand: overview, or per-command help when a
     // command name follows (`autter --help status`).
@@ -156,6 +168,10 @@ pub fn handle_autter(args: &[String]) {
             args[0].as_str() == "checkpoint" || crate::config::collection_consented_now();
         match init_daemon_telemetry_handle_with(allow_spawn) {
             DaemonTelemetryInitResult::Connected | DaemonTelemetryInitResult::Skipped => {}
+            // A command that does not exist fails as one whether or not the
+            // service is up (`autter stat --json` is a usage error with its
+            // one JSON document), so it is left to the dispatcher below.
+            DaemonTelemetryInitResult::Failed(_) if !is_autter_command(args[0].as_str()) => {}
             DaemonTelemetryInitResult::Failed(err) => {
                 eprintln!(
                     "error: failed to connect to autter background service: {}",
@@ -163,11 +179,21 @@ pub fn handle_autter(args: &[String]) {
                 );
                 commands::suggest_autter_doctor();
                 // Agent hooks never fail the agent: right after an upgrade the
-                // old service may be stopping while the new one starts.
+                // old service may be stopping while the new one starts. That
+                // holds for a hook subcommand this autter does not have, too.
                 if matches!(args[0].as_str(), "checkpoint" | "memory-hook") {
                     std::process::exit(0);
                 }
-                std::process::exit(1);
+                if has_hook_input_arg(args) {
+                    answer_hook_noop();
+                    std::process::exit(0);
+                }
+                // Exit 1. With `--json` the caller still gets its one
+                // document; the message and the hint are on stderr already.
+                commands::output::fail_reported(
+                    commands::output::ErrorKind::ServiceUnreachable,
+                    format!("failed to connect to autter background service: {}", err),
+                );
             }
         }
     }
@@ -403,10 +429,102 @@ pub fn handle_autter(args: &[String]) {
             handle_notes_subcommand(&args[1..]);
         }
         _ => {
-            eprintln!("Unknown autter command: {}", args[0]);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+            // A hook written by another autter version can name a subcommand
+            // this one does not have (a downgrade, or a renamed command).
+            // Exit 2 is the code Claude Code treats as "block the tool call",
+            // so a hook gets the stale-hook answer instead: `{}` and exit 0.
+            if has_hook_input_arg(args) {
+                answer_hook_noop();
+                exit_stale_hook(&format!("unknown command '{}'", args[0]));
+            }
+            // `autter stat --json` (a typo) still answers with one document.
+            commands::arg_parser::merge_json_flag_from(&args[1..]);
+            commands::output::fail(
+                commands::output::ErrorKind::Usage,
+                format!("Unknown autter command: {}", args[0]),
+            );
         }
     }
+}
+
+/// Every command the dispatcher in [`handle_autter`] has an arm for. Keep the
+/// two in step: a command missing here is reported as unknown when the
+/// background service cannot be reached.
+const AUTTER_COMMANDS: &[&str] = &[
+    "--help",
+    "--version",
+    "-h",
+    "-v",
+    "ask",
+    "badge",
+    "bg",
+    "blame",
+    "blame-analysis",
+    "checkpoint",
+    "ci",
+    "config",
+    "context",
+    "d",
+    "daemon",
+    "dash",
+    "dashboard",
+    "debug",
+    "diff",
+    "doctor",
+    "effective-ignore-patterns",
+    "exchange-nonce",
+    "fetch-authorship-notes",
+    "fetch-notes",
+    "fetch_authorship_notes",
+    "file-changes",
+    "flush-metrics-db",
+    "git-hooks",
+    "git-path",
+    "help",
+    "install",
+    "install-hooks",
+    "log",
+    "login",
+    "logout",
+    "logs",
+    "mcp",
+    "memory",
+    "memory-hook",
+    "notes",
+    "onboard",
+    "onboarding",
+    "personal-dashboard",
+    "personal_dashboard",
+    "push-authorship-notes",
+    "push_authorship_notes",
+    "setup",
+    "show",
+    "show-prompt",
+    "squash-authorship",
+    "stats",
+    "status",
+    "sync",
+    "telemetry",
+    "threads",
+    "uninstall",
+    "uninstall-hooks",
+    "upgrade",
+    "version",
+    "whoami",
+    "wrapped",
+];
+
+fn is_autter_command(command: &str) -> bool {
+    AUTTER_COMMANDS.contains(&command)
+}
+
+/// The commands whose `--json` output is a documented contract
+/// (docs/scripting.md). `sync` is here for `sync status`.
+fn is_reporting_command(command: &str) -> bool {
+    matches!(
+        command,
+        "stats" | "status" | "log" | "show" | "blame" | "diff" | "whoami" | "doctor" | "sync"
+    )
 }
 
 /// Dispatch `autter notes <subcommand>` commands.
@@ -734,6 +852,39 @@ fn handle_checkpoint(args: &[String]) {
     // beats losing the data.
     const CHECKPOINT_DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    // The service acknowledges a checkpoint with a receipt as soon as it has
+    // read it, before processing it: about a millisecond on a healthy
+    // service, however busy it is with other work. Without a receipt the
+    // checkpoint cannot be assumed recorded (the connection may sit queued
+    // behind others, or the service may be stuck), so the send is retried
+    // once and then reported.
+    //
+    // A hook runs before and after every edit an agent makes, so it waits
+    // for nothing but the receipt, and not for long: 200 ms is two orders of
+    // magnitude above a healthy receipt, and the agent only ever waits that
+    // long when something is wrong. A direct run waits as long as any other
+    // control request does for its answer, and then up to as long again for
+    // the service to say whether it could record the checkpoint.
+    const HOOK_CHECKPOINT_RECEIPT_WAIT: crate::daemon::CheckpointReceiptWait =
+        crate::daemon::CheckpointReceiptWait {
+            receipt: std::time::Duration::from_millis(200),
+            outcome: std::time::Duration::ZERO,
+        };
+    const DIRECT_CHECKPOINT_RECEIPT_WAIT: crate::daemon::CheckpointReceiptWait =
+        crate::daemon::CheckpointReceiptWait {
+            receipt: std::time::Duration::from_secs(2),
+            outcome: std::time::Duration::from_secs(2),
+        };
+    let receipt_wait = if hook_mode {
+        HOOK_CHECKPOINT_RECEIPT_WAIT
+    } else {
+        DIRECT_CHECKPOINT_RECEIPT_WAIT
+    };
+    // Before a resend. Longer than the 50 ms the service backs off after a
+    // connection it could not serve, so the resend is not left queued behind
+    // that pause.
+    const CHECKPOINT_RESEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
     let mut sent_count = 0u64;
     // Session-activity requests wake the transcript reader and record no
     // checkpoint, so they are counted apart from checkpoints.
@@ -746,13 +897,27 @@ fn handle_checkpoint(args: &[String]) {
             crate::commands::checkpoint_agent::orchestrator::is_session_activity(&request);
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
+            receipt: true,
         };
-        let mut send_result =
-            crate::daemon::send_control_request_fire_and_forget(&active_socket, &control_request);
+        let mut send_result = crate::daemon::send_checkpoint_with_receipt(
+            &active_socket,
+            &control_request,
+            receipt_wait,
+        );
+        // A checkpoint sent without a receipt may still be recorded, even if
+        // the resend then fails outright.
+        let mut maybe_recorded = matches!(
+            send_result,
+            Err(crate::daemon::CheckpointSendError::Unconfirmed(_))
+        );
 
         // A failed send almost always means the daemon is down (crashed, never
-        // started, or restarting). Rather than dropping the checkpoint — which
-        // silently loses the session's steps — spawn the daemon and retry once.
+        // started, or restarting), that it took the connection and closed it
+        // without handling the request (overloaded, or shutting down), or
+        // that it did not confirm it (stuck, or the connection is queued
+        // behind others). Rather than dropping the checkpoint — which
+        // silently loses the session's steps — spawn the daemon and retry
+        // once.
         // `ensure_daemon_running` is a no-op when the daemon is already up, so a
         // transient blip is retried too. Only attempt the spawn once per call.
         if send_result.is_err() && !tried_spawn {
@@ -760,9 +925,15 @@ fn handle_checkpoint(args: &[String]) {
             match crate::commands::daemon::ensure_daemon_running(CHECKPOINT_DAEMON_SPAWN_TIMEOUT) {
                 Ok(spawned) => {
                     active_socket = spawned.control_socket_path;
-                    send_result = crate::daemon::send_control_request_fire_and_forget(
+                    std::thread::sleep(CHECKPOINT_RESEND_PAUSE);
+                    send_result = crate::daemon::send_checkpoint_with_receipt(
                         &active_socket,
                         &control_request,
+                        receipt_wait,
+                    );
+                    maybe_recorded |= matches!(
+                        send_result,
+                        Err(crate::daemon::CheckpointSendError::Unconfirmed(_))
                     );
                 }
                 Err(e) => {
@@ -794,12 +965,17 @@ fn handle_checkpoint(args: &[String]) {
                 crate::commands::checkpoint_agent::hook_heartbeat::HookOutcome::Error,
                 Some(&format!("could not reach the background service: {}", e)),
             );
-            exit_checkpoint_not_captured(
-                hook_mode,
-                &format!(
+            let message = if maybe_recorded {
+                format!("Checkpoint may not have been recorded: {}", e)
+            } else {
+                format!(
                     "Failed to send checkpoint to background worker, checkpoint dropped: {}",
                     e
-                ),
+                )
+            };
+            exit_checkpoint_not_captured(
+                hook_mode,
+                &message,
                 &format!(
                     "run `{}`, then `autter doctor`",
                     crate::commands::daemon::RESTART_COMMAND
@@ -876,9 +1052,15 @@ fn checkpoint_runs_in_hook(preset: &str, has_hook_input: bool, hook_env: bool) -
 /// person: every hook autter installs passes `--hook-input`, and editor
 /// extensions set `AUTTER_CHECKPOINT_HOOK`.
 fn invoked_by_agent_hook(args: &[String]) -> bool {
+    has_hook_input_arg(args) || env_flag_set("AUTTER_CHECKPOINT_HOOK")
+}
+
+/// `--hook-input` on the command line: only an agent's hook config passes it.
+/// Used where the subcommand is not a checkpoint, so `AUTTER_CHECKPOINT_HOOK`
+/// left in a shell's environment never turns a person's command into a hook.
+fn has_hook_input_arg(args: &[String]) -> bool {
     args.iter()
         .any(|a| a == "--hook-input" || a.starts_with("--hook-input="))
-        || env_flag_set("AUTTER_CHECKPOINT_HOOK")
 }
 
 static HOOK_NOOP_ANSWERED: std::sync::atomic::AtomicBool =
@@ -1184,22 +1366,24 @@ fn handle_ai_blame(args: &[String]) {
     // LeadingOnly + no -C recognition: blame forwards git-style flags (e.g. `-C`
     // means copy detection here). Any leading `-C <path>` was already consumed
     // at the top level in handle_autter.
+    use crate::commands::output::{self, ErrorKind};
     let pp = match commands::arg_parser::pre_parse(
         args,
         commands::arg_parser::ScanMode::LeadingOnly,
         false,
     ) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         commands::arg_parser::print_command_help("blame");
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
+    // `blame` and `diff` parse their own trailing `--json` (after the file or
+    // revision, where the shared pre-parser stops). Record it globally as
+    // well, so their errors are JSON too.
+    commands::arg_parser::merge_json_flag_from(&pp.rest);
     // `-i`/`--interactive` is autter's own (git blame has no `-i`), so it is
     // taken out before the git-compatible flags are parsed.
     let interactive = pp
@@ -1222,11 +1406,9 @@ fn handle_ai_blame(args: &[String]) {
         if let Ok(repo) = find_repository_in_path(&current_dir) {
             commands::usage_hints::eprint_missing_blame_args(&repo);
         } else {
-            eprintln!("Error: blame requires a file argument");
-            eprintln!();
             eprintln!("Usage: autter blame <file>");
         }
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        output::fail(ErrorKind::Usage, "Error: blame requires a file argument");
     }
 
     // Find the git repository from current directory
@@ -1242,10 +1424,10 @@ fn handle_ai_blame(args: &[String]) {
     // Parse blame arguments
     let (file_path, mut options) = match commands::blame::parse_blame_args(args) {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Failed to parse blame arguments: {}", e);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-        }
+        Err(e) => output::fail(
+            ErrorKind::Usage,
+            format!("Failed to parse blame arguments: {}", e),
+        ),
     };
     // Honor a global `--json` supplied before the file positional (stripped by
     // the shared pre-parser) as well as blame's own trailing `--json`.
@@ -1291,8 +1473,10 @@ fn handle_ai_blame(args: &[String]) {
     if is_interactive && options.incremental {
         // For incremental mode in interactive terminal, we need special handling
         // This would typically involve a pager like less
-        eprintln!("Error: incremental mode is not supported in interactive terminal");
-        std::process::exit(1);
+        output::fail(
+            ErrorKind::Usage,
+            "Error: incremental mode is not supported in interactive terminal",
+        );
     }
 
     let file_path = if !std::path::Path::new(&file_path).is_absolute() {
@@ -1308,8 +1492,7 @@ fn handle_ai_blame(args: &[String]) {
     if interactive {
         if commands::interactive::available() && !options.json {
             if let Err(e) = commands::interactive::blame::run(&repo, &file_path, &options) {
-                eprintln!("Blame failed: {}", e);
-                std::process::exit(1);
+                output::fail(ErrorKind::Runtime, format!("Blame failed: {}", e));
             }
             return;
         }
@@ -1317,28 +1500,29 @@ fn handle_ai_blame(args: &[String]) {
     }
 
     if let Err(e) = repo.blame(&file_path, &options) {
-        eprintln!("Blame failed: {}", e);
-        std::process::exit(1);
+        output::fail(output::error_kind(&e), format!("Blame failed: {}", e));
     }
 }
 
 fn handle_ai_diff(args: &[String]) {
+    use crate::commands::output::{self, ErrorKind};
     let pp = match commands::arg_parser::pre_parse(
         args,
         commands::arg_parser::ScanMode::LeadingOnly,
         false,
     ) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
-        }
+        Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
     };
     if pp.flags.help {
         commands::arg_parser::print_command_help("diff");
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
+    // `blame` and `diff` parse their own trailing `--json` (after the file or
+    // revision, where the shared pre-parser stops). Record it globally as
+    // well, so their errors are JSON too.
+    commands::arg_parser::merge_json_flag_from(&pp.rest);
     let args = &pp.rest;
 
     let current_dir = env::current_dir()
@@ -1351,19 +1535,17 @@ fn handle_ai_diff(args: &[String]) {
     };
 
     if let Err(e) = commands::diff::handle_diff(&repo, args) {
-        eprintln!("Diff failed: {}", e);
-        std::process::exit(1);
+        output::fail(output::error_kind(&e), format!("Diff failed: {}", e));
     }
 }
 
 fn handle_stats(args: &[String]) {
+    use crate::commands::output::{self, ErrorKind};
+
     let pp =
         match commands::arg_parser::pre_parse(args, commands::arg_parser::ScanMode::Full, false) {
             Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                std::process::exit(2);
-            }
+            Err(e) => output::fail(ErrorKind::Usage, format!("error: {}", e)),
         };
     if pp.flags.help {
         commands::arg_parser::print_command_help("stats");
@@ -1375,12 +1557,11 @@ fn handle_stats(args: &[String]) {
     // Find the git repository
     let repo = match find_repository(&Vec::<String>::new()) {
         Ok(repo) => repo,
-        Err(e) => {
-            commands::exit_repository_error("stats", &e);
-        }
+        Err(e) => commands::exit_repository_error("stats", &e),
     };
     // Parse stats-specific arguments
     let json_output = commands::arg_parser::json();
+    let strict = output::strict();
     let mut commit_sha = None;
     let mut commit_range: Option<CommitRange> = None;
     let mut ignore_patterns: Vec<String> = Vec::new();
@@ -1423,8 +1604,10 @@ fn handle_stats(args: &[String]) {
                     i += 1;
                 }
                 if !found_pattern {
-                    eprintln!("--ignore requires at least one pattern argument");
-                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                    output::fail(
+                        ErrorKind::Usage,
+                        "--ignore requires at least one pattern argument",
+                    );
                 }
             }
             "--wait" => {
@@ -1435,10 +1618,10 @@ fn handle_stats(args: &[String]) {
                 let raw = &flag["--wait=".len()..];
                 match raw.parse::<u64>() {
                     Ok(secs) => wait_secs = Some(secs.max(1)),
-                    Err(_) => {
-                        eprintln!("--wait expects a positive number of seconds");
-                        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
-                    }
+                    Err(_) => output::fail(
+                        ErrorKind::Usage,
+                        "--wait expects a positive number of seconds",
+                    ),
                 }
                 i += 1;
             }
@@ -1461,22 +1644,29 @@ fn handle_stats(args: &[String]) {
                                 Ok(range) => {
                                     commit_range = Some(range);
                                 }
-                                Err(e) => {
-                                    eprintln!("Failed to create commit range: {}", e);
-                                    std::process::exit(1);
-                                }
+                                Err(e) => output::fail(
+                                    ErrorKind::RevisionNotFound,
+                                    format!("Failed to create commit range: {}", e),
+                                ),
                             }
                         } else {
-                            eprintln!("Invalid commit range format. Expected: <commit>..<commit>");
-                            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                            output::fail(
+                                ErrorKind::Usage,
+                                "Invalid commit range format. Expected: <commit>..<commit>",
+                            );
                         }
+                    } else if arg.starts_with('-') {
+                        // A revision never starts with `-`: this is a mistyped flag.
+                        commands::arg_parser::exit_unknown_option("stats", arg);
                     } else {
                         commit_sha = Some(normalize_head_rev(arg));
                     }
                     i += 1;
                 } else {
-                    eprintln!("Unknown stats argument: {}", args[i]);
-                    std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+                    output::fail(
+                        ErrorKind::Usage,
+                        format!("Unknown stats argument: {}", args[i]),
+                    );
                 }
             }
         }
@@ -1486,8 +1676,7 @@ fn handle_stats(args: &[String]) {
     // whether the records reached the remote.
     if coverage {
         if let Err(e) = commands::coverage::run_coverage(&repo, raw_spec.as_deref(), json_output) {
-            eprintln!("Coverage failed: {}", e);
-            std::process::exit(1);
+            output::fail(ErrorKind::Runtime, format!("Coverage failed: {}", e));
         }
         return;
     }
@@ -1496,8 +1685,7 @@ fn handle_stats(args: &[String]) {
     if interactive {
         if commands::interactive::available() && !json_output {
             if let Err(e) = commands::interactive::stats::run(&repo, commit_sha.as_deref()) {
-                eprintln!("{}", e);
-                std::process::exit(1);
+                output::fail(ErrorKind::Runtime, e.to_string());
             }
             return;
         }
@@ -1508,19 +1696,29 @@ fn handle_stats(args: &[String]) {
 
     // Handle commit range if detected
     if let Some(range) = commit_range {
+        let (start, end) = (range.start_oid.clone(), range.end_oid.clone());
         match range_authorship::range_authorship(range, false, &effective_patterns, None) {
             Ok(stats) => {
+                let report = range_authorship::RangeStatsReport::new(start, end, stats);
+                let status = report.summary.capture.status;
                 if json_output {
-                    let json_str = serde_json::to_string(&stats).unwrap();
-                    println!("{}", json_str);
+                    if strict && status == CaptureStatus::NothingCaptured {
+                        output::fail_with(
+                            ErrorKind::NothingCaptured,
+                            nothing_captured_message("this range"),
+                            Some(&report),
+                        );
+                    }
+                    output::print_json(&report);
                 } else {
-                    range_authorship::print_range_authorship_stats(&stats);
+                    range_authorship::print_range_authorship_stats(&report.stats);
                 }
+                exit_if_nothing_captured(strict, status, "this range");
             }
-            Err(e) => {
-                eprintln!("Range authorship failed: {}", e);
-                std::process::exit(1);
-            }
+            Err(e) => output::fail(
+                ErrorKind::Runtime,
+                format!("Range authorship failed: {}", e),
+            ),
         }
         return;
     }
@@ -1529,17 +1727,14 @@ fn handle_stats(args: &[String]) {
         let sha = match commit_sha.as_deref() {
             Some(s) => match repo.revparse_single(s) {
                 Ok(obj) => obj.id(),
-                Err(e) => {
-                    eprintln!("Failed to resolve commit: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => output::fail(
+                    ErrorKind::RevisionNotFound,
+                    format!("Failed to resolve commit: {e}"),
+                ),
             },
             None => match repo.head().and_then(|h| h.target()) {
                 Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to resolve HEAD: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => output::fail(ErrorKind::Runtime, format!("Failed to resolve HEAD: {e}")),
             },
         };
         let timeout = std::time::Duration::from_secs(secs);
@@ -1554,46 +1749,69 @@ fn handle_stats(args: &[String]) {
             std::thread::sleep(poll);
         }
         if !found {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "pending": true,
-                        "commit": sha,
-                        "waited_secs": secs,
-                        "error": "authorship note not ready"
-                    })
-                );
-            } else {
-                eprintln!(
+            #[derive(Serialize)]
+            struct Pending<'a> {
+                pending: bool,
+                commit: &'a str,
+                waited_secs: u64,
+            }
+            output::fail_with(
+                ErrorKind::NotePending,
+                format!(
                     "pending: authorship note for {} not ready after {}s (daemon still processing?)",
                     &sha[..std::cmp::min(8, sha.len())],
                     secs
-                );
-            }
-            std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
+                ),
+                Some(&Pending {
+                    pending: true,
+                    commit: &sha,
+                    waited_secs: secs,
+                }),
+            );
         }
     }
 
-    if let Err(e) = stats_command(
-        &repo,
-        commit_sha.as_deref(),
-        json_output,
-        &effective_patterns,
-    ) {
-        match e {
-            crate::error::AutterError::Generic(msg) if msg.starts_with("No commit found:") => {
-                eprintln!("{}", msg);
-            }
-            _ => {
-                eprintln!("Stats failed: {}", e);
-            }
+    let report = match commit_stats_report(&repo, commit_sha.as_deref(), &effective_patterns) {
+        Ok(report) => report,
+        Err(crate::error::AutterError::Generic(msg)) if msg.starts_with("No commit found:") => {
+            output::fail(ErrorKind::RevisionNotFound, msg)
         }
-        std::process::exit(1);
+        Err(_) if commit_sha.is_none() && commands::repository_has_no_commits(&repo) => {
+            output::fail(ErrorKind::Runtime, commands::no_commits_message("stats"))
+        }
+        Err(e) => output::fail(ErrorKind::Runtime, format!("Stats failed: {}", e)),
+    };
+    let status = report.summary.capture.status;
+    if json_output && strict && status == CaptureStatus::NothingCaptured {
+        output::fail_with(
+            ErrorKind::NothingCaptured,
+            nothing_captured_message("this commit"),
+            Some(&report),
+        );
+    }
+    print_commit_stats_report(&report, json_output);
+    exit_if_nothing_captured(strict, status, "this commit");
+}
+
+/// The `--strict` failure message for `stats`.
+fn nothing_captured_message(what: &str) -> String {
+    format!(
+        "nothing captured: autter has no record of the lines added in {what} (--strict). Run `autter doctor` to check capture."
+    )
+}
+
+/// `--strict` without `--json`: the human output is already printed; exit 3
+/// when nothing was captured.
+fn exit_if_nothing_captured(strict: bool, status: CaptureStatus, what: &str) {
+    if strict && status == CaptureStatus::NothingCaptured {
+        crate::commands::output::fail(
+            crate::commands::output::ErrorKind::NothingCaptured,
+            nothing_captured_message(what),
+        );
     }
 }
 
-/// Normalise a revision token that the user may have typed with a lowercase
+// Normalise a revision token that the user may have typed with a lowercase
 /// "head" prefix.  On case-insensitive file systems (macOS) git accepts both
 /// "head" and "HEAD", but in a linked worktree "head" can resolve to the
 /// *main* repository's HEAD file rather than the worktree's own HEAD, so the
@@ -1815,6 +2033,31 @@ mod checkpoint_exit_policy_tests {
             assert!(!checkpoint_runs_in_hook(preset, false, false), "{preset}");
             assert!(checkpoint_runs_in_hook(preset, true, false), "{preset}");
             assert!(checkpoint_runs_in_hook(preset, false, true), "{preset}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_list_tests {
+    use super::is_autter_command;
+
+    #[test]
+    fn every_documented_command_is_a_known_command() {
+        for command in crate::commands::arg_parser::documented_commands() {
+            assert!(
+                is_autter_command(command),
+                "`autter {command}` is documented but missing from AUTTER_COMMANDS"
+            );
+        }
+        for command in ["version", "help", "memory-hook", "notes", "checkpoint"] {
+            assert!(is_autter_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_typo_is_not_a_command() {
+        for command in ["stat", "bogus", "", "--json", "checkpoints"] {
+            assert!(!is_autter_command(command), "{command}");
         }
     }
 }

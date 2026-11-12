@@ -48,8 +48,10 @@ fn superuser_guard_warns_when_running_as_root_without_opt_in() {
     let output = cmd.output().expect("failed to execute binary");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // In full the first time and once a day, one line in between; both say
+    // the same thing.
     assert!(
-        stderr.contains("running as superuser (root/Administrator) is not recommended"),
+        stderr.contains("running as superuser") && stderr.contains("is not recommended"),
         "should show warning when running as root without opt-in, got: {stderr}"
     );
 }
@@ -88,8 +90,8 @@ fn superuser_guard_allows_root_with_env_var_opt_in() {
         "should NOT show warning when AUTTER_ALLOW_SUPERUSER=1 is set, got: {stderr}"
     );
     assert!(
-        stderr.contains("warning: running as superuser (AUTTER_ALLOW_SUPERUSER is set)"),
-        "should show opt-in acknowledgment when running as root with AUTTER_ALLOW_SUPERUSER, got: {stderr}"
+        !stderr.contains("running as superuser"),
+        "AUTTER_ALLOW_SUPERUSER=1 must silence the warning completely, got: {stderr}"
     );
 }
 

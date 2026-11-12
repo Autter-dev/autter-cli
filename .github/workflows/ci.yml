@@ -8,7 +8,8 @@ name: CI
 # anything; the `test` job runs the lib tests and a core integration subset.
 #
 # Plus one Windows job for install.ps1, which users run as `irm <url> | iex`
-# under Windows PowerShell 5.1 or PowerShell 7 (issues #9 and #11).
+# under Windows PowerShell 5.1 or PowerShell 7 (issues #9 and #11), and the
+# node tests of the npm bootstrapper (npm/).
 
 on:
   pull_request:
@@ -82,6 +83,48 @@ jobs:
           attribution_rewrites:: cherry_pick:: rebase:: install_hooks
           help_flag_safety:: --test-threads 4
 
+  # The release workflow was the first place the Windows build compiled, after
+  # the tag existed, so a `#[cfg(windows)]` error could only be found by a
+  # failed release. Compile the release binary for Windows on every PR.
+  windows-check:
+    name: cargo check (Windows)
+    runs-on: blacksmith-4vcpu-windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The binary only: the test targets have never been compiled on
+      # Windows, and this job exists to protect the release build.
+      - name: Check (release binary, default features)
+        run: cargo check --locked --bin autter
+
+  # The npm package (npm/) is a launcher that downloads the release binary.
+  # Its tests make no request: they pin the checked-in version (0.0.0-dev,
+  # stamped with the real one by release.yml at publish) and run an install
+  # from a checkout against a stand-in for GitHub.
+  npm-bootstrapper:
+    name: npm bootstrapper tests
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    env:
+      AUTTER_NO_INSTALL_PING: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test
+        run: node --test npm/install.test.js
+
   windows-installer:
     name: install.ps1 (Windows PowerShell 5.1 + pwsh)
     runs-on: blacksmith-4vcpu-windows-2025
@@ -94,7 +137,9 @@ jobs:
 
       # Pure ASCII, AST parse with this engine's parser, and no constructs that
       # break under iex (exit, top-level param(), $PSScriptRoot, unwrapped body).
-      # 5.1's parser is the one that rejects PowerShell 7-only syntax.
+      # 5.1's parser is the one that rejects PowerShell 7-only syntax. Also
+      # that the dry run returns before any request and that every failed
+      # download names the npm route.
       - name: Static checks (Windows PowerShell 5.1)
         shell: powershell
         run: |
@@ -115,7 +160,11 @@ jobs:
       # release through the normal checksum-verified download path, then
       # asserts `autter --version` resolves in the same session (PATH refresh),
       # a failing install throws instead of exiting the shell, and no
-      # StrictMode/preferences/functions leak into the caller.
+      # StrictMode/preferences/functions leak into the caller. Before that, a
+      # dry run (AUTTER_INSTALL_DRY_RUN=1) must print its plan and create
+      # nothing under a temporary profile directory, and a release that does
+      # not exist must fail naming the URL and the npm route. After it, a
+      # reinstall with AUTTER_INSTALL_PROGRESS=1 must show download progress.
       - name: End-to-end irm | iex install (Windows PowerShell 5.1)
         shell: powershell
         run: . ./scripts/test-install-ps1-iex.ps1

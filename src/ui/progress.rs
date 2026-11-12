@@ -57,6 +57,10 @@ impl Spinner {
             " ".repeat(indent)
         );
         let pb = ProgressBar::new_spinner();
+        // No spinner frames in CI logs or when stderr is not a terminal.
+        if !caps.tty {
+            pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        }
         pb.set_style(
             ProgressStyle::default_spinner()
                 .template(&template)

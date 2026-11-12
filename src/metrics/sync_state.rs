@@ -5,9 +5,12 @@
 //! server could not finish within the client timeout timed out forever, and
 //! the only record of why was a daemon log line. This file keeps:
 //!
-//! - the batch size to send next, halved after a timeout or an HTTP 413/504
-//!   and grown back after a run of successes;
+//! - the batch size to send next, halved after a timeout, an HTTP 413/504 or
+//!   a "retry later" answer, and grown back after a run of successes;
 //! - an exponential backoff between failed attempts;
+//! - the batch that keeps failing the same way, so a server error that is
+//!   tied to particular rows is narrowed down to those rows, which are then
+//!   set aside (kept, not deleted) so the rest of the queue drains;
 //! - the last failure (endpoint, kind, HTTP status, error, time, attempt
 //!   count), which `autter doctor` and `autter sync status` show.
 //!
@@ -30,6 +33,10 @@ pub const GROW_AFTER_SUCCESSES: u32 = 5;
 pub const BACKOFF_BASE_SECS: i64 = 5;
 /// Longest retry delay.
 pub const BACKOFF_MAX_SECS: i64 = 15 * 60;
+/// Identical failures on the same batch before it is halved to find the rows
+/// the server fails on. A lone event must also fail this many times on its
+/// own before it is set aside.
+pub const ISOLATE_AFTER_FAILURES: u32 = 3;
 
 /// The last failed metrics upload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +53,30 @@ pub struct MetricsFailureRecord {
     pub batch_size: usize,
     /// Failed attempts in a row, including this one.
     pub attempts: u32,
+}
+
+/// A batch that keeps failing the same way: the queue row it starts at, what
+/// the server answered, and how many times in a row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatedFailure {
+    /// Queue id of the first event in the failed request.
+    pub head_id: i64,
+    /// Failure kind and HTTP status (not the body, which can vary).
+    pub signature: String,
+    pub count: u32,
+    /// The batch is being halved to find the events the server fails on.
+    #[serde(default)]
+    pub isolating: bool,
+}
+
+/// What the queue should do with a batch that just failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedBatchAction {
+    /// Keep the events queued and try again after the backoff.
+    Retry,
+    /// The batch is a single event that fails the same way every time: set it
+    /// aside so the events behind it can upload.
+    SetAside,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +96,12 @@ pub struct MetricsSyncState {
     pub dropped_total: u64,
     /// Failed upload attempts since this state was created.
     pub failed_attempts_total: u64,
+    /// The batch that keeps failing the same way, if one does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeated_failure: Option<RepeatedFailure>,
+    /// Events set aside since this state was created because the server
+    /// failed on them every time. They stay in the local queue database.
+    pub set_aside_total: u64,
 }
 
 impl Default for MetricsSyncState {
@@ -79,28 +116,43 @@ impl Default for MetricsSyncState {
             uploaded_total: 0,
             dropped_total: 0,
             failed_attempts_total: 0,
+            repeated_failure: None,
+            set_aside_total: 0,
         }
     }
 }
 
 impl MetricsSyncState {
     pub fn path() -> PathBuf {
-        crate::mdm::utils::home_dir()
-            .join(".autter")
-            .join("internal")
-            .join("metrics-sync-state.json")
+        Self::path_in(
+            &crate::mdm::utils::home_dir()
+                .join(".autter")
+                .join("internal"),
+        )
+    }
+
+    /// The state file inside `internal_dir` (`~/.autter/internal`).
+    pub fn path_in(internal_dir: &std::path::Path) -> PathBuf {
+        internal_dir.join("metrics-sync-state.json")
     }
 
     /// The saved state, or a fresh one if there is none or it is unreadable.
     pub fn load() -> Self {
-        std::fs::read(Self::path())
+        Self::load_from(&Self::path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Self {
+        std::fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let path = Self::path();
+        self.save_to(&Self::path());
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -109,7 +161,8 @@ impl MetricsSyncState {
         }
     }
 
-    /// Forget failures and batch-size reductions (`autter sync purge`).
+    /// Forget failures and batch-size reductions. Only `autter sync purge`
+    /// does this: another queue recovering says nothing about this one.
     pub fn reset() {
         let _ = std::fs::remove_file(Self::path());
     }
@@ -120,24 +173,69 @@ impl MetricsSyncState {
     }
 
     /// True while the daemon should wait before the next upload attempt.
+    /// Call [`Self::clamp_backoff`] first so a clock that stepped backward
+    /// cannot stretch the wait.
     pub fn backoff_active(&self, now: i64) -> bool {
         now < self.next_attempt_at
     }
 
+    /// The longest the queue may still have to wait at `now`: the delay that
+    /// was set after the last failure (never more than [`BACKOFF_MAX_SECS`]).
+    fn longest_wait(&self) -> i64 {
+        backoff_secs(self.consecutive_failures.max(1))
+    }
+
+    /// Bound the wait to the backoff that was asked for, measured from `now`.
+    /// `next_attempt_at` is a wall-clock time, so when the system clock steps
+    /// backward (NTP correction, a VM resume, a manual change) it can be hours
+    /// or years ahead of the new clock and the queue would not retry until
+    /// then. Returns true when the stored time changed and should be saved.
+    pub fn clamp_backoff(&mut self, now: i64) -> bool {
+        let latest = now.saturating_add(self.longest_wait());
+        if self.next_attempt_at > latest {
+            self.next_attempt_at = latest;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// When the next attempt is due, as shown to the user at `now`.
+    fn next_attempt_at_clamped(&self, now: i64) -> i64 {
+        self.next_attempt_at
+            .min(now.saturating_add(self.longest_wait()))
+    }
+
     /// The server answered for a batch: clear the failure, and after a run
     /// of successes try a bigger batch again.
-    pub fn record_success(&mut self, now: i64, uploaded: usize, dropped: usize) {
+    pub fn record_success(&mut self, now: i64, uploaded: usize) {
         self.consecutive_failures = 0;
         self.next_attempt_at = 0;
         self.last_failure = None;
+        self.repeated_failure = None;
         self.last_success_at = Some(now);
         self.uploaded_total += uploaded as u64;
-        self.dropped_total += dropped as u64;
         self.consecutive_successes += 1;
         if self.consecutive_successes >= GROW_AFTER_SUCCESSES && self.batch_limit() < MAX_BATCH {
             self.batch_limit = (self.batch_limit() * 2).min(MAX_BATCH);
             self.consecutive_successes = 0;
         }
+    }
+
+    /// The server wrote part of a batch of `batch_size` events and answered
+    /// "retry later" for the rest: it ran out of time. That is progress, so
+    /// the failure is cleared, but the next batch is half the size and the
+    /// run of successes starts again.
+    pub fn record_partial_success(&mut self, now: i64, uploaded: usize, batch_size: usize) {
+        self.record_success(now, uploaded);
+        self.halve_batch(batch_size);
+        self.consecutive_successes = 0;
+    }
+
+    /// Events were deleted from the queue because the server can never accept
+    /// them. Counted whatever else happened in the same pass.
+    pub fn record_dropped(&mut self, dropped: usize) {
+        self.dropped_total += dropped as u64;
     }
 
     /// A batch of `batch_size` events failed. Halve the batch when a smaller
@@ -147,10 +245,9 @@ impl MetricsSyncState {
         self.consecutive_successes = 0;
         self.failed_attempts_total += 1;
         if failure.should_split() {
-            let failed_size = batch_size.clamp(1, self.batch_limit());
-            self.batch_limit = (failed_size / 2).max(1);
+            self.halve_batch(batch_size);
         }
-        self.next_attempt_at = now + backoff_secs(self.consecutive_failures);
+        self.next_attempt_at = now.saturating_add(backoff_secs(self.consecutive_failures));
         self.last_failure = Some(MetricsFailureRecord {
             at: now,
             endpoint: METRICS_UPLOAD_ENDPOINT.to_string(),
@@ -160,6 +257,84 @@ impl MetricsSyncState {
             batch_size,
             attempts: self.consecutive_failures,
         });
+    }
+
+    /// [`Self::record_failure`] for a request whose first queued event is
+    /// `head_id`, which also notices a batch that fails the same way every
+    /// time.
+    ///
+    /// A server error that depends on the rows (an HTTP 500 on the same
+    /// events every time) would otherwise be retried forever at full size,
+    /// and nothing behind those rows would ever upload. After
+    /// [`ISOLATE_AFTER_FAILURES`] identical failures the batch is halved on
+    /// each further one, down to a single event; a single event that has
+    /// failed that many times on its own is to be set aside.
+    pub fn record_batch_failure(
+        &mut self,
+        now: i64,
+        failure: &MetricsUploadFailure,
+        batch_size: usize,
+        head_id: i64,
+    ) -> FailedBatchAction {
+        self.record_failure(now, failure, batch_size);
+        if !failure.may_depend_on_rows() {
+            self.repeated_failure = None;
+            return FailedBatchAction::Retry;
+        }
+        let signature = failure.signature();
+        let mut repeated = match self.repeated_failure.take() {
+            Some(repeated) if repeated.head_id == head_id && repeated.signature == signature => {
+                RepeatedFailure {
+                    count: repeated.count.saturating_add(1),
+                    ..repeated
+                }
+            }
+            _ => RepeatedFailure {
+                head_id,
+                signature,
+                count: 1,
+                isolating: false,
+            },
+        };
+        let action = if repeated.count < ISOLATE_AFTER_FAILURES {
+            FailedBatchAction::Retry
+        } else if batch_size <= 1 {
+            FailedBatchAction::SetAside
+        } else {
+            // The same rows got the same answer again: look at half of them
+            // next. A lone event still has to fail on its own that many
+            // times before it is set aside.
+            self.halve_batch(batch_size);
+            repeated.isolating = true;
+            if self.batch_limit() == 1 {
+                repeated.count = 0;
+            }
+            FailedBatchAction::Retry
+        };
+        if repeated.isolating {
+            // Each request is now smaller than the last, so the wait stops
+            // growing while the failing rows are narrowed down.
+            let wait =
+                backoff_secs(self.consecutive_failures).min(backoff_secs(ISOLATE_AFTER_FAILURES));
+            self.next_attempt_at = now.saturating_add(wait);
+        }
+        self.repeated_failure = Some(repeated);
+        action
+    }
+
+    /// The failing event was moved out of the queue. The run of failures and
+    /// the wait that the last one set are kept: the events behind it are
+    /// tried after that wait, and if the server is failing on everything (an
+    /// outage, not these rows) the waits keep growing, so few events are set
+    /// aside before it recovers.
+    pub fn record_set_aside(&mut self, count: usize) {
+        self.set_aside_total += count as u64;
+        self.repeated_failure = None;
+    }
+
+    fn halve_batch(&mut self, failed_size: usize) {
+        let failed_size = failed_size.clamp(1, self.batch_limit());
+        self.batch_limit = (failed_size / 2).max(1);
     }
 }
 
@@ -174,6 +349,14 @@ pub struct UsageMetricsStatus {
     pub failed_attempts: u64,
     /// Events dropped because the server can never accept them.
     pub dropped: u64,
+    /// Events set aside on this computer because the server failed on them
+    /// every time. They are kept, not uploaded and not deleted, until
+    /// `autter sync retry` queues them again or `autter sync purge` deletes
+    /// them.
+    pub set_aside: i64,
+    /// The error the most recent set-aside event failed with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_aside_reason: Option<String>,
     /// Events the next replay sends.
     pub batch_size: usize,
     /// Events are queued and the last attempt failed.
@@ -187,7 +370,26 @@ pub struct UsageMetricsStatus {
 
 impl UsageMetricsStatus {
     pub fn current(queued: i64) -> Self {
+        let (set_aside, reason) = crate::metrics::db::MetricsDatabase::global()
+            .ok()
+            .and_then(|db| {
+                let db = db.lock().ok()?;
+                Some((
+                    db.count_set_aside().ok()?,
+                    db.last_set_aside_reason().ok().flatten(),
+                ))
+            })
+            .unwrap_or((0, None));
         Self::from_state(&MetricsSyncState::load(), queued, unix_now())
+            .with_set_aside(set_aside as i64, reason)
+    }
+
+    /// The same status with the set-aside events counted (they live in the
+    /// queue database, not in the state file).
+    pub fn with_set_aside(mut self, set_aside: i64, reason: Option<String>) -> Self {
+        self.set_aside = set_aside;
+        self.set_aside_reason = reason.filter(|_| set_aside > 0);
+        self
     }
 
     /// A recorded failure only counts while events are waiting: once the
@@ -199,12 +401,14 @@ impl UsageMetricsStatus {
             uploaded: state.uploaded_total,
             failed_attempts: state.failed_attempts_total,
             dropped: state.dropped_total,
+            set_aside: 0,
+            set_aside_reason: None,
             batch_size: state.batch_limit(),
             failing,
             last_failure: state.last_failure.clone().filter(|_| failing),
             last_success_at: state.last_success_at,
             next_retry_at: (failing && state.next_attempt_at > now)
-                .then_some(state.next_attempt_at),
+                .then(|| state.next_attempt_at_clamped(now)),
         }
     }
 
@@ -219,6 +423,9 @@ impl UsageMetricsStatus {
         if self.dropped > 0 {
             line.push_str(&format!(", {} dropped as unacceptable", self.dropped));
         }
+        if self.set_aside > 0 {
+            line.push_str(&format!(", {} set aside", self.set_aside));
+        }
         if let Some(failure) = &self.last_failure {
             line.push_str(&format!(
                 "\nLast metrics error: {}",
@@ -229,9 +436,32 @@ impl UsageMetricsStatus {
                 advice(failure, self.batch_size)
             ));
         }
+        if self.set_aside > 0 {
+            line.push_str(&format!("\n{}", set_aside_text(self.set_aside)));
+            if let Some(reason) = &self.set_aside_reason {
+                line.push_str(&format!("\nSet aside after: {reason}"));
+            }
+        }
         line
     }
 }
+
+/// What "set aside" means and what to do about it, for `autter doctor` and
+/// `autter sync status`.
+pub fn set_aside_text(count: i64) -> String {
+    format!(
+        "{count} usage-metrics {} set aside: the server failed on {} every time, so {} kept on this computer and the rest of the queue uploads. Queue {} again: `{RETRY_COMMAND}`. Delete {}: `{}`.",
+        if count == 1 { "event is" } else { "events are" },
+        if count == 1 { "it" } else { "them" },
+        if count == 1 { "it is" } else { "they are" },
+        if count == 1 { "it" } else { "them" },
+        if count == 1 { "it" } else { "them" },
+        crate::upload_hold::PURGE_COMMAND,
+    )
+}
+
+/// Puts set-aside usage-metrics events back in the upload queue.
+pub const RETRY_COMMAND: &str = "autter sync retry";
 
 /// "1 failed attempt", "4 failed attempts".
 pub fn failed_attempts_text(count: u64) -> String {
@@ -403,17 +633,205 @@ mod tests {
         state.record_failure(5, &timeout(), 500);
         assert_eq!(state.batch_limit(), 250);
 
-        state.record_success(20, 250, 0);
+        state.record_success(20, 250);
         assert!(state.last_failure.is_none());
         assert_eq!(state.consecutive_failures, 0);
         assert!(!state.backoff_active(20));
         assert_eq!(state.batch_limit(), 250, "one success does not grow");
 
         for _ in 1..GROW_AFTER_SUCCESSES {
-            state.record_success(21, 250, 0);
+            state.record_success(21, 250);
         }
         assert_eq!(state.batch_limit(), 500);
         assert_eq!(state.uploaded_total, 250 * GROW_AFTER_SUCCESSES as u64);
+    }
+
+    fn http(status: u16) -> MetricsUploadFailure {
+        MetricsUploadFailure::Http {
+            status,
+            body: r#"{"error":"Data-plane operation failed"}"#.to_string(),
+        }
+    }
+
+    /// The system clock stepped back a day after a failure. The stored retry
+    /// time is then a day ahead of the clock; before, the queue did not try
+    /// again until the clock caught up.
+    #[test]
+    fn a_clock_that_steps_backward_cannot_stretch_the_wait() {
+        let failed_at = 1_762_588_800;
+        let mut state = MetricsSyncState::default();
+        state.record_failure(failed_at, &timeout(), 1000);
+        state.record_failure(failed_at, &timeout(), 500);
+        assert_eq!(state.next_attempt_at, failed_at + 10);
+
+        let now = failed_at - 86_400;
+        assert!(state.clamp_backoff(now), "the stored time is out of range");
+        assert_eq!(
+            state.next_attempt_at,
+            now + 10,
+            "the wait is the backoff that was asked for, from the new clock"
+        );
+        assert!(state.backoff_active(now + 9));
+        assert!(!state.backoff_active(now + 10));
+        assert!(!state.clamp_backoff(now + 3), "already in range: no change");
+
+        // Whatever the stored value, the wait never exceeds the maximum.
+        for failures in [1, 5, 40] {
+            let mut state = MetricsSyncState {
+                consecutive_failures: failures,
+                next_attempt_at: i64::MAX,
+                ..MetricsSyncState::default()
+            };
+            state.clamp_backoff(now);
+            assert!(state.next_attempt_at - now <= BACKOFF_MAX_SECS);
+            assert_eq!(state.next_attempt_at - now, backoff_secs(failures));
+        }
+
+        // A clock that moves forward, or not at all, changes nothing.
+        let mut state = MetricsSyncState::default();
+        state.record_failure(failed_at, &timeout(), 1000);
+        assert!(!state.clamp_backoff(failed_at));
+        assert!(!state.clamp_backoff(failed_at + 3));
+        assert_eq!(state.next_attempt_at, failed_at + BACKOFF_BASE_SECS);
+    }
+
+    #[test]
+    fn the_status_never_shows_a_retry_further_away_than_the_backoff() {
+        let mut state = MetricsSyncState::default();
+        state.record_failure(1_000_000, &timeout(), 1000);
+        let status = UsageMetricsStatus::from_state(&state, 10, 1_000);
+        assert_eq!(status.next_retry_at, Some(1_000 + BACKOFF_BASE_SECS));
+    }
+
+    /// HTTP 500 on the same batch every time: after three identical failures
+    /// the batch is halved on each further one, and a lone event that fails
+    /// three times on its own is to be set aside.
+    #[test]
+    fn the_same_server_error_on_the_same_batch_narrows_it_down_to_one_event() {
+        let mut state = MetricsSyncState::default();
+        let mut now = 0;
+        let mut sizes = Vec::new();
+        let mut verdict = FailedBatchAction::Retry;
+        for _ in 0..40 {
+            let size = state.batch_limit();
+            sizes.push(size);
+            verdict = state.record_batch_failure(now, &http(500), size, 7);
+            if verdict == FailedBatchAction::SetAside {
+                break;
+            }
+            assert!(state.next_attempt_at > now, "every failure waits");
+            now = state.next_attempt_at;
+        }
+        assert_eq!(verdict, FailedBatchAction::SetAside);
+        assert_eq!(
+            sizes,
+            vec![1000, 1000, 1000, 500, 250, 125, 62, 31, 15, 7, 3, 1, 1, 1],
+            "three tries at full size, then halved to one, then three tries alone"
+        );
+        assert!(
+            now <= 5 + 10 + 20 * 11,
+            "the wait stops growing while the batch is narrowed down: {now}s"
+        );
+
+        state.record_set_aside(1);
+        assert_eq!(state.set_aside_total, 1);
+        assert!(state.repeated_failure.is_none());
+        assert!(
+            state.next_attempt_at - now <= backoff_secs(ISOLATE_AFTER_FAILURES),
+            "the events behind it are tried after a short wait"
+        );
+    }
+
+    #[test]
+    fn a_different_batch_or_a_different_error_starts_the_count_again() {
+        let mut state = MetricsSyncState::default();
+        state.record_batch_failure(0, &http(500), 1000, 7);
+        state.record_batch_failure(0, &http(500), 1000, 7);
+        // Another first row: the earlier rows uploaded or were re-queued.
+        state.record_batch_failure(0, &http(500), 1000, 8);
+        assert_eq!(state.batch_limit(), 1000);
+        // Another status.
+        state.record_batch_failure(0, &http(500), 1000, 8);
+        state.record_batch_failure(0, &http(400), 1000, 8);
+        assert_eq!(state.batch_limit(), 1000);
+        assert_eq!(state.repeated_failure.as_ref().unwrap().count, 1);
+        // A success forgets it.
+        state.record_success(1, 10);
+        assert!(state.repeated_failure.is_none());
+    }
+
+    /// Failures that say nothing about the events never isolate or set aside:
+    /// the login, the rate, a gateway, the network, a timeout.
+    #[test]
+    fn failures_that_are_not_about_the_events_never_set_anything_aside() {
+        for failure in [
+            http(401),
+            http(403),
+            http(408),
+            http(429),
+            http(502),
+            http(503),
+            MetricsUploadFailure::Network {
+                message: "connection refused".to_string(),
+            },
+            MetricsUploadFailure::InvalidResponse {
+                message: "expected value".to_string(),
+            },
+        ] {
+            let mut state = MetricsSyncState::default();
+            for _ in 0..30 {
+                let size = state.batch_limit();
+                assert_eq!(
+                    state.record_batch_failure(0, &failure, size, 7),
+                    FailedBatchAction::Retry,
+                    "{failure:?}"
+                );
+            }
+            assert_eq!(state.batch_limit(), 1000, "{failure:?}");
+            assert!(state.repeated_failure.is_none(), "{failure:?}");
+        }
+        // A timeout halves (a smaller batch finishes sooner) but a lone event
+        // that times out is kept in the queue.
+        let mut state = MetricsSyncState::default();
+        for _ in 0..30 {
+            let size = state.batch_limit();
+            assert_eq!(
+                state.record_batch_failure(0, &timeout(), size, 7),
+                FailedBatchAction::Retry
+            );
+        }
+        assert_eq!(state.batch_limit(), 1);
+    }
+
+    #[test]
+    fn a_partial_answer_halves_the_batch_without_counting_as_a_failure() {
+        let mut state = MetricsSyncState::default();
+        state.record_partial_success(10, 400, 1000);
+        assert_eq!(state.batch_limit(), 500);
+        assert_eq!(state.uploaded_total, 400);
+        assert!(state.last_failure.is_none());
+        assert!(!state.backoff_active(10));
+        assert_eq!(state.failed_attempts_total, 0);
+        // It takes a full run of successes to grow back.
+        for _ in 1..GROW_AFTER_SUCCESSES {
+            state.record_success(11, 500);
+        }
+        assert_eq!(state.batch_limit(), 500);
+        state.record_success(11, 500);
+        assert_eq!(state.batch_limit(), 1000);
+    }
+
+    #[test]
+    fn set_aside_events_are_reported_with_what_to_do() {
+        let status = UsageMetricsStatus::from_state(&MetricsSyncState::default(), 0, 0)
+            .with_set_aside(2, Some("HTTP 500".to_string()));
+        let line = status.summary_line();
+        assert!(line.contains("2 set aside"), "{line}");
+        assert!(line.contains("autter sync retry"), "{line}");
+        assert!(line.contains("Set aside after: HTTP 500"), "{line}");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["set_aside"], 2);
+        assert_eq!(json["set_aside_reason"], "HTTP 500");
     }
 
     #[test]

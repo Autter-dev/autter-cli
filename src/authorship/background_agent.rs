@@ -60,6 +60,25 @@ pub fn merge_trace2_env_vars(existing: &[String]) -> String {
     names.join(",")
 }
 
+/// The `trace2.envVars` value left after uninstalling: the names in `existing` that are
+/// not ours, in order. `None` when nothing of the user's remains.
+pub fn strip_trace2_env_vars(existing: &[String]) -> Option<String> {
+    let ours = trace2_env_vars_value();
+    let ours: Vec<&str> = ours.split(',').collect();
+    let mut names: Vec<&str> = Vec::new();
+    for name in existing
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !ours.contains(&name) && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    (!names.is_empty()).then(|| names.join(","))
+}
+
 /// A snapshot of the detection variables seen by one git command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentEnv(BTreeMap<String, String>);
@@ -381,6 +400,17 @@ mod tests {
         let merged = merge_trace2_env_vars(&["MY_VAR, CURSOR_AGENT".to_string()]);
         assert!(merged.starts_with("MY_VAR,CURSOR_AGENT,AUTTER_WRAPPER_INVOCATION_ID"));
         assert_eq!(merge_trace2_env_vars(std::slice::from_ref(&merged)), merged);
+    }
+
+    #[test]
+    fn strip_trace2_env_vars_keeps_only_the_users_names() {
+        assert_eq!(strip_trace2_env_vars(&[]), None);
+        assert_eq!(strip_trace2_env_vars(&[trace2_env_vars_value()]), None);
+        let merged = merge_trace2_env_vars(&["MY_VAR, OTHER".to_string()]);
+        assert_eq!(
+            strip_trace2_env_vars(&[merged]),
+            Some("MY_VAR,OTHER".to_string())
+        );
     }
 
     #[test]

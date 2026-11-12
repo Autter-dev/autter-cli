@@ -258,10 +258,13 @@ impl VirtualAttributions {
         repo: &Repository,
         session_id: &str,
     ) -> Result<SessionRecord, AutterError> {
-        let shas = crate::git::refs::grep_ai_notes(repo, &format!("\"{}\"", session_id))
-            .unwrap_or_default();
+        // Only the newest commit is read, so only the newest is worked out:
+        // the rest of the matches are not put in order.
+        let latest_sha =
+            crate::git::refs::grep_ai_notes_latest(repo, &format!("\"{}\"", session_id))
+                .unwrap_or_default();
 
-        if let Some(latest_sha) = shas.first()
+        if let Some(latest_sha) = latest_sha.as_deref()
             && let Ok(log) = crate::git::refs::get_reference_as_authorship_log_v3(repo, latest_sha)
             && let Some(session) = log.metadata.sessions.get(session_id)
         {

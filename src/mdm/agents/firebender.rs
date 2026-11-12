@@ -40,7 +40,7 @@ impl HookInstaller for FirebenderInstaller {
         vec![Self::hooks_path()]
     }
 
-    fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
+    fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_dotfiles = home_dir().join(".firebender").exists();
         if !has_dotfiles {
             return Ok(HookCheckResult {
@@ -82,10 +82,17 @@ impl HookInstaller for FirebenderInstaller {
         let has_post = has("postToolUse");
         let has_stop = has("stop");
 
+        // The checks above find an autter command without reading which
+        // binary it runs; the installer's dry run does.
+        let hooks_up_to_date = has_pre
+            && has_post
+            && has_stop
+            && crate::mdm::hook_refresh::install_would_change_nothing(self, params);
+
         Ok(HookCheckResult {
             tool_installed: true,
             hooks_installed: has_pre && has_post,
-            hooks_up_to_date: has_pre && has_post && has_stop,
+            hooks_up_to_date,
         })
     }
 

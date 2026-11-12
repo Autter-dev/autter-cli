@@ -1,0 +1,100 @@
+name: Windows
+
+# What the Windows build does on a real Windows machine, on every PR.
+#
+# - unit-tests: `cargo test --lib`, which had never run on Windows.
+# - e2e: a debug build (default features, as released) driven by
+#   scripts/windows-e2e.ps1 under Windows PowerShell 5.1, in a throwaway
+#   profile directory: background service start/status/shutdown/restart and a
+#   stale lock, a commit captured through git's trace2 pipe and blamed as AI,
+#   `doctor --json` and `--report`, the VS Code PATH order that used to open
+#   editor windows, the npm launcher against a broken autter.exe, and no
+#   raw escape codes in redirected output or in a real console (screen buffer
+#   read back). It also tries a service started elevated seen from a
+#   filtered, non-elevated token; on this runner (a service, UAC off) no
+#   process can start with such a token, which the script reports as a NOTE.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: unit tests (Windows)
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 45
+    env:
+      AUTTER_NO_INSTALL_PING: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-lib-tests
+
+      - name: git identity for tests that commit
+        run: |
+          git config --global user.name "autter ci"
+          git config --global user.email "ci@example.invalid"
+
+      - name: Build unit tests
+        run: cargo test --locked --lib --no-run
+
+      - name: Run unit tests
+        run: cargo test --locked --lib
+
+  e2e:
+    name: end-to-end (Windows PowerShell 5.1)
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 40
+    env:
+      AUTTER_NO_INSTALL_PING: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-e2e
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Default features, as released: a test-support build refuses to
+      # restart the background service (the test harness owns it there), so
+      # `autter install --system` and onboarding cannot finish with it.
+      - name: Build autter (debug, default features)
+        run: cargo build --locked --bin autter
+
+      - name: End-to-end script
+        shell: powershell
+        run: |
+          & ./scripts/windows-e2e.ps1 -Autter "$PWD\target\debug\autter.exe"
+          exit $LASTEXITCODE
+
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-e2e-logs
+          path: ${{ runner.temp }}/autter-e2e/logs
+          if-no-files-found: ignore
