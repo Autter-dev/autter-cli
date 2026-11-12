@@ -222,6 +222,7 @@ autter verify origin/main..HEAD --json --strict
 | `content_mismatch` | 5 | The note's record of the commit's files does not match the commit |
 | `range_out_of_bounds` | 5 | The note attributes lines past the end of a file, or lines of a file the commit does not have |
 | `digest_mismatch` | 5 | The note was changed after autter wrote it |
+| `carried_failure` | 5 | Autter derived the note, during a rebase, amend, cherry-pick or `autter ci` merge, from a note that failed the check. `recorded_commit` names that source commit |
 
 `--json` prints `{schema_version, range, commits, counts, failed, results}`,
 each result `{commit, status, detail, recorded_commit?}`; on exit 5 the same
@@ -233,6 +234,17 @@ have aged out of the ranges you check.
 `autter stats`, `autter blame` and the range stats do not trust a note that
 fails: its lines count as `unknown`, and they print one line naming the commit
 and pointing at `autter verify`.
+
+A rewrite does not make a failing note valid. Before a rebase (including
+reorder, squash and fixup), amend, cherry-pick or `autter ci` merge carries
+attribution to new commits, autter checks the notes it carries from, all in
+one pass. A new commit built from a failing note gets a note that fails with
+`carried_failure`, naming the source commit, so the evidence stays visible;
+a squash built from several notes fails if any of them does. Rewrites that
+put attribution back into the working tree (`reset`, `cherry-pick -n`,
+`merge --squash`) read it through blame, which skips a failing note: those
+lines are committed again as unknown. A source note that is `unavailable`
+(objects missing from a shallow clone) is carried as before.
 
 This is an integrity check, not tamper evidence. It catches notes copied to
 another commit, moved, or edited by hand. Someone who can write to the

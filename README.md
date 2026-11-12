@@ -206,7 +206,7 @@ Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `who
 | 2 | Usage error (bad flags, outside a repository) |
 | 3 | Nothing captured: autter has no record of the added lines (`stats`, `status`; only with `--strict`) |
 | 4 | Capture is broken (`doctor`; only with `--strict`) |
-| 5 | A note failed the integrity check (`verify`) |
+| 5 | A note failed the integrity check (`verify`), or was carried by a rewrite from one that did |
 
 ```bash
 autter stats "$BASE..$HEAD" --json --strict | jq '.percent.ai'
