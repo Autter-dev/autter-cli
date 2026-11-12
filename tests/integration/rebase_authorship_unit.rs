@@ -29,15 +29,17 @@ fn try_fast_path_rebase_note_remap(
     commits_to_process_lookup: &HashSet<&str>,
     tracked_paths: &[String],
 ) -> Result<bool, AutterError> {
+    if original_commits.len() != new_commits.len() {
+        return Ok(false);
+    }
     let note_cache = load_rebase_note_cache(repo, original_commits, new_commits)?;
-    try_fast_path_rebase_note_remap_cached(
-        repo,
-        original_commits,
-        new_commits,
-        commits_to_process_lookup,
-        tracked_paths,
-        &note_cache,
-    )
+    let commit_pairs: Vec<(String, String)> = original_commits
+        .iter()
+        .cloned()
+        .zip(new_commits.iter().cloned())
+        .filter(|(_, new_commit)| commits_to_process_lookup.contains(new_commit.as_str()))
+        .collect();
+    try_fast_path_rebase_note_remap_cached(repo, &commit_pairs, tracked_paths, &note_cache)
 }
 
 fn write_minimal_authorship_note(
