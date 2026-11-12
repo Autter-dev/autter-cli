@@ -11,6 +11,11 @@
 //!   same file.
 //! - `git cherry-pick -n` of several commits, in one run or in several, carries
 //!   every picked commit's attribution, not only the last one's.
+//! - `git cherry-pick -n` that stops on a conflict keeps the picked attribution
+//!   of what merged cleanly; lines written to resolve the conflict are not the
+//!   picked AI's.
+//! - `git cherry-pick -n` thrown away by `git reset --hard` gives nothing to
+//!   lines typed again by hand.
 //! - A `git reset` that leaves HEAD where it is (no target, or only paths) is
 //!   not a move from the branch checked out before, and keeps live AI work.
 //! - Lines typed after switching back from a branch with AI commits, or after
@@ -700,6 +705,179 @@ fn cherry_pick_no_commit_then_stash_and_pop_keeps_ai_attribution() {
         "Line 2".unattributed_human(),
         "Line 3".unattributed_human(),
         "Feature AI line".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_thrown_away_by_hard_reset_is_not_given_to_retyped_lines() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "discarded_pick.txt");
+
+    // The pick is thrown away, and the same line is then typed by hand in a
+    // plain editor: no checkpoint.
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    repo.git(&["reset", "--hard"]).unwrap();
+    fs::write(
+        repo.path().join("discarded_pick.txt"),
+        "Line 1\nLine 2\nLine 3\nFeature AI line\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("discarded_pick.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".unattributed_human(),
+    ]);
+}
+
+/// An AI commit on a feature branch that rewrites line 2 of `conflicted`, adds
+/// a line at its end and adds a line to `clean`; and a commit on the main
+/// branch where a person rewrites the same line 2. Then `git cherry-pick -n` of
+/// the AI commit, which stops on the conflict in line 2. Everything else the
+/// pick brought merged cleanly.
+fn conflicted_cherry_pick_no_commit(repo: &TestRepo, conflicted: &str, clean: &str) {
+    let conflicted_path = repo.path().join(conflicted);
+
+    fs::write(
+        &conflicted_path,
+        "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join(clean), "Clean base\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut conflicted_file = repo.filename(conflicted);
+    let mut clean_file = repo.filename(clean);
+    conflicted_file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+    ]);
+    clean_file.assert_committed_lines(lines!["Clean base".unattributed_human()]);
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    ai_edit(
+        repo,
+        conflicted,
+        "Line 1\nAI version\nLine 3\nLine 4\nLine 5\nLine 6\nAI tail line\n",
+    );
+    ai_edit(repo, clean, "Clean base\nAI clean line\n");
+    repo.stage_all_and_commit("AI change").unwrap();
+    conflicted_file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "AI version".ai(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+        "AI tail line".ai(),
+    ]);
+    clean_file.assert_committed_lines(lines![
+        "Clean base".unattributed_human(),
+        "AI clean line".ai(),
+    ]);
+    let source = head_sha(repo);
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    fs::write(
+        &conflicted_path,
+        "Line 1\nMain version\nLine 3\nLine 4\nLine 5\nLine 6\n",
+    )
+    .unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", conflicted])
+        .unwrap();
+    repo.stage_all_and_commit("Main change").unwrap();
+    conflicted_file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Main version".human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+    ]);
+    clean_file.assert_committed_lines(lines!["Clean base".unattributed_human()]);
+
+    assert!(
+        repo.git(&["cherry-pick", "-n", &source]).is_err(),
+        "cherry-pick -n should stop on the conflict"
+    );
+    repo.sync_daemon();
+    let stopped = fs::read_to_string(&conflicted_path).unwrap();
+    assert!(
+        stopped.contains("<<<<<<<") && stopped.ends_with("AI tail line\n"),
+        "the pick should leave line 2 conflicted and merge the tail line, got:\n{}",
+        stopped
+    );
+}
+
+#[test]
+fn conflicted_cherry_pick_no_commit_keeps_attribution_of_what_merged_cleanly() {
+    let repo = TestRepo::new();
+    conflicted_cherry_pick_no_commit(&repo, "conflict.txt", "clean.txt");
+
+    // Resolve by hand, in a plain editor: no checkpoint fires.
+    fs::write(
+        repo.path().join("conflict.txt"),
+        "Line 1\nResolved by hand\nLine 3\nLine 4\nLine 5\nLine 6\nAI tail line\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Resolved pick").unwrap();
+    repo.sync_daemon();
+
+    let mut conflicted = repo.filename("conflict.txt");
+    let mut clean = repo.filename("clean.txt");
+    // The file that applied cleanly, and the hunk that did, are the picked AI's.
+    clean.assert_committed_lines(lines![
+        "Clean base".unattributed_human(),
+        "AI clean line".ai(),
+    ]);
+    conflicted.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Resolved by hand".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+        "AI tail line".ai(),
+    ]);
+}
+
+#[test]
+fn conflicted_cherry_pick_no_commit_does_not_give_the_ai_a_hand_resolved_line() {
+    let repo = TestRepo::new();
+    conflicted_cherry_pick_no_commit(&repo, "typed.txt", "other.txt");
+
+    // The person resolving types the same text the AI had. It is still theirs:
+    // the pick never applied that line.
+    fs::write(
+        repo.path().join("typed.txt"),
+        "Line 1\nAI version\nLine 3\nLine 4\nLine 5\nLine 6\nAI tail line\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Resolved pick").unwrap();
+    repo.sync_daemon();
+
+    let mut conflicted = repo.filename("typed.txt");
+    let mut clean = repo.filename("other.txt");
+    clean.assert_committed_lines(lines![
+        "Clean base".unattributed_human(),
+        "AI clean line".ai(),
+    ]);
+    conflicted.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "AI version".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "Line 6".unattributed_human(),
+        "AI tail line".ai(),
     ]);
 }
 

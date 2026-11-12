@@ -1,6 +1,6 @@
 use crate::error::AutterError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Simple case classes for rewrite events
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +195,22 @@ pub struct MergeSquashEvent {
     /// `source_head` alone does not cover them. `source_head` is the last one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub picked_commits: Vec<String>,
+    /// Files a `git cherry-pick -n` left conflicted, by path, with what the
+    /// index held for each side when the pick stopped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conflicted_files: BTreeMap<String, ConflictedFileStages>,
+}
+
+/// The three sides of a conflicted file as blob ids: the index stages 1, 2 and
+/// 3. A side is missing when the file did not exist there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictedFileStages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ours: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theirs: Option<String>,
 }
 
 impl MergeSquashEvent {
@@ -213,6 +229,7 @@ impl MergeSquashEvent {
             staged_file_blobs,
             preserve_working_log: false,
             picked_commits: Vec::new(),
+            conflicted_files: BTreeMap::new(),
         }
     }
 
@@ -226,6 +243,15 @@ impl MergeSquashEvent {
     /// The commits a `git cherry-pick -n` picked, oldest pick first.
     pub fn with_picked_commits(mut self, picked_commits: Vec<String>) -> Self {
         self.picked_commits = picked_commits;
+        self
+    }
+
+    /// The files the pick left conflicted.
+    pub fn with_conflicted_files(
+        mut self,
+        conflicted_files: BTreeMap<String, ConflictedFileStages>,
+    ) -> Self {
+        self.conflicted_files = conflicted_files;
         self
     }
 

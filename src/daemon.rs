@@ -21,8 +21,9 @@ use crate::git::repository::{
     is_no_repository_discovered_error,
 };
 use crate::git::rewrite_log::{
-    CherryPickAbortEvent, CherryPickCompleteEvent, MergeSquashEvent, RebaseAbortEvent,
-    RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent, StashOperation,
+    CherryPickAbortEvent, CherryPickCompleteEvent, ConflictedFileStages, MergeSquashEvent,
+    RebaseAbortEvent, RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent,
+    StashOperation,
 };
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::LockFile;
@@ -3700,6 +3701,45 @@ fn distinct_cherry_pick_lines_of_history(
     distinct
 }
 
+/// The files the index holds as conflicted, with the blob of each side. Empty
+/// when the conflicts were already resolved by the time this runs.
+fn conflicted_index_stages(worktree: &Path) -> BTreeMap<String, ConflictedFileStages> {
+    let mut conflicted = BTreeMap::new();
+    let args = [
+        "-C",
+        worktree.to_string_lossy().as_ref(),
+        "ls-files",
+        "--unmerged",
+        "--full-name",
+        "-z",
+    ]
+    .map(str::to_string);
+    let Ok(output) = exec_git(&args) else {
+        return conflicted;
+    };
+    // Each record is "<mode> <blob> <stage>\t<path>".
+    for record in String::from_utf8_lossy(&output.stdout).split('\0') {
+        let Some((meta, path)) = record.split_once('\t') else {
+            continue;
+        };
+        let mut meta = meta.split_whitespace();
+        let (Some(_mode), Some(blob), Some(stage)) = (meta.next(), meta.next(), meta.next()) else {
+            continue;
+        };
+        if !is_valid_oid(blob) {
+            continue;
+        }
+        let stages: &mut ConflictedFileStages = conflicted.entry(path.to_string()).or_default();
+        match stage {
+            "1" => stages.base = Some(blob.to_string()),
+            "2" => stages.ours = Some(blob.to_string()),
+            "3" => stages.theirs = Some(blob.to_string()),
+            _ => {}
+        }
+    }
+    conflicted
+}
+
 /// Git dir of the worktree (per-worktree, so linked worktrees each get their
 /// own), found without spawning git. Used for small state files that must
 /// outlive the daemon.
@@ -7254,10 +7294,13 @@ impl ActorDaemonCoordinator {
     /// `git cherry-pick -n` applies the picked changes without committing. Treat
     /// it like `merge --squash` so the next commit inherits the source commits'
     /// attribution instead of recording the picked lines as untracked.
+    ///
+    /// A pick that stopped on a conflict still applied everything that merged
+    /// cleanly, so it is recorded too, along with the files it left conflicted.
     fn synthesize_cherry_pick_no_commit_squash_event(
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<Option<MergeSquashEvent>, AutterError> {
-        if cmd.exit_code != 0 || !command_is_no_commit_cherry_pick(cmd) {
+        if !command_is_no_commit_cherry_pick(cmd) {
             return Ok(None);
         }
         let Some(worktree) = cmd.worktree.as_deref() else {
@@ -7267,8 +7310,21 @@ impl ActorDaemonCoordinator {
         if source_refs.is_empty() {
             return Ok(None);
         }
-        let sources =
-            resolve_cherry_pick_source_refs(&source_refs, worktree, "cherry_pick_no_commit")?;
+        let stopped = cmd.exit_code != 0;
+        let sources = match resolve_cherry_pick_source_refs(
+            &source_refs,
+            worktree,
+            "cherry_pick_no_commit",
+        ) {
+            Ok(sources) => sources,
+            // A pick that failed may have failed on exactly this: a ref
+            // that names no commit. Then nothing was applied.
+            Err(error) if stopped => {
+                tracing::debug!(%error, "failed cherry-pick -n names no resolvable commits");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let sources = match find_repository_in_path(&worktree.to_string_lossy()) {
             Ok(repository) => distinct_cherry_pick_lines_of_history(&repository, sources),
             Err(_) => sources,
@@ -7300,6 +7356,9 @@ impl ActorDaemonCoordinator {
         .with_preserved_working_log();
         if sources.len() > 1 {
             event = event.with_picked_commits(sources);
+        }
+        if stopped {
+            event = event.with_conflicted_files(conflicted_index_stages(worktree));
         }
         Ok(Some(event))
     }
@@ -7831,8 +7890,51 @@ impl ActorDaemonCoordinator {
         if let Some(merge_squash) = implicit_merge_squash {
             out.push(RewriteLogEvent::merge_squash(merge_squash));
         }
+        if out.is_empty()
+            && let Some(discarded) = Self::synthesize_discarded_no_commit_pick_event(cmd)?
+        {
+            out.push(discarded);
+        }
 
         Ok(out)
+    }
+
+    /// `git reset --hard` (or `--merge` / `--keep`) that leaves HEAD where it is
+    /// throws away what an earlier `git cherry-pick -n` applied. Record it as an
+    /// abort of that pick, so the next commit does not hand the picked commits'
+    /// attribution to lines typed again by hand.
+    fn synthesize_discarded_no_commit_pick_event(
+        cmd: &crate::daemon::domain::NormalizedCommand,
+    ) -> Result<Option<RewriteLogEvent>, AutterError> {
+        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("reset") {
+            return Ok(None);
+        }
+        let discards_tree = cmd
+            .invoked_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--hard" | "--merge" | "--keep"));
+        if !discards_tree {
+            return Ok(None);
+        }
+        let Some(head) = cmd
+            .post_repo
+            .as_ref()
+            .and_then(|repo| repo.head.clone())
+            .filter(|head| is_valid_oid(head) && !is_zero_oid(head))
+        else {
+            return Ok(None);
+        };
+        let Some(worktree) = cmd.worktree.as_deref() else {
+            return Ok(None);
+        };
+        let repo = find_repository_in_path(&worktree.to_string_lossy())?;
+        let pending = preceding_merge_squashes_for_pending_commit(&repo, &head)?;
+        if !pending.iter().any(|pick| pick.preserve_working_log) {
+            return Ok(None);
+        }
+        Ok(Some(RewriteLogEvent::cherry_pick_abort(
+            CherryPickAbortEvent::new(head),
+        )))
     }
 
     async fn maybe_apply_side_effects_for_applied_command(
@@ -8081,7 +8183,7 @@ impl ActorDaemonCoordinator {
                     .any(|arg| arg == "--abort" || arg == "--quit")
                 {
                     self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
-                } else if cmd.exit_code != 0 {
+                } else if cmd.exit_code != 0 && !command_is_no_commit_cherry_pick(cmd) {
                     let source_refs = cherry_pick_source_refs_from_command(cmd);
                     // `--continue` / `--skip` that stop on the next conflict carry no
                     // source refs of their own; keep the ones the pick started with.
@@ -8090,6 +8192,11 @@ impl ActorDaemonCoordinator {
                     }
                 }
             }
+            // `cherry-pick -n` that stopped on a conflict still applied what
+            // merged cleanly, and nothing it applies is ever committed by git
+            // itself (not even by `--continue` of a multi-commit pick): the next
+            // plain commit carries it. Fall through so it is recorded.
+            let is_stopped_no_commit_pick = command_is_no_commit_cherry_pick(cmd);
             // Fix #957: `checkout/switch --merge` exits with code 1 when it produces
             // conflict markers but HEAD still moves to the target branch.  We must not
             // return early here — fall through so apply_checkout_switch_working_log_side_effect
@@ -8118,7 +8225,7 @@ impl ActorDaemonCoordinator {
                         }
                     )
                 });
-            if !is_merge_checkout && !is_stash_restore {
+            if !is_merge_checkout && !is_stash_restore && !is_stopped_no_commit_pick {
                 return Ok(());
             }
             if is_stash_restore {
