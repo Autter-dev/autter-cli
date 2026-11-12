@@ -44,6 +44,15 @@
 //! instead (reset, `cherry-pick -n`, `merge --squash`) read attribution
 //! through blame, which already skips a failing note, so its lines are not
 //! carried at all.
+//!
+//! **Notes rebound by an older autter.** An autter older than the integrity
+//! check that rewrites a note keeps the old stamp, so the digest cannot hold
+//! and the note reads as [`IntegrityStatus::ReboundByOlderAutter`], a warning
+//! (a failure under `autter verify --strict`). Anyone can make a note look
+//! rebound, so what can still be checked is: the stamp's tree and blobs must
+//! describe the commit it names when that commit is in this clone
+//! ([`IntegrityStatus::ContentMismatch`] otherwise), and when that commit's
+//! own note fails, the rebound note is [`IntegrityStatus::CarriedFailure`].
 
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -104,7 +113,9 @@ pub enum IntegrityStatus {
     PendingRewrite,
     /// A note rewritten by an autter release older than the integrity check:
     /// it names this commit but its integrity member still names the commit
-    /// it was first written for.
+    /// it was first written for. Its digest cannot be checked; what its stamp
+    /// says about that commit was checked when the commit is in this clone.
+    /// A warning, but a failure under `autter verify --strict`.
     ReboundByOlderAutter,
     /// The commit or the files the note describes are not in this clone
     /// (a shallow clone, for example), so the note could not be checked.
@@ -120,7 +131,8 @@ pub enum IntegrityStatus {
     /// The note was changed after autter wrote it.
     DigestMismatch,
     /// Autter derived this note during a rewrite (rebase, amend, cherry-pick,
-    /// `autter ci` merge) from a note that failed the check. The note names
+    /// `autter ci` merge) from a note that failed the check, or an older
+    /// autter rebound it from a note that fails the check. The result names
     /// the source commit; its lines are no more trusted than the source's.
     CarriedFailure,
 }
@@ -522,6 +534,18 @@ pub fn verify_notes(
     commits: &[String],
     notes: &HashMap<String, String>,
 ) -> Result<Vec<CommitIntegrity>, AutterError> {
+    let mut results = verify_notes_once(repo, commits, notes)?;
+    check_rebound_sources(repo, &mut results);
+    Ok(results)
+}
+
+/// [`verify_notes`] without looking at the notes of the commits that
+/// rebound notes name.
+fn verify_notes_once(
+    repo: &Repository,
+    commits: &[String],
+    notes: &HashMap<String, String>,
+) -> Result<Vec<CommitIntegrity>, AutterError> {
     struct Parsed {
         split: SplitNote,
         log: Option<AuthorshipLog>,
@@ -549,6 +573,16 @@ pub fn verify_notes(
         if let Some(log) = &log {
             for a in &log.attestations {
                 push(path_query(commit, &a.file_path), &mut queries);
+            }
+        }
+        // A stamp naming another commit: what it claims about that commit is
+        // checked when the note turns out to be rebound by an older autter.
+        if let Some(Ok(integrity)) = &split.integrity
+            && integrity.commit != *commit
+        {
+            push(tree_query(&integrity.commit), &mut queries);
+            for path in integrity.files.keys() {
+                push(path_query(&integrity.commit, path), &mut queries);
             }
         }
         parsed.insert(
@@ -731,10 +765,26 @@ fn check_one(
                     if let Some(c) = &integrity.carried_failure {
                         return carried(c);
                     }
+                    // The text changed, so the digest cannot hold. What the
+                    // stamp says about the commit it names still can be
+                    // checked, when that commit is in this clone.
+                    let checked = match stamp_claims_hold(integrity, objects) {
+                        Some(Err(detail)) => {
+                            return result(
+                                IntegrityStatus::ContentMismatch,
+                                detail,
+                                Some(integrity.commit.clone()),
+                            );
+                        }
+                        Some(Ok(())) => "",
+                        None => {
+                            " (that commit is not in this clone, so the record could not be checked against it)"
+                        }
+                    };
                     return result(
                         IntegrityStatus::ReboundByOlderAutter,
                         format!(
-                            "an autter release older than the integrity check moved this note from {}; run a newer autter over the range to stamp it again",
+                            "an autter release older than the integrity check moved this note from {}{checked}; run a newer autter over the range to stamp it again",
                             short(&integrity.commit)
                         ),
                         Some(integrity.commit.clone()),
@@ -823,6 +873,100 @@ fn check_one(
                 None,
             )
         }
+    }
+}
+
+/// Whether what `integrity` records about the commit it names (its tree and
+/// the blob of each file) is true of that commit. `None` when that commit is
+/// not in this clone; `Some(Err(detail))` when a claim is false.
+fn stamp_claims_hold(
+    integrity: &NoteIntegrity,
+    objects: &HashMap<String, (String, String)>,
+) -> Option<Result<(), String>> {
+    let named = &integrity.commit;
+    let (_, tree) = objects.get(&tree_query(named))?;
+    if *tree != integrity.tree {
+        return Some(Err(format!(
+            "the note's integrity record names {}, but does not describe that commit's tree",
+            short(named)
+        )));
+    }
+    for (path, recorded) in &integrity.files {
+        let actual = objects
+            .get(&path_query(named, path))
+            .filter(|(kind, _)| kind == "blob")
+            .map(|(_, oid)| oid.clone());
+        if actual != *recorded {
+            return Some(Err(format!(
+                "the note's integrity record names {}, but describes a different version of {} than that commit has",
+                short(named),
+                path
+            )));
+        }
+    }
+    Some(Ok(()))
+}
+
+/// A note rebound by an older autter keeps the stamp of the note it was
+/// derived from, and git keeps that note on the commit the stamp names. When
+/// that note is still there and fails the check, the rebound note was derived
+/// from a failing note: it fails as [`IntegrityStatus::CarriedFailure`], as a
+/// rewrite by this autter would have recorded. Never fails: when the notes
+/// cannot be read or checked, the results stay as they are.
+fn check_rebound_sources(repo: &Repository, results: &mut [CommitIntegrity]) {
+    let mut named: Vec<String> = results
+        .iter()
+        .filter(|r| r.status == IntegrityStatus::ReboundByOlderAutter)
+        .filter_map(|r| r.recorded_commit.clone())
+        .collect();
+    named.sort();
+    named.dedup();
+    if named.is_empty() {
+        return;
+    }
+    let notes = match crate::git::notes_api::read_notes_batch(repo, &named) {
+        Ok(notes) => notes,
+        Err(e) => {
+            tracing::debug!("note integrity: notes of rebound sources not read: {e}");
+            return;
+        }
+    };
+    let with_notes: Vec<String> = named
+        .into_iter()
+        .filter(|c| notes.contains_key(c))
+        .collect();
+    if with_notes.is_empty() {
+        return;
+    }
+    let sources = match verify_notes_once(repo, &with_notes, &notes) {
+        Ok(sources) => sources,
+        Err(e) => {
+            tracing::debug!("note integrity: rebound sources not checked: {e}");
+            return;
+        }
+    };
+    let failed: HashMap<&str, &CommitIntegrity> = sources
+        .iter()
+        .filter(|r| r.status.is_failure())
+        .map(|r| (r.commit.as_str(), r))
+        .collect();
+    for r in results.iter_mut() {
+        if r.status != IntegrityStatus::ReboundByOlderAutter {
+            continue;
+        }
+        let Some(source) = r
+            .recorded_commit
+            .as_deref()
+            .and_then(|c| failed.get(c).copied())
+        else {
+            continue;
+        };
+        r.status = IntegrityStatus::CarriedFailure;
+        r.detail = format!(
+            "an autter release older than the integrity check moved this note from {}, whose note fails the check ({})",
+            short(&source.commit),
+            source.status.as_str()
+        );
     }
 }
 

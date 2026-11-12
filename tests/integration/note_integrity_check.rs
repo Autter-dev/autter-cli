@@ -975,3 +975,125 @@ fn test_reset_does_not_carry_a_tampered_note() {
     let (_, code, doc) = status_of(&repo, &recommitted);
     assert_eq!(code, 0, "{doc}");
 }
+
+// ---------------------------------------------------------------------------
+// Notes rebound by an older autter: what can still be checked is checked
+// ---------------------------------------------------------------------------
+//
+// A rebound note's text changed, so its digest cannot hold. Its stamp's
+// claims about the commit it names (tree, file blobs) and that commit's own
+// note can still be checked, and `--strict` fails the note.
+
+/// Commit `ai one` / `human two` with explicit checkpoints, then reword it
+/// with plain git, so the first commit keeps its note. Returns (original,
+/// reworded); `reworded` has no note yet.
+fn ai_commit_then_reword(repo: &TestRepo) -> (String, String) {
+    let file_path = repo.path().join("app.txt");
+    fs::write(&file_path, "human two\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "app.txt"])
+        .unwrap();
+    fs::write(&file_path, "ai one\nhuman two\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    let original = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["ai one".ai(), "human two".human()]);
+
+    repo.git_og(&["commit", "--amend", "-m", "reworded"])
+        .unwrap();
+    let reworded = rev(repo, "HEAD");
+    assert_ne!(original, reworded);
+    (original, reworded)
+}
+
+/// What an older autter writes for `to` from `from`'s note: the text with
+/// `base_commit_sha` replaced, the integrity member kept.
+fn rebind_like_older_autter(repo: &TestRepo, from: &str, to: &str) {
+    let note = raw_note(repo, from);
+    let field = format!("\"base_commit_sha\": \"{from}\"");
+    assert!(note.contains(&field), "{note}");
+    write_raw_note(
+        repo,
+        to,
+        &note.replace(&field, &format!("\"base_commit_sha\": \"{to}\"")),
+    );
+    assert_eq!(read_integrity(&raw_note(repo, to)).unwrap().commit, from);
+}
+
+/// A genuine rebind warns (exit 0) without `--strict` and fails with it.
+#[test]
+fn test_note_rebound_by_older_autter_fails_under_strict() {
+    let repo = TestRepo::new();
+    let (original, reworded) = ai_commit_then_reword(&repo);
+    rebind_like_older_autter(&repo, &original, &reworded);
+
+    assert_status(&repo, &reworded, "rebound_by_older_autter");
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["ai one".ai(), "human two".human()]);
+
+    let (code, doc, stderr) = verify_json(&repo, &reworded, &["--strict"]);
+    assert_eq!(code, 5, "{doc}");
+    assert_eq!(doc["error"]["code"], "integrity_failed", "{doc}");
+    assert_eq!(doc["failed"], 1, "{doc}");
+    assert_eq!(doc["results"][0]["status"], "rebound_by_older_autter");
+
+    // The human report marks it FAIL and says why.
+    let out = repo
+        .autter_command(&["verify", &reworded, "--strict"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("FAIL") && stdout.contains("rebound_by_older_autter"),
+        "{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--strict: a note rebound"),
+        "{stderr}"
+    );
+}
+
+/// A stamp whose claims about the commit it names are false is not a rebind:
+/// it fails, also without `--strict`.
+#[test]
+fn test_rebound_note_whose_stamp_misdescribes_its_commit_fails() {
+    let repo = TestRepo::new();
+    let mut file = repo.filename("app.txt");
+    let file_path = repo.path().join("app.txt");
+    fs::write(&file_path, "base\n").unwrap();
+    let base = repo.stage_all_and_commit("base").unwrap().commit_sha;
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    repo.autter(&["checkpoint", "human", "app.txt"]).unwrap();
+    fs::write(&file_path, "base\nai one\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    let commit = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
+    file.assert_committed_lines(crate::lines!["base".unattributed_human(), "ai one".ai()]);
+
+    // Make the note look rebound: its stamp names `base` but still records
+    // this commit's tree and blob, which are not `base`'s.
+    let note = raw_note(&repo, &commit);
+    let mut integrity = read_integrity(&note).unwrap();
+    integrity.commit = base.clone();
+    let forged = seal_note(&replace_first_range(&note, "1-2"), &integrity).unwrap();
+    write_raw_note(&repo, &commit, &forged);
+
+    assert_status(&repo, &commit, "content_mismatch");
+    let (_, _, doc) = status_of(&repo, &commit);
+    assert_eq!(doc["results"][0]["recorded_commit"], base.as_str(), "{doc}");
+    assert_blame_distrusts_note(&repo, &file, "app.txt");
+    assert_eq!(ai_additions(&repo, &commit), 0);
+}
+
+/// An older autter rebinding a note that fails the check carries the failure.
+#[test]
+fn test_note_rebound_from_a_tampered_note_fails() {
+    let repo = TestRepo::new();
+    let (original, reworded) = ai_commit_then_reword(&repo);
+    tamper_note(&repo, &original);
+    rebind_like_older_autter(&repo, &original, &reworded);
+
+    assert_carried_failure(&repo, &reworded, &original);
+    assert_blame_distrusts_note(&repo, &repo.filename("app.txt"), "app.txt");
+}
+
