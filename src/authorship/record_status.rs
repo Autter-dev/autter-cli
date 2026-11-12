@@ -107,6 +107,18 @@ impl Explanation {
 /// Explain a commit's record. Returns `None` when there is nothing to say:
 /// a recorded commit with AI or human lines needs no explanation.
 pub fn explain(status: &RecordStatus, stats: &CommitStats) -> Option<Explanation> {
+    explain_with_agents(status, stats, false)
+}
+
+/// [`explain`], told whether an AI tool Autter cannot capture is installed on
+/// this machine. With one installed, a recorded commit with no agent lines
+/// may still have been written by it, so the explanation only speaks for the
+/// agents Autter captures.
+pub fn explain_with_agents(
+    status: &RecordStatus,
+    stats: &CommitStats,
+    unsupported_agent_detected: bool,
+) -> Option<Explanation> {
     match status {
         RecordStatus::Recorded => {
             let nothing_attributed = stats.ai_additions == 0
@@ -114,7 +126,11 @@ pub fn explain(status: &RecordStatus, stats: &CommitStats) -> Option<Explanation
                 && stats.unknown_additions > 0;
             nothing_attributed.then(|| {
                 Explanation::new(
-                    "No AI activity detected: Autter recorded this commit, and no agent wrote its lines.",
+                    if unsupported_agent_detected {
+                        "No AI activity detected: Autter recorded this commit, and none of the agents it captures wrote its lines."
+                    } else {
+                        "No AI activity detected: Autter recorded this commit, and no agent wrote its lines."
+                    },
                     None,
                 )
             })

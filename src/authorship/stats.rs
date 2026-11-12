@@ -118,7 +118,16 @@ pub fn print_commit_stats_report(report: &CommitStatsReport, json: bool) {
             unattributed,
         )
     );
-    print!("{}", stats_footer(stats, record));
+    // The unsupported-agent notice is cheap and explains the untracked share,
+    // so it is printed in piped output too. It is worked out before the
+    // footer: with such an agent installed, the footer must not say that no
+    // agent wrote the lines.
+    let notice = if record.is_recorded() {
+        unsupported_agent_notice_for(stats, stats.unknown_additions)
+    } else {
+        None
+    };
+    print!("{}", stats_footer(stats, record, notice.is_some()));
 
     if stats.unknown_additions > 0 && record.is_recorded() {
         // Probing every agent installer is slow, so only on a terminal.
@@ -128,13 +137,8 @@ pub fn print_commit_stats_report(report: &CommitStatsReport, json: bool) {
                 crate::authorship::record_status::capture_boundary_line()
             );
         }
-        // The unsupported-agent notice is cheap and explains the untracked
-        // share, so it is printed in piped output too, as before.
-        if untracked_share_is_high(stats) {
-            let agents = crate::mdm::unsupported_agents::detect_unsupported_agents();
-            if let Some(notice) = unsupported_agent_notice(&agents) {
-                print!("{notice}");
-            }
+        if let Some(notice) = notice {
+            print!("{notice}");
         }
     }
 }
@@ -194,12 +198,22 @@ impl StatsSummary {
     /// `note_present` decides whether unattributed lines are Untracked (there
     /// is data, it just doesn't cover them) or Unknown (there is no data).
     pub fn from_stats(stats: &CommitStats, note_present: bool) -> Self {
-        let unattributed = stats.unknown_additions;
-        let (untracked, unknown) = if note_present {
-            (unattributed, 0)
+        let unknown = if note_present {
+            0
         } else {
-            (0, unattributed)
+            stats.unknown_additions
         };
+        Self::with_unknown_lines(stats, unknown, note_present)
+    }
+
+    /// Like [`Self::from_stats`] for a view that covers more than one record
+    /// (a commit range, the working tree): `unknown_lines` of the lines
+    /// without attestation have no record behind them and are Unknown; the
+    /// rest are Untracked.
+    pub fn with_unknown_lines(stats: &CommitStats, unknown_lines: u32, note_present: bool) -> Self {
+        let unattributed = stats.unknown_additions;
+        let unknown = unknown_lines.min(unattributed);
+        let untracked = unattributed - unknown;
         let lines = LineBreakdown {
             added: stats.ai_additions + stats.human_additions + unattributed,
             deleted: stats.git_diff_deleted_lines,
@@ -273,13 +287,21 @@ impl CommitStatsReport {
 
 /// Lines printed under `autter stats` for one commit: why lines have no
 /// record (with at most one next step) and what the AI share measures.
-fn stats_footer(stats: &CommitStats, record: &RecordStatus) -> String {
+fn stats_footer(
+    stats: &CommitStats,
+    record: &RecordStatus,
+    unsupported_agent_detected: bool,
+) -> String {
     let mut out = String::new();
     // A commit with no note but an agent's author email gets simulated AI
     // attribution; don't call it unrecorded.
     let simulated_agent_commit = !record.is_recorded() && stats.ai_additions > 0;
     if !simulated_agent_commit
-        && let Some(explanation) = crate::authorship::record_status::explain(record, stats)
+        && let Some(explanation) = crate::authorship::record_status::explain_with_agents(
+            record,
+            stats,
+            unsupported_agent_detected,
+        )
     {
         out.push_str(&explanation.render());
     }
@@ -294,14 +316,32 @@ fn stats_footer(stats: &CommitStats, record: &RecordStatus) -> String {
 /// autter cannot capture.
 const HIGH_UNTRACKED_SHARE: f64 = 0.5;
 
-/// True when at least half of the added lines have no attestation.
-fn untracked_share_is_high(stats: &CommitStats) -> bool {
+/// True when `untracked_lines` is at least half of the added lines.
+fn untracked_lines_share_is_high(stats: &CommitStats, untracked_lines: u32) -> bool {
     let total = stats.human_additions + stats.unknown_additions + stats.ai_additions;
-    total > 0 && f64::from(stats.unknown_additions) / f64::from(total) >= HIGH_UNTRACKED_SHARE
+    total > 0 && f64::from(untracked_lines) / f64::from(total) >= HIGH_UNTRACKED_SHARE
+}
+
+/// Whether a view in which `untracked_lines` of the added lines are untracked
+/// (recorded, with no agent behind them) should look for AI tools Autter
+/// cannot capture: the untracked share is high.
+pub fn untracked_share_warrants_agent_check(stats: &CommitStats, untracked_lines: u32) -> bool {
+    untracked_lines > 0 && untracked_lines_share_is_high(stats, untracked_lines)
+}
+
+/// The unsupported-agent notice for such a view: `None` unless the untracked
+/// share is high and an AI tool Autter cannot capture is installed. Used by
+/// `stats` for one commit and for a range; `log` shares the two halves.
+pub fn unsupported_agent_notice_for(stats: &CommitStats, untracked_lines: u32) -> Option<String> {
+    if !untracked_share_warrants_agent_check(stats, untracked_lines) {
+        return None;
+    }
+    let agents = crate::mdm::unsupported_agents::detect_unsupported_agents();
+    unsupported_agent_notice(&agents)
 }
 
 /// One-line notice naming detected agents whose edits autter cannot capture.
-fn unsupported_agent_notice(
+pub fn unsupported_agent_notice(
     agents: &[crate::mdm::unsupported_agents::UnsupportedAgent],
 ) -> Option<String> {
     let first = agents.first()?;
@@ -332,16 +372,41 @@ pub fn write_stats_to_terminal_with(
     is_interactive: bool,
     unattributed: LineCategory,
 ) -> String {
+    write_stats_to_terminal_split(
+        stats,
+        is_interactive,
+        unknown_lines_for(stats, unattributed),
+    )
+}
+
+/// Like [`write_stats_to_terminal_with`] for a view that mixes recorded and
+/// unrecorded commits: `unknown_lines` of the lines without attestation are
+/// shown as unknown, the rest as untracked.
+pub fn write_stats_to_terminal_split(
+    stats: &CommitStats,
+    is_interactive: bool,
+    unknown_lines: u32,
+) -> String {
     // Honor the project-wide color decision (NO_COLOR / --no-color / non-TTY).
-    let output = render_stats_output(
+    let output = render_stats_output_split(
         stats,
         crate::commands::arg_parser::use_color(),
-        unattributed,
+        unknown_lines,
     );
     if is_interactive {
         print!("{output}");
     }
     output
+}
+
+/// How many of the lines without attestation are Unknown when they all carry
+/// the one label `unattributed`.
+fn unknown_lines_for(stats: &CommitStats, unattributed: LineCategory) -> u32 {
+    if unattributed == LineCategory::Unknown {
+        stats.unknown_additions
+    } else {
+        0
+    }
 }
 
 /// Rendering half of [`write_stats_to_terminal`], with the color decision passed
@@ -352,6 +417,12 @@ pub fn write_stats_to_terminal_with(
 /// Two lines: a bar running from human (`█`) through untracked or unknown
 /// (`·`) to AI (`░`), then each category's line count and share.
 fn render_stats_output(stats: &CommitStats, colorize: bool, unattributed: LineCategory) -> String {
+    render_stats_output_split(stats, colorize, unknown_lines_for(stats, unattributed))
+}
+
+/// [`render_stats_output`] with the lines without attestation divided into
+/// `unknown_lines` unknown and the rest untracked.
+fn render_stats_output_split(stats: &CommitStats, colorize: bool, unknown_lines: u32) -> String {
     let mut output = String::new();
 
     // Set maximum bar width to 40 characters
@@ -432,7 +503,7 @@ fn render_stats_output(stats: &CommitStats, colorize: bool, unattributed: LineCa
     output.push('\n');
 
     output.push_str(&indent);
-    output.push_str(&counts_line(stats, unattributed, colorize));
+    output.push_str(&counts_line(stats, unknown_lines, colorize));
     output.push('\n');
 
     output
@@ -440,7 +511,11 @@ fn render_stats_output(stats: &CommitStats, colorize: bool, unattributed: LineCa
 
 /// `12 human (30%) · 8 untracked (20%) · 20 AI (50%) · 40 added, 3 deleted`.
 /// Categories with no lines are left out, except AI, which always shows.
-fn counts_line(stats: &CommitStats, unattributed: LineCategory, colorize: bool) -> String {
+/// `unknown_lines` of the lines without attestation are unknown, the rest
+/// untracked.
+fn counts_line(stats: &CommitStats, unknown_lines: u32, colorize: bool) -> String {
+    let unknown_lines = unknown_lines.min(stats.unknown_additions);
+    let untracked_lines = stats.unknown_additions - unknown_lines;
     let total = stats.human_additions + stats.unknown_additions + stats.ai_additions;
     let percent = |count: u32| -> u32 {
         if total == 0 {
@@ -465,7 +540,8 @@ fn counts_line(stats: &CommitStats, unattributed: LineCategory, colorize: bool) 
         parts.push(format!("{count} {label} ({}%)", percent(count)));
     };
     push(LineCategory::Human, stats.human_additions, false);
-    push(unattributed, stats.unknown_additions, false);
+    push(LineCategory::Untracked, untracked_lines, false);
+    push(LineCategory::Unknown, unknown_lines, false);
     push(LineCategory::Ai, stats.ai_additions, true);
 
     let mut line = parts.join(" \u{00B7} ");
@@ -911,10 +987,13 @@ mod tests {
 
     #[test]
     fn untracked_share_threshold() {
-        assert!(untracked_share_is_high(&stats_with(0, 10, 0)));
-        assert!(untracked_share_is_high(&stats_with(5, 5, 0)));
-        assert!(!untracked_share_is_high(&stats_with(6, 4, 0)));
-        assert!(!untracked_share_is_high(&stats_with(0, 0, 0)));
+        assert!(untracked_lines_share_is_high(&stats_with(0, 10, 0), 10));
+        assert!(untracked_lines_share_is_high(&stats_with(5, 5, 0), 5));
+        assert!(!untracked_lines_share_is_high(&stats_with(6, 4, 0), 4));
+        assert!(!untracked_lines_share_is_high(&stats_with(0, 0, 0), 0));
+        // In a range, lines from commits with no record are unknown, not
+        // untracked: they don't count towards the untracked share.
+        assert!(!untracked_lines_share_is_high(&stats_with(0, 10, 0), 4));
     }
 
     #[test]
@@ -1090,29 +1169,60 @@ mod tests {
     fn stats_footer_explains_without_troubleshooting() {
         use crate::authorship::record_status::{MissingCause, RecordStatus};
         let human_only = stats_with(0, 5, 0);
-        let footer = stats_footer(&human_only, &RecordStatus::Recorded);
+        let footer = stats_footer(&human_only, &RecordStatus::Recorded, false);
         assert_eq!(
             footer,
             "No AI activity detected: Autter recorded this commit, and no agent wrote its lines.\n"
         );
+        // With an AI tool Autter cannot capture installed, the footer sits
+        // above "If it wrote this code…" and must not rule that out.
+        let footer = stats_footer(&human_only, &RecordStatus::Recorded, true);
+        assert_eq!(
+            footer,
+            "No AI activity detected: Autter recorded this commit, and none of the agents it captures wrote its lines.\n"
+        );
+        assert!(!footer.contains("no agent wrote"), "{footer}");
 
         let with_ai = stats_with(1, 2, 3);
         assert_eq!(
-            stats_footer(&with_ai, &RecordStatus::Recorded),
+            stats_footer(&with_ai, &RecordStatus::Recorded, false),
             format!("{AI_SHARE_MEANING}\n")
         );
 
         let missing = RecordStatus::Missing {
             cause: MissingCause::NotCaptured,
         };
-        let footer = stats_footer(&human_only, &missing);
+        let footer = stats_footer(&human_only, &missing, false);
         assert_eq!(footer.matches("Next:").count(), 1, "{footer}");
         assert!(!footer.contains("install-hooks"), "{footer}");
 
         // Simulated agent-email attribution: don't call it unrecorded.
         assert_eq!(
-            stats_footer(&stats_with(0, 0, 4), &missing),
+            stats_footer(&stats_with(0, 0, 4), &missing, false),
             format!("{AI_SHARE_MEANING}\n")
+        );
+    }
+
+    #[test]
+    fn a_range_splits_unattested_lines_into_untracked_and_unknown() {
+        // 6 lines without attestation, 4 of them from commits with no record.
+        let stats = stats_with(1, 6, 3);
+        let summary = StatsSummary::with_unknown_lines(&stats, 4, true);
+        assert_eq!(summary.lines.untracked, 2);
+        assert_eq!(summary.lines.unknown, 4);
+        assert_eq!(
+            summary.lines.ai
+                + summary.lines.human
+                + summary.lines.untracked
+                + summary.lines.unknown,
+            summary.lines.added
+        );
+        assert_eq!(summary.capture.status, CaptureStatus::Captured);
+
+        let text = render_stats_output_split(&stats, false, 4);
+        assert!(
+            text.contains("1 human (10%) \u{00B7} 2 untracked (20%) \u{00B7} 4 unknown (40%) \u{00B7} 3 AI (30%)"),
+            "{text}"
         );
     }
 

@@ -3,13 +3,14 @@ use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::labels::LineCategory;
 use crate::authorship::record_status::{DEFAULT_PENDING_WAIT, RecordClassifier, RecordStatus};
 use crate::authorship::stats::{
-    CommitStatsReport, stats_for_commit_stats_with_parent_and_authorship,
-    write_stats_to_terminal_with,
+    CommitStatsReport, stats_for_commit_stats_with_parent_and_authorship, unsupported_agent_notice,
+    untracked_share_warrants_agent_check, write_stats_to_terminal_with,
 };
 use crate::commands::output::{self, ErrorKind};
 use crate::config::Config;
 use crate::error::AutterError;
 use crate::git::repository::Repository;
+use crate::mdm::unsupported_agents::{UnsupportedAgent, detect_unsupported_agents};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode},
@@ -564,6 +565,30 @@ struct LogRenderer {
     eof: bool,
     classifier: RecordClassifier,
     head_sha: Option<String>,
+    agent_note: UnsupportedAgentNote,
+}
+
+/// The note `autter stats` prints under a mostly untracked commit when an AI
+/// tool Autter cannot capture is installed. `autter log` prints it once, under
+/// the first such commit, not under every one.
+#[derive(Default)]
+struct UnsupportedAgentNote {
+    shown: bool,
+    /// Detected once per run, and only if some commit is mostly untracked.
+    agents: Option<Vec<UnsupportedAgent>>,
+}
+
+impl UnsupportedAgentNote {
+    /// The note for a recorded commit with these stats, if it is due.
+    fn for_commit(&mut self, stats: &crate::authorship::stats::CommitStats) -> Option<String> {
+        if self.shown || !untracked_share_warrants_agent_check(stats, stats.unknown_additions) {
+            return None;
+        }
+        let agents = self.agents.get_or_insert_with(detect_unsupported_agents);
+        let notice = unsupported_agent_notice(agents)?;
+        self.shown = true;
+        Some(notice)
+    }
 }
 
 impl LogRenderer {
@@ -580,6 +605,7 @@ impl LogRenderer {
             eof: false,
             classifier,
             head_sha,
+            agent_note: UnsupportedAgentNote::default(),
         })
     }
 
@@ -631,20 +657,20 @@ impl LogRenderer {
             records.insert(commit.sha.clone(), status);
         }
 
-        Ok(commits
-            .iter()
-            .map(|commit| {
-                let note = notes.get(&commit.sha).map(String::as_str);
-                render_commit(
-                    &self.repo,
-                    commit,
-                    note,
-                    records.get(&commit.sha),
-                    &self.options,
-                    &self.ignore_patterns,
-                )
-            })
-            .collect())
+        let mut rendered = Vec::with_capacity(commits.len());
+        for commit in &commits {
+            let note = notes.get(&commit.sha).map(String::as_str);
+            rendered.push(render_commit(
+                &self.repo,
+                commit,
+                note,
+                records.get(&commit.sha),
+                &self.options,
+                &self.ignore_patterns,
+                &mut self.agent_note,
+            ));
+        }
+        Ok(rendered)
     }
 
     fn is_eof(&self) -> bool {
@@ -782,6 +808,7 @@ fn render_commit(
     missing_record: Option<&RecordStatus>,
     options: &ParsedLogArgs,
     ignore_patterns: &[String],
+    agent_note: &mut UnsupportedAgentNote,
 ) -> String {
     let authorship_log =
         raw_note.and_then(|note| AuthorshipLog::deserialize_from_string(note).ok());
@@ -851,16 +878,20 @@ fn render_commit(
     } else {
         LineCategory::Untracked
     };
-    match render_stats(
+    let stats = commit_stats(
         repo,
         &commit.sha,
         &commit.parents,
         authorship_log.as_ref(),
         ignore_patterns,
-        unattributed,
-    ) {
-        Ok(stats) => append_indented_block(&mut out, &stats, 6),
-        Err(message) => append_indented_line(&mut out, &message, 6),
+    );
+    match &stats {
+        Ok(stats) => append_indented_block(
+            &mut out,
+            &write_stats_to_terminal_with(stats, false, unattributed),
+            6,
+        ),
+        Err(message) => append_indented_line(&mut out, message, 6),
     }
     if let Some(record) = missing_record {
         append_indented_line(
@@ -868,6 +899,12 @@ fn render_commit(
             &format!("no Autter record: {}", record.short_reason()),
             6,
         );
+    } else if let Ok(stats) = &stats
+        && let Some(notice) = agent_note.for_commit(stats)
+    {
+        // Untracked lines in a recorded commit may have been written by an AI
+        // tool Autter cannot capture; say so once, as `autter stats` does.
+        append_indented_block(&mut out, &notice, 6);
     }
 
     if options.show_raw_notes {
@@ -881,18 +918,6 @@ fn render_commit(
 
     out.push('\n');
     out
-}
-
-fn render_stats(
-    repo: &Repository,
-    commit_sha: &str,
-    parents: &[String],
-    authorship_log: Option<&AuthorshipLog>,
-    ignore_patterns: &[String],
-    unattributed: LineCategory,
-) -> Result<String, String> {
-    let stats = commit_stats(repo, commit_sha, parents, authorship_log, ignore_patterns)?;
-    Ok(write_stats_to_terminal_with(&stats, false, unattributed))
 }
 
 /// A commit's stats for `autter log`, or why they were skipped.

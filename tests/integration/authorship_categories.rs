@@ -379,3 +379,142 @@ fn coverage_reports_recorded_and_predating_commits() {
     assert!(text.contains("Attribution coverage:"), "{text}");
     assert!(text.contains("predate Autter in this repository"), "{text}");
 }
+
+/// The scenario the next tests share. `mixed.txt` ends up with, in order: an
+/// untracked line, a known-human line, two AI lines and an untracked line
+/// (commits `recorded`), then two lines from a commit capture missed
+/// (`unrecorded`). A last recorded commit adds a hand-typed file.
+struct MixedHistory {
+    repo: TestRepo,
+    base: String,
+    recorded: String,
+    unrecorded: String,
+}
+
+fn mixed_history() -> MixedHistory {
+    let repo = TestRepo::new();
+    let path = repo.path().join("mixed.txt");
+
+    fs::write(&path, "Base 1\n").unwrap();
+    let base = repo.stage_all_and_commit("Base").unwrap().commit_sha;
+    let mut file = repo.filename("mixed.txt");
+    file.assert_committed_lines(lines!["Base 1".unattributed_human()]);
+
+    // One commit with a known-human line, two AI lines and a line typed with
+    // nothing recording it.
+    fs::write(&path, "Base 1\nKnown human line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "mixed.txt"])
+        .unwrap();
+    repo.autter(&["checkpoint", "human", "mixed.txt"]).unwrap();
+    fs::write(&path, "Base 1\nKnown human line\nAI one\nAI two\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "mixed.txt"])
+        .unwrap();
+    fs::write(
+        &path,
+        "Base 1\nKnown human line\nAI one\nAI two\nTyped, untracked\n",
+    )
+    .unwrap();
+    let recorded = repo.stage_all_and_commit("Mixed").unwrap().commit_sha;
+    file.assert_committed_lines(lines![
+        "Base 1".unattributed_human(),
+        "Known human line".human(),
+        "AI one".ai(),
+        "AI two".ai(),
+        "Typed, untracked".unattributed_human(),
+    ]);
+
+    // A commit capture missed: plain git, which the service never sees.
+    fs::write(
+        &path,
+        "Base 1\nKnown human line\nAI one\nAI two\nTyped, untracked\nNo record 1\nNo record 2\n",
+    )
+    .unwrap();
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "No record"]).unwrap();
+    let unrecorded = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(repo.read_authorship_note(&unrecorded).is_none());
+    file.assert_committed_lines(lines![
+        "Base 1".unattributed_human(),
+        "Known human line".human(),
+        "AI one".ai(),
+        "AI two".ai(),
+        "Typed, untracked".unattributed_human(),
+        "No record 1".unattributed_human(),
+        "No record 2".unattributed_human(),
+    ]);
+
+    // A recorded commit typed by hand.
+    fs::write(repo.path().join("hand.txt"), "By hand\n").unwrap();
+    repo.stage_all_and_commit("Human only, recorded").unwrap();
+    let mut hand = repo.filename("hand.txt");
+    hand.assert_committed_lines(lines!["By hand".unattributed_human()]);
+    assert!(
+        repo.read_authorship_note(&unrecorded).is_none(),
+        "the missed commit still has no record"
+    );
+
+    MixedHistory {
+        repo,
+        base,
+        recorded,
+        unrecorded,
+    }
+}
+
+/// In a range, lines from a commit with no record are `unknown`, as
+/// `stats <that commit>` and `blame --markers` call them. They used to be
+/// counted as `untracked` whenever another commit in the range had a record.
+#[test]
+fn range_stats_call_lines_of_an_unrecorded_commit_unknown() {
+    let history = mixed_history();
+    let repo = &history.repo;
+
+    // The single commit and blame agree the two lines are unknown.
+    let single = stats_json(repo, &[&history.unrecorded]);
+    assert_eq!(single["lines"]["unknown"], 2, "{single}");
+    assert_eq!(single["lines"]["untracked"], 0, "{single}");
+    let blame = repo
+        .autter(&["blame", "--markers", "mixed.txt"])
+        .expect("autter blame --markers");
+    let markers: Vec<&str> = blame
+        .lines()
+        .filter(|line| line.contains("No record"))
+        .collect();
+    assert_eq!(markers.len(), 2, "{blame}");
+    assert!(
+        markers.iter().all(|line| line.starts_with("unknown ")),
+        "{blame}"
+    );
+
+    // The range over all three commits says the same.
+    let range = format!("{}..HEAD", history.base);
+    let json = stats_json(repo, &[&range]);
+    assert_eq!(json["lines"]["added"], 7, "{json}");
+    assert_eq!(json["lines"]["ai"], 2, "{json}");
+    assert_eq!(json["lines"]["human"], 1, "{json}");
+    assert_eq!(json["lines"]["untracked"], 2, "{json}");
+    assert_eq!(json["lines"]["unknown"], 2, "{json}");
+    assert_eq!(json["range_stats"]["unknown_additions"], 4, "{json}");
+    assert_eq!(json["capture"]["status"], "captured", "{json}");
+
+    let text = repo.autter(&["stats", &range]).expect("autter stats range");
+    assert!(text.contains("2 untracked (29%)"), "{text}");
+    assert!(text.contains("2 unknown (29%)"), "{text}");
+    assert!(
+        text.contains("1 of 3 commits has no Autter record (its lines count as unknown):"),
+        "{text}"
+    );
+    assert!(!text.contains("commit has no"), "{text}");
+    assert!(!text.contains("count as untracked"), "{text}");
+
+    // A range that is only the unrecorded commit is all unknown.
+    let only = format!("{}..{}", history.recorded, history.unrecorded);
+    let json = stats_json(repo, &[&only]);
+    assert_eq!(json["lines"]["unknown"], 2, "{json}");
+    assert_eq!(json["lines"]["untracked"], 0, "{json}");
+    assert_eq!(json["capture"]["status"], "nothing_captured", "{json}");
+}
