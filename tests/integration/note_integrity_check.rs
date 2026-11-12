@@ -1097,3 +1097,186 @@ fn test_note_rebound_from_a_tampered_note_fails() {
     assert_blame_distrusts_note(&repo, &repo.filename("app.txt"), "app.txt");
 }
 
+// ---------------------------------------------------------------------------
+// Stash notes (refs/notes/ai-stash)
+// ---------------------------------------------------------------------------
+//
+// `git stash` saves the working log as a note on the stash commit, and
+// `stash pop` restores it; the next commit stamps it. A stash note is stamped
+// for its stash, and one that fails is not restored.
+
+fn stash_sha(repo: &TestRepo) -> String {
+    repo.sync_daemon();
+    rev(repo, "refs/stash")
+}
+
+fn raw_stash_note(repo: &TestRepo, stash: &str) -> String {
+    repo.sync_daemon();
+    repo.git_og(&["notes", "--ref=ai-stash", "show", stash])
+        .unwrap_or_else(|e| panic!("stash {stash} should have a note: {e}"))
+}
+
+fn write_raw_stash_note(repo: &TestRepo, stash: &str, content: &str) {
+    let git_dir = repo
+        .git_og(&["rev-parse", "--absolute-git-dir"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let path = std::path::Path::new(&git_dir).join("autter-test-stash-note");
+    fs::write(&path, content).unwrap();
+    let blob = repo
+        .git_og(&["hash-object", "-w", path.to_str().unwrap()])
+        .unwrap();
+    repo.git_og(&[
+        "notes",
+        "--ref=ai-stash",
+        "add",
+        "-f",
+        "-C",
+        blob.trim(),
+        stash,
+    ])
+    .unwrap();
+}
+
+/// `app.txt` committed as `base`, then an untracked line and an AI line
+/// (checkpointed as an agent would), stashed. HEAD then moves on (a commit of
+/// another file), so the working log of the commit the stash was made on
+/// plays no part when it is popped: only the stash note can restore the AI
+/// line. Returns the stash commit.
+fn stash_an_ai_edit(repo: &TestRepo) -> String {
+    let file_path = repo.path().join("app.txt");
+    fs::write(&file_path, "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    fs::write(&file_path, "base\nuntracked line\n").unwrap();
+    repo.autter(&["checkpoint", "human", "app.txt"]).unwrap();
+    fs::write(&file_path, "base\nuntracked line\nai line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    repo.git(&["stash"]).unwrap();
+    assert_eq!(fs::read_to_string(&file_path).unwrap(), "base\n");
+    let stash = stash_sha(repo);
+
+    fs::write(repo.path().join("other.txt"), "other\n").unwrap();
+    repo.stage_all_and_commit("move HEAD on").unwrap();
+    let mut other = repo.filename("other.txt");
+    other.assert_committed_lines(crate::lines!["other".unattributed_human()]);
+    stash
+}
+
+/// Pop the top stash and commit it; returns the new commit.
+fn pop_and_commit(repo: &TestRepo) -> String {
+    repo.git(&["stash", "pop"]).unwrap();
+    repo.sync_daemon();
+    repo.git(&["add", "."]).unwrap();
+    repo.commit("after stash").unwrap().commit_sha
+}
+
+#[test]
+fn test_stash_note_is_stamped_and_restores() {
+    let repo = TestRepo::new();
+    let stash = stash_an_ai_edit(&repo);
+
+    let note = raw_stash_note(&repo, &stash);
+    let integrity = read_integrity(&note).expect("stash notes carry an integrity member");
+    assert_eq!(integrity.commit, stash);
+    assert_eq!(integrity.tree, rev(&repo, &format!("{stash}^{{tree}}")));
+    assert_eq!(
+        integrity.files.get("app.txt").cloned().flatten(),
+        Some(rev(&repo, &format!("{stash}:app.txt")))
+    );
+
+    let commit = pop_and_commit(&repo);
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "untracked line".unattributed_human(),
+        "ai line".ai()
+    ]);
+    assert_status(&repo, &commit, "verified");
+}
+
+/// A stash note edited before the pop (an untracked line claimed for AI) is
+/// not restored: its lines count as untracked, and the next commit's note
+/// does not credit them.
+#[test]
+fn test_edited_stash_note_is_not_restored() {
+    let repo = TestRepo::new();
+    let stash = stash_an_ai_edit(&repo);
+    let note = raw_stash_note(&repo, &stash);
+    write_raw_stash_note(&repo, &stash, &replace_first_range(&note, "2-3"));
+
+    let commit = pop_and_commit(&repo);
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "untracked line".unattributed_human(),
+        "ai line".unattributed_human()
+    ]);
+    assert_eq!(ai_additions(&repo, &commit), 0);
+    let (status, code, doc) = status_of(&repo, &commit);
+    assert!(status == "verified" || status == "missing", "{doc}");
+    assert_eq!(code, 0, "{doc}");
+}
+
+/// Another stash's note copied onto this stash is not restored.
+#[test]
+fn test_stash_note_copied_to_another_stash_is_not_restored() {
+    let repo = TestRepo::new();
+    let ai_stash = stash_an_ai_edit(&repo);
+
+    // A second stash with no checkpoint at all, so autter saves no note
+    // for it.
+    let file_path = repo.path().join("app.txt");
+    fs::write(&file_path, "base\nanother line\nai line\n").unwrap();
+    repo.git(&["stash"]).unwrap();
+    let plain_stash = stash_sha(&repo);
+    assert_ne!(ai_stash, plain_stash);
+    repo.git_og(&[
+        "notes",
+        "--ref=ai-stash",
+        "copy",
+        "-f",
+        &ai_stash,
+        &plain_stash,
+    ])
+    .unwrap();
+
+    // Applied by SHA: the daemon can resolve `stash@{0}` of a `pop` only
+    // after git has already moved the stack, to the entry below it.
+    repo.git(&["stash", "apply", &plain_stash]).unwrap();
+    repo.sync_daemon();
+    repo.git(&["add", "."]).unwrap();
+    let commit = repo.commit("after stash").unwrap().commit_sha;
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "another line".unattributed_human(),
+        "ai line".unattributed_human()
+    ]);
+    assert_eq!(ai_additions(&repo, &commit), 0);
+}
+
+/// A stash note written before stash notes were stamped (no integrity
+/// member) still restores, so stashes made before an upgrade keep their AI
+/// lines.
+#[test]
+fn test_unstamped_stash_note_from_older_autter_still_restores() {
+    let repo = TestRepo::new();
+    let stash = stash_an_ai_edit(&repo);
+    let note = raw_stash_note(&repo, &stash);
+    write_raw_stash_note(&repo, &stash, &strip_integrity(&note));
+    assert!(read_integrity(&raw_stash_note(&repo, &stash)).is_none());
+
+    let commit = pop_and_commit(&repo);
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "untracked line".unattributed_human(),
+        "ai line".ai()
+    ]);
+    assert_status(&repo, &commit, "verified");
+}
+

@@ -53,6 +53,11 @@
 //! describe the commit it names when that commit is in this clone
 //! ([`IntegrityStatus::ContentMismatch`] otherwise), and when that commit's
 //! own note fails, the rebound note is [`IntegrityStatus::CarriedFailure`].
+//!
+//! **Stash notes.** `git stash` saves the working log as a note in
+//! `refs/notes/ai-stash`, stamped for the stash commit
+//! ([`seal_stash_note`]); `stash pop`/`apply` checks it
+//! ([`check_stash_note`]) and does not restore one that fails.
 
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -1238,6 +1243,181 @@ pub fn check_rewrite_sources(
         check.commits.push(new_commit.clone());
     }
     check
+}
+
+// ---------------------------------------------------------------------------
+// Stash notes (refs/notes/ai-stash)
+// ---------------------------------------------------------------------------
+//
+// `git stash` saves the working log's attribution as a note on the stash
+// commit, and `stash pop`/`apply` puts it back into the working log, where
+// the next commit stamps it. A stash note is bound to its stash commit the
+// same way a note is bound to its commit: `commit` is the stash commit,
+// `tree` its tree, `files` the blob of each attested file in the stash (the
+// stash commit's tree, or its untracked-files parent for `stash -u`), and
+// the digest covers the note.
+
+/// The places a stashed file's content is: the stash commit's tree (tracked
+/// files), then its third parent (untracked files, `git stash -u`).
+fn stash_path_queries(stash_sha: &str, path: &str) -> [String; 2] {
+    [
+        path_query(stash_sha, path),
+        path_query(&format!("{stash_sha}^3"), path),
+    ]
+}
+
+fn stash_blob(
+    objects: &HashMap<String, (String, String)>,
+    stash_sha: &str,
+    path: &str,
+) -> Option<String> {
+    stash_path_queries(stash_sha, path).iter().find_map(|q| {
+        objects
+            .get(q)
+            .filter(|(kind, _)| kind == "blob")
+            .map(|(_, oid)| oid.clone())
+    })
+}
+
+fn stash_objects(
+    repo: &Repository,
+    stash_sha: &str,
+    log: &AuthorshipLog,
+    extra_paths: impl Iterator<Item = String>,
+) -> Result<HashMap<String, (String, String)>, AutterError> {
+    let mut queries = vec![tree_query(stash_sha)];
+    let mut seen = HashSet::new();
+    for path in log
+        .attestations
+        .iter()
+        .map(|a| a.file_path.clone())
+        .chain(extra_paths)
+    {
+        if seen.insert(path.clone()) {
+            queries.extend(stash_path_queries(stash_sha, &path));
+        }
+    }
+    batch_check(repo, &queries)
+}
+
+/// `note` (a stash's authorship log) stamped for the stash commit
+/// `stash_sha`. Never fails the stash: on any error the note is returned
+/// as it is, and it restores as a note written before stash notes were
+/// stamped.
+pub fn seal_stash_note(repo: &Repository, stash_sha: &str, note: &str) -> String {
+    let body = split_note(note).body;
+    let Ok(log) = AuthorshipLog::deserialize_from_string(&body) else {
+        return note.to_string();
+    };
+    let objects = match stash_objects(repo, stash_sha, &log, std::iter::empty()) {
+        Ok(objects) => objects,
+        Err(e) => {
+            tracing::debug!("note integrity: stash note not stamped: {e}");
+            return note.to_string();
+        }
+    };
+    let Some((_, tree)) = objects.get(&tree_query(stash_sha)) else {
+        return note.to_string();
+    };
+    let files = log
+        .attestations
+        .iter()
+        .map(|a| {
+            (
+                a.file_path.clone(),
+                stash_blob(&objects, stash_sha, &a.file_path),
+            )
+        })
+        .collect();
+    let integrity = NoteIntegrity {
+        v: INTEGRITY_FORMAT_VERSION,
+        commit: stash_sha.to_string(),
+        tree: tree.clone(),
+        files,
+        carried_failure: None,
+        digest: None,
+    };
+    insert_integrity(&body, &integrity).unwrap_or_else(|| note.to_string())
+}
+
+/// Result of checking a stash note before restoring it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashNoteCheck {
+    /// Stamped for this stash and unchanged since.
+    Verified,
+    /// No integrity member: written by an autter older than stash-note
+    /// stamping (3.8.1 and earlier). Restored as before; a stamped note with
+    /// its member removed looks the same, which this check cannot tell apart.
+    Legacy,
+    /// The note does not belong to this stash or was changed after autter
+    /// wrote it; the reason completes "its record ...".
+    Failed(String),
+}
+
+/// Check the stash note `note` of the stash commit `stash_sha` before its
+/// attribution is restored into the working log.
+pub fn check_stash_note(repo: &Repository, stash_sha: &str, note: &str) -> StashNoteCheck {
+    let split = split_note(note);
+    if split.integrity_moved {
+        return StashNoteCheck::Failed(
+            "has an integrity record that was moved or reformatted after autter wrote it"
+                .to_string(),
+        );
+    }
+    let integrity = match split.integrity {
+        None => return StashNoteCheck::Legacy,
+        Some(Err(e)) => {
+            return StashNoteCheck::Failed(format!("has an unreadable integrity record ({e})"));
+        }
+        Some(Ok(integrity)) => integrity,
+    };
+    if integrity.commit != stash_sha {
+        return StashNoteCheck::Failed(format!(
+            "was written for {}, not for this stash",
+            short(&integrity.commit)
+        ));
+    }
+    if integrity.digest.as_deref() != Some(compute_digest(&split.body, &integrity).as_str()) {
+        return StashNoteCheck::Failed("was changed after autter wrote it".to_string());
+    }
+    if integrity.carried_failure.is_some() {
+        return StashNoteCheck::Failed("was derived from a note that failed the check".to_string());
+    }
+    let Ok(log) = AuthorshipLog::deserialize_from_string(&split.body) else {
+        return StashNoteCheck::Failed("is not a readable authorship record".to_string());
+    };
+    let objects = match stash_objects(repo, stash_sha, &log, integrity.files.keys().cloned()) {
+        Ok(objects) => objects,
+        // The digest holds; only the comparison with the stash could not run.
+        Err(e) => {
+            tracing::debug!("note integrity: stash note compared by digest only: {e}");
+            return StashNoteCheck::Verified;
+        }
+    };
+    match objects.get(&tree_query(stash_sha)) {
+        Some((_, tree)) if *tree == integrity.tree => {}
+        _ => {
+            return StashNoteCheck::Failed("does not describe this stash's tree".to_string());
+        }
+    }
+    for a in &log.attestations {
+        match integrity.files.get(&a.file_path) {
+            Some(recorded) if *recorded == stash_blob(&objects, stash_sha, &a.file_path) => {}
+            Some(_) => {
+                return StashNoteCheck::Failed(format!(
+                    "describes a different version of {} than the stash has",
+                    a.file_path
+                ));
+            }
+            None => {
+                return StashNoteCheck::Failed(format!(
+                    "attributes lines in {}, which its integrity record does not cover",
+                    a.file_path
+                ));
+            }
+        }
+    }
+    StashNoteCheck::Verified
 }
 
 // ---------------------------------------------------------------------------

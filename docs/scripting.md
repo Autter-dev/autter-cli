@@ -254,11 +254,23 @@ put attribution back into the working tree (`reset`, `cherry-pick -n`,
 lines are committed again as unknown. A source note that is `unavailable`
 (objects missing from a shallow clone) is carried as before.
 
+The same holds for the other ways attribution comes back:
+
+- **`git stash`.** The attribution saved with a stash (`refs/notes/ai-stash`)
+  is stamped for the stash commit. `stash pop`/`apply` checks it first; a note
+  written for another stash, or changed after autter wrote it, is not restored
+  (those lines count as untracked, as any edit autter has no record of) and
+  autter prints one warning line naming the stash (in the background service's
+  log when the service handles the stash). A stash note without a stamp,
+  written by autter 3.8.1 or earlier, is restored as before, so stashes made
+  before an upgrade keep their AI lines; a stamped note with its stamp removed
+  looks the same and is restored too.
+
 This is an integrity check, not tamper evidence. It catches notes copied to
 another commit, moved, or edited by hand. Not caught:
 
 - someone who can write to the repository and recomputes every field of the
-  note (the digest is not a signature); a record kept
+  note (the digest is not a signature), including a stash note; a record kept
   outside the repository is planned for that;
 - a note made to look rebound with a genuine stamp copied from another note
   whose commit is not in the clone, or whose claims hold: it is a warning
