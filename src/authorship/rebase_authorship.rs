@@ -31,6 +31,13 @@ pub struct RebaseNoteCache {
     original_note_contents: HashMap<String, String>,
     /// AI-touched file paths extracted from original commit notes
     ai_touched_files: HashSet<String>,
+    /// Note blob OIDs for new commits (commit_sha → blob_oid). A new commit
+    /// whose note blob is an original commit's was given that note by git
+    /// (`notes.rewriteRef`), which names the commit it replays.
+    new_note_blob_oids: HashMap<String, String>,
+    /// Notes git built for new commits by joining original notes: what it does
+    /// for a squash or fixup when `notes.rewriteRef` is set (commit_sha → raw_content).
+    new_joined_note_contents: HashMap<String, String>,
 }
 
 #[doc(hidden)]
@@ -83,24 +90,6 @@ pub fn load_rebase_note_cache(
     // the original note verbatim onto the rewritten commit, with the original line ranges.
     // If the rebase shifted lines, those ranges are stale, so we must recompute them
     // instead of trusting the copy.
-    let original_blob_oid_set: HashSet<&String> = original_note_blob_oids.values().collect();
-    let mut new_commits_with_notes = HashSet::new();
-    for (commit, blob_oid) in &new_commit_note_blob_oids {
-        if original_blob_oid_set.contains(blob_oid) {
-            tracing::debug!(
-                "Commit {} carries a note copied verbatim by git (notes.rewriteRef); recomputing",
-                commit
-            );
-            continue;
-        }
-        if let Some(content) = blob_contents.get(blob_oid)
-            && let Ok(log) = AuthorshipLog::deserialize_from_string(content)
-            && !log.attestations.is_empty()
-        {
-            new_commits_with_notes.insert(commit.clone());
-        }
-    }
-
     let mut original_note_contents = HashMap::new();
     let mut ai_touched_files = HashSet::new();
 
@@ -115,11 +104,53 @@ pub fn load_rebase_note_cache(
         }
     }
 
+    // Likewise for a note git joined from several original notes (squash or
+    // fixup with `notes.rewriteRef` set): each original note is in it whole,
+    // and each names its own commit, so it cannot match by accident.
+    let original_note_texts: Vec<&str> = original_note_contents
+        .values()
+        .map(|content| content.trim_end_matches('\n'))
+        .filter(|content| !content.is_empty())
+        .collect();
+    let original_blob_oid_set: HashSet<&String> = original_note_blob_oids.values().collect();
+    let mut new_commits_with_notes = HashSet::new();
+    let mut new_joined_note_contents = HashMap::new();
+    for (commit, blob_oid) in &new_commit_note_blob_oids {
+        if original_blob_oid_set.contains(blob_oid) {
+            tracing::debug!(
+                "Commit {} carries a note copied verbatim by git (notes.rewriteRef); recomputing",
+                commit
+            );
+            continue;
+        }
+        let Some(content) = blob_contents.get(blob_oid) else {
+            continue;
+        };
+        if original_note_texts
+            .iter()
+            .any(|original| content.contains(original))
+        {
+            tracing::debug!(
+                "Commit {} carries notes joined by git (notes.rewriteRef); recomputing",
+                commit
+            );
+            new_joined_note_contents.insert(commit.clone(), content.clone());
+            continue;
+        }
+        if let Ok(log) = AuthorshipLog::deserialize_from_string(content)
+            && !log.attestations.is_empty()
+        {
+            new_commits_with_notes.insert(commit.clone());
+        }
+    }
+
     Ok(RebaseNoteCache {
         new_commits_with_notes,
         original_note_blob_oids,
         original_note_contents,
         ai_touched_files,
+        new_note_blob_oids: new_commit_note_blob_oids,
+        new_joined_note_contents,
     })
 }
 
@@ -1274,82 +1305,488 @@ fn batch_read_file_contents_at_commit(
     Ok(results)
 }
 
-/// Pair original commits with new (rebased) commits for authorship rewriting.
+/// Which original commit each rebased commit replays.
+#[derive(Debug, Default)]
+struct CommitPairing {
+    /// `(original, rebased)` for every rebased commit that replays an original
+    /// commit, in rebased order. A rebased commit takes over this commit's note.
+    pairs: Vec<(String, String)>,
+    /// Rebased commit -> the further original commits a squash or fixup folded
+    /// into it, in original order.
+    absorbed: HashMap<String, Vec<String>>,
+}
+
+/// Pair each rebased commit with the original commit it replays, by identity
+/// rather than by position, so a reordered, squashed, dropped or added commit
+/// does not take over the note of whichever commit used to sit in its slot.
 ///
-/// When the counts are equal we use positional pairing (the common case for a
-/// normal rebase where every original commit becomes exactly one new commit).
+/// In order of preference:
+/// 1. Git's own mapping. With `notes.rewriteRef` covering `refs/notes/ai` (the
+///    installer sets it) git copies each original note onto the commit that
+///    replays it, and concatenates the notes of commits it squashes together.
+///    A copied note names its original exactly: every note records its own
+///    commit's sha.
+/// 2. `git patch-id --stable`: the same change, picked onto another base or
+///    moved to another place in the branch.
+/// 3. For a change git had to alter (a squash, a fixup, a resolved conflict, a
+///    commit amended at an `edit` stop): the unused original most of whose
+///    changed lines it shares, preferring one with the same subject; then one
+///    with the same subject.
+/// 4. Position, only among commits that have no diff to compare (merges,
+///    empty commits), or for everything left when git could not diff the
+///    commits at all.
 ///
-/// When counts differ — which happens when an interactive rebase *drops* one or
-/// more commits — positional pairing is wrong: e.g. with originals [A, B, C] and
-/// new commits [A′, C′] (B was dropped), a positional zip gives [(A,A′),(B,C′)]
-/// so C′ is incorrectly attributed using B's note instead of C's.
+/// A rebased commit nothing matches (one added at an `edit` stop) replays no
+/// original, and an original nothing matches was dropped. An unused original
+/// whose changed lines a rebased commit mostly contains was folded into it.
 ///
-/// We fix this by matching each new commit to the first unused original commit
-/// that has the same subject line (first line of the commit message).  If no
-/// subject match is found we fall back to the next positionally-available original
-/// so that the pairing is never shorter than `new_commits`.
+/// Git processes: none beyond the note cache when git copied every note;
+/// otherwise one `git diff-tree --stdin` and one `git patch-id` for all the
+/// commits together.
 fn pair_commits_for_rewrite(
     repo: &Repository,
     original_commits: &[String],
     new_commits: &[String],
-) -> Vec<(String, String)> {
-    if original_commits.len() == new_commits.len() {
-        // Equal length: positional pairing is correct and avoids extra git calls.
-        return original_commits
-            .iter()
-            .zip(new_commits.iter())
-            .map(|(a, b)| (a.clone(), b.clone()))
-            .collect();
+    note_cache: &RebaseNoteCache,
+) -> CommitPairing {
+    let mut state = PairingState::new(original_commits, new_commits);
+    state.pair_by_copied_notes(note_cache);
+
+    let originals_left = state.used.iter().any(|used| !used);
+    let rebased_left = state.original_of_new.iter().any(Option::is_none);
+    if originals_left {
+        let mut commits: Vec<String> = Vec::new();
+        commits.extend(
+            original_commits
+                .iter()
+                .zip(&state.used)
+                .filter(|(_, used)| !**used)
+                .map(|(commit, _)| commit.clone()),
+        );
+        commits.extend(new_commits.iter().cloned());
+        match load_commit_change_signatures(repo, &commits) {
+            Ok(signatures) => {
+                if rebased_left {
+                    state.pair_by_patch_id(&signatures);
+                    state.pair_by_shared_changes(&signatures);
+                    state.pair_by_subject(&signatures);
+                    state.pair_commits_without_diff_in_order(&signatures);
+                }
+                state.absorb_folded_originals(&signatures);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "rebase pairing: could not diff the commits; pairing the rest by position"
+                );
+                state.pair_rest_in_order();
+            }
+        }
+    }
+    state.finish()
+}
+
+struct PairingState<'a> {
+    original_commits: &'a [String],
+    new_commits: &'a [String],
+    /// Per rebased commit, the index of the original it replays.
+    original_of_new: Vec<Option<usize>>,
+    /// Per original commit, whether a rebased commit replays or absorbed it.
+    used: Vec<bool>,
+    /// Per rebased commit, the originals folded into it.
+    absorbed: Vec<Vec<usize>>,
+}
+
+impl<'a> PairingState<'a> {
+    fn new(original_commits: &'a [String], new_commits: &'a [String]) -> Self {
+        Self {
+            original_commits,
+            new_commits,
+            original_of_new: vec![None; new_commits.len()],
+            used: vec![false; original_commits.len()],
+            absorbed: vec![Vec::new(); new_commits.len()],
+        }
     }
 
-    // Unequal length (dropped or squashed commits): match by commit subject.
-    let original_subjects: Vec<(String, String)> = original_commits
-        .iter()
-        .map(|sha| {
-            let subject = repo
-                .find_commit(sha.clone())
-                .and_then(|c| c.summary())
-                .unwrap_or_default();
-            (sha.clone(), subject)
-        })
-        .collect();
+    fn pair(&mut self, new_index: usize, original_index: usize) {
+        self.original_of_new[new_index] = Some(original_index);
+        self.used[original_index] = true;
+    }
 
-    let mut used: HashSet<String> = HashSet::new();
-    let mut pairs: Vec<(String, String)> = Vec::with_capacity(new_commits.len());
+    fn unpaired_new(&self) -> Vec<usize> {
+        (0..self.new_commits.len())
+            .filter(|&index| self.original_of_new[index].is_none())
+            .collect()
+    }
 
-    for new_sha in new_commits {
-        let new_subject = repo
-            .find_commit(new_sha.clone())
-            .and_then(|c| c.summary())
-            .unwrap_or_default();
+    fn unused_originals(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.original_commits.len()).filter(|&index| !self.used[index])
+    }
 
-        // Prefer an unused original with the same subject.
-        let matched = original_subjects.iter().find(|(orig_sha, orig_subject)| {
-            !used.contains(orig_sha) && *orig_subject == new_subject
-        });
-
-        let orig_sha = if let Some((orig_sha, _)) = matched {
-            orig_sha.clone()
-        } else {
-            // No subject match — fall back to the next positionally-available
-            // unused original so every new commit gets a pairing.
-            match original_subjects
-                .iter()
-                .find(|(orig_sha, _)| !used.contains(orig_sha))
+    /// Step 1: the notes git copied (see `pair_commits_for_rewrite`).
+    fn pair_by_copied_notes(&mut self, note_cache: &RebaseNoteCache) {
+        let original_by_note_blob: HashMap<&str, usize> = self
+            .original_commits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, commit)| {
+                note_cache
+                    .original_note_blob_oids
+                    .get(commit)
+                    .map(|blob| (blob.as_str(), index))
+            })
+            .collect();
+        for new_index in 0..self.new_commits.len() {
+            let new_commit = &self.new_commits[new_index];
+            if let Some(blob) = note_cache.new_note_blob_oids.get(new_commit)
+                && let Some(&original_index) = original_by_note_blob.get(blob.as_str())
+                && !self.used[original_index]
             {
-                Some((orig_sha, _)) => orig_sha.clone(),
-                None => {
-                    // All originals consumed (shouldn't happen in practice).
-                    continue;
+                self.pair(new_index, original_index);
+                continue;
+            }
+            // Squashed commits: git joins their notes in the order it folded
+            // the commits together, the picked commit's first.
+            let Some(note) = note_cache.new_joined_note_contents.get(new_commit) else {
+                continue;
+            };
+            let mut folded: Vec<(usize, usize)> = self
+                .unused_originals()
+                .filter_map(|original_index| {
+                    let original_note = note_cache
+                        .original_note_contents
+                        .get(&self.original_commits[original_index])?;
+                    let original_note = original_note.trim_end_matches('\n');
+                    if original_note.is_empty() {
+                        return None;
+                    }
+                    note.find(original_note)
+                        .map(|position| (position, original_index))
+                })
+                .collect();
+            folded.sort_unstable();
+            let mut folded = folded.into_iter().map(|(_, original_index)| original_index);
+            if let Some(first) = folded.next() {
+                self.pair(new_index, first);
+                for original_index in folded {
+                    self.used[original_index] = true;
+                    self.absorbed[new_index].push(original_index);
                 }
             }
-        };
-
-        used.insert(orig_sha.clone());
-        pairs.push((orig_sha, new_sha.clone()));
+        }
     }
 
-    pairs
+    /// Step 2: the same patch.
+    fn pair_by_patch_id(&mut self, signatures: &HashMap<String, CommitChangeSignature>) {
+        let mut originals_by_patch_id: HashMap<&str, Vec<usize>> = HashMap::new();
+        for original_index in self.unused_originals() {
+            if let Some(patch_id) = signatures
+                .get(&self.original_commits[original_index])
+                .and_then(|signature| signature.patch_id.as_deref())
+            {
+                originals_by_patch_id
+                    .entry(patch_id)
+                    .or_default()
+                    .push(original_index);
+            }
+        }
+        for new_index in self.unpaired_new() {
+            let Some(signature) = signatures.get(&self.new_commits[new_index]) else {
+                continue;
+            };
+            let Some(candidates) = signature
+                .patch_id
+                .as_deref()
+                .and_then(|patch_id| originals_by_patch_id.get(patch_id))
+            else {
+                continue;
+            };
+            // Two commits can make the same change; tell them apart by subject.
+            let unused: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&original_index| !self.used[original_index])
+                .collect();
+            let chosen = unused
+                .iter()
+                .copied()
+                .find(|&original_index| {
+                    signatures
+                        .get(&self.original_commits[original_index])
+                        .is_some_and(|original| original.subject == signature.subject)
+                })
+                .or_else(|| unused.first().copied());
+            if let Some(original_index) = chosen {
+                self.pair(new_index, original_index);
+            }
+        }
+    }
+
+    /// Step 3a: most of the changed lines in common.
+    fn pair_by_shared_changes(&mut self, signatures: &HashMap<String, CommitChangeSignature>) {
+        for new_index in self.unpaired_new() {
+            let Some(signature) = signatures.get(&self.new_commits[new_index]) else {
+                continue;
+            };
+            let mut best: Option<((bool, usize), usize)> = None;
+            for original_index in self.unused_originals() {
+                let Some(original) = signatures.get(&self.original_commits[original_index]) else {
+                    continue;
+                };
+                if !signature.mostly_shares_changes_with(original) {
+                    continue;
+                }
+                let key = (
+                    original.subject == signature.subject,
+                    signature.shared_changes(original),
+                );
+                if best.is_none_or(|(best_key, _)| key > best_key) {
+                    best = Some((key, original_index));
+                }
+            }
+            if let Some((_, original_index)) = best {
+                self.pair(new_index, original_index);
+            }
+        }
+    }
+
+    /// Step 3b: the same subject.
+    fn pair_by_subject(&mut self, signatures: &HashMap<String, CommitChangeSignature>) {
+        for new_index in self.unpaired_new() {
+            let Some(signature) = signatures.get(&self.new_commits[new_index]) else {
+                continue;
+            };
+            if signature.subject.is_empty() {
+                continue;
+            }
+            let matched = self.unused_originals().find(|&original_index| {
+                signatures
+                    .get(&self.original_commits[original_index])
+                    .is_some_and(|original| original.subject == signature.subject)
+            });
+            if let Some(original_index) = matched {
+                self.pair(new_index, original_index);
+            }
+        }
+    }
+
+    /// Step 4: commits with no diff to compare, in order.
+    fn pair_commits_without_diff_in_order(
+        &mut self,
+        signatures: &HashMap<String, CommitChangeSignature>,
+    ) {
+        let has_no_diff = |commit: &String| {
+            signatures
+                .get(commit)
+                .is_none_or(|signature| signature.patch_id.is_none())
+        };
+        let mut originals = self
+            .unused_originals()
+            .filter(|&index| has_no_diff(&self.original_commits[index]))
+            .collect::<Vec<_>>()
+            .into_iter();
+        for new_index in self.unpaired_new() {
+            if !has_no_diff(&self.new_commits[new_index]) {
+                continue;
+            }
+            let Some(original_index) = originals.next() else {
+                break;
+            };
+            self.pair(new_index, original_index);
+        }
+    }
+
+    /// Originals no rebased commit replays, folded by a squash or fixup into
+    /// the rebased commit that contains most of their changes.
+    fn absorb_folded_originals(&mut self, signatures: &HashMap<String, CommitChangeSignature>) {
+        let unused: Vec<usize> = self.unused_originals().collect();
+        for original_index in unused {
+            let Some(original) = signatures.get(&self.original_commits[original_index]) else {
+                continue;
+            };
+            let mut best: Option<(usize, usize)> = None;
+            for (new_index, new_commit) in self.new_commits.iter().enumerate() {
+                if self.original_of_new[new_index].is_none() {
+                    continue;
+                }
+                let Some(signature) = signatures.get(new_commit) else {
+                    continue;
+                };
+                let shared = signature.shared_changes(original);
+                if shared * 2 > original.changed_lines.len()
+                    && best.is_none_or(|(best_shared, _)| shared > best_shared)
+                {
+                    best = Some((shared, new_index));
+                }
+            }
+            if let Some((_, new_index)) = best {
+                self.used[original_index] = true;
+                self.absorbed[new_index].push(original_index);
+            }
+        }
+    }
+
+    /// Fallback when git could not diff the commits.
+    fn pair_rest_in_order(&mut self) {
+        let mut originals = self.unused_originals().collect::<Vec<_>>().into_iter();
+        for new_index in self.unpaired_new() {
+            let Some(original_index) = originals.next() else {
+                break;
+            };
+            self.pair(new_index, original_index);
+        }
+    }
+
+    fn finish(self) -> CommitPairing {
+        let mut pairing = CommitPairing::default();
+        for (new_index, original_index) in self.original_of_new.iter().enumerate() {
+            let Some(original_index) = original_index else {
+                continue;
+            };
+            let new_commit = &self.new_commits[new_index];
+            pairing.pairs.push((
+                self.original_commits[*original_index].clone(),
+                new_commit.clone(),
+            ));
+            let mut absorbed = self.absorbed[new_index].clone();
+            if !absorbed.is_empty() {
+                absorbed.sort_unstable();
+                pairing.absorbed.insert(
+                    new_commit.clone(),
+                    absorbed
+                        .into_iter()
+                        .map(|index| self.original_commits[index].clone())
+                        .collect(),
+                );
+            }
+        }
+        pairing
+    }
+}
+
+/// What a commit changes, for telling which original commit a rebased commit
+/// replays.
+#[derive(Debug, Default)]
+struct CommitChangeSignature {
+    /// `git patch-id --stable` of the commit's diff; `None` for a commit with
+    /// no diff (a merge or an empty commit).
+    patch_id: Option<String>,
+    subject: String,
+    /// The lines the commit adds and removes, sign first, ignoring blank lines
+    /// and trailing whitespace.
+    changed_lines: HashSet<String>,
+}
+
+impl CommitChangeSignature {
+    fn shared_changes(&self, other: &CommitChangeSignature) -> usize {
+        let (smaller, larger) = if self.changed_lines.len() <= other.changed_lines.len() {
+            (&self.changed_lines, &other.changed_lines)
+        } else {
+            (&other.changed_lines, &self.changed_lines)
+        };
+        smaller.iter().filter(|line| larger.contains(*line)).count()
+    }
+
+    /// More than half the changed lines of the smaller of the two commits are
+    /// changed by the other one too.
+    fn mostly_shares_changes_with(&self, other: &CommitChangeSignature) -> bool {
+        let smaller = self.changed_lines.len().min(other.changed_lines.len());
+        smaller > 0 && self.shared_changes(other) * 2 > smaller
+    }
+}
+
+/// Diff `commits` with one `git diff-tree --stdin` and hash those diffs with
+/// one `git patch-id --stable`: two git processes for any number of commits.
+/// Zero lines of context, so a commit moved past changes nearby keeps its
+/// patch id.
+fn load_commit_change_signatures(
+    repo: &Repository,
+    commits: &[String],
+) -> Result<HashMap<String, CommitChangeSignature>, AutterError> {
+    if commits.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut diff_args = repo.global_args_for_exec();
+    diff_args.extend(
+        [
+            "diff-tree",
+            "--stdin",
+            "-r",
+            "-p",
+            "-U0",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--root",
+            "--always",
+            // A subject line never starts like a diff line or a commit id,
+            // which `git patch-id` would mistake for one.
+            "--format=%H%n#subject %s",
+        ]
+        .map(str::to_string),
+    );
+    let stdin = commits.join("\n") + "\n";
+    let diff = exec_git_stdin(&diff_args, stdin.as_bytes())?.stdout;
+    let mut signatures = parse_commit_change_signatures(&diff);
+
+    let mut patch_id_args = repo.global_args_for_exec();
+    patch_id_args.push("patch-id".to_string());
+    patch_id_args.push("--stable".to_string());
+    let patch_ids = exec_git_stdin(&patch_id_args, &diff)?.stdout;
+    for line in String::from_utf8_lossy(&patch_ids).lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(patch_id), Some(commit)) = (fields.next(), fields.next())
+            && let Some(signature) = signatures.get_mut(commit)
+        {
+            signature.patch_id = Some(patch_id.to_string());
+        }
+    }
+    Ok(signatures)
+}
+
+/// Parse `git diff-tree --stdin -p --format=%H%n#subject %s` output into each
+/// commit's subject and changed lines (patch ids are added afterwards).
+fn parse_commit_change_signatures(diff: &[u8]) -> HashMap<String, CommitChangeSignature> {
+    fn is_commit_id(line: &str) -> bool {
+        matches!(line.len(), 40 | 64) && line.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    let text = String::from_utf8_lossy(diff);
+    let mut signatures: Vec<(String, CommitChangeSignature)> = Vec::new();
+    let mut expect_subject = false;
+    let mut in_hunk = false;
+    for line in text.split('\n') {
+        // Diff lines start with a sign, a space, `@@` or a header keyword, so
+        // a bare commit id can only be the start of the next commit.
+        if is_commit_id(line) {
+            signatures.push((line.to_string(), CommitChangeSignature::default()));
+            expect_subject = true;
+            in_hunk = false;
+            continue;
+        }
+        let Some((_, signature)) = signatures.last_mut() else {
+            continue;
+        };
+        if expect_subject {
+            expect_subject = false;
+            if let Some(subject) = line.strip_prefix("#subject ") {
+                signature.subject = subject.trim().to_string();
+                continue;
+            }
+        }
+        if line.starts_with("diff ") {
+            in_hunk = false;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk && (line.starts_with('+') || line.starts_with('-')) {
+            let content = line[1..].trim_end();
+            if !content.trim_start().is_empty() {
+                signature
+                    .changed_lines
+                    .insert(format!("{}{}", &line[..1], content));
+            }
+        }
+    }
+    signatures.into_iter().collect()
 }
 
 pub fn rewrite_authorship_after_rebase_v2(
@@ -1407,7 +1844,10 @@ pub fn rewrite_authorship_after_rebase_v2(
     );
     let commits_to_process_lookup: HashSet<&str> =
         commits_to_process.iter().map(String::as_str).collect();
-    let all_commit_pairs = pair_commits_for_rewrite(repo, original_commits, new_commits);
+    let CommitPairing {
+        pairs: all_commit_pairs,
+        absorbed: absorbed_by_new,
+    } = pair_commits_for_rewrite(repo, original_commits, new_commits, &note_cache);
     let commit_pairs_to_process: Vec<(String, String)> = all_commit_pairs
         .into_iter()
         .filter(|(_original_commit, new_commit)| {
@@ -1484,14 +1924,18 @@ pub fn rewrite_authorship_after_rebase_v2(
         new_commits.len()
     );
 
-    if try_fast_path_rebase_note_remap_cached(
-        repo,
-        original_commits,
-        new_commits,
-        &commits_to_process_lookup,
-        &pathspecs,
-        &note_cache,
-    )? {
+    // Only a rebase that kept every commit as one commit can just carry the
+    // notes over.
+    if original_commits.len() == new_commits.len()
+        && absorbed_by_new.is_empty()
+        && commit_pairs_to_process.len() == commits_to_process.len()
+        && try_fast_path_rebase_note_remap_cached(
+            repo,
+            &commit_pairs_to_process,
+            &pathspecs,
+            &note_cache,
+        )?
+    {
         return Ok(());
     }
 
@@ -1907,9 +2351,23 @@ pub fn rewrite_authorship_after_rebase_v2(
                 cached_file_attestation_text.remove(old_path);
             }
         }
-        // The commit this one replays, and its note (parsed only if needed).
+        // The commit this one replays, then any squashed or fixed up into it,
+        // and their notes (parsed only if needed).
         let original_commit = new_to_original.get(new_commit).map(String::as_str);
-        let original_note: std::cell::OnceCell<Option<AuthorshipLog>> = std::cell::OnceCell::new();
+        let replayed_commits: Vec<&str> = original_commit
+            .into_iter()
+            .chain(
+                absorbed_by_new
+                    .get(new_commit)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .collect();
+        let replayed_notes: Vec<std::cell::OnceCell<Option<AuthorshipLog>>> = replayed_commits
+            .iter()
+            .map(|_| std::cell::OnceCell::new())
+            .collect();
 
         // Only transform attributions for files that actually changed.
         if !changed_files_in_commit.is_empty() {
@@ -2008,7 +2466,7 @@ pub fn rewrite_authorship_after_rebase_v2(
                     // be replayed to find what this file is called there. If
                     // nothing is recorded under that name (an interactive rebase
                     // can drop or reorder a rename), follow the renames of the
-                    // original branch from the commit whose note is being carried.
+                    // original branch from the commits whose notes are being carried.
                     let has_original_head_state = |path: &str| {
                         original_head_attributions.contains_key(path)
                             || original_head_contents
@@ -2020,21 +2478,22 @@ pub fn rewrite_authorship_after_rebase_v2(
                     let state_path = rebased_path
                         .filter(|path| has_original_head_state(path))
                         .or_else(|| {
-                            let original_commit = original_commit?;
-                            original_path_candidates(
-                                file_path,
-                                commit_renames,
-                                &upstream_rename_sources,
-                            )
-                            .into_iter()
-                            .filter_map(|candidate| {
-                                path_after_later_commits(
-                                    &original_later_paths,
-                                    original_commit,
-                                    candidate,
+                            replayed_commits.iter().find_map(|original_commit| {
+                                original_path_candidates(
+                                    file_path,
+                                    commit_renames,
+                                    &upstream_rename_sources,
                                 )
+                                .into_iter()
+                                .filter_map(|candidate| {
+                                    path_after_later_commits(
+                                        &original_later_paths,
+                                        original_commit,
+                                        candidate,
+                                    )
+                                })
+                                .find(|path| has_original_head_state(path))
                             })
-                            .find(|path| has_original_head_state(path))
                         })
                         .or(rebased_path)
                         .unwrap_or(file_path.as_str());
@@ -2054,72 +2513,79 @@ pub fn rewrite_authorship_after_rebase_v2(
                 // The lines this commit adds are the lines the original commit
                 // added, and that commit's note says who wrote them. The
                 // original_head state cannot: a line a later commit rewrote or
-                // removed is not in it.
-                if let Some(original_commit) = original_commit
-                    && let Some(hunks) = file_hunks
-                    && let Some(original_hunks) = original_hunks_by_commit.get(original_commit)
-                    && let Some(note) = original_note
-                        .get_or_init(|| {
-                            let note = note_cache
-                                .original_note_contents
-                                .get(original_commit)
-                                .and_then(|content| {
+                // removed is not in it. A squash carries each folded commit's
+                // note for the files where it adds the same lines.
+                for (original_commit, original_note) in
+                    replayed_commits.iter().copied().zip(&replayed_notes)
+                {
+                    if let Some(hunks) = file_hunks
+                        && let Some(original_hunks) = original_hunks_by_commit.get(original_commit)
+                        && let Some(note) = original_note
+                            .get_or_init(|| {
+                                let note = note_cache
+                                    .original_note_contents
+                                    .get(original_commit)
+                                    .and_then(|content| {
                                     AuthorshipLog::deserialize_from_string(content).ok()
                                 })?;
-                            // The rebased note has to be able to describe every
-                            // author this note names. The original_head state
-                            // does not know an author none of whose lines
-                            // survive to original_head.
-                            for (prompt_id, record) in &note.metadata.prompts {
-                                current_prompts
-                                    .entry(prompt_id.clone())
-                                    .or_default()
-                                    .entry(original_commit.to_string())
-                                    .or_insert_with(|| record.clone());
-                            }
-                            for (hash, record) in &note.metadata.humans {
-                                initial_humans
-                                    .entry(hash.clone())
-                                    .or_insert_with(|| record.clone());
-                            }
-                            for (session_id, record) in &note.metadata.sessions {
-                                initial_sessions
-                                    .entry(session_id.clone())
-                                    .or_insert_with(|| record.clone());
-                            }
-                            Some(note)
-                        })
-                        .as_ref()
-                {
-                    // The file under the name the original commit knew it by:
-                    // normally the same name, otherwise the file that ends up
-                    // at the same original_head path.
-                    let original_path = original_path_candidates(
-                        file_path,
-                        commit_renames,
-                        &upstream_rename_sources,
-                    )
-                    .into_iter()
-                    .find(|candidate| original_hunks.contains_key(*candidate))
-                    .or_else(|| {
-                        let original_head_path = original_head_path_of.get(file_path)?;
-                        original_hunks.keys().map(String::as_str).find(|path| {
-                            path_after_later_commits(&original_later_paths, original_commit, path)
-                                == Some(original_head_path.as_str())
-                        })
-                    });
-                    if let Some(original_path) = original_path
-                        && let Some(attestation) = note
-                            .attestations
-                            .iter()
-                            .find(|attestation| attestation.file_path == original_path)
+                                // The rebased note has to be able to describe every
+                                // author this note names. The original_head state
+                                // does not know an author none of whose lines
+                                // survive to original_head.
+                                for (prompt_id, record) in &note.metadata.prompts {
+                                    current_prompts
+                                        .entry(prompt_id.clone())
+                                        .or_default()
+                                        .entry(original_commit.to_string())
+                                        .or_insert_with(|| record.clone());
+                                }
+                                for (hash, record) in &note.metadata.humans {
+                                    initial_humans
+                                        .entry(hash.clone())
+                                        .or_insert_with(|| record.clone());
+                                }
+                                for (session_id, record) in &note.metadata.sessions {
+                                    initial_sessions
+                                        .entry(session_id.clone())
+                                        .or_insert_with(|| record.clone());
+                                }
+                                Some(note)
+                            })
+                            .as_ref()
                     {
-                        carry_note_authors_for_added_lines(
-                            &mut line_attrs,
-                            hunks,
-                            &original_hunks[original_path],
-                            attestation,
-                        );
+                        // The file under the name the original commit knew it by:
+                        // normally the same name, otherwise the file that ends up
+                        // at the same original_head path.
+                        let original_path = original_path_candidates(
+                            file_path,
+                            commit_renames,
+                            &upstream_rename_sources,
+                        )
+                        .into_iter()
+                        .find(|candidate| original_hunks.contains_key(*candidate))
+                        .or_else(|| {
+                            let original_head_path = original_head_path_of.get(file_path)?;
+                            original_hunks.keys().map(String::as_str).find(|path| {
+                                path_after_later_commits(
+                                    &original_later_paths,
+                                    original_commit,
+                                    path,
+                                ) == Some(original_head_path.as_str())
+                            })
+                        });
+                        if let Some(original_path) = original_path
+                            && let Some(attestation) = note
+                                .attestations
+                                .iter()
+                                .find(|attestation| attestation.file_path == original_path)
+                        {
+                            carry_note_authors_for_added_lines(
+                                &mut line_attrs,
+                                hunks,
+                                &original_hunks[original_path],
+                                attestation,
+                            );
+                        }
                     }
                 }
 
@@ -4485,37 +4951,23 @@ fn build_metadata_only_authorship_log_from_source_notes(
 
 /// Cached version of try_fast_path_rebase_note_remap that uses pre-loaded note data.
 #[doc(hidden)]
+/// Copy each original note onto the rebased commit paired with it, when every
+/// pair has the same content in the tracked files (so no line moved).
+/// `commit_pairs` are `(original, rebased)` pairs of the commits to process.
 pub fn try_fast_path_rebase_note_remap_cached(
     repo: &Repository,
-    original_commits: &[String],
-    new_commits: &[String],
-    commits_to_process_lookup: &HashSet<&str>,
+    commit_pairs: &[(String, String)],
     tracked_paths: &[String],
     note_cache: &RebaseNoteCache,
 ) -> Result<bool, AutterError> {
     let fast_path_start = std::time::Instant::now();
-    if original_commits.len() != new_commits.len()
-        || tracked_paths.is_empty()
-        || commits_to_process_lookup.is_empty()
-    {
+    if tracked_paths.is_empty() || commit_pairs.is_empty() {
         return Ok(false);
     }
-
-    let commits_to_remap: Vec<(String, String)> = original_commits
-        .iter()
-        .zip(new_commits.iter())
-        .filter(|(_original_commit, new_commit)| {
-            commits_to_process_lookup.contains(new_commit.as_str())
-        })
-        .map(|(original_commit, new_commit)| (original_commit.clone(), new_commit.clone()))
-        .collect();
-
-    if commits_to_remap.is_empty() {
-        return Ok(false);
-    }
+    let commits_to_remap = commit_pairs;
 
     let compare_start = std::time::Instant::now();
-    if !tracked_paths_match_for_commit_pairs(repo, &commits_to_remap, tracked_paths)? {
+    if !tracked_paths_match_for_commit_pairs(repo, commits_to_remap, tracked_paths)? {
         return Ok(false);
     }
     tracing::debug!(
@@ -4525,7 +4977,7 @@ pub fn try_fast_path_rebase_note_remap_cached(
     );
 
     // Use cached note blob OIDs and contents instead of additional git calls.
-    for (original_commit, _) in &commits_to_remap {
+    for (original_commit, _) in commits_to_remap {
         if !note_cache
             .original_note_blob_oids
             .contains_key(original_commit)
@@ -4536,7 +4988,7 @@ pub fn try_fast_path_rebase_note_remap_cached(
 
     let mut remapped_note_entries: Vec<(String, String)> =
         Vec::with_capacity(commits_to_remap.len());
-    for (original_commit, new_commit) in &commits_to_remap {
+    for (original_commit, new_commit) in commits_to_remap {
         let Some(raw_note) = note_cache.original_note_contents.get(original_commit) else {
             return Ok(false);
         };
@@ -5962,5 +6414,83 @@ mod rename_tracking_tests {
         carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
         assert_eq!(line_attrs.len(), 1);
         assert_eq!((line_attrs[0].start_line, line_attrs[0].end_line), (11, 11));
+    }
+}
+
+#[cfg(test)]
+mod commit_pairing_tests {
+    use super::{CommitChangeSignature, PairingState, parse_commit_change_signatures};
+    use std::collections::HashMap;
+
+    fn sha(digit: char) -> String {
+        std::iter::repeat_n(digit, 40).collect()
+    }
+
+    fn signature(patch_id: Option<&str>, subject: &str, lines: &[&str]) -> CommitChangeSignature {
+        CommitChangeSignature {
+            patch_id: patch_id.map(str::to_string),
+            subject: subject.to_string(),
+            changed_lines: lines.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_subjects_and_changed_lines_per_commit() {
+        let diff = format!(
+            "{}\n#subject diff in the subject\n\ndiff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new  \n+\n{}\n#subject Merge branch\n",
+            sha('a'),
+            sha('b')
+        );
+        let signatures = parse_commit_change_signatures(diff.as_bytes());
+        let first = &signatures[&sha('a')];
+        assert_eq!(first.subject, "diff in the subject");
+        let mut lines: Vec<&str> = first.changed_lines.iter().map(String::as_str).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec!["+new", "-old"]);
+        let merge = &signatures[&sha('b')];
+        assert_eq!(merge.subject, "Merge branch");
+        assert!(merge.changed_lines.is_empty());
+    }
+
+    #[test]
+    fn pairs_by_change_not_position() {
+        // Originals: 1 (AI edit), 2 (other edit), 3 (fixup of 1), 4 (dropped).
+        // Rebased: 2' first, then 1 with 3 folded in, then a commit added at
+        // an `edit` stop.
+        let originals = vec![sha('1'), sha('2'), sha('3'), sha('4')];
+        let rebased = vec![sha('a'), sha('b'), sha('c')];
+        let signatures: HashMap<String, CommitChangeSignature> = [
+            (sha('1'), signature(Some("p1"), "Add a", &["+AI a"])),
+            (sha('2'), signature(Some("p2"), "Add b", &["+AI b"])),
+            (sha('3'), signature(Some("p3"), "fixup! Add a", &["+AI c"])),
+            (sha('4'), signature(Some("p4"), "Debug", &["+debug"])),
+            (sha('a'), signature(Some("p2"), "Add b", &["+AI b"])),
+            (
+                sha('b'),
+                signature(Some("p5"), "Add a", &["+AI a", "+AI c"]),
+            ),
+            (
+                sha('c'),
+                signature(Some("p6"), "Added at the stop", &["+new"]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut state = PairingState::new(&originals, &rebased);
+        state.pair_by_patch_id(&signatures);
+        state.pair_by_shared_changes(&signatures);
+        state.pair_by_subject(&signatures);
+        state.pair_commits_without_diff_in_order(&signatures);
+        state.absorb_folded_originals(&signatures);
+        let pairing = state.finish();
+
+        assert_eq!(
+            pairing.pairs,
+            vec![(sha('2'), sha('a')), (sha('1'), sha('b'))],
+            "the added commit replays nothing and the dropped one is not replayed"
+        );
+        assert_eq!(pairing.absorbed.get(&sha('b')), Some(&vec![sha('3')]));
+        assert_eq!(pairing.absorbed.len(), 1);
     }
 }
