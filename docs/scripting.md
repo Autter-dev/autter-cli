@@ -19,34 +19,53 @@ the subcommand (`autter --json stats` and `autter stats --json` are the same).
   non-zero:
 
   ```json
-  {"schema_version":1,"error":{"code":"not_a_repository","message":"Failed to find repository: …","exit_code":2}}
+  {"schema_version":1,"error":{"code":"not_a_repository","message":"`autter stats` must be run inside a git repository (or pass -C <path>).","exit_code":2}}
   ```
 
+  This holds for every way a command can fail, including the ones that happen
+  before the command itself runs: a flag or subcommand that does not exist
+  (`autter sync bogus --json`), a command that does not exist
+  (`autter stat --json`), a `-C` path that cannot be entered, and a background
+  service that cannot be reached. `error.exit_code` is always the process exit
+  code, and `error.message` is one line.
+
   When the command got far enough to build its report (for example
-  `stats --strict` on a commit with nothing captured), the report's fields are
-  kept next to `error`, so you can read both. The message is also printed to
-  stderr, so it shows in CI logs.
+  `stats --strict` on a commit with nothing captured, or `whoami` on a machine
+  that is not signed in), the report's fields are kept next to `error`, so you
+  can read both. The message is also printed to stderr, so it shows in CI
+  logs; text that follows it there (usage help, a hint to run `autter doctor`)
+  is not part of the document.
 
 The JSON Schema for every document is in
 [`docs/schemas/autter-cli.schema.json`](schemas/autter-cli.schema.json), one
 entry under `$defs` per command (`stats`, `stats_range`, `status`, `log`,
 `show`, `blame`, `diff`, `whoami`, `doctor`, `sync_status`, and `error_only`
-for a command that failed before producing anything).
+for a command that failed before producing anything). The codes `error.code`
+can take are listed in the schema's `error` entry and below.
 
 ### Error codes
 
 | `error.code` | Exit | When |
 |---|---|---|
-| `usage_error` | 2 | Bad flags or arguments |
-| `not_a_repository` | 2 | Run outside a git repository |
-| `revision_not_found` | 1 | A commit or range that does not resolve |
+| `usage_error` | 2 | Bad flags or arguments: an unknown option, command or subcommand, a missing or extra argument, an option value that does not parse |
+| `not_a_repository` | 2 | `stats`, `status`, `log`, `show`, `blame` or `diff` run outside a git repository |
+| `revision_not_found` | 1 | A commit, revision or range that does not resolve (`stats`, `log`, `show`, `diff`, and `blame --ignore-rev`) |
+| `service_unreachable` | 1 | The background service could not be reached, so the command did not run (`stats`, `status`, `log`, `show`, `blame`, `diff`) |
 | `note_pending` | 1 | `stats --wait` gave up before the authorship note was written |
 | `not_signed_in` | 1 | `whoami` on a machine that is not signed in |
 | `sync_unhealthy` | 1 | `sync status` found an upload problem |
 | `check_failed` | 1 | `doctor` found a failed check |
-| `runtime_error` | 1 | Anything else that went wrong |
+| `runtime_error` | 1 | Anything else that went wrong (a file `blame` cannot find, a repository with no commits, a `-C` path that does not exist) |
 | `nothing_captured` | 3 | `--strict`: nothing was captured |
 | `capture_broken` | 4 | `--strict`: capture is broken (`doctor`) |
+
+The exit code is the same with and without `--json`. `whoami`, `doctor` and
+`sync status` do not read a repository and do not need the background service,
+so they run outside a repository and while the service is down (`doctor`
+reports the service as a failed check). `autter log` passes the options it
+does not render itself to `git log`; one that git rejects is a `usage_error`,
+and a revision git cannot resolve is `revision_not_found`. New codes may be
+added; treat a code you do not know as a failure with the given `exit_code`.
 
 ### Line labels
 
