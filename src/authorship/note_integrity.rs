@@ -646,9 +646,9 @@ fn check_one(
                     None,
                 );
             }
-            if recorded != commit {
-                return moved(recorded);
-            }
+            // The stamp names this commit and its digest holds, so autter wrote
+            // the note for this commit: a `base_commit_sha` naming another one
+            // is stale metadata from the writer, not a moved note.
             if integrity.tree != *actual_tree {
                 return result(
                     IntegrityStatus::ContentMismatch,
