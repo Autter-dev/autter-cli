@@ -9,6 +9,8 @@
 //! - `git cherry-pick -n` onto a tree with uncommitted AI work keeps both the
 //!   picked lines' attribution and the live work's, in other files and in the
 //!   same file.
+//! - `git cherry-pick -n` of several commits, in one run or in several, carries
+//!   every picked commit's attribution, not only the last one's.
 //! - A `git reset` that leaves HEAD where it is (no target, or only paths) is
 //!   not a move from the branch checked out before, and keeps live AI work.
 //! - Lines typed after switching back from a branch with AI commits, or after
@@ -504,6 +506,200 @@ fn line_typed_after_hard_reset_of_an_ai_commit_is_not_the_ais() {
         "Line 1".unattributed_human(),
         "Hand version".unattributed_human(),
         "Line 3".unattributed_human(),
+    ]);
+}
+
+/// Two AI commits on two branches that both start at the initial commit: one
+/// adds a line to `first`, the other to `second`. Returns both commits, in
+/// that order, with the main branch checked out again.
+fn ai_commits_on_two_branches(repo: &TestRepo, first: &str, second: &str) -> (String, String) {
+    fs::write(repo.path().join(first), "First base\n").unwrap();
+    fs::write(repo.path().join(second), "Second base\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut first_file = repo.filename(first);
+    let mut second_file = repo.filename(second);
+    first_file.assert_committed_lines(lines!["First base".unattributed_human()]);
+    second_file.assert_committed_lines(lines!["Second base".unattributed_human()]);
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature-a"]).unwrap();
+    ai_edit(repo, first, "First base\nAI line from A\n");
+    repo.stage_all_and_commit("AI change A").unwrap();
+    first_file.assert_committed_lines(lines![
+        "First base".unattributed_human(),
+        "AI line from A".ai(),
+    ]);
+    let commit_a = head_sha(repo);
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    repo.git(&["checkout", "-b", "feature-b"]).unwrap();
+    ai_edit(repo, second, "Second base\nAI line from B\n");
+    repo.stage_all_and_commit("AI change B").unwrap();
+    second_file.assert_committed_lines(lines![
+        "Second base".unattributed_human(),
+        "AI line from B".ai(),
+    ]);
+    let commit_b = head_sha(repo);
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    first_file.assert_committed_lines(lines!["First base".unattributed_human()]);
+    second_file.assert_committed_lines(lines!["Second base".unattributed_human()]);
+    (commit_a, commit_b)
+}
+
+#[test]
+fn cherry_pick_no_commit_of_commits_from_two_branches_keeps_both() {
+    let repo = TestRepo::new();
+    let (commit_a, commit_b) = ai_commits_on_two_branches(&repo, "a.txt", "b.txt");
+
+    repo.git(&["cherry-pick", "-n", &commit_a, &commit_b])
+        .unwrap();
+    repo.commit("Picked A and B without committing").unwrap();
+    repo.sync_daemon();
+
+    let mut first = repo.filename("a.txt");
+    let mut second = repo.filename("b.txt");
+    first.assert_committed_lines(lines![
+        "First base".unattributed_human(),
+        "AI line from A".ai(),
+    ]);
+    second.assert_committed_lines(lines![
+        "Second base".unattributed_human(),
+        "AI line from B".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_run_twice_before_one_commit_keeps_both() {
+    let repo = TestRepo::new();
+    let (commit_a, commit_b) = ai_commits_on_two_branches(&repo, "first.txt", "second.txt");
+
+    repo.git(&["cherry-pick", "-n", &commit_a]).unwrap();
+    repo.git(&["cherry-pick", "-n", &commit_b]).unwrap();
+    repo.commit("Picked A, then B, without committing").unwrap();
+    repo.sync_daemon();
+
+    let mut first = repo.filename("first.txt");
+    let mut second = repo.filename("second.txt");
+    first.assert_committed_lines(lines![
+        "First base".unattributed_human(),
+        "AI line from A".ai(),
+    ]);
+    second.assert_committed_lines(lines![
+        "Second base".unattributed_human(),
+        "AI line from B".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_of_two_branches_into_the_same_file_keeps_both() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("both.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("both.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+    ]);
+    let main_branch = repo.current_branch();
+
+    // Branch A adds a line at the top, branch B at the bottom.
+    repo.git(&["checkout", "-b", "feature-a"]).unwrap();
+    ai_edit(
+        &repo,
+        "both.txt",
+        "AI line from A\nLine 1\nLine 2\nLine 3\nLine 4\nLine 5\n",
+    );
+    repo.stage_all_and_commit("AI change A").unwrap();
+    file.assert_committed_lines(lines![
+        "AI line from A".ai(),
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+    ]);
+    let commit_a = head_sha(&repo);
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    repo.git(&["checkout", "-b", "feature-b"]).unwrap();
+    ai_edit(
+        &repo,
+        "both.txt",
+        "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nAI line from B\n",
+    );
+    repo.stage_all_and_commit("AI change B").unwrap();
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "AI line from B".ai(),
+    ]);
+    let commit_b = head_sha(&repo);
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    repo.git(&["cherry-pick", "-n", &commit_a, &commit_b])
+        .unwrap();
+    repo.commit("Picked A and B without committing").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "AI line from A".ai(),
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Line 4".unattributed_human(),
+        "Line 5".unattributed_human(),
+        "AI line from B".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_bundled_with_another_flag_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "bundled.txt");
+
+    // `-nx` is `-n -x`.
+    repo.git(&["cherry-pick", "-nx", &source]).unwrap();
+    repo.commit("Picked with -nx").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("bundled.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_then_stash_and_pop_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "stashed.txt");
+
+    // Stashing the picked change and bringing it back leaves HEAD alone; the
+    // pick is still waiting for its commit.
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    repo.git(&["stash"]).unwrap();
+    repo.git(&["stash", "pop"]).unwrap();
+    repo.stage_all_and_commit("Picked, stashed, popped")
+        .unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("stashed.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".ai(),
     ]);
 }
 

@@ -3,8 +3,8 @@ use crate::daemon::domain::RepoContext;
 use crate::daemon::git_backend::GitBackend;
 use crate::error::AutterError;
 use crate::git::cli_parser::{
-    ParsedGitInvocation, explicit_rebase_branch_arg, parse_git_cli_args,
-    stash_requires_target_resolution, stash_target_spec, summarize_rebase_args,
+    ParsedGitInvocation, cherry_pick_requests_no_commit, explicit_rebase_branch_arg,
+    parse_git_cli_args, stash_requires_target_resolution, stash_target_spec, summarize_rebase_args,
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
@@ -27,13 +27,13 @@ use crate::git::rewrite_log::{
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::LockFile;
 use crate::{
+    authorship::no_commit_pick::carry_no_commit_pick_into_working_log,
     authorship::post_commit::post_commit_with_final_state,
     authorship::rebase_authorship::{
-        committed_file_snapshot_between_commits, merge_working_log_after_squash_from_final_state,
-        prepare_working_log_after_squash_from_final_state, reconstruct_working_log_after_reset,
-        restore_virtual_attribution_carryover, restore_working_log_carryover,
-        rewrite_authorship_after_commit_amend_with_snapshot, rewrite_authorship_if_needed,
-        take_pending_no_commit_pick,
+        committed_file_snapshot_between_commits, prepare_working_log_after_squash_from_final_state,
+        reconstruct_working_log_after_reset, restore_virtual_attribution_carryover,
+        restore_working_log_carryover, rewrite_authorship_after_commit_amend_with_snapshot,
+        rewrite_authorship_if_needed, take_pending_no_commit_pick,
     },
     authorship::working_log::{AgentId, CheckpointKind},
     commands::checkpoint_agent::orchestrator::CheckpointRequest,
@@ -2264,24 +2264,40 @@ pub fn restore_recent_working_log_snapshot(
     Ok(working_log_has_tracked_state_for_base(repo, base_commit))
 }
 
-fn preceding_merge_squash_for_pending_commit(
+/// The squash events waiting for the commit about to be made on `base_commit`,
+/// oldest first. A `merge --squash` stands alone. `git cherry-pick -n` can be
+/// run several times before committing, and each run counts.
+fn preceding_merge_squashes_for_pending_commit(
     repo: &Repository,
     base_commit: &str,
-) -> Result<Option<MergeSquashEvent>, AutterError> {
-    let events = repo.storage.read_rewrite_events()?;
-    for event in events {
+) -> Result<Vec<MergeSquashEvent>, AutterError> {
+    let mut pending = Vec::new();
+    // The rewrite log is read newest event first.
+    for event in repo.storage.read_rewrite_events()? {
         match event {
             RewriteLogEvent::AuthorshipLogsSynced { .. } => continue,
             RewriteLogEvent::Commit { .. } | RewriteLogEvent::CommitAmend { .. } => continue,
+            // Stashing and unstashing leaves HEAD alone; what was squashed or
+            // picked before is still waiting for its commit.
+            RewriteLogEvent::Stash { .. } => continue,
             RewriteLogEvent::MergeSquash { merge_squash }
                 if merge_squash.base_head == base_commit =>
             {
-                return Ok(Some(merge_squash));
+                let newest_is_merge_squash = pending.is_empty();
+                if !merge_squash.preserve_working_log && !newest_is_merge_squash {
+                    break;
+                }
+                let stands_alone = !merge_squash.preserve_working_log;
+                pending.push(merge_squash);
+                if stands_alone {
+                    break;
+                }
             }
-            _ => return Ok(None),
+            _ => break,
         }
     }
-    Ok(None)
+    pending.reverse();
+    Ok(pending)
 }
 
 fn latest_reset_for_base_commit(
@@ -2656,31 +2672,34 @@ fn seed_merge_squash_working_log_for_commit_replay(
         return Ok(());
     }
 
-    let Some(merge_squash) = preceding_merge_squash_for_pending_commit(repo, base_commit)? else {
+    let merge_squashes = preceding_merge_squashes_for_pending_commit(repo, base_commit)?;
+    let Some(newest) = merge_squashes.last() else {
         return Ok(());
     };
-    if has_tracked_state && !merge_squash.preserve_working_log {
+    if has_tracked_state && !newest.preserve_working_log {
         return Ok(());
     }
 
-    let merge_base = repo
-        .merge_base(
-            merge_squash.source_head.clone(),
-            merge_squash.base_head.clone(),
-        )
-        .ok()
-        .flatten();
-    if let Err(error) = attempt_materialize_commit_chain_authorship(
-        repo,
-        merge_base.as_deref(),
-        &merge_squash.source_head,
-        author,
-    ) {
-        tracing::debug!(
-            %error,
-            source_head = %merge_squash.source_head,
-            "failed to backfill squash prerequisite notes"
-        );
+    for source_head in merge_squashes
+        .iter()
+        .flat_map(|merge_squash| merge_squash.source_commits())
+    {
+        let merge_base = repo
+            .merge_base(source_head.clone(), base_commit.to_string())
+            .ok()
+            .flatten();
+        if let Err(error) = attempt_materialize_commit_chain_authorship(
+            repo,
+            merge_base.as_deref(),
+            &source_head,
+            author,
+        ) {
+            tracing::debug!(
+                %error,
+                %source_head,
+                "failed to backfill squash prerequisite notes"
+            );
+        }
     }
 
     tracing::debug!(
@@ -2694,22 +2713,31 @@ fn seed_merge_squash_working_log_for_commit_replay(
         );
         return Ok(());
     };
-    if has_tracked_state {
-        return merge_working_log_after_squash_from_final_state(
+    if !newest.preserve_working_log {
+        return prepare_working_log_after_squash_from_final_state(
             repo,
-            &merge_squash.source_head,
+            &newest.source_head,
             base_commit,
             final_state,
             author,
         );
     }
-    prepare_working_log_after_squash_from_final_state(
-        repo,
-        &merge_squash.source_head,
-        base_commit,
-        final_state,
-        author,
-    )
+    // `cherry-pick -n`, possibly run more than once: every picked commit
+    // brings its attribution, oldest pick first, into whatever the working log
+    // already tracks.
+    let mut replace_working_log = !has_tracked_state;
+    for pick in &merge_squashes {
+        carry_no_commit_pick_into_working_log(
+            repo,
+            pick,
+            base_commit,
+            final_state,
+            author,
+            replace_working_log,
+        )?;
+        replace_working_log = false;
+    }
+    Ok(())
 }
 
 fn recover_recent_replay_prerequisites_for_commit_replay(
@@ -3638,7 +3666,38 @@ fn is_cherry_pick_range_spec(arg: &str) -> bool {
 
 /// True when `git cherry-pick` was told not to commit (`-n` / `--no-commit`).
 fn cherry_pick_is_no_commit(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "-n" || arg == "--no-commit")
+    cherry_pick_requests_no_commit(args)
+}
+
+/// True for a `git cherry-pick -n <commits>` invocation, as opposed to one that
+/// continues, skips or ends a pick already under way.
+fn command_is_no_commit_cherry_pick(cmd: &crate::daemon::domain::NormalizedCommand) -> bool {
+    cmd.primary_command.as_deref() == Some("cherry-pick")
+        && cherry_pick_is_no_commit(&cmd.invoked_args)
+        && !cmd
+            .invoked_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--abort" | "--continue" | "--quit" | "--skip"))
+}
+
+/// Drops every picked commit that the next pick descends from. The attribution
+/// of a commit is read through blame from where its branch left the base, so
+/// the descendant already covers its ancestors; what is left is one commit per
+/// line of history, still in pick order.
+fn distinct_cherry_pick_lines_of_history(
+    repository: &Repository,
+    sources: Vec<String>,
+) -> Vec<String> {
+    let mut distinct: Vec<String> = Vec::with_capacity(sources.len());
+    for source in sources {
+        if let Some(previous) = distinct.last()
+            && (*previous == source || is_ancestor_commit(repository, previous, &source))
+        {
+            distinct.pop();
+        }
+        distinct.push(source);
+    }
+    distinct
 }
 
 /// Git dir of the worktree (per-worktree, so linked worktrees each get their
@@ -7198,10 +7257,7 @@ impl ActorDaemonCoordinator {
     fn synthesize_cherry_pick_no_commit_squash_event(
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<Option<MergeSquashEvent>, AutterError> {
-        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("cherry-pick") {
-            return Ok(None);
-        }
-        if !cherry_pick_is_no_commit(&cmd.invoked_args) {
+        if cmd.exit_code != 0 || !command_is_no_commit_cherry_pick(cmd) {
             return Ok(None);
         }
         let Some(worktree) = cmd.worktree.as_deref() else {
@@ -7213,6 +7269,10 @@ impl ActorDaemonCoordinator {
         }
         let sources =
             resolve_cherry_pick_source_refs(&source_refs, worktree, "cherry_pick_no_commit")?;
+        let sources = match find_repository_in_path(&worktree.to_string_lossy()) {
+            Ok(repository) => distinct_cherry_pick_lines_of_history(&repository, sources),
+            Err(_) => sources,
+        };
         let Some(source_head) = sources.last().cloned() else {
             return Ok(None);
         };
@@ -7230,16 +7290,18 @@ impl ActorDaemonCoordinator {
             .as_ref()
             .and_then(|repo| repo.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        Ok(Some(
-            MergeSquashEvent::new(
-                source_refs.join(" "),
-                source_head,
-                base_branch,
-                base_head,
-                HashMap::new(),
-            )
-            .with_preserved_working_log(),
-        ))
+        let mut event = MergeSquashEvent::new(
+            source_refs.join(" "),
+            source_head,
+            base_branch,
+            base_head,
+            HashMap::new(),
+        )
+        .with_preserved_working_log();
+        if sources.len() > 1 {
+            event = event.with_picked_commits(sources);
+        }
+        Ok(Some(event))
     }
 
     fn rewrite_events_from_semantic_events(

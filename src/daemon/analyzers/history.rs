@@ -3,7 +3,9 @@ use crate::daemon::domain::{
     AnalysisResult, CommandClass, Confidence, NormalizedCommand, ResetKind, SemanticEvent,
 };
 use crate::error::AutterError;
-use crate::git::cli_parser::{explicit_rebase_branch_arg, parse_git_cli_args};
+use crate::git::cli_parser::{
+    cherry_pick_requests_no_commit, explicit_rebase_branch_arg, parse_git_cli_args,
+};
 use crate::git::repo_state::{
     HeadReflogLanding, head_reflog_entry_written_by, is_valid_git_oid,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree,
@@ -103,7 +105,7 @@ impl CommandAnalyzer for HistoryAnalyzer {
                             .and_then(|repo| repo.head.clone())
                             .unwrap_or_default(),
                     });
-                } else if args.iter().any(|arg| arg == "-n" || arg == "--no-commit") {
+                } else if cherry_pick_requests_no_commit(&args) {
                     // `-n` applies the picked changes without committing, so
                     // there is no new commit to map. The daemon carries the
                     // sources into the next commit instead. A stale ref state
