@@ -257,6 +257,7 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
                 Ok(repo) => repo,
                 Err(e) => crate::commands::exit_repository_error("log", &e),
             };
+        exit_if_nothing_to_log(&repo);
         return run_json_log(repo, parsed);
     }
 
@@ -277,6 +278,10 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
         Ok(repo) => repo,
         Err(e) => crate::commands::exit_repository_error("log", &e),
     };
+    // A fresh `git init`: say there are no commits yet, as `status` and
+    // `stats` do, instead of git's "does not have any commits yet" plus
+    // "git log exited with status 128".
+    exit_if_nothing_to_log(&repo);
     let use_pager = should_use_pager(&global_args);
     let renderer = LogRenderer::new(repo, parsed)?;
 
@@ -286,6 +291,29 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
         stream_to_stdout(renderer)?;
     }
     Ok(status_from_code(0))
+}
+
+/// Stop with the no-commits message when the repository has no commit on any
+/// ref. With HEAD on a branch that has no commits while other refs do,
+/// `autter log <ref>` still has something to show, so git decides.
+fn exit_if_nothing_to_log(repo: &Repository) {
+    if !crate::commands::repository_has_no_commits(repo) {
+        return;
+    }
+    let mut args = repo.global_args_for_exec();
+    args.extend(
+        ["rev-list", "--all", "--max-count=1"]
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
+    let any_commit = crate::git::repository::exec_git(&args)
+        .is_ok_and(|output| !output.stdout.iter().all(u8::is_ascii_whitespace));
+    if !any_commit {
+        output::fail(
+            ErrorKind::Runtime,
+            crate::commands::no_commits_message("log"),
+        );
+    }
 }
 
 fn run_plain_log(global_args: &[String], git_log_args: &[String]) -> Result<ExitStatus, LogError> {

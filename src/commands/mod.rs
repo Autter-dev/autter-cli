@@ -111,8 +111,18 @@ pub fn repository_has_no_commits(repo: &crate::git::repository::Repository) -> b
         full.extend(args.iter().map(|a| a.to_string()));
         exec_git(&full).is_ok()
     };
-    git(&["symbolic-ref", "--quiet", "HEAD"])
-        && !git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+    // The usual case, a repository with commits, costs one git process.
+    !git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        && git(&["symbolic-ref", "--quiet", "HEAD"])
+}
+
+/// In a repository with no commits yet, stop with the same message and exit
+/// code `autter status` and `autter stats` use, instead of git's own error for
+/// a branch that does not exist. Returns when the repository has commits.
+pub fn exit_if_no_commits(repo: &crate::git::repository::Repository, command: &str) {
+    if repository_has_no_commits(repo) {
+        output::fail(output::ErrorKind::Runtime, no_commits_message(command));
+    }
 }
 
 /// What a reporting command says in a repository with no commits yet. It used

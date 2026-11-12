@@ -55,6 +55,9 @@ pub fn handle_show(args: &[String]) {
         show_authorship(&repo, &revisions[0])
     };
     if let Err(e) = result {
+        // A fresh `git init` has nothing to show; say so instead of printing
+        // git's "ambiguous argument 'HEAD'".
+        crate::commands::exit_if_no_commits(&repo, "show");
         let kind = match e {
             AutterError::GitCliError { .. } => ErrorKind::RevisionNotFound,
             _ => ErrorKind::Runtime,

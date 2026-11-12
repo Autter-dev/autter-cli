@@ -570,8 +570,28 @@ impl Repository {
         }
     }
 
+    /// Blame a file and print the result (unless `options.no_output`).
+    ///
+    /// When printing for `autter blame` in a repository with no commits yet,
+    /// this stops with the message `autter status` and `autter stats` use
+    /// there, instead of returning git's "no such ref: HEAD". Errors that are
+    /// not git's (a path outside the repository, a bad line range) are
+    /// returned as they are.
     #[allow(clippy::type_complexity)]
     pub fn blame(
+        &self,
+        file_path: &str,
+        options: &AutterBlameOptions,
+    ) -> Result<(HashMap<u32, String>, HashMap<String, PromptRecord>), AutterError> {
+        let result = self.blame_and_print(file_path, options);
+        if matches!(result, Err(AutterError::GitCliError { .. })) && !options.no_output {
+            crate::commands::exit_if_no_commits(self, "blame");
+        }
+        result
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn blame_and_print(
         &self,
         file_path: &str,
         options: &AutterBlameOptions,
