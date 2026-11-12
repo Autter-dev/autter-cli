@@ -18,6 +18,7 @@ const FAILURES: &[&str] = &[
     "content_mismatch",
     "range_out_of_bounds",
     "digest_mismatch",
+    "carried_failure",
 ];
 
 const NOTICE_PREFIX: &str = "Autter's record for";
@@ -722,4 +723,255 @@ fn test_verify_range_counts_statuses() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("missing"), "{stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// Rewrites do not launder a note that fails the check
+// ---------------------------------------------------------------------------
+//
+// A rewrite autter performs verifies the note it carries attribution from.
+// When autter writes the rewritten commit's note itself (rebase, amend,
+// cherry-pick, `autter ci`), a failing source makes the new note
+// `carried_failure`, naming the source commit. When the attribution goes to
+// the working log of a commit not made yet (`cherry-pick -n`, reset), the
+// failing note's lines are not carried and count as unknown.
+
+/// Edit `commit`'s note after autter wrote it (the agent's name), so it fails
+/// with digest_mismatch while its line ranges still fit the commit.
+fn tamper_note(repo: &TestRepo, commit: &str) {
+    let note = raw_note(repo, commit);
+    assert!(note.contains("mock_ai"), "{note}");
+    write_raw_note(repo, commit, &note.replace("mock_ai", "forged_ai"));
+    assert_status(repo, commit, "digest_mismatch");
+}
+
+/// `commit`'s note was derived from `source`'s failing note: it fails with
+/// `carried_failure`, names `source`, and its AI lines are not trusted.
+fn assert_carried_failure(repo: &TestRepo, commit: &str, source: &str) {
+    assert_status(repo, commit, "carried_failure");
+    let (_, _, doc) = status_of(repo, commit);
+    assert_eq!(doc["results"][0]["recorded_commit"], source, "{doc}");
+    assert_eq!(
+        ai_additions(repo, commit),
+        0,
+        "stats must not count AI lines"
+    );
+}
+
+#[test]
+fn test_rebase_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    repo.git_og(&["config", "notes.rewriteRef", "refs/notes/ai"])
+        .unwrap();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD~1");
+    tamper_note(&repo, &tampered);
+
+    repo.git(&["rebase", &main]).unwrap();
+    let rebased = rev(&repo, "HEAD~1");
+    assert_ne!(tampered, rebased);
+    assert_carried_failure(&repo, &rebased, &tampered);
+    assert_blame_distrusts_note(&repo, &repo.filename("one.txt"), "one.txt");
+    // The untampered commit rebased with it still verifies.
+    let mut two = repo.filename("two.txt");
+    two.assert_committed_lines(crate::lines!["ai two".ai(), "human two".human()]);
+    assert_verified(&repo, &["HEAD"]);
+}
+
+#[test]
+fn test_rebase_without_rewrite_ref_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    repo.git(&["rebase", &main]).unwrap();
+    assert_carried_failure(&repo, &rev(&repo, "HEAD"), &tampered);
+    let mut one = repo.filename("one.txt");
+    one.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+    assert_verified(&repo, &["HEAD~1"]);
+}
+
+/// With the background service stopped, git copies a tampered note byte for
+/// byte; the copy is not pending_rewrite (a warning) but still fails.
+#[test]
+fn test_rebase_while_service_is_stopped_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    repo.git_og(&["config", "notes.rewriteRef", "refs/notes/ai"])
+        .unwrap();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    // Plain git: no hooks, no trace2, so autter does not see the rebase.
+    repo.git_og(&["rebase", &main]).unwrap();
+    assert_status(&repo, &rev(&repo, "HEAD"), "digest_mismatch");
+    assert_status(&repo, &rev(&repo, "HEAD~1"), "pending_rewrite");
+    let mut one = repo.filename("one.txt");
+    one.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_rebase_reorder_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    // Swap the two picks: "feature two" (tampered) now comes first.
+    rebase_interactive(&repo, &main, "1{h;d;};2{G;}");
+    assert_eq!(
+        repo.git_og(&["log", "-1", "--format=%s", "HEAD~1"])
+            .unwrap()
+            .trim(),
+        "feature two"
+    );
+    assert_carried_failure(&repo, &rev(&repo, "HEAD~1"), &tampered);
+    let mut one = repo.filename("one.txt");
+    one.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+    assert_verified(&repo, &["HEAD"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_rebase_squash_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    rebase_interactive(&repo, &main, "2s/^pick/squash/");
+    assert_eq!(rev(&repo, "HEAD~1"), rev(&repo, &main));
+    // The squashed note took lines from the failing note: all of it fails.
+    assert_carried_failure(&repo, &rev(&repo, "HEAD"), &tampered);
+    assert_blame_distrusts_note(&repo, &repo.filename("two.txt"), "two.txt");
+}
+
+#[test]
+fn test_amend_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("app.txt");
+    fs::write(&file_path, "human one\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "app.txt"])
+        .unwrap();
+    fs::write(&file_path, "human one\nai one\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    let first = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+    tamper_note(&repo, &first);
+
+    repo.autter(&["checkpoint", "human", "app.txt"]).unwrap();
+    fs::write(&file_path, "human one\nai one\nai two\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    repo.git(&["add", "."]).unwrap();
+    repo.git(&["commit", "--amend", "--no-edit"]).unwrap();
+    let amended = rev(&repo, "HEAD");
+    assert_ne!(first, amended);
+    assert_carried_failure(&repo, &amended, &first);
+    assert_blame_distrusts_note(&repo, &file, "app.txt");
+}
+
+#[test]
+fn test_cherry_pick_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD~1");
+    let clean = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    repo.git(&["checkout", &main]).unwrap();
+    repo.git(&["cherry-pick", &tampered, &clean]).unwrap();
+    assert_carried_failure(&repo, &rev(&repo, "HEAD~1"), &tampered);
+    assert_blame_distrusts_note(&repo, &repo.filename("one.txt"), "one.txt");
+    let mut two = repo.filename("two.txt");
+    two.assert_committed_lines(crate::lines!["ai two".ai(), "human two".human()]);
+    assert_verified(&repo, &["HEAD"]);
+}
+
+/// `cherry-pick -n` leaves the picked lines in the working log; the commit
+/// that follows is a new note, which does not take the failing note's lines.
+#[test]
+fn test_cherry_pick_no_commit_does_not_carry_a_tampered_note() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    repo.git(&["checkout", &main]).unwrap();
+    repo.git(&["cherry-pick", "-n", &tampered]).unwrap();
+    let picked = repo.commit("picked without committing").unwrap().commit_sha;
+    let mut two = repo.filename("two.txt");
+    two.assert_committed_lines(crate::lines![
+        "ai two".unattributed_human(),
+        "human two".unattributed_human()
+    ]);
+    assert_eq!(ai_additions(&repo, &picked), 0);
+    let (status, code, doc) = status_of(&repo, &picked);
+    assert!(
+        status == "verified" || status == "missing",
+        "the new note must not fail or credit the tampered lines: {doc}"
+    );
+    assert_eq!(code, 0, "{doc}");
+}
+
+#[test]
+fn test_ci_squash_merge_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD~1");
+    tamper_note(&repo, &tampered);
+    let head_sha = rev(&repo, "HEAD");
+    let base_sha = rev(&repo, &format!("{main}~1"));
+    repo.git_og(&["checkout", &main]).unwrap();
+    repo.git_og(&["merge", "--squash", "feature"]).unwrap();
+    repo.git_og(&["commit", "-m", "squash merge"]).unwrap();
+    let merge_sha = rev(&repo, "HEAD");
+    let _origin = add_bare_origin(&repo);
+
+    ci_local_merge(&repo, &merge_sha, &head_sha, &base_sha, &main);
+    assert_carried_failure(&repo, &merge_sha, &tampered);
+}
+
+#[test]
+fn test_ci_rebase_merge_keeps_a_tampered_note_failing() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD~1");
+    tamper_note(&repo, &tampered);
+    let head_sha = rev(&repo, "HEAD");
+    let base_sha = rev(&repo, &format!("{main}~1"));
+    repo.git_og(&["rebase", &main]).unwrap();
+    repo.git_og(&["checkout", &main]).unwrap();
+    repo.git_og(&["merge", "--ff-only", "feature"]).unwrap();
+    let merge_sha = rev(&repo, "HEAD");
+    let _origin = add_bare_origin(&repo);
+
+    ci_local_merge(&repo, &merge_sha, &head_sha, &base_sha, &main);
+    assert_carried_failure(&repo, &rev(&repo, "HEAD~1"), &tampered);
+    let mut two = repo.filename("two.txt");
+    two.assert_committed_lines(crate::lines!["ai two".ai(), "human two".human()]);
+    assert_verified(&repo, &["HEAD"]);
+}
+
+/// A reset rebuilds the working log through blame, which already skips a
+/// failing note: the recommitted lines are not credited to AI.
+#[test]
+fn test_reset_does_not_carry_a_tampered_note() {
+    let repo = TestRepo::new();
+    feature_behind_main(&repo);
+    let tampered = rev(&repo, "HEAD");
+    tamper_note(&repo, &tampered);
+
+    repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
+    let recommitted = repo.commit("feature two again").unwrap().commit_sha;
+    let mut two = repo.filename("two.txt");
+    two.assert_committed_lines(crate::lines![
+        "ai two".unattributed_human(),
+        "human two".unattributed_human()
+    ]);
+    assert_eq!(ai_additions(&repo, &recommitted), 0);
+    let (_, code, doc) = status_of(&repo, &recommitted);
+    assert_eq!(code, 0, "{doc}");
 }

@@ -905,6 +905,16 @@ pub fn rewrite_authorship_after_squash_or_rebase(
     } else {
         vec![source_head_sha.to_string()]
     };
+
+    // Check the source notes before carrying them (note_integrity.rs): the
+    // merge commit's note is built from all of them, so one failing note makes
+    // it fail too.
+    let _source_check = crate::authorship::note_integrity::check_rewrite_sources(
+        repo,
+        &[(merge_commit_sha.to_string(), source_commits.clone())],
+        None,
+    );
+
     let changed_files =
         filter_pathspecs_to_ai_touched_files(repo, &source_commits, &changed_files)?;
 
@@ -1867,6 +1877,31 @@ pub fn rewrite_authorship_after_rebase_v2(
         .iter()
         .map(|(orig, new)| (new.clone(), orig.clone()))
         .collect();
+
+    // Check the original notes before carrying them (note_integrity.rs): a
+    // rebased commit derived from a failing note, the one it replays or one a
+    // squash or fixup folded into it, gets a note that fails too. One pass over
+    // the notes already in the cache, before any path below writes a note.
+    let phase_start = std::time::Instant::now();
+    let derived_from: Vec<(String, Vec<String>)> = commit_pairs_to_process
+        .iter()
+        .map(|(original, new)| {
+            let mut sources = vec![original.clone()];
+            if let Some(absorbed) = absorbed_by_new.get(new) {
+                sources.extend(absorbed.iter().cloned());
+            }
+            (new.clone(), sources)
+        })
+        .collect();
+    let _source_check = crate::authorship::note_integrity::check_rewrite_sources(
+        repo,
+        &derived_from,
+        Some(&note_cache.original_note_contents),
+    );
+    timing_phases.push((
+        "check_rewrite_sources".to_string(),
+        phase_start.elapsed().as_millis(),
+    ));
 
     // Step 1: Use AI-touched files directly from the note cache as pathspecs.
     // This eliminates a diff-tree --stdin subprocess call entirely.
@@ -3359,6 +3394,15 @@ pub fn rewrite_authorship_after_cherry_pick(
         .map(|(source_commit, _new_commit)| source_commit.clone())
         .collect();
 
+    // Check the picked notes before carrying them (note_integrity.rs): a commit
+    // picked from a failing note gets a note that fails too.
+    let derived_from: Vec<(String, Vec<String>)> = commit_pairs
+        .iter()
+        .map(|(source_commit, new_commit)| (new_commit.clone(), vec![source_commit.clone()]))
+        .collect();
+    let _source_check =
+        crate::authorship::note_integrity::check_rewrite_sources(repo, &derived_from, None);
+
     // Step 1: Extract pathspecs from all source commits
     let pathspecs = get_pathspecs_from_commits(repo, source_commits)?;
     let pathspecs = filter_pathspecs_to_ai_touched_files(repo, source_commits, &pathspecs)?;
@@ -4289,6 +4333,17 @@ pub fn rewrite_authorship_after_commit_amend_with_snapshot(
     agent_env: &crate::authorship::background_agent::AgentEnv,
 ) -> Result<AuthorshipLog, AutterError> {
     use crate::authorship::virtual_attribution::VirtualAttributions;
+
+    // Check the original note before carrying it (note_integrity.rs): an
+    // amended commit whose original note fails gets a note that fails too.
+    let _source_check = crate::authorship::note_integrity::check_rewrite_sources(
+        repo,
+        &[(
+            amended_commit.to_string(),
+            vec![original_commit.to_string()],
+        )],
+        None,
+    );
 
     // Get the files that changed between original and amended commit
     let changed_files = repo.list_commit_files(amended_commit, None)?;
