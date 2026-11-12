@@ -23,6 +23,8 @@
 //!   gives nothing to lines typed again by hand, nor to unrelated work.
 //! - A known-human checkpoint after a clean `git cherry-pick -n` claims only
 //!   the lines the person wrote.
+//! - Uncommitted AI work thrown away by `git reset --hard` gives nothing to
+//!   lines typed again by hand; an AI edit made again afterwards is the AI's.
 //! - A `git reset` that leaves HEAD where it is (no target, or only paths) is
 //!   not a move from the branch checked out before, and keeps live AI work.
 //! - Lines typed after switching back from a branch with AI commits, or after
@@ -575,6 +577,74 @@ fn line_typed_after_hard_reset_of_an_ai_commit_is_not_the_ais() {
         "Hand version".unattributed_human(),
         "Line 3".unattributed_human(),
     ]);
+}
+
+#[test]
+fn live_ai_work_thrown_away_by_hard_reset_is_not_given_to_retyped_lines() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("live.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("live.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    // Uncommitted AI work, thrown away; the same line is then typed by hand.
+    ai_edit(&repo, "live.txt", "Line 1\nLine 2\nLine 3\nLive AI line\n");
+    repo.git(&["reset", "--hard"]).unwrap();
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLive AI line\n").unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Live AI line".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn ai_edit_made_again_after_hard_reset_is_the_ais() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("again.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\n").unwrap();
+    fs::write(repo.path().join("kept.txt"), "Kept base\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("again.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    // A mistaken AI edit is undone with `reset --hard`, and the agent makes
+    // its edit again. A new file the agent wrote and nobody added survives
+    // the reset, and so does its attribution.
+    ai_edit(&repo, "again.txt", "Line 1\nWrong AI line\nLine 3\n");
+    ai_edit(&repo, "untracked.txt", "Untracked AI line\n");
+    repo.git(&["reset", "--hard"]).unwrap();
+    ai_edit(
+        &repo,
+        "again.txt",
+        "Line 1\nLine 2\nLine 3\nRight AI line\n",
+    );
+    repo.stage_all_and_commit("AI edit made again").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Right AI line".ai(),
+    ]);
+    repo.filename("untracked.txt")
+        .assert_committed_lines(lines!["Untracked AI line".ai()]);
 }
 
 /// Two AI commits on two branches that both start at the initial commit: one

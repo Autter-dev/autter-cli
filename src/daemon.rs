@@ -3994,9 +3994,11 @@ fn repo_is_ancestor(
 
 /// What a command that left HEAD where it was did to uncommitted work.
 ///
-/// - `git reset --hard` threw every change to a tracked file away: a pending
-///   `git cherry-pick -n` is cancelled. (`--merge` and `--keep` onto HEAD
-///   itself leave the working tree alone.)
+/// - `git reset --hard` threw every change to a tracked file away: the
+///   attribution the working log held for those changes goes too, so text
+///   typed again afterwards starts with none, and a pending `git cherry-pick
+///   -n` is cancelled. (`--merge` and `--keep` onto HEAD itself leave the
+///   working tree alone.)
 /// - `git checkout` / `git restore` of paths that leaves the tree without any
 ///   line a pending pick brought (`checkout HEAD -- .`, `restore --staged
 ///   --worktree .`) cancels it. `checkout --theirs` / `restore --theirs`
@@ -4090,8 +4092,11 @@ fn apply_tree_discard_side_effects(
 
     let picks = pending_no_commit_picks(&repo, &head)?;
     if primary == Some("reset") {
-        if cmd.invoked_args.iter().any(|arg| arg == "--hard") && !picks.is_empty() {
-            cancel_pending_no_commit_picks(&repo, &head, None)?;
+        if cmd.invoked_args.iter().any(|arg| arg == "--hard") {
+            if !picks.is_empty() {
+                cancel_pending_no_commit_picks(&repo, &head, None)?;
+            }
+            drop_attribution_discarded_by_hard_reset(&repo, worktree, &head)?;
         }
         return Ok(());
     }
@@ -4295,6 +4300,34 @@ fn paths_taken_from_picked_side(
         }
     }
     Some(paths)
+}
+
+/// `git reset --hard` that left HEAD in place put every file of HEAD back and
+/// removed every file the index held that HEAD lacks: what the working log
+/// tracked for those files was thrown away with them. A file in neither,
+/// never added, is left as it was, and so is its attribution.
+fn drop_attribution_discarded_by_hard_reset(
+    repo: &Repository,
+    worktree: &Path,
+    head: &str,
+) -> Result<(), AutterError> {
+    let tracked = tracked_working_log_files(repo, head)?;
+    if tracked.is_empty() {
+        return Ok(());
+    }
+    let tree = repo.find_commit(head.to_string())?.tree()?.id();
+    let mut discarded: Vec<String> = tracked
+        .into_iter()
+        .filter(|file| {
+            repo.read_file_blob_at_tree(&tree, Path::new(file)).is_ok()
+                || !worktree.join(file).exists()
+        })
+        .collect();
+    if discarded.is_empty() {
+        return Ok(());
+    }
+    discarded.sort();
+    remove_working_log_attributions_for_pathspecs(repo, head, &discarded)
 }
 
 fn apply_reset_working_log_side_effect(
