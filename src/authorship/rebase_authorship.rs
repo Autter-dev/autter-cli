@@ -161,6 +161,9 @@ struct CommitTrackedDelta {
     /// `(old path, new path)` for tracked files this commit renamed. Only
     /// filled when the diff ran with rename detection.
     renames: Vec<(String, String)>,
+    /// Whether this commit creates a tracked file (without rename detection,
+    /// a rename to a tracked path looks like that).
+    creates_a_tracked_file: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1965,12 +1968,14 @@ pub fn rewrite_authorship_after_rebase_v2(
     )?;
 
     // A tracked file that disappears in one of these commits may have been
-    // renamed there. Ask git which of these commits rename a tracked file, and
+    // renamed there, and one that appears may have been renamed from a path
+    // nothing tracks yet (a reorder can move an edit of the old path to the
+    // rebased side). Ask git which of these commits rename a tracked file, and
     // if any does, diff again with rename detection so attribution follows the
     // file instead of being dropped with the old path. This holds whether or
     // not the new path is already tracked: a file that is edited again after
     // the rename is attested under both names.
-    if combined_diff_tree_result.removes_a_tracked_file()
+    if combined_diff_tree_result.removes_or_creates_a_tracked_file()
         && let Some(renamed_to) = renamed_paths_within_commits(repo, &combined_commits, &pathspecs)
     {
         pathspecs.extend(renamed_to);
@@ -2980,10 +2985,12 @@ fn parse_name_status_renames(raw: &[u8], wanted: &HashSet<&str>) -> HashMap<Stri
     renames
 }
 
-/// Paths that tracked files are renamed to by `commits`, following chains of
-/// renames (a -> b, then b -> c), as git reports them for each commit. Returns
-/// `None` when no commit renames a tracked file, otherwise the new paths that
-/// are not in `pathspecs` yet (none, when every new path is already tracked).
+/// Paths that tracked files are renamed to or from by `commits`, following
+/// chains of renames (a -> b, then b -> c), as git reports them for each
+/// commit. Returns `None` when no commit renames a tracked file, otherwise the
+/// paths that are not in `pathspecs` yet (none, when every one is already
+/// tracked). The old name of a tracked file matters too: a reorder can move an
+/// edit made after the rename ahead of it, onto the old name.
 /// Best effort: a git failure yields `None`, which is the previous behavior.
 fn renamed_paths_within_commits(
     repo: &Repository,
@@ -3021,8 +3028,17 @@ fn untracked_rename_targets(
     loop {
         let mut grew = false;
         for (old_path, new_path) in renames {
-            if tracked.contains(old_path.as_str()) && tracked.insert(new_path.as_str()) {
-                renamed_to.push(new_path.clone());
+            let added = if tracked.contains(old_path.as_str()) {
+                Some(new_path)
+            } else if tracked.contains(new_path.as_str()) {
+                Some(old_path)
+            } else {
+                None
+            };
+            if let Some(path) = added
+                && tracked.insert(path.as_str())
+            {
+                renamed_to.push(path.clone());
                 grew = true;
             }
         }
@@ -3823,11 +3839,12 @@ impl DiffTreeResult {
         files
     }
 
-    /// Whether any commit deleted (or renamed away) a tracked file.
-    fn removes_a_tracked_file(&self) -> bool {
-        self.commit_deltas
-            .iter()
-            .any(|(_, delta)| delta.file_to_blob_oid.values().any(Option::is_none))
+    /// Whether any commit deleted (or renamed away) or created (or renamed
+    /// in) a tracked file.
+    fn removes_or_creates_a_tracked_file(&self) -> bool {
+        self.commit_deltas.iter().any(|(_, delta)| {
+            delta.creates_a_tracked_file || delta.file_to_blob_oid.values().any(Option::is_none)
+        })
     }
 }
 
@@ -4071,6 +4088,9 @@ fn run_diff_tree_with_hunks(
                             current_delta
                                 .renames
                                 .push((old_path.to_string(), file_path.clone()));
+                        }
+                        if status_char == 'A' {
+                            current_delta.creates_a_tracked_file = true;
                         }
                         current_delta.changed_files.insert(file_path.clone());
                         let new_blob_oid = if is_zero_oid(new_oid) || !is_blob_mode(new_mode) {
@@ -6187,6 +6207,16 @@ mod rename_tracking_tests {
         );
         let unrelated = ["unrelated.txt".to_string()];
         assert_eq!(untracked_rename_targets(&renames, &unrelated), None);
+    }
+
+    #[test]
+    fn rename_sources_of_tracked_files_are_reported() {
+        let renames = [rename("a.txt", "b.txt"), rename("b.txt", "c.txt")];
+        let tracked = ["c.txt".to_string()];
+        assert_eq!(
+            untracked_rename_targets(&renames, &tracked),
+            Some(vec!["b.txt".to_string(), "a.txt".to_string()])
+        );
     }
 
     #[test]
