@@ -73,7 +73,7 @@ The npm package is a thin bootstrapper that downloads the same release binary in
 
 Three things about the npm route:
 
-- **Run `autter onboard` after installing.** npm hides the output of install scripts, so the hint to do this is not shown. Until onboarding runs, nothing is captured.
+- **Run `autter onboard` after installing.** npm hides the output of install scripts, so the hint to do this is not shown. Until onboarding runs, nothing is captured, and everyday commands (`autter stats`, `autter status`, ...) say so in one line, at most once a day.
 - **If install scripts are blocked** (`--ignore-scripts`, pnpm, npm settings that skip them), the binary is not downloaded during `npm install`. It downloads the first time you run `autter`, so no extra flag is needed.
 - **npm picks the version.** Upgrade with `npm install -g @autter/cli@latest`, or install `@autter/cli@<version>` to stay on one release. The background service does not replace an npm-installed binary by itself; when a new release is out, autter says so once and names that npm command, and `autter upgrade` prints it instead of installing. `npm update` alone does not upgrade the CLI, because the package only bootstraps the binary. Installing with the shell or PowerShell installer afterwards hands updates back to autter.
 
@@ -330,7 +330,7 @@ This removes Autter's agent hooks and editor extensions, its settings in your gl
 
 ### An agent or editor installed after Autter is not detected
 
-Re-run integration setup:
+When an agent with hook support is installed after onboarding, the next everyday command says once that its edits are not captured. Agents you left unselected during `autter onboard` are never named. Nothing is installed until you run integration setup:
 
 ```bash
 autter install-hooks

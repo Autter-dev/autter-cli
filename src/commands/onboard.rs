@@ -804,6 +804,30 @@ fn in_test_harness() -> bool {
     std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
 }
 
+/// The detected tools picked in onboarding's multiselect and the ones left
+/// unselected, as installer ids. Indexes past the tools are the "Git capture"
+/// item and are ignored.
+fn split_tool_choice(
+    tools: &[crate::commands::install_hooks::DetectedTool],
+    chosen: &[usize],
+) -> (Vec<String>, Vec<String>) {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, tool)| (chosen.contains(&i), tool.id.clone()))
+        .fold(
+            (Vec::new(), Vec::new()),
+            |(mut yes, mut no), (picked, id)| {
+                if picked {
+                    yes.push(id)
+                } else {
+                    no.push(id)
+                }
+                (yes, no)
+            },
+        )
+}
+
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
 ///
 /// Only `assume_yes` (`--yes`) applies them all without asking. Interactive
@@ -867,6 +891,10 @@ fn apply_system_integrations_with_consent(
                 ui::caps().paint("2", "space toggles \u{00B7} enter confirms")
             );
             let chosen = ui::multiselect(&question, &items, &all);
+            let (accepted, declined) = split_tool_choice(&tools, &chosen);
+            // Agents left unselected are never named in the "installed but
+            // not captured" notice (`setup_notices`).
+            crate::commands::setup_notices::record_onboarding_choice(&declined, &accepted);
             if chosen.is_empty() {
                 rail::print_note("Skipped. Run `autter install --system` when you're ready.");
                 return Ok(SystemCapture::NotSetUp);
@@ -1032,6 +1060,24 @@ mod tests {
 
     fn args(flags: &[&str]) -> Vec<String> {
         flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tools_left_unselected_in_onboarding_are_declined() {
+        use crate::commands::install_hooks::DetectedTool;
+        let tool = |id: &str| DetectedTool {
+            id: id.to_string(),
+            name: id.to_string(),
+        };
+        let tools = vec![tool("claude-code"), tool("cursor"), tool("codex")];
+        // Index 3 is the "Git capture and background service" item.
+        let (accepted, declined) = split_tool_choice(&tools, &[0, 2, 3]);
+        assert_eq!(accepted, args(&["claude-code", "codex"]));
+        assert_eq!(declined, args(&["cursor"]));
+        // Nothing picked: every tool was turned down.
+        let (accepted, declined) = split_tool_choice(&tools, &[]);
+        assert!(accepted.is_empty());
+        assert_eq!(declined, args(&["claude-code", "cursor", "codex"]));
     }
 
     fn plain() -> TermCaps {
