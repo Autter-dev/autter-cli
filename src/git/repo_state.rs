@@ -193,6 +193,78 @@ pub fn resolve_worktree_head_reflog_old_oid_for_new_head(
         .map(|transition| transition.old))
 }
 
+/// A HEAD reflog entry of a worktree that left HEAD at a given commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadReflogLanding {
+    /// Where HEAD was before the entry. Equal to the commit itself when the
+    /// entry did not move HEAD, as with `reset: moving to HEAD`.
+    pub old: String,
+    /// The reflog message, starting with the action that wrote it
+    /// (`commit:`, `reset:`, `checkout:` and so on).
+    pub message: String,
+}
+
+/// Every HEAD reflog entry that left HEAD at `new_oid`, newest first. Unlike
+/// [`resolve_worktree_head_reflog_old_oid_for_new_head`], entries that did not
+/// move HEAD are included: a `reset` that stays on the same commit writes one,
+/// and it is newer than whatever moved HEAD there before.
+pub fn worktree_head_reflog_landings(
+    worktree: &Path,
+    new_oid: &str,
+) -> Result<Vec<HeadReflogLanding>, AutterError> {
+    if !is_valid_git_oid(new_oid) {
+        return Ok(Vec::new());
+    }
+
+    Ok(
+        read_head_reflog_transitions_for_worktree_internal(worktree, true)?
+            .into_iter()
+            .rev()
+            .filter(|transition| transition.new == new_oid)
+            .map(|transition| HeadReflogLanding {
+                old: transition.old,
+                message: transition.message,
+            })
+            .collect(),
+    )
+}
+
+/// Finds the newest HEAD reflog entry that moved HEAD to `new_oid` from another
+/// commit, with the message that says which command did it.
+pub fn latest_worktree_head_reflog_move(
+    worktree: &Path,
+    new_oid: &str,
+) -> Result<Option<HeadReflogLanding>, AutterError> {
+    Ok(worktree_head_reflog_landings(worktree, new_oid)?
+        .into_iter()
+        .find(|landing| landing.old != new_oid))
+}
+
+/// Whether `command` can have written a HEAD reflog entry with this message.
+/// Git starts the message with the action: `commit:`, `commit (amend):`,
+/// `reset:`, `checkout:`, `merge <branch>:`, `rebase (pick):` and so on.
+/// An action git does not use itself comes from a script that set
+/// `GIT_REFLOG_ACTION`, and is accepted for any command.
+pub fn head_reflog_entry_written_by(command: &str, message: &str) -> bool {
+    let action = message.split([' ', ':', '(']).next().unwrap_or_default();
+    match action {
+        "commit" => match command {
+            "commit" => true,
+            // `--continue` after a conflict commits through `git commit`.
+            "cherry-pick" => message.starts_with("commit (cherry-pick)"),
+            "merge" => message.starts_with("commit (merge)"),
+            _ => false,
+        },
+        "reset" => command == "reset",
+        "cherry-pick" => command == "cherry-pick",
+        "merge" => command == "merge",
+        "rebase" => command == "rebase",
+        "pull" => matches!(command, "pull" | "rebase" | "merge"),
+        "checkout" | "clone" | "revert" | "am" | "branch" => false,
+        _ => true,
+    }
+}
+
 pub fn read_head_state_for_worktree(worktree: &Path) -> Option<HeadState> {
     use crate::git::fast_reader::{FastRefReader, HeadKind};
     let git_dir = git_dir_for_worktree(worktree)?;

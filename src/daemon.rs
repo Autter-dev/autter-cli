@@ -3,13 +3,14 @@ use crate::daemon::domain::RepoContext;
 use crate::daemon::git_backend::GitBackend;
 use crate::error::AutterError;
 use crate::git::cli_parser::{
-    ParsedGitInvocation, explicit_rebase_branch_arg, parse_git_cli_args,
-    stash_requires_target_resolution, stash_target_spec, summarize_rebase_args,
+    ParsedGitInvocation, cherry_pick_requests_no_commit, explicit_rebase_branch_arg,
+    parse_git_cli_args, stash_requires_target_resolution, stash_target_spec, summarize_rebase_args,
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
     HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
-    latest_reflog_old_oid_for_worktree, read_head_state_for_worktree, read_ref_oid_for_worktree,
+    head_reflog_entry_written_by, latest_reflog_old_oid_for_worktree,
+    latest_worktree_head_reflog_move, read_head_state_for_worktree, read_ref_oid_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -20,19 +21,20 @@ use crate::git::repository::{
     is_no_repository_discovered_error,
 };
 use crate::git::rewrite_log::{
-    CherryPickAbortEvent, CherryPickCompleteEvent, MergeSquashEvent, RebaseAbortEvent,
-    RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent, StashOperation,
+    CherryPickAbortEvent, CherryPickCompleteEvent, ConflictedFileStages, MergeSquashEvent,
+    RebaseAbortEvent, RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent,
+    StashOperation,
 };
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::LockFile;
 use crate::{
+    authorship::no_commit_pick::carry_no_commit_pick_into_working_log,
     authorship::post_commit::post_commit_with_final_state,
     authorship::rebase_authorship::{
-        committed_file_snapshot_between_commits, merge_working_log_after_squash_from_final_state,
-        prepare_working_log_after_squash_from_final_state, reconstruct_working_log_after_reset,
-        restore_virtual_attribution_carryover, restore_working_log_carryover,
-        rewrite_authorship_after_commit_amend_with_snapshot, rewrite_authorship_if_needed,
-        take_pending_no_commit_pick,
+        committed_file_snapshot_between_commits, prepare_working_log_after_squash_from_final_state,
+        reconstruct_working_log_after_reset, restore_virtual_attribution_carryover,
+        restore_working_log_carryover, rewrite_authorship_after_commit_amend_with_snapshot,
+        rewrite_authorship_if_needed, take_pending_no_commit_pick,
     },
     authorship::working_log::{AgentId, CheckpointKind},
     commands::checkpoint_agent::orchestrator::CheckpointRequest,
@@ -2263,24 +2265,40 @@ pub fn restore_recent_working_log_snapshot(
     Ok(working_log_has_tracked_state_for_base(repo, base_commit))
 }
 
-fn preceding_merge_squash_for_pending_commit(
+/// The squash events waiting for the commit about to be made on `base_commit`,
+/// oldest first. A `merge --squash` stands alone. `git cherry-pick -n` can be
+/// run several times before committing, and each run counts.
+fn preceding_merge_squashes_for_pending_commit(
     repo: &Repository,
     base_commit: &str,
-) -> Result<Option<MergeSquashEvent>, AutterError> {
-    let events = repo.storage.read_rewrite_events()?;
-    for event in events {
+) -> Result<Vec<MergeSquashEvent>, AutterError> {
+    let mut pending = Vec::new();
+    // The rewrite log is read newest event first.
+    for event in repo.storage.read_rewrite_events()? {
         match event {
             RewriteLogEvent::AuthorshipLogsSynced { .. } => continue,
             RewriteLogEvent::Commit { .. } | RewriteLogEvent::CommitAmend { .. } => continue,
+            // Stashing and unstashing leaves HEAD alone; what was squashed or
+            // picked before is still waiting for its commit.
+            RewriteLogEvent::Stash { .. } => continue,
             RewriteLogEvent::MergeSquash { merge_squash }
                 if merge_squash.base_head == base_commit =>
             {
-                return Ok(Some(merge_squash));
+                let newest_is_merge_squash = pending.is_empty();
+                if !merge_squash.preserve_working_log && !newest_is_merge_squash {
+                    break;
+                }
+                let stands_alone = !merge_squash.preserve_working_log;
+                pending.push(merge_squash);
+                if stands_alone {
+                    break;
+                }
             }
-            _ => return Ok(None),
+            _ => break,
         }
     }
-    Ok(None)
+    pending.reverse();
+    Ok(pending)
 }
 
 fn latest_reset_for_base_commit(
@@ -2466,15 +2484,27 @@ fn attempt_materialize_commit_chain_authorship(
     Ok(())
 }
 
-fn resolve_reset_old_head_for_base(worktree: &Path, base_commit: &str) -> Option<String> {
-    read_ref_oid_for_worktree(worktree, "ORIG_HEAD")
-        .filter(|oid| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid))
-        .or_else(|| {
-            resolve_worktree_head_reflog_old_oid_for_new_head(worktree, base_commit)
-                .ok()
-                .flatten()
-                .filter(|oid| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid))
-        })
+/// Where HEAD was before it last moved to `base_commit`, read from the
+/// repository when the move itself was never seen, and whether that move was a
+/// reset. Only a reset undoes commits whose work can still be in the tree: a
+/// `checkout` back to a branch, a rebase or a merge also leave HEAD on a commit
+/// other commits descend from, and rebuilding "undone" work from those commits
+/// would hand their attribution to whatever is typed next. Such a move can
+/// still have carried uncommitted work along, which is why it is returned.
+fn resolve_reset_old_head_for_base(worktree: &Path, base_commit: &str) -> Option<(String, bool)> {
+    let usable = |oid: &String| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid);
+    match latest_worktree_head_reflog_move(worktree, base_commit) {
+        Ok(Some(moved)) => {
+            let by_reset = head_reflog_entry_written_by("reset", &moved.message);
+            Some(moved.old)
+                .filter(usable)
+                .map(|old_head| (old_head, by_reset))
+        }
+        // No reflog says how HEAD got here; ORIG_HEAD is all there is.
+        Ok(None) | Err(_) => read_ref_oid_for_worktree(worktree, "ORIG_HEAD")
+            .filter(usable)
+            .map(|old_head| (old_head, true)),
+    }
 }
 
 fn read_reset_recovery_final_state(
@@ -2580,15 +2610,20 @@ fn recover_reset_working_log_for_commit_replay(
         return Ok(false);
     }
 
-    let old_head = latest_reset_for_base_commit(repo, base_commit)?
-        .map(|reset| reset.old_head_sha)
-        .or_else(|| resolve_reset_old_head_for_base(worktree, base_commit));
-    let Some(old_head) = old_head else {
-        return Ok(false);
+    let (old_head, undone_by_reset) = match latest_reset_for_base_commit(repo, base_commit)? {
+        // `reset --hard` threw the undone work away. There is nothing to recover.
+        Some(reset) if reset.kind == ResetKind::Hard => return Ok(false),
+        Some(reset) => (reset.old_head_sha, true),
+        None => match resolve_reset_old_head_for_base(worktree, base_commit) {
+            Some(moved) => moved,
+            None => return Ok(false),
+        },
     };
     if !repo_is_ancestor(repo, base_commit, &old_head) {
         return Ok(false);
     }
+    // Uncommitted work left under the old HEAD that matches the tree exactly
+    // travelled with the move, whatever kind of move it was.
     if restore_matching_old_head_reset_snapshot(
         repo,
         base_commit,
@@ -2598,6 +2633,9 @@ fn recover_reset_working_log_for_commit_replay(
         final_state_override,
     )? {
         return Ok(true);
+    }
+    if !undone_by_reset {
+        return Ok(false);
     }
 
     if let Err(error) =
@@ -2635,31 +2673,34 @@ fn seed_merge_squash_working_log_for_commit_replay(
         return Ok(());
     }
 
-    let Some(merge_squash) = preceding_merge_squash_for_pending_commit(repo, base_commit)? else {
+    let merge_squashes = preceding_merge_squashes_for_pending_commit(repo, base_commit)?;
+    let Some(newest) = merge_squashes.last() else {
         return Ok(());
     };
-    if has_tracked_state && !merge_squash.preserve_working_log {
+    if has_tracked_state && !newest.preserve_working_log {
         return Ok(());
     }
 
-    let merge_base = repo
-        .merge_base(
-            merge_squash.source_head.clone(),
-            merge_squash.base_head.clone(),
-        )
-        .ok()
-        .flatten();
-    if let Err(error) = attempt_materialize_commit_chain_authorship(
-        repo,
-        merge_base.as_deref(),
-        &merge_squash.source_head,
-        author,
-    ) {
-        tracing::debug!(
-            %error,
-            source_head = %merge_squash.source_head,
-            "failed to backfill squash prerequisite notes"
-        );
+    for source_head in merge_squashes
+        .iter()
+        .flat_map(|merge_squash| merge_squash.source_commits())
+    {
+        let merge_base = repo
+            .merge_base(source_head.clone(), base_commit.to_string())
+            .ok()
+            .flatten();
+        if let Err(error) = attempt_materialize_commit_chain_authorship(
+            repo,
+            merge_base.as_deref(),
+            &source_head,
+            author,
+        ) {
+            tracing::debug!(
+                %error,
+                %source_head,
+                "failed to backfill squash prerequisite notes"
+            );
+        }
     }
 
     tracing::debug!(
@@ -2673,22 +2714,31 @@ fn seed_merge_squash_working_log_for_commit_replay(
         );
         return Ok(());
     };
-    if has_tracked_state {
-        return merge_working_log_after_squash_from_final_state(
+    if !newest.preserve_working_log {
+        return prepare_working_log_after_squash_from_final_state(
             repo,
-            &merge_squash.source_head,
+            &newest.source_head,
             base_commit,
             final_state,
             author,
         );
     }
-    prepare_working_log_after_squash_from_final_state(
-        repo,
-        &merge_squash.source_head,
-        base_commit,
-        final_state,
-        author,
-    )
+    // `cherry-pick -n`, possibly run more than once: every picked commit
+    // brings its attribution, oldest pick first, into whatever the working log
+    // already tracks.
+    let mut replace_working_log = !has_tracked_state;
+    for pick in &merge_squashes {
+        carry_no_commit_pick_into_working_log(
+            repo,
+            pick,
+            base_commit,
+            final_state,
+            author,
+            replace_working_log,
+        )?;
+        replace_working_log = false;
+    }
+    Ok(())
 }
 
 fn recover_recent_replay_prerequisites_for_commit_replay(
@@ -3008,22 +3058,26 @@ fn apply_rewrite_side_effect(
             carryover_snapshot,
             reset_pathspecs,
         )?;
-        coordinator.record_recent_replay_prerequisite(
-            &prerequisite_family,
-            RecentReplayPrerequisite::Reset {
-                target_head: reset.new_head_sha.clone(),
-                old_head: reset.old_head_sha.clone(),
-                pathspecs: reset_pathspecs
-                    .map(|paths| paths.to_vec())
-                    .unwrap_or_default(),
-                final_state: carryover_snapshot.cloned(),
-                working_log_snapshot: capture_recent_working_log_snapshot(
-                    &repo,
-                    &reset.new_head_sha,
-                    Some(author.clone()),
-                )?,
-            },
-        )?;
+        // `reset --hard` threw the undone work away, so the next commit has
+        // nothing of it to recover.
+        if reset.kind != ResetKind::Hard {
+            coordinator.record_recent_replay_prerequisite(
+                &prerequisite_family,
+                RecentReplayPrerequisite::Reset {
+                    target_head: reset.new_head_sha.clone(),
+                    old_head: reset.old_head_sha.clone(),
+                    pathspecs: reset_pathspecs
+                        .map(|paths| paths.to_vec())
+                        .unwrap_or_default(),
+                    final_state: carryover_snapshot.cloned(),
+                    working_log_snapshot: capture_recent_working_log_snapshot(
+                        &repo,
+                        &reset.new_head_sha,
+                        Some(author.clone()),
+                    )?,
+                },
+            )?;
+        }
     }
     if !rewrite_event_needs_authorship_processing(&repo, &rewrite_event)? {
         repo.storage.append_rewrite_event(rewrite_event)?;
@@ -3613,7 +3667,77 @@ fn is_cherry_pick_range_spec(arg: &str) -> bool {
 
 /// True when `git cherry-pick` was told not to commit (`-n` / `--no-commit`).
 fn cherry_pick_is_no_commit(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "-n" || arg == "--no-commit")
+    cherry_pick_requests_no_commit(args)
+}
+
+/// True for a `git cherry-pick -n <commits>` invocation, as opposed to one that
+/// continues, skips or ends a pick already under way.
+fn command_is_no_commit_cherry_pick(cmd: &crate::daemon::domain::NormalizedCommand) -> bool {
+    cmd.primary_command.as_deref() == Some("cherry-pick")
+        && cherry_pick_is_no_commit(&cmd.invoked_args)
+        && !cmd
+            .invoked_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--abort" | "--continue" | "--quit" | "--skip"))
+}
+
+/// Drops every picked commit that the next pick descends from. The attribution
+/// of a commit is read through blame from where its branch left the base, so
+/// the descendant already covers its ancestors; what is left is one commit per
+/// line of history, still in pick order.
+fn distinct_cherry_pick_lines_of_history(
+    repository: &Repository,
+    sources: Vec<String>,
+) -> Vec<String> {
+    let mut distinct: Vec<String> = Vec::with_capacity(sources.len());
+    for source in sources {
+        if let Some(previous) = distinct.last()
+            && (*previous == source || is_ancestor_commit(repository, previous, &source))
+        {
+            distinct.pop();
+        }
+        distinct.push(source);
+    }
+    distinct
+}
+
+/// The files the index holds as conflicted, with the blob of each side. Empty
+/// when the conflicts were already resolved by the time this runs.
+fn conflicted_index_stages(worktree: &Path) -> BTreeMap<String, ConflictedFileStages> {
+    let mut conflicted = BTreeMap::new();
+    let args = [
+        "-C",
+        worktree.to_string_lossy().as_ref(),
+        "ls-files",
+        "--unmerged",
+        "--full-name",
+        "-z",
+    ]
+    .map(str::to_string);
+    let Ok(output) = exec_git(&args) else {
+        return conflicted;
+    };
+    // Each record is "<mode> <blob> <stage>\t<path>".
+    for record in String::from_utf8_lossy(&output.stdout).split('\0') {
+        let Some((meta, path)) = record.split_once('\t') else {
+            continue;
+        };
+        let mut meta = meta.split_whitespace();
+        let (Some(_mode), Some(blob), Some(stage)) = (meta.next(), meta.next(), meta.next()) else {
+            continue;
+        };
+        if !is_valid_oid(blob) {
+            continue;
+        }
+        let stages: &mut ConflictedFileStages = conflicted.entry(path.to_string()).or_default();
+        match stage {
+            "1" => stages.base = Some(blob.to_string()),
+            "2" => stages.ours = Some(blob.to_string()),
+            "3" => stages.theirs = Some(blob.to_string()),
+            _ => {}
+        }
+    }
+    conflicted
 }
 
 /// Git dir of the worktree (per-worktree, so linked worktrees each get their
@@ -7185,13 +7309,13 @@ impl ActorDaemonCoordinator {
     /// `git cherry-pick -n` applies the picked changes without committing. Treat
     /// it like `merge --squash` so the next commit inherits the source commits'
     /// attribution instead of recording the picked lines as untracked.
+    ///
+    /// A pick that stopped on a conflict still applied everything that merged
+    /// cleanly, so it is recorded too, along with the files it left conflicted.
     fn synthesize_cherry_pick_no_commit_squash_event(
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<Option<MergeSquashEvent>, AutterError> {
-        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("cherry-pick") {
-            return Ok(None);
-        }
-        if !cherry_pick_is_no_commit(&cmd.invoked_args) {
+        if !command_is_no_commit_cherry_pick(cmd) {
             return Ok(None);
         }
         let Some(worktree) = cmd.worktree.as_deref() else {
@@ -7201,8 +7325,25 @@ impl ActorDaemonCoordinator {
         if source_refs.is_empty() {
             return Ok(None);
         }
-        let sources =
-            resolve_cherry_pick_source_refs(&source_refs, worktree, "cherry_pick_no_commit")?;
+        let stopped = cmd.exit_code != 0;
+        let sources = match resolve_cherry_pick_source_refs(
+            &source_refs,
+            worktree,
+            "cherry_pick_no_commit",
+        ) {
+            Ok(sources) => sources,
+            // A pick that failed may have failed on exactly this: a ref
+            // that names no commit. Then nothing was applied.
+            Err(error) if stopped => {
+                tracing::debug!(%error, "failed cherry-pick -n names no resolvable commits");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let sources = match find_repository_in_path(&worktree.to_string_lossy()) {
+            Ok(repository) => distinct_cherry_pick_lines_of_history(&repository, sources),
+            Err(_) => sources,
+        };
         let Some(source_head) = sources.last().cloned() else {
             return Ok(None);
         };
@@ -7220,16 +7361,21 @@ impl ActorDaemonCoordinator {
             .as_ref()
             .and_then(|repo| repo.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        Ok(Some(
-            MergeSquashEvent::new(
-                source_refs.join(" "),
-                source_head,
-                base_branch,
-                base_head,
-                HashMap::new(),
-            )
-            .with_preserved_working_log(),
-        ))
+        let mut event = MergeSquashEvent::new(
+            source_refs.join(" "),
+            source_head,
+            base_branch,
+            base_head,
+            HashMap::new(),
+        )
+        .with_preserved_working_log();
+        if sources.len() > 1 {
+            event = event.with_picked_commits(sources);
+        }
+        if stopped {
+            event = event.with_conflicted_files(conflicted_index_stages(worktree));
+        }
+        Ok(Some(event))
     }
 
     fn rewrite_events_from_semantic_events(
@@ -7759,8 +7905,51 @@ impl ActorDaemonCoordinator {
         if let Some(merge_squash) = implicit_merge_squash {
             out.push(RewriteLogEvent::merge_squash(merge_squash));
         }
+        if out.is_empty()
+            && let Some(discarded) = Self::synthesize_discarded_no_commit_pick_event(cmd)?
+        {
+            out.push(discarded);
+        }
 
         Ok(out)
+    }
+
+    /// `git reset --hard` (or `--merge` / `--keep`) that leaves HEAD where it is
+    /// throws away what an earlier `git cherry-pick -n` applied. Record it as an
+    /// abort of that pick, so the next commit does not hand the picked commits'
+    /// attribution to lines typed again by hand.
+    fn synthesize_discarded_no_commit_pick_event(
+        cmd: &crate::daemon::domain::NormalizedCommand,
+    ) -> Result<Option<RewriteLogEvent>, AutterError> {
+        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("reset") {
+            return Ok(None);
+        }
+        let discards_tree = cmd
+            .invoked_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--hard" | "--merge" | "--keep"));
+        if !discards_tree {
+            return Ok(None);
+        }
+        let Some(head) = cmd
+            .post_repo
+            .as_ref()
+            .and_then(|repo| repo.head.clone())
+            .filter(|head| is_valid_oid(head) && !is_zero_oid(head))
+        else {
+            return Ok(None);
+        };
+        let Some(worktree) = cmd.worktree.as_deref() else {
+            return Ok(None);
+        };
+        let repo = find_repository_in_path(&worktree.to_string_lossy())?;
+        let pending = preceding_merge_squashes_for_pending_commit(&repo, &head)?;
+        if !pending.iter().any(|pick| pick.preserve_working_log) {
+            return Ok(None);
+        }
+        Ok(Some(RewriteLogEvent::cherry_pick_abort(
+            CherryPickAbortEvent::new(head),
+        )))
     }
 
     async fn maybe_apply_side_effects_for_applied_command(
@@ -8009,7 +8198,7 @@ impl ActorDaemonCoordinator {
                     .any(|arg| arg == "--abort" || arg == "--quit")
                 {
                     self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
-                } else if cmd.exit_code != 0 {
+                } else if cmd.exit_code != 0 && !command_is_no_commit_cherry_pick(cmd) {
                     let source_refs = cherry_pick_source_refs_from_command(cmd);
                     // `--continue` / `--skip` that stop on the next conflict carry no
                     // source refs of their own; keep the ones the pick started with.
@@ -8018,6 +8207,11 @@ impl ActorDaemonCoordinator {
                     }
                 }
             }
+            // `cherry-pick -n` that stopped on a conflict still applied what
+            // merged cleanly, and nothing it applies is ever committed by git
+            // itself (not even by `--continue` of a multi-commit pick): the next
+            // plain commit carries it. Fall through so it is recorded.
+            let is_stopped_no_commit_pick = command_is_no_commit_cherry_pick(cmd);
             // Fix #957: `checkout/switch --merge` exits with code 1 when it produces
             // conflict markers but HEAD still moves to the target branch.  We must not
             // return early here — fall through so apply_checkout_switch_working_log_side_effect
@@ -8046,7 +8240,7 @@ impl ActorDaemonCoordinator {
                         }
                     )
                 });
-            if !is_merge_checkout && !is_stash_restore {
+            if !is_merge_checkout && !is_stash_restore && !is_stopped_no_commit_pick {
                 return Ok(());
             }
             if is_stash_restore {
