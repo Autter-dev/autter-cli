@@ -563,6 +563,11 @@ try {
     $probeSrc = @'
 param([string]$Autter, [string]$Repo, [string]$OutDir)
 $ErrorActionPreference = 'Continue'
+[IO.File]::WriteAllText((Join-Path $OutDir 'started'), 'started')
+trap {
+    [IO.File]::AppendAllText((Join-Path $OutDir 'error.txt'), (($_ | Out-String) + "`r`n"))
+    continue
+}
 Remove-Item Env:CI -ErrorAction SilentlyContinue
 Remove-Item Env:TERM -ErrorAction SilentlyContinue
 Remove-Item Env:WT_SESSION -ErrorAction SilentlyContinue
@@ -624,7 +629,9 @@ Save-Screen 'vtcheck.txt'
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $probe + '"'),
             '-Autter', ('"' + $script:AutterExe + '"'), '-Repo', ('"' + $RepoDir + '"'), '-OutDir', ('"' + $out + '"'))
         if (-not $proc.WaitForExit(300000)) { try { $proc.Kill() } catch { }; Fail ("{0} console probe timed out" -f $mode); continue }
-        if (-not (Test-Path -LiteralPath (Join-Path $out 'done'))) { Fail ("{0} console probe did not finish (exit {1})" -f $mode, $proc.ExitCode); continue }
+        $probeErrors = Join-Path $out 'error.txt'
+        if (Test-Path -LiteralPath $probeErrors) { Write-Host ("  {0} console probe errors:`n{1}" -f $mode, [IO.File]::ReadAllText($probeErrors)) }
+        if (-not (Test-Path -LiteralPath (Join-Path $out 'done'))) { Fail ("{0} console probe did not finish (exit {1}, started: {2})" -f $mode, $proc.ExitCode, (Test-Path -LiteralPath (Join-Path $out 'started'))); continue }
         $vt = [IO.File]::ReadAllText((Join-Path $out 'vtcheck.txt'))
         $vtOn = -not $vt.Contains($esc)
         Write-Host ("  {0} console: VT processing {1}" -f $mode, $(if ($vtOn) { 'on' } else { 'off (raw ESC shows as text)' }))
@@ -701,6 +708,44 @@ public static class FilteredToken {
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle, uint code);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr GetThreadDesktop(uint threadId);
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool GetUserObjectInformation(IntPtr obj, int index, System.Text.StringBuilder info, int length, out int needed);
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr OpenWindowStation(string name, bool inherit, uint access);
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr OpenDesktop(string name, uint flags, bool inherit, uint access);
+    [DllImport("advapi32.dll")]
+    static extern uint SetSecurityInfo(IntPtr handle, int objectType, uint securityInfo, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+
+    static string ObjectName(IntPtr obj) {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder(256);
+        int needed;
+        if (!GetUserObjectInformation(obj, 2, sb, sb.Capacity * 2, out needed)) { throw new Win32Exception(); }
+        return sb.ToString();
+    }
+
+    // A process started with the filtered token fails to initialize
+    // (STATUS_DLL_INIT_FAILED) unless it may use this window station and
+    // desktop, which on a service-run CI agent only Administrators may. Give
+    // them a null DACL (everyone) on this throwaway machine and return the
+    // "winsta\desktop" name for STARTUPINFO.
+    static string OpenUpDesktop() {
+        string winsta = ObjectName(GetProcessWindowStation());
+        string desktop = ObjectName(GetThreadDesktop(GetCurrentThreadId()));
+        // READ_CONTROL | WRITE_DAC
+        IntPtr ws = OpenWindowStation(winsta, false, 0x00020000 | 0x00040000);
+        if (ws == IntPtr.Zero) { throw new Win32Exception(); }
+        uint rc = SetSecurityInfo(ws, 7, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (rc != 0) { throw new Win32Exception((int)rc); }
+        IntPtr dt = OpenDesktop(desktop, 0, false, 0x00020000 | 0x00040000);
+        if (dt == IntPtr.Zero) { throw new Win32Exception(); }
+        rc = SetSecurityInfo(dt, 7, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (rc != 0) { throw new Win32Exception((int)rc); }
+        return winsta + "\\" + desktop;
+    }
 
     static IntPtr Sid(string text) {
         IntPtr sid;
@@ -733,6 +778,7 @@ public static class FilteredToken {
 
         STARTUPINFO si = new STARTUPINFO();
         si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        si.lpDesktop = OpenUpDesktop();
         PROCESS_INFORMATION pi;
         // CREATE_NO_WINDOW; environment block null: this process's environment.
         if (!CreateProcessAsUser(filtered, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, cwd, ref si, out pi)) {

@@ -3,7 +3,7 @@ name: Windows
 # What the Windows build does on a real Windows machine, on every PR.
 #
 # - unit-tests: `cargo test --lib`, which had never run on Windows.
-# - e2e: a debug build (test-support feature) driven by
+# - e2e: a debug build (default features, as released) driven by
 #   scripts/windows-e2e.ps1 under Windows PowerShell 5.1, in a throwaway
 #   profile directory: background service start/status/shutdown/restart and a
 #   stale lock, a commit captured through git's trace2 pipe and blamed as AI,
@@ -77,8 +77,11 @@ jobs:
         with:
           node-version: 20
 
-      - name: Build autter (debug, test-support)
-        run: cargo build --locked --features test-support --bin autter
+      # Default features, as released: a test-support build refuses to
+      # restart the background service (the test harness owns it there), so
+      # `autter install --system` and onboarding cannot finish with it.
+      - name: Build autter (debug, default features)
+        run: cargo build --locked --bin autter
 
       - name: End-to-end script
         shell: powershell
