@@ -19,6 +19,8 @@
 //!   file, and when an interactive rebase folds the rename into the AI commit.
 //!   So does an interactive rebase that drops the rename, and a second rebase
 //!   of the already rebased branch.
+//! - A rebase keeps an AI line attributed in the commit that added it when a
+//!   later commit on the branch rewrites the line.
 
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
@@ -944,6 +946,60 @@ fn interactive_rebase_that_folds_the_rename_into_the_ai_commit_keeps_ai_attribut
         "Base line 2".unattributed_human(),
         "AI one".ai(),
         "Human tail".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn rebase_keeps_an_ai_line_attributed_in_its_commit_when_a_later_commit_rewrites_it() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    // A later commit rewrites the AI line. No checkpoint: nothing recorded who
+    // made the change.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Base line 1\nBase line 2\nRewritten by hand\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Rewrite the AI line").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Rewritten by hand".unattributed_human(),
+    ]);
+
+    add_main_header_to_base_file(&repo, &main_branch);
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 2, "the rebase should replay two commits");
+
+    // The AI line is gone at the tip, but the commit that added it still has
+    // it, and it is still the AI's.
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Main header".unattributed_human(),
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Rewritten by hand".unattributed_human(),
     ]);
 }
 

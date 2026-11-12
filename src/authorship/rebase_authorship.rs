@@ -1614,8 +1614,8 @@ pub fn rewrite_authorship_after_rebase_v2(
         mut original_head_attributions,
         mut original_head_contents,
         initial_prompts,
-        initial_humans,
-        initial_sessions,
+        mut initial_humans,
+        mut initial_sessions,
         _rebase_ts,
     ) = if let Some((attrs, contents, prompts, humans, sessions)) =
         try_reconstruct_attributions_from_notes_cached(
@@ -1907,8 +1907,9 @@ pub fn rewrite_authorship_after_rebase_v2(
                 cached_file_attestation_text.remove(old_path);
             }
         }
-        // The commit this one replays.
+        // The commit this one replays, and its note (parsed only if needed).
         let original_commit = new_to_original.get(new_commit).map(String::as_str);
+        let original_note: std::cell::OnceCell<Option<AuthorshipLog>> = std::cell::OnceCell::new();
 
         // Only transform attributions for files that actually changed.
         if !changed_files_in_commit.is_empty() {
@@ -1954,7 +1955,7 @@ pub fn rewrite_authorship_after_rebase_v2(
 
                 // Metrics are updated after all files in this commit are processed (below).
 
-                let line_attrs = if use_hunk_based {
+                let mut line_attrs = if use_hunk_based {
                     // FAST PATH: Hunk-based attribution transfer
                     let thunk = std::time::Instant::now();
                     let hunks = file_hunks.map(Vec::as_slice).unwrap_or(&[]);
@@ -2049,6 +2050,78 @@ pub fn rewrite_authorship_after_rebase_v2(
                     loop_diff_ms += tdiff.elapsed().as_micros();
                     result
                 };
+
+                // The lines this commit adds are the lines the original commit
+                // added, and that commit's note says who wrote them. The
+                // original_head state cannot: a line a later commit rewrote or
+                // removed is not in it.
+                if let Some(original_commit) = original_commit
+                    && let Some(hunks) = file_hunks
+                    && let Some(original_hunks) = original_hunks_by_commit.get(original_commit)
+                    && let Some(note) = original_note
+                        .get_or_init(|| {
+                            let note = note_cache
+                                .original_note_contents
+                                .get(original_commit)
+                                .and_then(|content| {
+                                    AuthorshipLog::deserialize_from_string(content).ok()
+                                })?;
+                            // The rebased note has to be able to describe every
+                            // author this note names. The original_head state
+                            // does not know an author none of whose lines
+                            // survive to original_head.
+                            for (prompt_id, record) in &note.metadata.prompts {
+                                current_prompts
+                                    .entry(prompt_id.clone())
+                                    .or_default()
+                                    .entry(original_commit.to_string())
+                                    .or_insert_with(|| record.clone());
+                            }
+                            for (hash, record) in &note.metadata.humans {
+                                initial_humans
+                                    .entry(hash.clone())
+                                    .or_insert_with(|| record.clone());
+                            }
+                            for (session_id, record) in &note.metadata.sessions {
+                                initial_sessions
+                                    .entry(session_id.clone())
+                                    .or_insert_with(|| record.clone());
+                            }
+                            Some(note)
+                        })
+                        .as_ref()
+                {
+                    // The file under the name the original commit knew it by:
+                    // normally the same name, otherwise the file that ends up
+                    // at the same original_head path.
+                    let original_path = original_path_candidates(
+                        file_path,
+                        commit_renames,
+                        &upstream_rename_sources,
+                    )
+                    .into_iter()
+                    .find(|candidate| original_hunks.contains_key(*candidate))
+                    .or_else(|| {
+                        let original_head_path = original_head_path_of.get(file_path)?;
+                        original_hunks.keys().map(String::as_str).find(|path| {
+                            path_after_later_commits(&original_later_paths, original_commit, path)
+                                == Some(original_head_path.as_str())
+                        })
+                    });
+                    if let Some(original_path) = original_path
+                        && let Some(attestation) = note
+                            .attestations
+                            .iter()
+                            .find(|attestation| attestation.file_path == original_path)
+                    {
+                        carry_note_authors_for_added_lines(
+                            &mut line_attrs,
+                            hunks,
+                            &original_hunks[original_path],
+                            attestation,
+                        );
+                    }
+                }
 
                 let tatt = std::time::Instant::now();
                 if let Some(text) = serialize_attestation_from_line_attrs(file_path, &line_attrs) {
@@ -2656,6 +2729,99 @@ fn original_path_candidates<'a>(
     );
     candidates.extend(upstream_rename_sources.get(file_path).copied());
     candidates
+}
+
+/// Give the lines a rebased commit adds to a file the authors that the note of
+/// the commit it replays records for the same lines.
+///
+/// `hunks` are the rebased commit's hunks for the file, `original_hunks` the
+/// original commit's, and `original_attestation` the original note's entry for
+/// it. This only applies when both commits add exactly the same lines in the
+/// same order, which is what replaying a commit does; then each rebased line
+/// takes the author of its original line. A commit whose added lines differ (a
+/// conflict resolved differently, commits squashed together) is left to the
+/// original_head state, as are lines the original note does not attest.
+fn carry_note_authors_for_added_lines(
+    line_attrs: &mut Vec<crate::authorship::attribution_tracker::LineAttribution>,
+    hunks: &[DiffHunk],
+    original_hunks: &[DiffHunk],
+    original_attestation: &crate::authorship::authorship_log_serialization::FileAttestation,
+) {
+    use crate::authorship::authorship_log::LineRange;
+
+    fn added_lines(hunks: &[DiffHunk]) -> impl Iterator<Item = (u32, &str)> {
+        hunks.iter().flat_map(|hunk| {
+            hunk.added_lines
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| (hunk.new_start + offset as u32, line.as_str()))
+        })
+    }
+    if !added_lines(original_hunks)
+        .map(|(_, text)| text)
+        .eq(added_lines(hunks).map(|(_, text)| text))
+    {
+        return;
+    }
+
+    // The note's ranges, sorted so each added line's range is a binary search
+    // away (a note's ranges do not overlap).
+    let mut attested: Vec<(u32, u32, &str)> = original_attestation
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            entry.line_ranges.iter().map(|range| match range {
+                LineRange::Single(line) => (*line, *line, entry.hash.as_str()),
+                LineRange::Range(start, end) => (*start, *end, entry.hash.as_str()),
+            })
+        })
+        .collect();
+    attested.sort_unstable_by_key(|(start, _, _)| *start);
+    let author_of = |line: u32| -> Option<&str> {
+        let index = attested.partition_point(|(start, _, _)| *start <= line);
+        let (_, end, author) = attested.get(index.checked_sub(1)?)?;
+        (line <= *end).then_some(*author)
+    };
+    // (rebased line number, author) for the added lines the original note
+    // attests, ascending by line number.
+    let wanted: Vec<(u32, &str)> = added_lines(original_hunks)
+        .zip(added_lines(hunks))
+        .filter_map(|((original_line, _), (line, _))| Some((line, author_of(original_line)?)))
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+
+    // Most lines already have the right author from the original_head state;
+    // find those in one pass so only the others are rewritten.
+    let mut already_attributed = vec![false; wanted.len()];
+    for attr in line_attrs.iter() {
+        let first = wanted.partition_point(|(line, _)| *line < attr.start_line);
+        for (offset, (line, author)) in wanted[first..].iter().enumerate() {
+            if *line > attr.end_line {
+                break;
+            }
+            if attr.author_id == *author {
+                already_attributed[first + offset] = true;
+            }
+        }
+    }
+    // Rewrite the others a run of consecutive lines at a time.
+    let mut runs: Vec<(u32, u32, &str)> = Vec::new();
+    for ((line, author), done) in wanted.into_iter().zip(already_attributed) {
+        if done {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, end, run_author)) if *end + 1 == line && *run_author == author => {
+                *end = line;
+            }
+            _ => runs.push((line, line, author)),
+        }
+    }
+    for (start, end, author) in runs {
+        overlay_attribution(line_attrs, start, end, author.to_string());
+    }
 }
 
 /// Rewrite authorship logs after cherry-pick using VirtualAttributions
@@ -5488,11 +5654,14 @@ pub fn transform_attributions_to_final_state(
 #[cfg(test)]
 mod rename_tracking_tests {
     use super::{
-        CommitTrackedDelta, later_paths_by_commit, move_renamed_entries, move_renamed_members,
-        parse_diff_tree_name_status_renames, parse_name_status_renames, path_after_later_commits,
-        serialize_attestation_from_line_attrs, untracked_rename_targets,
+        CommitTrackedDelta, DiffHunk, carry_note_authors_for_added_lines, later_paths_by_commit,
+        move_renamed_entries, move_renamed_members, parse_diff_tree_name_status_renames,
+        parse_name_status_renames, path_after_later_commits, serialize_attestation_from_line_attrs,
+        untracked_rename_targets,
     };
     use crate::authorship::attribution_tracker::LineAttribution;
+    use crate::authorship::authorship_log::LineRange;
+    use crate::authorship::authorship_log_serialization::{AttestationEntry, FileAttestation};
     use std::collections::{HashMap, HashSet};
 
     fn rename(old_path: &str, new_path: &str) -> (String, String) {
@@ -5731,5 +5900,67 @@ mod rename_tracking_tests {
             serialize_attestation_from_line_attrs("a.txt", &[attr(5, 5, "ai"), attr(4, 4, "ai")])
                 .unwrap();
         assert_eq!(text, "a.txt\n  ai 4-5\n");
+    }
+
+    fn hunk(new_start: u32, added_lines: &[&str]) -> DiffHunk {
+        DiffHunk {
+            old_start: new_start.saturating_sub(1),
+            old_count: 0,
+            new_start,
+            new_count: added_lines.len() as u32,
+            added_lines: added_lines.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    fn attestation(path: &str, entries: &[(&str, LineRange)]) -> FileAttestation {
+        let mut attestation = FileAttestation::new(path.to_string());
+        for (hash, range) in entries {
+            attestation
+                .entries
+                .push(AttestationEntry::new(hash.to_string(), vec![range.clone()]));
+        }
+        attestation
+    }
+
+    #[test]
+    fn added_lines_take_the_authors_of_the_original_note() {
+        // The original commit added lines 3-4; its note attests line 3 only.
+        let original_hunks = [hunk(3, &["ai line", "human line"])];
+        let note = attestation("a.txt", &[("ai_author", LineRange::Single(3))]);
+        // Rebased, the same lines land one lower and nothing else is attributed.
+        let rebased_hunks = [hunk(4, &["ai line", "human line"])];
+        let mut line_attrs = Vec::new();
+        carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
+        assert_eq!(line_attrs.len(), 1);
+        assert_eq!((line_attrs[0].start_line, line_attrs[0].end_line), (4, 4));
+        assert_eq!(line_attrs[0].author_id, "ai_author");
+    }
+
+    #[test]
+    fn added_lines_take_authors_only_where_they_are_missing_or_differ() {
+        let original_hunks = [hunk(1, &["one", "two", "three"])];
+        let note = attestation("a.txt", &[("ai_author", LineRange::Range(1, 3))]);
+        let rebased_hunks = [hunk(10, &["one"]), hunk(20, &["two", "three"])];
+        // Line 10 is already right, line 20 has another author, 21 has none.
+        let mut line_attrs = vec![attr(10, 10, "ai_author"), attr(20, 20, "other")];
+        carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
+        line_attrs.sort_by_key(|attr| attr.start_line);
+        let lines: Vec<(u32, u32, &str)> = line_attrs
+            .iter()
+            .map(|attr| (attr.start_line, attr.end_line, attr.author_id.as_str()))
+            .collect();
+        assert_eq!(lines, vec![(10, 10, "ai_author"), (20, 21, "ai_author")]);
+    }
+
+    #[test]
+    fn added_lines_are_left_alone_when_the_rebased_commit_adds_other_lines() {
+        // A squash or a conflict resolution: not the same patch any more.
+        let original_hunks = [hunk(1, &["one", "two", "three"])];
+        let note = attestation("a.txt", &[("ai_author", LineRange::Range(1, 3))]);
+        let rebased_hunks = [hunk(10, &["extra", "one", "two"])];
+        let mut line_attrs = vec![attr(11, 11, "ai_author")];
+        carry_note_authors_for_added_lines(&mut line_attrs, &rebased_hunks, &original_hunks, &note);
+        assert_eq!(line_attrs.len(), 1);
+        assert_eq!((line_attrs[0].start_line, line_attrs[0].end_line), (11, 11));
     }
 }
