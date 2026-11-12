@@ -21,13 +21,13 @@ fn schema() -> Value {
     serde_json::from_str(&fs::read_to_string(&path).expect("read schema")).expect("schema is JSON")
 }
 
-struct Run {
-    code: i32,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Run {
+    pub(crate) code: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
-fn run_output(output: Output) -> Run {
+pub(crate) fn run_output(output: Output) -> Run {
     Run {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -52,7 +52,7 @@ fn run(repo: &TestRepo, args: &[&str], envs: &[(&str, &str)]) -> Run {
 }
 
 /// Stdout must be one JSON document and nothing else.
-fn parse_document(run: &Run, what: &str) -> Value {
+pub(crate) fn parse_document(run: &Run, what: &str) -> Value {
     serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| {
         panic!(
             "{what}: stdout is not exactly one JSON document ({e})\nexit: {}\nstdout:\n{}\nstderr:\n{}",
@@ -156,7 +156,7 @@ fn validate(root: &Value, schema: &Value, value: &Value, path: &str, errors: &mu
     }
 }
 
-fn assert_valid(document: &Value, def: &str, what: &str) {
+pub(crate) fn assert_valid(document: &Value, def: &str, what: &str) {
     let root = schema();
     let schema = resolve(&root, &format!("#/$defs/{def}"));
     let mut errors = Vec::new();
@@ -228,7 +228,7 @@ fn shape_text(document: &Value) -> String {
 
 /// A repo whose last commit has one human and two AI lines, and a second-to-
 /// last commit with an untracked line.
-fn repo_with_ai_commit() -> TestRepo {
+pub(crate) fn repo_with_ai_commit() -> TestRepo {
     let repo = TestRepo::new();
     fs::write(repo.path().join("base.txt"), "untracked base\n").unwrap();
     repo.stage_all_and_commit("Base").unwrap();

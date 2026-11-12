@@ -20,6 +20,7 @@
             "usage_error",
             "not_a_repository",
             "revision_not_found",
+            "service_unreachable",
             "note_pending",
             "not_signed_in",
             "sync_unhealthy",

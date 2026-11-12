@@ -1622,6 +1622,18 @@ fn usage_metrics_check(
             String::new()
         }
     );
+    // Events the server failed on every time are kept out of the queue. Say
+    // how many, why, and how to queue or delete them.
+    let set_aside_details = || {
+        let mut lines = Vec::new();
+        if status.set_aside > 0 {
+            lines.push(crate::metrics::sync_state::set_aside_text(status.set_aside));
+            if let Some(reason) = &status.set_aside_reason {
+                lines.push(format!("set aside after: {reason}"));
+            }
+        }
+        lines
+    };
 
     if !sync_enabled {
         return DoctorCheck {
@@ -1652,6 +1664,7 @@ fn usage_metrics_check(
             "attribution is not affected: authorship notes upload through their own queue"
                 .to_string(),
         );
+        details.extend(set_aside_details());
         return DoctorCheck {
             section: SECTION_ACCOUNT,
             name,
@@ -1673,6 +1686,30 @@ fn usage_metrics_check(
     } else {
         "no usage metrics waiting".to_string()
     };
+    if status.set_aside > 0 {
+        let mut details = vec![counts];
+        details.extend(set_aside_details());
+        return DoctorCheck {
+            section: SECTION_ACCOUNT,
+            name,
+            status: DoctorStatus::Warning,
+            summary: format!(
+                "{} usage-metrics {} set aside after repeated server errors; {}",
+                status.set_aside,
+                if status.set_aside == 1 {
+                    "event is"
+                } else {
+                    "events are"
+                },
+                summary
+            ),
+            details,
+            remediation: Some(format!(
+                "nothing is lost: the set-aside events are kept on this computer and the rest of the queue uploads. `{}` queues them again; if they are set aside again, send this output to autter support",
+                crate::metrics::sync_state::RETRY_COMMAND
+            )),
+        };
+    }
     DoctorCheck {
         section: SECTION_ACCOUNT,
         name,
@@ -2641,6 +2678,27 @@ mod tests {
         };
         let check = usage_metrics_check(&metrics_status_after(&[timeout], 0), true);
         assert_eq!(check.status, DoctorStatus::Passed);
+    }
+
+    #[test]
+    fn usage_metrics_set_aside_events_are_a_warning_that_says_how_many_and_what_to_do() {
+        let status = metrics_status_after(&[], 0)
+            .with_set_aside(2, Some("HTTP 500: Data-plane operation failed".to_string()));
+        let check = usage_metrics_check(&status, true);
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(
+            check
+                .summary
+                .contains("2 usage-metrics events are set aside")
+        );
+        let fix = check.remediation.as_deref().unwrap();
+        assert!(fix.contains("autter sync retry"), "{fix}");
+        assert!(!fix.contains("bg restart"), "{fix}");
+        insta::assert_snapshot!(render_check(&check));
+
+        // Nothing set aside: no mention of it.
+        let check = usage_metrics_check(&metrics_status_after(&[], 0), true);
+        assert!(!render_check(&check).contains("set aside"));
     }
 
     #[test]
