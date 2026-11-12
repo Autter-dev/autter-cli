@@ -1808,3 +1808,453 @@ fn rebasing_a_renaming_branch_twice_keeps_ai_attribution() {
         "AI two".ai(),
     ]);
 }
+
+/// Run `git rebase -i <onto>` with the todo list replaced by `todo`, one
+/// `(command, commit)` per line, such as `("pick", sha)` or `("squash", sha)`.
+/// Commits the list leaves out are dropped; squash messages are kept as git
+/// proposes them.
+fn rebase_interactive_with_todo(repo: &TestRepo, onto: &str, todo: &[(&str, &str)]) {
+    let lines: String = todo
+        .iter()
+        .map(|(command, commit)| format!("{} {}\\n", command, commit))
+        .collect();
+    let sequence_editor = format!(
+        "perl -e 'open(my $todo, \">\", $ARGV[0]) or die; print $todo \"{}\"'",
+        lines
+    );
+    repo.git_with_env(
+        &["rebase", "-i", onto],
+        &[
+            ("GIT_SEQUENCE_EDITOR", sequence_editor.as_str()),
+            ("GIT_EDITOR", "true"),
+        ],
+        None,
+    )
+    .unwrap();
+    repo.sync_daemon();
+}
+
+/// Whether `commit`'s note attests `file`.
+fn note_names_file(repo: &TestRepo, commit: &str, file: &str) -> bool {
+    repo.read_authorship_note(commit)
+        .is_some_and(|note| note.lines().any(|line| line == file))
+}
+
+/// Have git copy notes onto rewritten commits, as the installer sets it up:
+/// git then records which commit each rebased commit replays.
+fn let_git_copy_notes(repo: &TestRepo) {
+    repo.git(&["config", "notes.rewriteRef", "refs/notes/ai"])
+        .unwrap();
+}
+
+/// Two AI commits on different files, with the given subjects, then a commit
+/// that rewrites the first one's AI line by hand. Returns the three commits,
+/// oldest first.
+fn two_ai_commits_and_a_rewrite(
+    repo: &TestRepo,
+    subjects: (&str, &str),
+) -> (String, String, String) {
+    ai_edit(repo, "a.txt", "Base line 1\nBase line 2\nAI a\n");
+    repo.stage_all_and_commit(subjects.0).unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    let ai_a = head_sha(repo);
+
+    ai_edit(repo, "b.txt", "AI b\n");
+    repo.stage_all_and_commit(subjects.1).unwrap();
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    let ai_b = head_sha(repo);
+
+    // No checkpoint: nothing recorded who rewrote the line.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Base line 1\nBase line 2\nHand a\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Rewrite the AI line by hand")
+        .unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    let rewrite = head_sha(repo);
+
+    (ai_a, ai_b, rewrite)
+}
+
+#[test]
+fn interactive_rebase_that_reorders_commits_on_different_files_keeps_ai_attribution() {
+    reorder_commits_on_different_files(false);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_commits_keeps_ai_attribution_when_git_copies_notes() {
+    reorder_commits_on_different_files(true);
+}
+
+fn reorder_commits_on_different_files(git_copies_notes: bool) {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+    let (ai_a, ai_b, rewrite) =
+        two_ai_commits_and_a_rewrite(&repo, ("AI edit to a", "AI edit to b"));
+    if git_copies_notes {
+        let_git_copy_notes(&repo);
+    }
+
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[("pick", &ai_b), ("pick", &ai_a), ("pick", &rewrite)],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the reorder should keep three commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    assert!(
+        !note_names_file(&repo, &rebased[0], "a.txt"),
+        "the commit that only adds b.txt should not attest a.txt"
+    );
+
+    // The AI line is gone at the tip, so only the note of the commit that
+    // added it says who wrote it.
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+}
+
+#[test]
+fn interactive_rebase_that_moves_commits_ahead_of_a_rename_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI one\n");
+    repo.stage_all_and_commit("AI edit").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+    let ai_edit_commit = head_sha(&repo);
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    repo.commit("Rename file").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+    let rename = head_sha(&repo);
+
+    ai_edit(&repo, "b.txt", "Base line 1\nBase line 2\nAI one\nAI two\n");
+    repo.stage_all_and_commit("AI edit after rename").unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+    let ai_edit_after_rename = head_sha(&repo);
+
+    // No checkpoint: nothing recorded who rewrote the line.
+    fs::write(
+        repo.path().join("b.txt"),
+        "Base line 1\nBase line 2\nAI one\nHand two\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Rewrite the second AI line by hand")
+        .unwrap();
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "Hand two".unattributed_human(),
+    ]);
+    let rewrite = head_sha(&repo);
+
+    // A commit on a file no AI touched.
+    fs::write(repo.path().join("notes.txt"), "Human note\n").unwrap();
+    repo.stage_all_and_commit("Add notes").unwrap();
+    repo.filename("notes.txt")
+        .assert_committed_lines(lines!["Human note".unattributed_human()]);
+    let unrelated = head_sha(&repo);
+
+    // Move the second AI edit and the unrelated commit ahead of the rename:
+    // git applies the AI edit to a.txt, and the unrelated commit takes the
+    // slot the rename had.
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[
+            ("pick", &ai_edit_commit),
+            ("pick", &ai_edit_after_rename),
+            ("pick", &unrelated),
+            ("pick", &rename),
+            ("pick", &rewrite),
+        ],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 5, "the reorder should keep five commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[1]);
+    assert!(
+        !repo.path().join("b.txt").exists(),
+        "the AI edit should now be made before the rename"
+    );
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    checkout_detached(&repo, &rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+    repo.filename("notes.txt")
+        .assert_committed_lines(lines!["Human note".unattributed_human()]);
+    assert!(
+        !note_names_file(&repo, &rebased[2], "b.txt"),
+        "the unrelated commit should not get the rename's note"
+    );
+
+    checkout_detached(&repo, &rebased[3]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "AI two".ai(),
+    ]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[4]);
+    repo.filename("b.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI one".ai(),
+        "Hand two".unattributed_human(),
+    ]);
+    repo.filename("notes.txt")
+        .assert_committed_lines(lines!["Human note".unattributed_human()]);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_and_squashes_keeps_ai_attribution() {
+    reorder_and_squash(false);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_and_squashes_keeps_ai_attribution_when_git_copies_notes() {
+    reorder_and_squash(true);
+}
+
+fn reorder_and_squash(git_copies_notes: bool) {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+    let (ai_a, ai_b, rewrite) =
+        two_ai_commits_and_a_rewrite(&repo, ("AI edit to a", "AI edit to b"));
+    if git_copies_notes {
+        let_git_copy_notes(&repo);
+    }
+
+    // Move the b.txt commit first and squash the a.txt commit into it.
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[("pick", &ai_b), ("squash", &ai_a), ("pick", &rewrite)],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 2, "the squash should leave two commits");
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+}
+
+#[test]
+fn interactive_rebase_that_reorders_and_drops_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+    // A branch being cleaned up: its commits do not have telling subjects, so
+    // only what they change says which is which.
+    let (ai_a, ai_b, rewrite) = two_ai_commits_and_a_rewrite(&repo, ("WIP", "WIP"));
+
+    fs::write(repo.path().join("debug.txt"), "Debug output\n").unwrap();
+    repo.stage_all_and_commit("Add debug output").unwrap();
+    repo.filename("debug.txt")
+        .assert_committed_lines(lines!["Debug output".unattributed_human()]);
+
+    // Swap the two AI commits; leaving the debug commit out drops it.
+    rebase_interactive_with_todo(
+        &repo,
+        &main_branch,
+        &[("pick", &ai_b), ("pick", &ai_a), ("pick", &rewrite)],
+    );
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the drop should leave three commits");
+    assert!(!repo.path().join("debug.txt").exists());
+
+    checkout_detached(&repo, &rebased[0]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+}
+
+#[test]
+fn autosquash_that_moves_a_fixup_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let main_branch = base_file_and_feature_branch(&repo);
+
+    ai_edit(&repo, "a.txt", "Base line 1\nBase line 2\nAI a\n");
+    repo.stage_all_and_commit("Add the a line").unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+
+    ai_edit(&repo, "b.txt", "AI b\n");
+    repo.stage_all_and_commit("Add the b line").unwrap();
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+
+    // A fixup for the first commit, made after the second.
+    ai_edit(&repo, "c.txt", "AI c\n");
+    repo.stage_all_and_commit("fixup! Add the a line").unwrap();
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["AI c".ai()]);
+
+    // No checkpoint: nothing recorded who rewrote the lines.
+    fs::write(
+        repo.path().join("a.txt"),
+        "Base line 1\nBase line 2\nHand a\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("c.txt"), "Hand c\n").unwrap();
+    repo.stage_all_and_commit("Rewrite the AI lines by hand")
+        .unwrap();
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["Hand c".unattributed_human()]);
+
+    repo.git_with_env(
+        &["rebase", "-i", "--autosquash", &main_branch],
+        &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+        None,
+    )
+    .unwrap();
+    repo.sync_daemon();
+
+    let rebased = commits_since(&repo, &main_branch);
+    assert_eq!(rebased.len(), 3, "the fixup should leave three commits");
+
+    // The fixup moved up into the first commit.
+    checkout_detached(&repo, &rebased[0]);
+    assert!(!repo.path().join("b.txt").exists());
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "AI a".ai(),
+    ]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["AI c".ai()]);
+
+    checkout_detached(&repo, &rebased[1]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["AI c".ai()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_eq!(head_sha(&repo), rebased[2]);
+    repo.filename("a.txt").assert_committed_lines(lines![
+        "Base line 1".unattributed_human(),
+        "Base line 2".unattributed_human(),
+        "Hand a".unattributed_human(),
+    ]);
+    repo.filename("b.txt")
+        .assert_committed_lines(lines!["AI b".ai()]);
+    repo.filename("c.txt")
+        .assert_committed_lines(lines!["Hand c".unattributed_human()]);
+}
