@@ -5,7 +5,7 @@ Autter runs one small background process per user, called the background service
 ## What it does
 
 - **Writes authorship notes.** When you commit, git reports the command to the service, which matches it with the checkpoints your agents sent and writes the authorship note for the commit to `refs/notes/ai`. It does the same bookkeeping for rebase, cherry-pick, merge, stash and reset, so attribution follows the code.
-- **Receives checkpoints.** Agent hooks call `autter checkpoint`, which hands the edit to the service and returns at once, so the agent is not slowed down.
+- **Receives checkpoints.** Agent hooks call `autter checkpoint`, which hands the edit to the service and returns as soon as the service confirms it has it (about a millisecond), before the service processes it, so the agent is not slowed down. If the service does not confirm it within 200 ms, the hook tries once more and then prints `Checkpoint may not have been recorded` on stderr; it still exits 0 so the agent carries on. Run by hand, `autter checkpoint` exits 1 instead.
 - **Uploads, in connected mode only.** If this machine is connected to the Autter platform, the service uploads queued authorship and usage data. In local mode it uploads nothing.
 - **Checks for updates.** Release builds check for a newer version about once an hour and install it in the background. It does not do this in CI, when `AUTTER_RELEASE_TAG` pins a release, or when updates are turned off (`AUTTER_DISABLE_AUTO_UPDATES=1`, or `autter config set disable_auto_updates true`). `autter upgrade` upgrades on request.
 

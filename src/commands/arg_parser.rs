@@ -1017,6 +1017,13 @@ pub fn reject_any_args(cmd: &str, args: &[String]) {
     }
 }
 
+/// Every command name and alias in the help registry.
+pub fn documented_commands() -> impl Iterator<Item = &'static str> {
+    HELP_REGISTRY
+        .iter()
+        .flat_map(|e| std::iter::once(e.name).chain(e.aliases.iter().copied()))
+}
+
 /// Whether `cmd` (or one of its aliases) has an entry in the help registry.
 pub fn has_command_help(cmd: &str) -> bool {
     HELP_REGISTRY

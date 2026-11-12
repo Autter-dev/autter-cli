@@ -183,6 +183,10 @@ const CASES: &[(Mode, &[&str], Expect)] = &[
         &["diff", "HEAD", "--json"],
         UNREACHABLE,
     ),
+    // A command that does not exist is a usage error whether or not the
+    // service is up; `--json` after it still gets its one document.
+    (Mode::ServiceUnreachable, &["bogus", "--json"], USAGE),
+    (Mode::ServiceUnreachable, &["--json", "bogus"], USAGE),
     // These three work without the service, so that a broken setup can
     // still be diagnosed.
     (

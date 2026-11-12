@@ -93,8 +93,8 @@ pub mod trace_normalizer;
 pub mod transcript_redaction;
 
 pub use control_api::{
-    BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
-    FamilyStatus, TelemetryEnvelope,
+    BashSessionQueryResponse, BashSnapshotQueryResponse, CHECKPOINT_RECEIPT_PROTOCOL,
+    CONTROL_PROTOCOL_VERSION, ControlRequest, ControlResponse, FamilyStatus, TelemetryEnvelope,
 };
 
 const PID_META_FILE: &str = "daemon.pid.json";
@@ -8986,7 +8986,7 @@ impl ActorDaemonCoordinator {
 
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
-            ControlRequest::CheckpointRun { request } => {
+            ControlRequest::CheckpointRun { request, .. } => {
                 if let Some(worker) = &self.stream_worker
                     && let Some(stream_source) = &request.stream_source
                 {
@@ -9162,7 +9162,7 @@ impl ActorDaemonCoordinator {
                 Ok(response)
             }
             ControlRequest::Shutdown => Ok(ControlResponse::ok(None, None)),
-            ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::Ping => Ok(ControlResponse::pong()),
         };
 
         match result {
@@ -9307,7 +9307,6 @@ const HANDOFF_FAILURE_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
 /// within that time; 5 seconds more means the threads are held by requests
 /// that are not finishing. Refusals are not counted: a flood refuses hundreds
 /// of connections in a moment and must not restart the service.
-#[cfg(not(windows))]
 const AT_CAPACITY_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
     max_consecutive: None,
     max_duration: Duration::from_secs(15),
@@ -9371,15 +9370,29 @@ impl ListenerFailureStreak {
 
 /// Record that `listener` could not hand a connection to a handler thread.
 /// Returns `true` when the listener must stop, which shuts the service down;
-/// otherwise backs off and lets it keep accepting.
+/// otherwise backs off and lets it keep accepting. (The control listener
+/// counts through [`ControlConnectionGate`].)
+#[cfg(not(windows))]
 fn listener_handoff_failed(
     listener: &str,
     streak: &mut ListenerFailureStreak,
     what: &str,
     error: &dyn std::fmt::Display,
 ) -> bool {
+    let verdict = record_handoff_failure(listener, streak, what, error);
+    finish_handoff_failure(verdict)
+}
+
+/// Count and log one connection `listener` could not hand to a handler.
+fn record_handoff_failure(
+    listener: &str,
+    streak: &mut ListenerFailureStreak,
+    what: &str,
+    error: &dyn std::fmt::Display,
+) -> ListenerFailureVerdict {
     let now = std::time::Instant::now();
-    match streak.record_failure(HANDOFF_FAILURE_LIMITS, now) {
+    let verdict = streak.record_failure(HANDOFF_FAILURE_LIMITS, now);
+    match verdict {
         ListenerFailureVerdict::KeepServing => {
             tracing::error!(
                 consecutive = streak.consecutive,
@@ -9388,8 +9401,6 @@ fn listener_handoff_failed(
                 listener,
                 what
             );
-            std::thread::sleep(LISTENER_FAILURE_BACKOFF);
-            false
         }
         ListenerFailureVerdict::ShutDown => {
             tracing::error!(
@@ -9401,8 +9412,20 @@ fn listener_handoff_failed(
                 listener,
                 what
             );
-            true
         }
+    }
+    verdict
+}
+
+/// `true` when the listener must stop; otherwise back off before it accepts
+/// again.
+fn finish_handoff_failure(verdict: ListenerFailureVerdict) -> bool {
+    match verdict {
+        ListenerFailureVerdict::KeepServing => {
+            std::thread::sleep(LISTENER_FAILURE_BACKOFF);
+            false
+        }
+        ListenerFailureVerdict::ShutDown => true,
     }
 }
 
@@ -9481,13 +9504,13 @@ fn control_connection_idle_timeout() -> Duration {
 /// Most control handler threads alive at once. Far above real use (a client
 /// holds a connection for one short request) and far below the per-process
 /// thread limit (about 4,096 on macOS), so connections left open on the
-/// control socket cannot starve the rest of the service of threads.
-#[cfg(not(windows))]
+/// control socket cannot starve the rest of the service of threads. The same
+/// on Windows, where each one also holds a pipe instance.
 const CONTROL_MAX_HANDLER_THREADS: usize = 512;
 
 /// Each handler holds one file descriptor, so stay within half of what this
-/// process may open (macOS starts processes with 256).
-#[cfg(not(windows))]
+/// process may open (macOS starts processes with 256). Windows has no such
+/// limit to read (`None`).
 fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
     match open_file_limit {
         Some(limit) => usize::try_from(limit / 2)
@@ -9497,7 +9520,6 @@ fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
     }
 }
 
-#[cfg(not(windows))]
 fn control_handler_limit() -> usize {
     #[cfg(feature = "test-support")]
     if let Some(limit) = std::env::var("AUTTER_TEST_CONTROL_MAX_HANDLERS")
@@ -9507,6 +9529,18 @@ fn control_handler_limit() -> usize {
     {
         return limit;
     }
+    #[cfg(windows)]
+    {
+        control_handler_limit_for(None)
+    }
+    #[cfg(not(windows))]
+    {
+        control_handler_limit_for(process_open_file_limit())
+    }
+}
+
+#[cfg(not(windows))]
+fn process_open_file_limit() -> Option<u64> {
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -9515,22 +9549,18 @@ fn control_handler_limit() -> usize {
     let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0;
     // `rlim_t` is not 64 bits wide on every platform.
     #[allow(clippy::unnecessary_cast)]
-    let open_file_limit = ok.then_some(limits.rlim_cur as u64);
-    control_handler_limit_for(open_file_limit)
+    ok.then_some(limits.rlim_cur as u64)
 }
 
 /// Counts live control handler threads against a fixed limit.
-#[cfg(not(windows))]
 struct HandlerSlots {
     live: Arc<AtomicUsize>,
     limit: usize,
 }
 
 /// One handler thread's place in [`HandlerSlots`], given back when dropped.
-#[cfg(not(windows))]
 struct HandlerSlot(Arc<AtomicUsize>);
 
-#[cfg(not(windows))]
 impl HandlerSlots {
     fn new(limit: usize) -> Self {
         Self {
@@ -9549,10 +9579,94 @@ impl HandlerSlots {
     }
 }
 
-#[cfg(not(windows))]
 impl Drop for HandlerSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What to do with a control connection that was just accepted.
+enum ControlAdmission {
+    /// Serve it on a handler thread, which holds this slot.
+    Serve(HandlerSlot),
+    /// Every handler thread is busy: refuse it. `shut_down` once they have
+    /// all been busy for so long that they are stuck.
+    Refuse { shut_down: bool },
+}
+
+/// The control listener's limits, shared by every thread that accepts
+/// control connections: the one Unix listener, or all the Windows pipe
+/// workers, which together are one listener (one failure count, one handler
+/// limit), not one each.
+struct ControlConnectionGate {
+    slots: HandlerSlots,
+    /// Connections refused since the last one served.
+    at_capacity: Mutex<ListenerFailureStreak>,
+    /// Connections that could not be handed to a handler since the last one
+    /// served.
+    handoff_failures: Mutex<ListenerFailureStreak>,
+}
+
+impl ControlConnectionGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            slots: HandlerSlots::new(limit),
+            at_capacity: Mutex::new(ListenerFailureStreak::default()),
+            handoff_failures: Mutex::new(ListenerFailureStreak::default()),
+        }
+    }
+
+    fn admit(&self, now: std::time::Instant) -> ControlAdmission {
+        if let Some(slot) = self.slots.try_acquire() {
+            return ControlAdmission::Serve(slot);
+        }
+        let mut at_capacity = self
+            .at_capacity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
+        if verdict == ListenerFailureVerdict::ShutDown {
+            tracing::error!(
+                limit = self.slots.limit,
+                refused = at_capacity.consecutive,
+                failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
+                "control listener: every handler thread has been busy since the first \
+                 refusal; shutting the background service down so it is started again"
+            );
+            return ControlAdmission::Refuse { shut_down: true };
+        }
+        if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
+            tracing::warn!(
+                limit = self.slots.limit,
+                refused = at_capacity.consecutive,
+                "control listener: every handler thread is busy; refusing connections"
+            );
+        }
+        ControlAdmission::Refuse { shut_down: false }
+    }
+
+    /// A connection was handed to its handler thread.
+    fn handoff_succeeded(&self) {
+        for streak in [&self.at_capacity, &self.handoff_failures] {
+            streak
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_success();
+        }
+    }
+
+    /// A connection could not be handed to a handler thread (or could not be
+    /// accepted). `true` when the listener must stop; otherwise this has
+    /// backed off and the caller keeps accepting.
+    fn handoff_failed(&self, what: &str, error: &dyn std::fmt::Display) -> bool {
+        let verdict = {
+            let mut streak = self
+                .handoff_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            record_handoff_failure("control", &mut streak, what, error)
+        };
+        finish_handoff_failure(verdict)
     }
 }
 
@@ -9580,9 +9694,7 @@ fn control_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding control socket: {}", e)))?;
         set_socket_owner_only(&control_socket_path)?;
-        let slots = HandlerSlots::new(control_handler_limit());
-        let mut handoff_failures = ListenerFailureStreak::default();
-        let mut at_capacity = ListenerFailureStreak::default();
+        let gate = ControlConnectionGate::new(control_handler_limit());
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
                 if let Ok(stream) = stream {
@@ -9597,44 +9709,28 @@ fn control_listener_loop_actor(
                     // Out of file descriptors, most likely. Retrying at once
                     // would spin: the connection stays queued and `accept`
                     // fails again until something frees a descriptor.
-                    if listener_handoff_failed(
-                        "control",
-                        &mut handoff_failures,
-                        "failed to accept a connection, which stays queued",
-                        &error,
-                    ) {
+                    if gate
+                        .handoff_failed("failed to accept a connection, which stays queued", &error)
+                    {
                         coordinator.request_shutdown_unhealthy();
                         break;
                     }
                     continue;
                 }
             };
-            let Some(slot) = slots.try_acquire() else {
-                refuse_control_connection(
-                    stream,
-                    "the background service is at its connection limit",
-                );
-                let now = std::time::Instant::now();
-                let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
-                if verdict == ListenerFailureVerdict::ShutDown {
-                    tracing::error!(
-                        limit = slots.limit,
-                        refused = at_capacity.consecutive,
-                        failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
-                        "control listener: every handler thread has been busy since the first \
-                         refusal; shutting the background service down so it is started again"
+            let slot = match gate.admit(std::time::Instant::now()) {
+                ControlAdmission::Serve(slot) => slot,
+                ControlAdmission::Refuse { shut_down } => {
+                    refuse_control_connection(
+                        stream,
+                        "the background service is at its connection limit",
                     );
-                    coordinator.request_shutdown_unhealthy();
-                    break;
+                    if shut_down {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
                 }
-                if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
-                    tracing::warn!(
-                        limit = slots.limit,
-                        refused = at_capacity.consecutive,
-                        "control listener: every handler thread is busy; refusing connections"
-                    );
-                }
-                continue;
             };
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
@@ -9644,18 +9740,13 @@ fn control_listener_loop_actor(
                     tracing::debug!(%e, "control connection error");
                 }
             }) {
-                Ok(()) => {
-                    handoff_failures.record_success();
-                    at_capacity.record_success();
-                }
+                Ok(()) => gate.handoff_succeeded(),
                 Err(error) => {
                     // Usually a transient resource limit on a busy machine, so
                     // one failure must not take the whole service down. The
                     // connection is gone though, and nothing resends it, so a
                     // service that keeps failing has to stop and be restarted.
-                    if listener_handoff_failed(
-                        "control",
-                        &mut handoff_failures,
+                    if gate.handoff_failed(
                         "failed to spawn handler thread, so its connection was dropped",
                         &error,
                     ) {
@@ -9672,14 +9763,21 @@ fn control_listener_loop_actor(
     {
         let mut workers = Vec::new();
         let worker_count = windows_control_pipe_worker_count();
+        let gate = Arc::new(ControlConnectionGate::new(control_handler_limit()));
         let first_connecting = windows_pipe_connecting_server(&control_socket_path, true)?;
         {
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
+            let gate = gate.clone();
             workers.push(std::thread::spawn(move || {
-                let result =
-                    windows_control_pipe_worker_loop(path, first_connecting, coord.clone(), handle);
+                let result = windows_control_pipe_worker_loop(
+                    path,
+                    first_connecting,
+                    coord.clone(),
+                    handle,
+                    gate,
+                );
                 if let Err(error) = &result {
                     tracing::error!(%error, "control worker error");
                     coord.request_shutdown();
@@ -9691,10 +9789,11 @@ fn control_listener_loop_actor(
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
+            let gate = gate.clone();
             let connecting = windows_pipe_connecting_server(&path, false)?;
             workers.push(std::thread::spawn(move || {
                 let result =
-                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle);
+                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle, gate);
                 if let Err(error) = &result {
                     tracing::error!(%error, "control worker error");
                     coord.request_shutdown();
@@ -9764,8 +9863,8 @@ fn windows_control_pipe_worker_loop(
     mut connecting: WindowsConnectingServer,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
+    gate: Arc<ControlConnectionGate>,
 ) -> Result<(), AutterError> {
-    let mut handoff_failures = ListenerFailureStreak::default();
     loop {
         let server = connecting.wait().map_err(|e| {
             AutterError::Generic(format!(
@@ -9782,19 +9881,34 @@ fn windows_control_pipe_worker_loop(
 
         connecting = windows_pipe_connecting_server(&control_socket_path, false)?;
 
+        let slot = match gate.admit(std::time::Instant::now()) {
+            ControlAdmission::Serve(slot) => slot,
+            ControlAdmission::Refuse { shut_down } => {
+                // Closed without a refusal message: closing a pipe instance
+                // waits (FlushFileBuffers) until the client has read what
+                // was written to it, and a client that never reads would
+                // hold this worker. The client sees the connection closed
+                // unanswered, which `autter` reports the same way.
+                drop(server);
+                if shut_down {
+                    coordinator.request_shutdown_unhealthy();
+                    break;
+                }
+                continue;
+            }
+        };
         let coord = coordinator.clone();
         let handle = runtime_handle.clone();
         match spawn_connection_handler(move || {
+            let _slot = slot;
             handle_windows_control_pipe_connection(server, coord, handle);
         }) {
-            Ok(()) => handoff_failures.record_success(),
+            Ok(()) => gate.handoff_succeeded(),
             Err(e) => {
-                // Same policy as the Unix listener: drop this connection and
-                // keep accepting, and stop only when it keeps failing. Each
-                // worker counts its own failures.
-                if listener_handoff_failed(
-                    "control",
-                    &mut handoff_failures,
+                // Same policy as the Unix listener, counted across all the
+                // workers: drop this connection and keep accepting, and stop
+                // only when it keeps failing.
+                if gate.handoff_failed(
                     "failed to spawn handler thread, so its connection was dropped",
                     &e,
                 ) {
@@ -9860,21 +9974,45 @@ fn handle_control_connection_actor_reader<R: Read + Write>(
         }
         let parsed = serde_json::from_str::<ControlRequest>(trimmed);
         let mut shutdown_after_response = false;
+        let mut receipt_requested = false;
         let response = match parsed {
             Ok(req) => {
                 shutdown_after_response = matches!(req, ControlRequest::Shutdown);
+                // The checkpoint is read in full and this thread hands it to
+                // its repository's queue next, so say so before processing
+                // it, which can wait behind other work for that repository.
+                // The sender waits for this, not for the processing. If the
+                // sender has gone, the checkpoint is still processed.
+                if matches!(req, ControlRequest::CheckpointRun { receipt: true, .. }) {
+                    receipt_requested = true;
+                    let _ = write_control_response(reader.get_mut(), &ControlResponse::receipt());
+                }
                 runtime_handle.block_on(async { coordinator.handle_control_request(req).await })
             }
             Err(e) => ControlResponse::err(format!("invalid control request: {}", e)),
         };
-        let raw = serde_json::to_string(&response)?;
-        reader.get_mut().write_all(raw.as_bytes())?;
-        reader.get_mut().write_all(b"\n")?;
-        reader.get_mut().flush()?;
+        let written = write_control_response(reader.get_mut(), &response);
         if shutdown_after_response {
             coordinator.request_stop();
         }
+        match written {
+            Ok(()) => {}
+            // A hook closes its end once it has the receipt.
+            Err(_) if receipt_requested => return Ok(()),
+            Err(error) => return Err(error),
+        }
     }
+    Ok(())
+}
+
+fn write_control_response<W: Write>(
+    writer: &mut W,
+    response: &ControlResponse,
+) -> Result<(), AutterError> {
+    let mut raw = serde_json::to_vec(response)?;
+    raw.push(b'\n');
+    writer.write_all(&raw)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -11073,6 +11211,219 @@ pub fn send_control_request_fire_and_forget(
     }
 }
 
+/// How long `autter checkpoint` waits on the background service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointReceiptWait {
+    /// For the receipt; and, when none came, for the service's answer to a
+    /// `ping` that says whether it sends receipts at all.
+    pub receipt: Duration,
+    /// After the receipt, for the service to say how processing went. Zero:
+    /// return at the receipt.
+    pub outcome: Duration,
+}
+
+/// A checkpoint that may not have been recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointSendError {
+    /// The service did not take the checkpoint (not running, refused it,
+    /// closed the connection, or answered that it could not record it). It
+    /// is not recorded.
+    NotTaken(String),
+    /// The service took the connection but did not confirm the checkpoint in
+    /// time. It may still be recorded.
+    Unconfirmed(String),
+}
+
+impl std::fmt::Display for CheckpointSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointSendError::NotTaken(reason) | CheckpointSendError::Unconfirmed(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+/// What one read on a checkpoint's connection showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckpointReply {
+    /// The service has the checkpoint and will process it (protocol 1).
+    Receipt,
+    /// The service processed the checkpoint and answered `ok`: what an older
+    /// service sends instead of a receipt, once it is done.
+    Handled,
+    /// The service would not take the checkpoint.
+    Refused(String),
+    /// The service answered that it could not take or record the checkpoint.
+    Rejected(String),
+    /// The connection was closed with no answer.
+    Dropped,
+    /// Nothing arrived before the read timed out.
+    Silent,
+}
+
+/// Classify one read of a line (`read`, into `line`) on a checkpoint's
+/// connection.
+fn classify_checkpoint_reply(read: &std::io::Result<usize>, line: &str) -> CheckpointReply {
+    match read {
+        Ok(0) => CheckpointReply::Dropped,
+        Ok(_) => match serde_json::from_str::<ControlResponse>(line.trim()) {
+            Ok(response) if response.is_refusal() => CheckpointReply::Refused(
+                response
+                    .error
+                    .unwrap_or_else(|| "request refused".to_string()),
+            ),
+            Ok(response) if !response.ok => CheckpointReply::Rejected(
+                response
+                    .error
+                    .unwrap_or_else(|| "request failed".to_string()),
+            ),
+            Ok(response) if response.is_receipt() => CheckpointReply::Receipt,
+            Ok(_) => CheckpointReply::Handled,
+            Err(_) => CheckpointReply::Rejected(format!(
+                "unreadable answer: {}",
+                line.trim().chars().take(120).collect::<String>()
+            )),
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            CheckpointReply::Silent
+        }
+        Err(_) => CheckpointReply::Dropped,
+    }
+}
+
+/// No receipt came within `waited`. `ping_protocol` is the protocol version
+/// the service reported when asked right after (`None`: it did not answer,
+/// or refused).
+///
+/// A service older than receipts says nothing until it has processed a
+/// checkpoint, so its silence is the checkpoint being processed, as it always
+/// was: the send counts as taken, as the drop watch it replaces did. A
+/// service that sends receipts and sent none, or a service that answers
+/// nothing, cannot be assumed to have it.
+fn unconfirmed_checkpoint_verdict(
+    ping_protocol: Option<u32>,
+    waited: Duration,
+) -> Result<(), CheckpointSendError> {
+    match ping_protocol {
+        Some(version) if version < CHECKPOINT_RECEIPT_PROTOCOL => Ok(()),
+        Some(_) => Err(CheckpointSendError::Unconfirmed(format!(
+            "the background service did not confirm the checkpoint within {} ms, although it \
+             answers other requests",
+            waited.as_millis()
+        ))),
+        None => Err(CheckpointSendError::Unconfirmed(format!(
+            "the background service did not confirm the checkpoint within {} ms and did not \
+             answer a ping either",
+            waited.as_millis()
+        ))),
+    }
+}
+
+/// After a `ping`, how long to look once more for a receipt that came in
+/// while the `ping` was out.
+const LATE_RECEIPT_GRACE: Duration = Duration::from_millis(5);
+
+/// Send a checkpoint and wait for the service to confirm it has it.
+///
+/// `request` should be a `checkpoint.run` with `receipt: true`. The service
+/// (protocol 1) acknowledges it as soon as it has read it, before processing
+/// it, which takes about a millisecond on a healthy service. Without a
+/// receipt within `wait.receipt` the sender asks the service for its protocol
+/// version (`ping`): a service that predates receipts is left to process the
+/// checkpoint, as before; anything else is [`CheckpointSendError::Unconfirmed`].
+/// A refusal, a closed connection or an error answer is
+/// [`CheckpointSendError::NotTaken`].
+pub fn send_checkpoint_with_receipt(
+    socket_path: &Path,
+    request: &ControlRequest,
+    wait: CheckpointReceiptWait,
+) -> Result<(), CheckpointSendError> {
+    let not_taken = |error: AutterError| CheckpointSendError::NotTaken(error.to_string());
+    let mut stream =
+        open_local_socket_stream_with_timeout(socket_path, DAEMON_CONTROL_CONNECT_TIMEOUT)
+            .map_err(not_taken)?;
+    // Setting a timeout fails (EINVAL on macOS) when the service has already
+    // closed the connection; the write or the read below then says so.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, Duration::from_millis(500));
+    let mut body =
+        serde_json::to_vec(request).map_err(|error| not_taken(AutterError::from(error)))?;
+    body.push(b'\n');
+    if let Err(error) = write_all_daemon_client_stream(&mut stream, socket_path, &body) {
+        // A service that refuses a connection writes why and closes it, which
+        // can happen before the request is written. Report its reason.
+        let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, LATE_RECEIPT_GRACE);
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if let CheckpointReply::Refused(reason) =
+            classify_checkpoint_reply(&reader.read_line(&mut line), &line)
+        {
+            return Err(CheckpointSendError::NotTaken(format!(
+                "the background service refused the request: {}",
+                reason
+            )));
+        }
+        return Err(not_taken(error));
+    }
+
+    // Fails when the service has already closed the connection (EINVAL on
+    // macOS); the read below then returns at once and says what happened.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, wait.receipt);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut reply = classify_checkpoint_reply(&reader.read_line(&mut line), &line);
+    if reply == CheckpointReply::Silent {
+        let ping_protocol = send_control_request_with_timeouts(
+            socket_path,
+            &ControlRequest::Ping,
+            wait.receipt,
+            wait.receipt,
+        )
+        .ok()
+        .and_then(|response| response.ping_protocol());
+        let _ =
+            set_daemon_client_stream_timeouts(reader.get_mut(), socket_path, LATE_RECEIPT_GRACE);
+        reply = classify_checkpoint_reply(&reader.read_line(&mut line), &line);
+        if reply == CheckpointReply::Silent {
+            return unconfirmed_checkpoint_verdict(ping_protocol, wait.receipt);
+        }
+    }
+    match reply {
+        CheckpointReply::Receipt => {
+            if wait.outcome.is_zero() {
+                return Ok(());
+            }
+            let _ = set_daemon_client_stream_timeouts(reader.get_mut(), socket_path, wait.outcome);
+            line.clear();
+            match classify_checkpoint_reply(&reader.read_line(&mut line), &line) {
+                CheckpointReply::Rejected(reason) => Err(CheckpointSendError::NotTaken(format!(
+                    "the background service could not record the checkpoint: {}",
+                    reason
+                ))),
+                // Recorded, or still being processed: either way it is queued.
+                _ => Ok(()),
+            }
+        }
+        CheckpointReply::Handled | CheckpointReply::Silent => Ok(()),
+        CheckpointReply::Refused(reason) => Err(CheckpointSendError::NotTaken(format!(
+            "the background service refused the request: {}",
+            reason
+        ))),
+        CheckpointReply::Rejected(reason) => Err(CheckpointSendError::NotTaken(format!(
+            "the background service could not take the request: {}",
+            reason
+        ))),
+        CheckpointReply::Dropped => Err(CheckpointSendError::NotTaken(
+            "the background service closed the connection without handling the request".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod stream_worker_tests;
 
@@ -11458,6 +11809,425 @@ mod tests {
             .expect("a handled request is sent");
     }
 
+    #[test]
+    fn control_gate_refuses_past_the_limit_and_shuts_down_when_stuck() {
+        let gate = ControlConnectionGate::new(2);
+        let start = std::time::Instant::now();
+        let ControlAdmission::Serve(first) = gate.admit(start) else {
+            panic!("first connection must be served");
+        };
+        let ControlAdmission::Serve(second) = gate.admit(start) else {
+            panic!("second connection must be served");
+        };
+        // At the limit: refused, and a flood of refusals is no reason to stop.
+        for millis in [0, 1_000, 14_000] {
+            assert!(matches!(
+                gate.admit(start + Duration::from_millis(millis)),
+                ControlAdmission::Refuse { shut_down: false }
+            ));
+        }
+        // Every handler still busy 15 s after the first refusal: stuck.
+        assert!(matches!(
+            gate.admit(start + Duration::from_secs(15)),
+            ControlAdmission::Refuse { shut_down: true }
+        ));
+        // A freed handler serves the next connection, and serving one ends
+        // the run of refusals.
+        drop(first);
+        let ControlAdmission::Serve(third) = gate.admit(start + Duration::from_secs(16)) else {
+            panic!("a freed slot must serve the next connection");
+        };
+        gate.handoff_succeeded();
+        let later = start + Duration::from_secs(17);
+        assert!(matches!(
+            gate.admit(later),
+            ControlAdmission::Refuse { shut_down: false }
+        ));
+        assert!(matches!(
+            gate.admit(later + Duration::from_secs(14)),
+            ControlAdmission::Refuse { shut_down: false }
+        ));
+        drop((second, third));
+        assert_eq!(gate.slots.live.load(Ordering::SeqCst), 0);
+    }
+
+    /// The Windows pipe workers share one gate. Each used to count its own
+    /// handoff failures, so with 8 workers it took 8 times as many failures
+    /// to stop a service that could not serve anyone.
+    #[test]
+    fn control_gate_counts_handoff_failures_across_workers() {
+        let gate = Arc::new(ControlConnectionGate::new(4));
+        let error = std::io::Error::other("injected");
+        let max = HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        for failure in 1..=max {
+            // Alternate between two "workers".
+            let worker_gate = gate.clone();
+            let message = error.to_string();
+            let stop = std::thread::spawn(move || {
+                worker_gate.handoff_failed("failed to spawn handler thread", &message)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(stop, failure == max, "failure {failure} of {max}");
+        }
+        // One connection served resets the count for every worker.
+        gate.handoff_succeeded();
+        assert!(!gate.handoff_failed("failed to spawn handler thread", &error));
+    }
+
+    #[test]
+    fn checkpoint_reply_classification() {
+        let line = |response: ControlResponse| serde_json::to_string(&response).unwrap();
+        let read = |text: &str| -> std::io::Result<usize> { Ok(text.len()) };
+        let receipt = line(ControlResponse::receipt());
+        assert_eq!(
+            classify_checkpoint_reply(&read(&receipt), &receipt),
+            CheckpointReply::Receipt
+        );
+        // What an older service sends once it has processed the checkpoint.
+        let handled = line(ControlResponse::ok(None, None));
+        assert_eq!(
+            classify_checkpoint_reply(&read(&handled), &handled),
+            CheckpointReply::Handled
+        );
+        let refused = line(ControlResponse::refused("at its limit"));
+        assert_eq!(
+            classify_checkpoint_reply(&read(&refused), &refused),
+            CheckpointReply::Refused("at its limit".to_string())
+        );
+        let rejected = line(ControlResponse::err("no repository"));
+        assert_eq!(
+            classify_checkpoint_reply(&read(&rejected), &rejected),
+            CheckpointReply::Rejected("no repository".to_string())
+        );
+        assert!(matches!(
+            classify_checkpoint_reply(&read("garbage"), "garbage"),
+            CheckpointReply::Rejected(_)
+        ));
+        assert_eq!(
+            classify_checkpoint_reply(&Ok(0), ""),
+            CheckpointReply::Dropped
+        );
+        assert_eq!(
+            classify_checkpoint_reply(
+                &Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                ""
+            ),
+            CheckpointReply::Dropped
+        );
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            assert_eq!(
+                classify_checkpoint_reply(&Err(std::io::Error::from(kind)), ""),
+                CheckpointReply::Silent
+            );
+        }
+    }
+
+    #[test]
+    fn unconfirmed_checkpoint_verdicts() {
+        let waited = Duration::from_millis(200);
+        // An older service is processing it, as it always did: taken.
+        assert_eq!(unconfirmed_checkpoint_verdict(Some(0), waited), Ok(()));
+        // A service that sends receipts sent none.
+        assert!(matches!(
+            unconfirmed_checkpoint_verdict(Some(CHECKPOINT_RECEIPT_PROTOCOL), waited),
+            Err(CheckpointSendError::Unconfirmed(reason)) if reason.contains("answers other requests")
+        ));
+        assert!(matches!(
+            unconfirmed_checkpoint_verdict(Some(u32::MAX), waited),
+            Err(CheckpointSendError::Unconfirmed(_))
+        ));
+        // A service that answers nothing at all.
+        assert!(matches!(
+            unconfirmed_checkpoint_verdict(None, waited),
+            Err(CheckpointSendError::Unconfirmed(reason)) if reason.contains("did not answer a ping")
+        ));
+    }
+
+    /// Long enough for a loaded test machine, short enough that a test that
+    /// waits it out several times stays quick.
+    #[cfg(unix)]
+    const TEST_RECEIPT_WAIT: CheckpointReceiptWait = CheckpointReceiptWait {
+        receipt: Duration::from_millis(300),
+        outcome: Duration::ZERO,
+    };
+
+    #[cfg(unix)]
+    fn receipt_checkpoint_request() -> ControlRequest {
+        match sample_checkpoint_request() {
+            ControlRequest::CheckpointRun { request, .. } => ControlRequest::CheckpointRun {
+                request,
+                receipt: true,
+            },
+            other => other,
+        }
+    }
+
+    /// A stand-in service that reads each connection's request and answers
+    /// with `answer(method)`, one thread per connection. `None`: read it and
+    /// say nothing, holding the connection open for a while.
+    #[cfg(unix)]
+    fn scripted_control_socket(
+        answer: impl Fn(&str) -> Vec<ControlResponse> + Send + Sync + 'static,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let answer = Arc::new(answer);
+        fake_control_socket(move |stream| {
+            let answer = answer.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let method = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default();
+                let responses = answer(&method);
+                if responses.is_empty() {
+                    std::thread::sleep(Duration::from_secs(3));
+                    return;
+                }
+                for response in responses {
+                    let _ = write_control_response(reader.get_mut(), &response);
+                }
+            });
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_with_a_receipt_is_sent() {
+        let (_dir, path) = scripted_control_socket(|_| vec![ControlResponse::receipt()]);
+        let started = std::time::Instant::now();
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a receipted checkpoint is sent");
+        assert!(started.elapsed() < TEST_RECEIPT_WAIT.receipt);
+    }
+
+    /// The gap the drop watch left: a service that took the connection and
+    /// never handled it (stuck, or the connection queued behind others) was
+    /// read as "taken" once the watch ended.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_without_a_receipt_from_a_silent_service_is_unconfirmed() {
+        let (_dir, path) = scripted_control_socket(|_| Vec::new());
+        let started = std::time::Instant::now();
+        let error =
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+                .expect_err("silence is not a receipt");
+        assert!(
+            matches!(&error, CheckpointSendError::Unconfirmed(reason) if reason.contains("did not answer a ping")),
+            "{error:?}"
+        );
+        // The receipt wait, then as long again for the ping.
+        assert!(
+            started.elapsed() < TEST_RECEIPT_WAIT.receipt * 2 + Duration::from_millis(500),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_without_a_receipt_from_a_receipt_service_is_unconfirmed() {
+        // Answers a ping but never confirms the checkpoint.
+        let (_dir, path) = scripted_control_socket(|method| match method {
+            "ping" => vec![ControlResponse::pong()],
+            _ => Vec::new(),
+        });
+        let error =
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+                .expect_err("silence is not a receipt");
+        assert!(
+            matches!(&error, CheckpointSendError::Unconfirmed(reason) if reason.contains("answers other requests")),
+            "{error:?}"
+        );
+    }
+
+    /// A service from before receipts says nothing until it has processed a
+    /// checkpoint. That must not be reported as a lost checkpoint.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_to_an_older_service_falls_back_to_the_drop_watch() {
+        // This branch's first `ping`: ok, without a protocol version.
+        let (_dir, path) = scripted_control_socket(|method| match method {
+            "ping" => vec![ControlResponse::ok(None, None)],
+            _ => Vec::new(),
+        });
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("an older service working on the checkpoint has it");
+
+        // A released service that does not know `ping`.
+        let (_dir, path) = scripted_control_socket(|method| match method {
+            "ping" => vec![ControlResponse::err(
+                "invalid control request: unknown variant `ping`",
+            )],
+            _ => Vec::new(),
+        });
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("an older service working on the checkpoint has it");
+
+        // An older service that finishes within the wait answers `ok`.
+        let (_dir, path) = scripted_control_socket(|_| vec![ControlResponse::ok(None, None)]);
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a processed checkpoint is sent");
+
+        // Its drops are still drops.
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut line = String::new();
+            let _ = BufReader::new(stream).read_line(&mut line);
+        });
+        assert!(matches!(
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT),
+            Err(CheckpointSendError::NotTaken(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refused_or_dropped_is_not_taken() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            refuse_control_connection(stream, "the background service is at its connection limit")
+        });
+        let error =
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+                .expect_err("a refusal is not a receipt");
+        assert!(
+            matches!(&error, CheckpointSendError::NotTaken(reason) if reason.contains("at its connection limit")),
+            "{error:?}"
+        );
+        let (_dir, path) = fake_control_socket(drop);
+        assert!(matches!(
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT),
+            Err(CheckpointSendError::NotTaken(_))
+        ));
+        // Nothing listening at all.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            send_checkpoint_with_receipt(
+                &dir.path().join("none.sock"),
+                &receipt_checkpoint_request(),
+                TEST_RECEIPT_WAIT
+            ),
+            Err(CheckpointSendError::NotTaken(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_checkpoint_waits_for_the_outcome_after_the_receipt() {
+        let wait = CheckpointReceiptWait {
+            receipt: TEST_RECEIPT_WAIT.receipt,
+            outcome: Duration::from_secs(2),
+        };
+        let (_dir, path) = scripted_control_socket(|_| {
+            vec![
+                ControlResponse::receipt(),
+                ControlResponse::err("could not resolve the repository"),
+            ]
+        });
+        let error = send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), wait)
+            .expect_err("a checkpoint the service could not record is not sent");
+        assert!(
+            matches!(&error, CheckpointSendError::NotTaken(reason) if reason.contains("could not record")),
+            "{error:?}"
+        );
+        // A hook does not wait for that.
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a hook returns at the receipt");
+        // Still processing when the outcome wait ends: it is queued.
+        let (_dir, path) = scripted_control_socket(|_| vec![ControlResponse::receipt()]);
+        let quick = CheckpointReceiptWait {
+            receipt: TEST_RECEIPT_WAIT.receipt,
+            outcome: Duration::from_millis(100),
+        };
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), quick)
+            .expect("a receipted checkpoint still being processed is sent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_that_comes_while_the_ping_is_out_counts() {
+        // The receipt is late: after the receipt wait, but before the sender
+        // has given up.
+        let (_dir, path) = fake_control_socket(|stream| {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line.contains("\"ping\"") {
+                    std::thread::sleep(Duration::from_millis(150));
+                    let _ = write_control_response(reader.get_mut(), &ControlResponse::pong());
+                } else {
+                    std::thread::sleep(TEST_RECEIPT_WAIT.receipt + Duration::from_millis(50));
+                    let _ = write_control_response(reader.get_mut(), &ControlResponse::receipt());
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+        });
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a late receipt is still a receipt");
+    }
+
+    #[test]
+    fn checkpoint_asking_for_a_receipt_gets_it_before_the_answer() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        // No files: handled without a repository.
+        let request = |receipt: bool| {
+            let ControlRequest::CheckpointRun { mut request, .. } = sample_checkpoint_request()
+            else {
+                unreachable!()
+            };
+            request.files.clear();
+            let mut raw =
+                serde_json::to_vec(&ControlRequest::CheckpointRun { request, receipt }).unwrap();
+            raw.push(b'\n');
+            raw
+        };
+        let answers = |input: Vec<u8>| -> Vec<ControlResponse> {
+            let mut reader = BufReader::new(ScriptedConnection {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+            });
+            handle_control_connection_actor_reader(
+                &mut reader,
+                coordinator.clone(),
+                runtime.handle().clone(),
+            )
+            .unwrap();
+            String::from_utf8(reader.get_ref().output.clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let with_receipt = answers(request(true));
+        assert_eq!(with_receipt.len(), 2, "{with_receipt:?}");
+        assert!(with_receipt[0].is_receipt());
+        assert!(with_receipt[1].ok && !with_receipt[1].is_receipt());
+        // An older client asks for none and gets exactly what it used to.
+        let without = answers(request(false));
+        assert_eq!(without.len(), 1, "{without:?}");
+        assert!(without[0].ok && !without[0].is_receipt());
+    }
+
+    #[test]
+    fn ping_reports_the_protocol_version() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        let response = runtime.block_on(coordinator.handle_control_request(ControlRequest::Ping));
+        assert_eq!(response.ping_protocol(), Some(CONTROL_PROTOCOL_VERSION));
+        const { assert!(CONTROL_PROTOCOL_VERSION >= CHECKPOINT_RECEIPT_PROTOCOL) };
+    }
+
     #[cfg(unix)]
     #[test]
     fn control_probe_fails_when_connections_are_accepted_but_not_served() {
@@ -11797,6 +12567,7 @@ mod tests {
                 stream_source: None,
                 metadata: std::collections::HashMap::new(),
             }),
+            receipt: false,
         }
     }
 
