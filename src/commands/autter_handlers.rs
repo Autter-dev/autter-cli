@@ -50,17 +50,29 @@ pub fn handle_autter(args: &[String]) {
             if invoked_by_agent_hook(args) {
                 exit_stale_hook(&e.to_string());
             }
-            eprintln!("error: {}", e);
-            std::process::exit(2);
+            // The leading flags could not be parsed, so `--json` among them
+            // was never recorded: look for it, so the error is JSON too.
+            commands::arg_parser::merge_json_flag_from(args);
+            commands::output::fail(commands::output::ErrorKind::Usage, format!("error: {}", e));
         }
     };
+    commands::arg_parser::merge_global_flags(&leading.flags);
+    // A reporting command takes `--json` after its name as well. Record it
+    // here, before anything the dispatcher itself can fail on (`-C`, the
+    // background service), so those failures print a JSON document too.
+    if let Some(command) = leading.rest.first()
+        && is_reporting_command(command)
+    {
+        commands::arg_parser::merge_json_flag_from(&leading.rest[1..]);
+    }
     if let Some(path) = leading.flags.change_dir.as_deref()
         && let Err(e) = std::env::set_current_dir(path)
     {
-        eprintln!("error: cannot change to '{}': {}", path, e);
-        std::process::exit(1);
+        commands::output::fail(
+            commands::output::ErrorKind::Runtime,
+            format!("error: cannot change to '{}': {}", path, e),
+        );
     }
-    commands::arg_parser::merge_global_flags(&leading.flags);
 
     // `-h`/`--help` before any subcommand: overview, or per-command help when a
     // command name follows (`autter --help status`).
@@ -172,7 +184,12 @@ pub fn handle_autter(args: &[String]) {
                     answer_hook_noop();
                     std::process::exit(0);
                 }
-                std::process::exit(1);
+                // Exit 1. With `--json` the caller still gets its one
+                // document; the message and the hint are on stderr already.
+                commands::output::fail_reported(
+                    commands::output::ErrorKind::ServiceUnreachable,
+                    format!("failed to connect to autter background service: {}", err),
+                );
             }
         }
     }
@@ -416,10 +433,23 @@ pub fn handle_autter(args: &[String]) {
                 answer_hook_noop();
                 exit_stale_hook(&format!("unknown command '{}'", args[0]));
             }
-            eprintln!("Unknown autter command: {}", args[0]);
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+            // `autter stat --json` (a typo) still answers with one document.
+            commands::arg_parser::merge_json_flag_from(&args[1..]);
+            commands::output::fail(
+                commands::output::ErrorKind::Usage,
+                format!("Unknown autter command: {}", args[0]),
+            );
         }
     }
+}
+
+/// The commands whose `--json` output is a documented contract
+/// (docs/scripting.md). `sync` is here for `sync status`.
+fn is_reporting_command(command: &str) -> bool {
+    matches!(
+        command,
+        "stats" | "status" | "log" | "show" | "blame" | "diff" | "whoami" | "doctor" | "sync"
+    )
 }
 
 /// Dispatch `autter notes <subcommand>` commands.
@@ -747,6 +777,32 @@ fn handle_checkpoint(args: &[String]) {
     // beats losing the data.
     const CHECKPOINT_DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    // A checkpoint is sent without waiting for the service to finish it. A
+    // service that cannot take it (overloaded, or shutting down) closes the
+    // connection instead, so the sender watches the connection briefly after
+    // writing: without that, a dropped checkpoint looks exactly like a sent
+    // one. The watch ends as soon as the service answers; until then a
+    // service that is working on the checkpoint is silent, so the watch is
+    // also the most a healthy send can cost.
+    //
+    // A hook runs before and after every edit an agent makes, so it only
+    // waits long enough to see a connection that is closed at once (about a
+    // millisecond; 25 ms leaves room for a busy machine, which is when this
+    // happens). A direct run waits as long as any other control request does
+    // for its answer: that also covers a connection left queued by a service
+    // that then gives up and exits, which closes it.
+    const HOOK_CHECKPOINT_DROP_WATCH: std::time::Duration = std::time::Duration::from_millis(25);
+    const DIRECT_CHECKPOINT_DROP_WATCH: std::time::Duration = std::time::Duration::from_secs(2);
+    let drop_watch = if hook_mode {
+        HOOK_CHECKPOINT_DROP_WATCH
+    } else {
+        DIRECT_CHECKPOINT_DROP_WATCH
+    };
+    // Before a resend. Longer than the 50 ms the service backs off after a
+    // connection it could not serve, so the resend is not left queued behind
+    // that pause, where a short watch would not see it dropped.
+    const CHECKPOINT_RESEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
     let mut sent_count = 0u64;
     // Session-activity requests wake the transcript reader and record no
     // checkpoint, so they are counted apart from checkpoints.
@@ -760,12 +816,17 @@ fn handle_checkpoint(args: &[String]) {
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
         };
-        let mut send_result =
-            crate::daemon::send_control_request_fire_and_forget(&active_socket, &control_request);
+        let mut send_result = crate::daemon::send_control_request_fire_and_forget(
+            &active_socket,
+            &control_request,
+            drop_watch,
+        );
 
         // A failed send almost always means the daemon is down (crashed, never
-        // started, or restarting). Rather than dropping the checkpoint — which
-        // silently loses the session's steps — spawn the daemon and retry once.
+        // started, or restarting), or that it took the connection and closed
+        // it without handling the request (overloaded, or shutting down).
+        // Rather than dropping the checkpoint — which silently loses the
+        // session's steps — spawn the daemon and retry once.
         // `ensure_daemon_running` is a no-op when the daemon is already up, so a
         // transient blip is retried too. Only attempt the spawn once per call.
         if send_result.is_err() && !tried_spawn {
@@ -773,9 +834,11 @@ fn handle_checkpoint(args: &[String]) {
             match crate::commands::daemon::ensure_daemon_running(CHECKPOINT_DAEMON_SPAWN_TIMEOUT) {
                 Ok(spawned) => {
                     active_socket = spawned.control_socket_path;
+                    std::thread::sleep(CHECKPOINT_RESEND_PAUSE);
                     send_result = crate::daemon::send_control_request_fire_and_forget(
                         &active_socket,
                         &control_request,
+                        drop_watch,
                     );
                 }
                 Err(e) => {
@@ -1217,7 +1280,10 @@ fn handle_ai_blame(args: &[String]) {
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
-    merge_trailing_json_flag(&pp.rest);
+    // `blame` and `diff` parse their own trailing `--json` (after the file or
+    // revision, where the shared pre-parser stops). Record it globally as
+    // well, so their errors are JSON too.
+    commands::arg_parser::merge_json_flag_from(&pp.rest);
     // `-i`/`--interactive` is autter's own (git blame has no `-i`), so it is
     // taken out before the git-compatible flags are parsed.
     let interactive = pp
@@ -1334,7 +1400,7 @@ fn handle_ai_blame(args: &[String]) {
     }
 
     if let Err(e) = repo.blame(&file_path, &options) {
-        output::fail(ErrorKind::Runtime, format!("Blame failed: {}", e));
+        output::fail(output::error_kind(&e), format!("Blame failed: {}", e));
     }
 }
 
@@ -1353,7 +1419,10 @@ fn handle_ai_diff(args: &[String]) {
         return;
     }
     commands::arg_parser::merge_global_flags(&pp.flags);
-    merge_trailing_json_flag(&pp.rest);
+    // `blame` and `diff` parse their own trailing `--json` (after the file or
+    // revision, where the shared pre-parser stops). Record it globally as
+    // well, so their errors are JSON too.
+    commands::arg_parser::merge_json_flag_from(&pp.rest);
     let args = &pp.rest;
 
     let current_dir = env::current_dir()
@@ -1366,23 +1435,7 @@ fn handle_ai_diff(args: &[String]) {
     };
 
     if let Err(e) = commands::diff::handle_diff(&repo, args) {
-        output::fail(ErrorKind::Runtime, format!("Diff failed: {}", e));
-    }
-}
-
-/// `blame` and `diff` parse their own trailing `--json` (after the file or
-/// revision, where the shared pre-parser stops). Record it globally as well,
-/// so their errors are JSON too.
-fn merge_trailing_json_flag(rest: &[String]) {
-    if rest
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--json")
-    {
-        commands::arg_parser::merge_global_flags(&commands::arg_parser::GlobalFlags {
-            json: true,
-            ..Default::default()
-        });
+        output::fail(output::error_kind(&e), format!("Diff failed: {}", e));
     }
 }
 
@@ -1643,7 +1696,7 @@ fn handle_stats(args: &[String]) {
 /// The `--strict` failure message for `stats`.
 fn nothing_captured_message(what: &str) -> String {
     format!(
-        "nothing captured: no added line in {what} is attributed to AI or a known human (--strict). Run `autter doctor` to check capture."
+        "nothing captured: autter has no record of the lines added in {what} (--strict). Run `autter doctor` to check capture."
     )
 }
 

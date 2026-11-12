@@ -50,6 +50,18 @@ Use the `api.autter.dev` URL exactly as shown. Other hosts (such as `autter.dev/
 
 The installer adds `%USERPROFILE%\.autter\bin` to your user `PATH`. That reaches terminals opened afterwards, not the window you ran the command from: open a new terminal (and restart your IDE) before running `autter`. The installer prints the full path to `autter.exe` at the end so you can run it straight away. If you are already in PowerShell, `irm https://api.autter.dev/install.ps1 | iex` runs the same installer inside your current window, and `autter` works there immediately.
 
+To see what the installer would do without downloading, writing or starting anything, set `AUTTER_INSTALL_DRY_RUN` first. It is an environment variable because `irm | iex` cannot pass arguments:
+
+```powershell
+$env:AUTTER_INSTALL_DRY_RUN = '1'
+irm https://api.autter.dev/install.ps1 | iex
+Remove-Item Env:\AUTTER_INSTALL_DRY_RUN
+```
+
+It lists the download and its checksum check, where `autter.exe` goes, the `PATH` change, the Git Bash profile it would add a line to, the anonymous install ping and the onboarding step. Remove the variable afterwards, as shown: while it is set, every run in that window is a dry run. From Command Prompt, run `set AUTTER_INSTALL_DRY_RUN=1` before the `powershell ...` command above.
+
+In a terminal the binary download shows its progress on one line (megabytes received and percent). CI logs and redirected output stay quiet. The download is checked against the SHA-256 published with the release before it is installed. If a download fails (a `502`, a proxy, a blocked host), the error names the URL that failed: wait a minute and retry, or use npm below.
+
 ### npm (any platform, Node.js 18+)
 
 ```bash
@@ -70,6 +82,22 @@ Three things about the npm route:
 Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autter.dev/cli/install) generates a single-use command that runs this same installer and signs the machine in automatically.
 
 The installer downloads Autter into `~/.autter/bin` and adds it to your user `PATH`. IDE/agent hooks, global git capture settings, and the background service are applied during `autter onboard` (with consent) or with `autter install --system`. On macOS, Linux, and WSL the script starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later with `autter onboard`.
+
+### Where Autter is installed
+
+The install location is fixed and is not configurable. Every install method puts the same binary in the same place:
+
+| | macOS, Linux, WSL | Windows |
+| --- | --- | --- |
+| Binary | `~/.autter/bin/autter` | `%USERPROFILE%\.autter\bin\autter.exe` |
+| `PATH` entry | `~/.autter/env` (and `env.fish`) adds `~/.autter/bin`; one line in your shell file loads it | `%USERPROFILE%\.autter\bin` on your user `PATH` (and one line in `~/.bashrc` for Git Bash) |
+| Link | `~/.local/bin/autter`, a symlink to the binary | none |
+
+With npm, the `autter` command in npm's global bin directory is a launcher for that same binary. The installers' dry run prints these paths for your machine.
+
+It is one fixed path because three things point at it: the agent hooks that `autter onboard` installs run the binary by its full path, `autter upgrade` replaces the binary at that path, and the background service runs from it and upgrades it in place. A binary somewhere else would not be upgraded, and hooks would keep running the old one.
+
+If you want `autter` somewhere else, leave the binary where it is and point at it: add a symlink (`ln -s "$HOME/.autter/bin/autter" /usr/local/bin/autter`) or add `~/.autter/bin` to the `PATH` of that environment. Do not move the binary. If you did move it, run `autter install-hooks` so the agent hooks name the path it is at now, then `autter doctor` to check that capture works.
 
 ### System requirements
 
@@ -273,7 +301,7 @@ The script was started with `sh`. Run the same command with `bash` at the end (`
 
 ### The download fails or returns HTML
 
-A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli && autter onboard`). If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
+A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli`, then `autter onboard`). Both installers name the URL that failed. If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
 
 ### Windows or WSL: which one to set up
 

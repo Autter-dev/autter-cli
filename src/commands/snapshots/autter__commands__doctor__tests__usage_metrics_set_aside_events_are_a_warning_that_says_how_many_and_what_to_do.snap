@@ -1,0 +1,9 @@
+---
+source: src/commands/doctor.rs
+expression: render_check(&check)
+---
+[warning] usage metrics upload: 2 usage-metrics events are set aside after repeated server errors; no usage metrics waiting
+  fix: nothing is lost: the set-aside events are kept on this computer and the rest of the queue uploads. `autter sync retry` queues them again; if they are set aside again, send this output to autter support
+  0 events queued, 1200 uploaded, 0 failed attempts
+  2 usage-metrics events are set aside: the server failed on them every time, so they are kept on this computer and the rest of the queue uploads. Queue them again: `autter sync retry`. Delete them: `autter sync purge --force`.
+  set aside after: HTTP 500: Data-plane operation failed

@@ -27,8 +27,9 @@ use serde::Serialize;
 /// that breaks a reader (a removed or retyped field); added fields keep it.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// `--strict`: the command ran, but nothing was captured for what it looked
-/// at (`stats`, `status`).
+/// `--strict`: the command ran, and Autter has no record of the lines added
+/// in what it looked at (`stats`, `status`): capture missed them. A commit
+/// with a record and no AI lines is not this; it exits 0.
 pub const EXIT_NOTHING_CAPTURED: i32 = 3;
 
 /// `--strict`: capture itself is broken (`doctor`: a background service,
@@ -45,6 +46,9 @@ pub enum ErrorKind {
     NotARepository,
     /// A commit, revision or range that does not resolve.
     RevisionNotFound,
+    /// The background service could not be reached, so the command did not
+    /// run.
+    ServiceUnreachable,
     /// `stats --wait` gave up before the authorship note was written.
     NotePending,
     /// Not signed in (`whoami`).
@@ -53,7 +57,7 @@ pub enum ErrorKind {
     SyncUnhealthy,
     /// A setup check failed that does not break capture (`doctor`).
     CheckFailed,
-    /// `--strict`: nothing was captured.
+    /// `--strict`: nothing was captured (no Autter record of the added lines).
     NothingCaptured,
     /// `--strict`: capture is broken.
     CaptureBroken,
@@ -67,6 +71,7 @@ impl ErrorKind {
             ErrorKind::Usage => "usage_error",
             ErrorKind::NotARepository => "not_a_repository",
             ErrorKind::RevisionNotFound => "revision_not_found",
+            ErrorKind::ServiceUnreachable => "service_unreachable",
             ErrorKind::NotePending => "note_pending",
             ErrorKind::NotSignedIn => "not_signed_in",
             ErrorKind::SyncUnhealthy => "sync_unhealthy",
@@ -83,6 +88,7 @@ impl ErrorKind {
             ErrorKind::NothingCaptured => EXIT_NOTHING_CAPTURED,
             ErrorKind::CaptureBroken => EXIT_CAPTURE_BROKEN,
             ErrorKind::RevisionNotFound
+            | ErrorKind::ServiceUnreachable
             | ErrorKind::NotePending
             | ErrorKind::NotSignedIn
             | ErrorKind::SyncUnhealthy
@@ -170,19 +176,81 @@ pub fn fail_with<T: Serialize + ?Sized>(
 ) -> ! {
     let message = message.as_ref();
     eprintln!("{message}");
-    if arg_parser::json() {
-        let body = ErrorBody::new(kind, first_line(message));
-        match document(payload, Some(&body)) {
-            Ok(line) => println!("{line}"),
-            // The payload is what failed to serialize: the error alone still can.
-            Err(_) => {
-                if let Ok(line) = document::<()>(None, Some(&body)) {
-                    println!("{line}");
-                }
+    print_error_document(kind, message, payload);
+    std::process::exit(kind.exit_code())
+}
+
+/// [`fail`] for a caller that has already written its message (and any hint)
+/// to stderr: under `--json` print the error document, then exit.
+pub fn fail_reported(kind: ErrorKind, message: impl AsRef<str>) -> ! {
+    print_error_document::<()>(kind, message.as_ref(), None);
+    std::process::exit(kind.exit_code())
+}
+
+/// Under `--json`, print the one document of a failed command on stdout.
+fn print_error_document<T: Serialize + ?Sized>(
+    kind: ErrorKind,
+    message: &str,
+    payload: Option<&T>,
+) {
+    if !arg_parser::json() {
+        return;
+    }
+    let body = ErrorBody::new(kind, first_line(message));
+    match document(payload, Some(&body)) {
+        Ok(line) => println!("{line}"),
+        // The payload is what failed to serialize: the error alone still can.
+        Err(_) => {
+            if let Ok(line) = document::<()>(None, Some(&body)) {
+                println!("{line}");
             }
         }
     }
-    std::process::exit(kind.exit_code())
+}
+
+/// Classify a failed git invocation by what git said: an option git does not
+/// know is a usage error, a revision or range that does not resolve is
+/// `revision_not_found`, anything else is a runtime error.
+pub fn git_error_kind(stderr: &str) -> ErrorKind {
+    let text = stderr.to_ascii_lowercase();
+    if text.contains("unrecognized argument")
+        || text.contains("unknown option")
+        || text.contains("unknown switch")
+        || text.contains("invalid option")
+        || text.contains("not an integer")
+        || text.contains("requires a value")
+        || text.contains("requires an argument")
+        || text.contains("usage: git")
+    {
+        ErrorKind::Usage
+    } else if text.contains("unknown revision")
+        || text.contains("bad revision")
+        || text.contains("ambiguous argument")
+        || text.contains("not a valid object name")
+        || text.contains("needed a single revision")
+        || text.contains("invalid revision range")
+        || text.contains("cannot find revision")
+        || text.contains("no commit found")
+    {
+        ErrorKind::RevisionNotFound
+    } else {
+        ErrorKind::Runtime
+    }
+}
+
+/// Whether an error from a git helper says a revision or range does not
+/// resolve; anything else it reports is a runtime error. (Bad options are
+/// rejected by each command's own parser before git runs.)
+pub fn error_kind(err: &AutterError) -> ErrorKind {
+    let text = match err {
+        AutterError::GitCliError { stderr, .. } => stderr.clone(),
+        other => other.to_string(),
+    };
+    if git_error_kind(&text) == ErrorKind::RevisionNotFound {
+        ErrorKind::RevisionNotFound
+    } else {
+        ErrorKind::Runtime
+    }
 }
 
 /// The first line of an error message, without the `error: ` prefix human
@@ -292,8 +360,36 @@ mod tests {
         assert_eq!(ErrorKind::Usage.exit_code(), 2);
         assert_eq!(ErrorKind::NotARepository.exit_code(), 2);
         assert_eq!(ErrorKind::Runtime.exit_code(), 1);
+        assert_eq!(ErrorKind::RevisionNotFound.exit_code(), 1);
+        assert_eq!(ErrorKind::ServiceUnreachable.exit_code(), 1);
         assert_eq!(ErrorKind::NothingCaptured.exit_code(), 3);
         assert_eq!(ErrorKind::CaptureBroken.exit_code(), 4);
+    }
+
+    #[test]
+    fn git_errors_are_classified_by_what_git_said() {
+        for (stderr, kind) in [
+            ("fatal: unrecognized argument: --bogus", ErrorKind::Usage),
+            (
+                "error: unknown option `bogus'\nusage: git blame",
+                ErrorKind::Usage,
+            ),
+            (
+                "fatal: ambiguous argument 'nosuchrev': unknown revision or path not in the working tree.",
+                ErrorKind::RevisionNotFound,
+            ),
+            (
+                "fatal: bad revision 'nosuchrev..HEAD'",
+                ErrorKind::RevisionNotFound,
+            ),
+            (
+                "fatal: Not a valid object name nosuchrev",
+                ErrorKind::RevisionNotFound,
+            ),
+            ("fatal: unable to read tree", ErrorKind::Runtime),
+        ] {
+            assert_eq!(git_error_kind(stderr), kind, "{stderr}");
+        }
     }
 
     #[test]

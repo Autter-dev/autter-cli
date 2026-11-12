@@ -3,7 +3,149 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const crypto = require('node:crypto');
-const { spawnFailureHelp, verifyChecksum } = require('./install');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const pkg = require('./package.json');
+const {
+  DEV_VERSION,
+  assetName,
+  binaryDest,
+  ensureBinary,
+  releaseTag,
+  resolveLatestTag,
+  spawnFailureHelp,
+  verifyChecksum,
+} = require('./install');
+
+const RELEASES = 'https://github.com/autter-dev/autter-cli/releases';
+
+// Set or remove environment variables for one test and put them back after.
+function withEnv(t, vars) {
+  const saved = {};
+  for (const [name, value] of Object.entries(vars)) {
+    saved[name] = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  t.after(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+}
+
+test('the checked-in version is the dev placeholder, and the release stamps the real one', () => {
+  // A release version left here goes stale: every install from a checkout
+  // then fetches that old release's binary (3.1.0 was checked in until 3.6.0).
+  assert.equal(DEV_VERSION, '0.0.0-dev');
+  assert.equal(pkg.version, DEV_VERSION);
+
+  // The placeholder must never reach npm: release.yml sets the version from
+  // the tag in npm/ before it publishes.
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'release.yml'),
+    'utf8',
+  );
+  const stamp = workflow.indexOf('npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version');
+  const publish = workflow.indexOf('\n          npm publish ');
+  assert.ok(stamp > 0, 'release.yml no longer stamps the npm version from the tag');
+  assert.ok(publish > stamp, 'release.yml must stamp the version before npm publish');
+  assert.match(workflow, /working-directory: npm\n/);
+});
+
+test('a checkout asks for the latest release; a published version asks for its own tag', (t) => {
+  withEnv(t, { AUTTER_RELEASE_TAG: undefined });
+  t.after(() => {
+    pkg.version = DEV_VERSION;
+  });
+
+  assert.equal(releaseTag(), 'latest');
+
+  // What `npm version 3.6.0` in release.yml leaves in the published package.
+  pkg.version = '3.6.0';
+  assert.equal(releaseTag(), 'v3.6.0');
+
+  // AUTTER_RELEASE_TAG wins over both, as in install.sh.
+  process.env.AUTTER_RELEASE_TAG = 'v3.5.1';
+  assert.equal(releaseTag(), 'v3.5.1');
+  process.env.AUTTER_RELEASE_TAG = 'latest';
+  pkg.version = DEV_VERSION;
+  assert.equal(releaseTag(), 'latest');
+});
+
+test('"latest" is resolved to the tag GitHub redirects to', async () => {
+  const seen = [];
+  const redirecting = async (url, init) => {
+    seen.push([url, init.method, init.redirect]);
+    return new Response(null, { status: 302, headers: { location: `${RELEASES}/tag/v3.6.0` } });
+  };
+  assert.equal(await resolveLatestTag(redirecting), 'v3.6.0');
+  assert.deepEqual(seen, [[`${RELEASES}/latest`, 'HEAD', 'manual']]);
+
+  // No redirect to a tag (GitHub is down, a proxy answers): an error that
+  // names the URL, never a guess.
+  const failing = async () => new Response(null, { status: 502 });
+  await assert.rejects(resolveLatestTag(failing), (err) => {
+    assert.match(err.message, /HTTP 502/);
+    assert.ok(err.message.includes(`${RELEASES}/latest`), err.message);
+    return true;
+  });
+});
+
+test(
+  'an install from a checkout downloads the latest release and verifies its checksum',
+  { skip: process.platform === 'win32' ? 'the stand-in binary is a shell script' : false },
+  async (t) => {
+    // A throwaway home: the binary goes to <home>/.autter/bin.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'autter-npm-test-'));
+    withEnv(t, { HOME: home, AUTTER_RELEASE_TAG: undefined, AUTTER_NO_INSTALL_PING: '1' });
+    const realFetch = globalThis.fetch;
+    t.after(() => {
+      globalThis.fetch = realFetch;
+      fs.rmSync(home, { recursive: true, force: true });
+    });
+    assert.ok(binaryDest().startsWith(home + path.sep), `refusing to install into ${binaryDest()}`);
+    assert.equal(pkg.version, DEV_VERSION);
+
+    const asset = assetName();
+    const binary = Buffer.from('#!/bin/sh\necho 9.9.9\n');
+    const sha256 = crypto.createHash('sha256').update(binary).digest('hex');
+    const requested = [];
+    globalThis.fetch = async (url) => {
+      requested.push(String(url));
+      switch (String(url)) {
+        case `${RELEASES}/latest`:
+          return new Response(null, { status: 302, headers: { location: `${RELEASES}/tag/v9.9.9` } });
+        case `${RELEASES}/download/v9.9.9/${asset}`:
+          return new Response(binary);
+        case `${RELEASES}/download/v9.9.9/checksums.txt`:
+          return new Response(`${sha256}  ${asset}\n`);
+        default:
+          throw new Error(`unexpected request: ${url}`);
+      }
+    };
+
+    const result = await ensureBinary();
+    assert.deepEqual(result, { bin: path.join(home, '.autter', 'bin', 'autter'), downloaded: true });
+    assert.deepEqual(fs.readFileSync(result.bin), binary);
+    // The binary and its checksums come from the one release that "latest"
+    // named, not from /releases/latest/download/, which has no version to
+    // decide the checksum policy with.
+    assert.deepEqual(requested, [
+      `${RELEASES}/latest`,
+      `${RELEASES}/download/v9.9.9/${asset}`,
+      `${RELEASES}/download/v9.9.9/checksums.txt`,
+    ]);
+
+    // A binary that is already there is left alone: the background service
+    // keeps it current.
+    requested.length = 0;
+    assert.deepEqual(await ensureBinary(), { bin: result.bin, downloaded: false });
+    assert.deepEqual(requested, []);
+  },
+);
 
 test('rejects invalid release tags rather than guessing checksum policy', async () => {
   await assert.rejects(
@@ -13,7 +155,7 @@ test('rejects invalid release tags rather than guessing checksum policy', async 
 });
 
 test('checksum policy parser accepts current semantic release tags', async () => {
-  const source = require('node:fs').readFileSync(require.resolve('./install'), 'utf8');
+  const source = fs.readFileSync(require.resolve('./install'), 'utf8');
   assert.match(source, /checksumsRequired = major > 1/);
   assert.match(source, /patch >= 8/);
 });

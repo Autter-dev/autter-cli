@@ -206,9 +206,13 @@ fn test_status_honors_uncommitted_root_gitattributes_linguist_generated() {
 
     let status = status_from_args(&repo, &["status", "--json"]);
 
-    assert_eq!(status.stats.git_diff_added_lines, 1);
+    // src/app.ts adds one AI line; generated/** is ignored. The new
+    // .gitattributes file is an uncommitted change too: its one line is
+    // counted, and no checkpoint attributes it.
+    assert_eq!(status.stats.git_diff_added_lines, 2);
     assert_eq!(status.stats.git_diff_deleted_lines, 0);
     assert_eq!(status.stats.ai_accepted, 1);
+    assert_eq!(status.stats.unknown_additions, 1);
 }
 
 #[test]
@@ -280,9 +284,12 @@ fn test_status_honors_autter_ignore_file() {
 
     let status = status_from_args(&repo, &["status", "--json"]);
 
-    assert_eq!(status.stats.git_diff_added_lines, 1);
+    // src/app.ts adds one AI line; docs/** is ignored. The new .autter-ignore
+    // file itself is an uncommitted, hand-written line.
+    assert_eq!(status.stats.git_diff_added_lines, 2);
     assert_eq!(status.stats.git_diff_deleted_lines, 0);
     assert_eq!(status.stats.ai_accepted, 1);
+    assert_eq!(status.stats.unknown_additions, 1);
 }
 
 #[test]
@@ -322,12 +329,14 @@ fn test_status_autter_ignore_union_with_gitattributes() {
 
     let status = status_from_args(&repo, &["status", "--json"]);
 
-    // Only src/app.ts addition should be counted (1 line)
-    // generated/out.ts ignored by .gitattributes linguist-generated
-    // docs/api.md ignored by .autter-ignore
-    assert_eq!(status.stats.git_diff_added_lines, 1);
+    // Of the checkpointed files only src/app.ts is counted (1 AI line):
+    // generated/out.ts is ignored by .gitattributes linguist-generated and
+    // docs/api.md by .autter-ignore. The two new config files are uncommitted
+    // hand-written lines (1 each), counted and not attributed.
+    assert_eq!(status.stats.git_diff_added_lines, 3);
     assert_eq!(status.stats.git_diff_deleted_lines, 0);
     assert_eq!(status.stats.ai_accepted, 1);
+    assert_eq!(status.stats.unknown_additions, 2);
 }
 
 #[test]
@@ -350,7 +359,10 @@ fn test_status_ignores_repo_external_diff_helper_for_internal_numstat() {
     );
 
     let status = status_from_args(&repo, &["status", "--json"]);
-    assert_eq!(status.stats.git_diff_added_lines, 1);
+    // app.txt adds one AI line, counted by the internal numstat and not by
+    // the helper. The helper script is a new, untracked 3-line file in the
+    // repository, so its lines are uncommitted additions as well.
+    assert_eq!(status.stats.git_diff_added_lines, 4);
     assert_eq!(status.stats.git_diff_deleted_lines, 0);
     assert_eq!(status.stats.ai_accepted, 1);
 }

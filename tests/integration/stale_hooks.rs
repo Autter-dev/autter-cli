@@ -623,3 +623,56 @@ fn hook_commands_behind_a_global_flag_start_no_refresh() {
     );
     assert!(claim.exists(), "`--json whoami` must start the refresh");
 }
+
+/// `install-hooks --refresh-stale` reports a failed agent through the normal
+/// error path (message, `autter doctor` hint, exit 1) instead of exiting from
+/// inside the command, and records the failure for doctor.
+#[cfg(unix)]
+#[test]
+fn refresh_stale_reports_an_agent_it_could_not_rewrite() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TestRepo::new();
+    let home = repo.test_home_path().clone();
+    std::fs::create_dir_all(home.join(".gemini").join("antigravity")).unwrap();
+    let config_dir = home.join(".gemini").join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let hooks_path = config_dir.join("hooks.json");
+    let stale = serde_json::json!({"autter": {"PreToolUse": [{"matcher": "write_to_file",
+        "hooks": [{"type": "command",
+            "command": format!("{OLD_BINARY} checkpoint antigravity-pre --hook-input stdin"),
+            "timeout": 30}]}]}});
+    std::fs::write(&hooks_path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+    // Neither the file nor its folder can be written: the rewrite fails.
+    std::fs::set_permissions(&hooks_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(config_dir.join("probe"), "").is_ok() {
+        // Running as root: permissions do not stop the write.
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let run = run_in_test_home(&repo, &["install-hooks", "--refresh-stale"], &[]);
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        run.code,
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("Install hooks failed")
+            && run
+                .stderr
+                .contains("could not refresh autter hooks for Google Antigravity")
+            && run.stderr.contains("autter doctor"),
+        "{}",
+        run.stderr
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join(".autter/internal/hooks_version.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["failed"][0]["name"], "Google Antigravity", "{state}");
+}

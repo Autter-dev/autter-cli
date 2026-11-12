@@ -5,6 +5,12 @@
 # or, already inside PowerShell (autter is then usable in that window at once):
 #   irm https://api.autter.dev/install.ps1 | iex
 #
+# Dry run (prints what would be downloaded, written and started, and changes
+# nothing). iex cannot pass arguments, so it is an environment variable:
+#   $env:AUTTER_INSTALL_DRY_RUN = '1'
+#   irm https://api.autter.dev/install.ps1 | iex
+#   Remove-Item Env:\AUTTER_INSTALL_DRY_RUN
+#
 # Rules for editing this file, because it usually runs through `irm | iex`:
 #   - Keep it pure ASCII. irm decodes with whatever charset the server sends,
 #     and a mis-decoded em-dash or smart quote can become a quote character
@@ -24,10 +30,22 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Dry run: print the plan and return before anything is downloaded, written
+# or started (see the block after the release tag is determined).
+$dryRun = ($env:AUTTER_INSTALL_DRY_RUN -eq '1')
+
+# What to try when a download from GitHub fails (a 502, a proxy, a blocked
+# host): the npm package installs the same binary and is a second route.
+# The two commands are on separate lines because Windows PowerShell 5.1 has
+# no operator that chains them.
+$NpmFallbackHint = "This is usually temporary: wait a minute and run the installer again.`nIf it keeps failing on this network, install with npm instead (needs Node.js 18+):`n  npm install -g @autter/cli`n  autter onboard"
+
 function Start-DaemonIfRequested {
     if ($env:AUTTER_RESTART_DAEMON_AFTER_INSTALL -ne '1') {
         return
     }
+    # A dry run starts nothing, also when it stops on an error.
+    if ($dryRun) { return }
 
     $daemonExe = Join-Path $HOME '.autter\bin\autter.exe'
     if (-not (Test-Path $daemonExe)) {
@@ -278,12 +296,15 @@ $ChecksumsSentinel = '__CHECKSUMS_' + 'PLACEHOLDER__'
 # under iex it is the user's own session: leave SystemDefault (0, the OS picks,
 # including TLS 1.3) alone and otherwise only add TLS 1.2 with -bor instead of
 # overwriting the list. (PowerShell 7's web cmdlets ignore this setting.)
-try {
-    $securityProtocol = [Net.ServicePointManager]::SecurityProtocol
-    if ([int]$securityProtocol -ne 0 -and -not ($securityProtocol -band [Net.SecurityProtocolType]::Tls12)) {
-        [Net.ServicePointManager]::SecurityProtocol = $securityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    }
-} catch { }
+# A dry run makes no request, so it leaves the setting alone.
+if (-not $dryRun) {
+    try {
+        $securityProtocol = [Net.ServicePointManager]::SecurityProtocol
+        if ([int]$securityProtocol -ne 0 -and -not ($securityProtocol -band [Net.SecurityProtocolType]::Tls12)) {
+            [Net.ServicePointManager]::SecurityProtocol = $securityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        }
+    } catch { }
+}
 
 function Get-Architecture {
     # Environment variables first: they exist on every PowerShell version.
@@ -364,6 +385,73 @@ function Set-PathEnsureContains {
     }
 }
 
+# Whether $PathToCheck is already an entry of the persistent User PATH. Reads
+# only; the dry run uses it to say what a real install would change.
+function Test-UserPathContains {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathToCheck
+    )
+
+    try {
+        $wanted = Normalize-PathString $PathToCheck
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (-not $userPath) { return $false }
+        foreach ($entry in ($userPath -split ';')) {
+            if ($entry -and $entry.Trim() -ne '' -and (Normalize-PathString $entry) -eq $wanted) {
+                return $true
+            }
+        }
+    } catch { }
+    return $false
+}
+
+# Git Bash (MSYS2/MinGW) puts its own directories in front of the Windows
+# PATH, so the installer adds one PATH line to a bash profile. Returns $null
+# when Git for Windows is not installed, else the profile that line goes in
+# (~/.bashrc if it exists, else an existing ~/.bash_profile, else a new
+# ~/.bashrc) and whether it is already there. Reads only: the install and the
+# dry run both call it, so the dry run reports what the install would do.
+function Get-GitBashPlan {
+    $gitBashInstalled = $false
+    $gitForWindowsPaths = @()
+    if ($env:ProgramFiles) { $gitForWindowsPaths += Join-Path $env:ProgramFiles 'Git\bin\bash.exe' }
+    if (${env:ProgramFiles(x86)}) { $gitForWindowsPaths += Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe' }
+    if ($env:LOCALAPPDATA) { $gitForWindowsPaths += Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe' }
+    foreach ($p in $gitForWindowsPaths) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            $gitBashInstalled = $true
+            break
+        }
+    }
+    if (-not $gitBashInstalled) {
+        return $null
+    }
+
+    $bashrcPath = Join-Path $HOME '.bashrc'
+    $bashProfilePath = Join-Path $HOME '.bash_profile'
+    if (Test-Path -LiteralPath $bashrcPath) {
+        $targetBashConfig = $bashrcPath
+    } elseif (Test-Path -LiteralPath $bashProfilePath) {
+        $targetBashConfig = $bashProfilePath
+    } else {
+        # No existing config; the install creates .bashrc
+        $targetBashConfig = $bashrcPath
+    }
+
+    $alreadyPresent = $false
+    if (Test-Path -LiteralPath $targetBashConfig) {
+        $content = Get-Content -LiteralPath $targetBashConfig -Raw -ErrorAction SilentlyContinue
+        if ($content -and $content.Contains('.autter/bin')) {
+            $alreadyPresent = $true
+        }
+    }
+
+    return [PSCustomObject]@{
+        Path              = $targetBashConfig
+        AlreadyConfigured = $alreadyPresent
+    }
+}
+
 # Detect architecture and OS
 $arch = Get-Architecture
 if (-not $arch) {
@@ -407,6 +495,77 @@ if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
     $releaseTag = 'latest'
 }
 
+# Dry run: say what would happen and stop before the first network request.
+# `return` leaves the scriptblock this whole file runs in; nothing below runs.
+if ($dryRun) {
+    $dryInstallDir = Join-Path $HOME '.autter\bin'
+    $dryExe = Join-Path $dryInstallDir 'autter.exe'
+    $drySteps = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
+        [void]$drySteps.Add("copy the local binary $($env:AUTTER_LOCAL_BINARY)")
+    } elseif ($releaseTag -eq 'latest') {
+        [void]$drySteps.Add("download $binaryName.exe from the latest release at https://github.com/$Repo/releases/latest and check its SHA-256 against that release's checksums.txt")
+    } else {
+        [void]$drySteps.Add("download $downloadUrlExe and check its SHA-256 against that release's checksums.txt")
+    }
+
+    if (Test-Path -LiteralPath $dryExe) {
+        [void]$drySteps.Add("replace $dryExe (the autter background service is stopped first, so the file is free)")
+    } else {
+        [void]$drySteps.Add("install it as $dryExe")
+    }
+    if (Test-Path -LiteralPath (Join-Path $dryInstallDir 'git.exe')) {
+        [void]$drySteps.Add("refresh the copy at $(Join-Path $dryInstallDir 'git.exe')")
+    }
+
+    if ($env:AUTTER_SKIP_PATH_UPDATE -eq '1') {
+        [void]$drySteps.Add('leave PATH as it is (AUTTER_SKIP_PATH_UPDATE=1)')
+    } elseif (Test-UserPathContains -PathToCheck $dryInstallDir) {
+        [void]$drySteps.Add("leave your user PATH as it is ($dryInstallDir is already on it) and add it to this window's PATH")
+    } else {
+        [void]$drySteps.Add("add $dryInstallDir to your user PATH (for new terminals) and to this window's PATH")
+    }
+
+    $dryGitBash = $null
+    try { $dryGitBash = Get-GitBashPlan } catch { }
+    if ($dryGitBash) {
+        if ($dryGitBash.AlreadyConfigured) {
+            [void]$drySteps.Add("leave $($dryGitBash.Path) as it is (it already puts autter on the Git Bash PATH)")
+        } else {
+            [void]$drySteps.Add("add one line to $($dryGitBash.Path) that puts autter on the Git Bash PATH")
+        }
+    }
+
+    if ($env:AUTTER_NO_INSTALL_PING -eq '1' -or -not [string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
+        [void]$drySteps.Add('send no install ping')
+    } else {
+        [void]$drySteps.Add('send one anonymous install ping (OS, CPU architecture and version only; AUTTER_NO_INSTALL_PING=1 turns it off)')
+    }
+
+    if ($env:INSTALL_NONCE -and $env:API_BASE) {
+        [void]$drySteps.Add('sign this machine in with the single-use setup token from the dashboard')
+    }
+    [void]$drySteps.Add("run 'autter onboard', which asks before it installs agent hooks, changes your global git config or starts the background service")
+    if ($env:AUTTER_RESTART_DAEMON_AFTER_INSTALL -eq '1') {
+        [void]$drySteps.Add('start the autter background service again (AUTTER_RESTART_DAEMON_AFTER_INSTALL=1)')
+    }
+
+    Write-Host 'Dry run: nothing is downloaded, written or started.'
+    Write-Host ''
+    Write-Host 'The installer would:'
+    $dryStepNumber = 0
+    foreach ($dryStep in $drySteps) {
+        $dryStepNumber++
+        Write-Host ('  {0}. {1}' -f $dryStepNumber, $dryStep)
+    }
+    Write-Host ''
+    Write-Host 'To install, clear the variable and run the installer again:'
+    Write-Host '  Remove-Item Env:\AUTTER_INSTALL_DRY_RUN'
+    Write-Host 'To undo an install later: autter uninstall'
+    return
+}
+
 # Resolve a specific release and load the checksum file produced by release.yml
 # before downloading the executable. A missing/malformed checksum is fatal.
 if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
@@ -415,8 +574,9 @@ if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
     if ($releaseTag -eq 'latest') {
         $latestUrl = $null
         $latestError = $null
+        $latestReleaseUrl = "https://github.com/$Repo/releases/latest"
         try {
-            $latestResponse = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -Method Head -UseBasicParsing -ErrorAction Stop
+            $latestResponse = Invoke-WebRequest -Uri $latestReleaseUrl -Method Head -UseBasicParsing -ErrorAction Stop
             $latestResponseUriProperty = $latestResponse.BaseResponse.PSObject.Properties['ResponseUri']
             $latestUrl = if ($latestResponseUriProperty -and $latestResponseUriProperty.Value) {
                 $latestResponse.BaseResponse.ResponseUri.AbsoluteUri
@@ -427,7 +587,7 @@ if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
             $latestError = $_.Exception.Message
         }
         if ($latestError) {
-            Write-ErrorAndExit "Failed to resolve the latest release: $latestError"
+            Write-ErrorAndExit "Failed to resolve the latest release from ${latestReleaseUrl}: $latestError`n`n$NpmFallbackHint"
         }
         if ("$latestUrl" -notmatch '/releases/tag/([^/?]+)') {
             Write-ErrorAndExit 'Failed to resolve latest release to a specific version'
@@ -452,7 +612,7 @@ if ([string]::IsNullOrWhiteSpace($env:AUTTER_LOCAL_BINARY)) {
         Remove-Item -Force -ErrorAction SilentlyContinue $checksumsTmp
     }
     if ($checksumsError) {
-        Write-ErrorAndExit "Failed to download release checksums: $checksumsError"
+        Write-ErrorAndExit "Failed to download release checksums from ${checksumsUrl}: $checksumsError`n`n$NpmFallbackHint"
     }
     if ([string]::IsNullOrWhiteSpace($EmbeddedChecksums)) {
         Write-ErrorAndExit 'Release checksums are empty'
@@ -578,13 +738,109 @@ $tmpFile = Join-Path $installDir "autter.tmp.$PID.exe"
 # can report exactly what was tried instead of an opaque "HTTP error".
 $downloadFailures = New-Object System.Collections.Generic.List[string]
 
+# Show download progress only when a person is watching: not in CI, not for
+# the background service's self-upgrade, and not when output is redirected
+# to a file or another program. AUTTER_INSTALL_PROGRESS=1 or 0 forces it on
+# or off (CI sets 1 to exercise the progress download).
+function Test-ShowDownloadProgress {
+    if ($env:AUTTER_INSTALL_PROGRESS -eq '1') { return $true }
+    if ($env:AUTTER_INSTALL_PROGRESS -eq '0') { return $false }
+    if ($env:CI -or $env:GITHUB_ACTIONS -or $env:AUTTER_DAEMON_UPGRADE) { return $false }
+    try {
+        return ([Environment]::UserInteractive -and -not [Console]::IsOutputRedirected)
+    } catch {
+        return $false
+    }
+}
+
+function Format-DownloadProgress {
+    param(
+        [Parameter(Mandatory = $true)][long]$Done,
+        [Parameter(Mandatory = $true)][long]$Total
+    )
+
+    if ($Total -gt 0) {
+        $percent = [int][Math]::Floor(($Done * 100.0) / $Total)
+        return ('  {0,6:F1} MB of {1:F1} MB ({2,3}%)' -f ($Done / 1MB), ($Total / 1MB), $percent)
+    }
+    return ('  {0,6:F1} MB' -f ($Done / 1MB))
+}
+
+# Download $Url to $OutFile and show how far along it is on one status line.
+#
+# Invoke-WebRequest's own progress bar is not an option: Windows PowerShell
+# 5.1 redraws it for every chunk received, which makes the download many
+# times slower. This copies the response stream to the file in 80 KB chunks
+# and rewrites one line of text at most four times a second, so the display
+# costs a few dozen Write-Host calls in total.
+#
+# Returns $true only when the whole file arrived. On any failure it returns
+# $false and reports nothing: the caller then runs the plain
+# Invoke-WebRequest download, which retries and records the reason.
+function Save-UrlWithProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$OutFile
+    )
+
+    $response = $null
+    $source = $null
+    $target = $null
+    $lineOpen = $false
+    try {
+        $request = [System.Net.WebRequest]::Create($Url)
+        $request.UserAgent = 'autter-install-ps1'
+        $response = $request.GetResponse()
+        $total = [long]$response.ContentLength
+        $source = $response.GetResponseStream()
+        $target = [System.IO.File]::Create($OutFile)
+        $buffer = New-Object byte[] 81920
+        $done = [long]0
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $nextDraw = [long]0
+        while ($true) {
+            $read = $source.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $target.Write($buffer, 0, $read)
+            $done += $read
+            if ($clock.ElapsedMilliseconds -ge $nextDraw) {
+                $nextDraw = $clock.ElapsedMilliseconds + 250
+                Write-Host -NoNewline ("`r" + (Format-DownloadProgress -Done $done -Total $total))
+                $lineOpen = $true
+            }
+        }
+        Write-Host -NoNewline ("`r" + (Format-DownloadProgress -Done $done -Total $total))
+        Write-Host ''
+        $lineOpen = $false
+        if ($total -gt 0 -and $done -ne $total) {
+            return $false
+        }
+        return ($done -gt 0)
+    } catch {
+        return $false
+    } finally {
+        if ($lineOpen) { Write-Host '' }
+        if ($target) { $target.Dispose() }
+        if ($source) { $source.Dispose() }
+        if ($response) { $response.Close() }
+    }
+}
+
+$showDownloadProgress = Test-ShowDownloadProgress
+
 function Try-Download {
     param(
         [Parameter(Mandatory = $true)][string]$Url
     )
+    if ($showDownloadProgress) {
+        if (Save-UrlWithProgress -Url $Url -OutFile $tmpFile) {
+            return $true
+        }
+        # Fall through to the plain download below.
+    }
     try {
-        # Disable progress bar to avoid extreme slowdown caused by PowerShell's
-        # progress-stream rendering (can make downloads 10-50x slower).
+        # Keep Invoke-WebRequest's progress bar off: PowerShell's
+        # progress-stream rendering can make downloads 10-50x slower.
         $oldProgressPreference = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
         try {
@@ -632,9 +888,13 @@ if (-not $downloadedBinaryName) {
         $message += "`nA 404 means release '$releaseTag' does not include a Windows binary named $binaryName."
         $message += "`nWindows binaries ship with releases v1.6.8 and later - see https://github.com/$Repo/releases"
         $message += "`nIf AUTTER_RELEASE_TAG pins an older version, unset it to install the latest release."
+        $message += "`nTo install the latest release with npm instead (needs Node.js 18+):"
+        $message += "`n  npm install -g @autter/cli"
+        $message += "`n  autter onboard"
     } else {
         $message += "`nCheck your network connection, proxy, and TLS settings, then retry."
         $message += "`nReleases: https://github.com/$Repo/releases"
+        $message += "`n`n$NpmFallbackHint"
     }
     Write-ErrorAndExit $message
 }
@@ -743,49 +1003,15 @@ Write-Success "Successfully installed autter into $installDir"
 # bin directory is prepended after Git Bash's own PATH setup.
 $gitBashConfigured = $false
 $gitBashAlreadyConfigured = $false
+$targetBashConfig = $null
 try {
-    $bashrcPath = Join-Path $HOME '.bashrc'
-    $bashProfilePath = Join-Path $HOME '.bash_profile'
-    $pathCmd = 'export PATH="$HOME/.autter/bin:$PATH"'
-    $markerString = '.autter/bin'
-
-    # Detect if Git Bash is installed
-    $gitBashInstalled = $false
-    $gitForWindowsPaths = @()
-    if ($env:ProgramFiles) { $gitForWindowsPaths += Join-Path $env:ProgramFiles 'Git\bin\bash.exe' }
-    if (${env:ProgramFiles(x86)}) { $gitForWindowsPaths += Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe' }
-    if ($env:LOCALAPPDATA) { $gitForWindowsPaths += Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe' }
-    foreach ($p in $gitForWindowsPaths) {
-        if ($p -and (Test-Path -LiteralPath $p)) {
-            $gitBashInstalled = $true
-            break
-        }
-    }
-
-    if ($gitBashInstalled) {
-        # Determine which config file to update (prefer .bashrc, fall back to .bash_profile)
-        $targetBashConfig = $null
-        if (Test-Path -LiteralPath $bashrcPath) {
-            $targetBashConfig = $bashrcPath
-        } elseif (Test-Path -LiteralPath $bashProfilePath) {
-            $targetBashConfig = $bashProfilePath
-        } else {
-            # No existing config; create .bashrc
-            $targetBashConfig = $bashrcPath
-        }
-
-        # Check if already configured
-        $alreadyPresent = $false
-        if (Test-Path -LiteralPath $targetBashConfig) {
-            $content = Get-Content -LiteralPath $targetBashConfig -Raw -ErrorAction SilentlyContinue
-            if ($content -and $content.Contains($markerString)) {
-                $alreadyPresent = $true
-            }
-        }
-
-        if ($alreadyPresent) {
+    $gitBashPlan = Get-GitBashPlan
+    if ($gitBashPlan) {
+        $targetBashConfig = $gitBashPlan.Path
+        if ($gitBashPlan.AlreadyConfigured) {
             $gitBashAlreadyConfigured = $true
         } else {
+            $pathCmd = 'export PATH="$HOME/.autter/bin:$PATH"'
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
             $appendContent = "`n# Added by autter installer on $timestamp`n$pathCmd`n"
             $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

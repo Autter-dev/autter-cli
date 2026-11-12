@@ -203,6 +203,189 @@ fn show_prompt_with_offset_skips_occurrences() {
     );
 }
 
+const SAME_SECOND: [(&str, &str); 2] = [
+    ("GIT_AUTHOR_DATE", "2030-01-01T00:00:00Z"),
+    ("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z"),
+];
+
+/// A repo whose HEAD is commit A: one AI line, committed at the shared
+/// timestamp. Returns the repo, A's SHA, its note and its session ID.
+fn repo_with_same_second_ai_commit() -> (TestRepo, String, String, String) {
+    let repo = TestRepo::new();
+    let path = repo.path().join("f.txt");
+    fs::write(&path, "Base\n").unwrap();
+    repo.stage_all_and_commit("init").unwrap();
+    let mut file = repo.filename("f.txt");
+    file.assert_committed_lines(crate::lines!["Base".unattributed_human()]);
+
+    repo.autter(&["checkpoint", "human", "f.txt"]).unwrap();
+    fs::write(&path, "Base\nAI line\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "f.txt"]).unwrap();
+    let commit_a = repo
+        .stage_all_and_commit_with_env("A", &SAME_SECOND)
+        .unwrap();
+    file.assert_committed_lines(crate::lines!["Base".unattributed_human(), "AI line".ai()]);
+
+    let session = head_session_id(&repo);
+    let note = repo
+        .read_authorship_note(&commit_a.commit_sha)
+        .expect("A has an authorship note");
+    (repo, commit_a.commit_sha, note, session)
+}
+
+/// An empty commit at the shared timestamp carrying `note`, made with plain
+/// git so the background service does not write a note of its own for it.
+fn same_second_commit_with_note(repo: &TestRepo, message: &str, note: &str) -> String {
+    repo.git_og_with_env(&["commit", "--allow-empty", "-m", message], &SAME_SECOND)
+        .unwrap_or_else(|e| panic!("commit {message}: {e}"));
+    let sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let handle = autter::git::repository::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("find repository");
+    autter::git::refs::notes_add(&handle, &sha, note).expect("add note");
+    sha
+}
+
+fn show_prompt_commit(repo: &TestRepo, session: &str, offset: usize) -> String {
+    let offset = offset.to_string();
+    let output = repo
+        .autter(&["show-prompt", session, "--offset", &offset])
+        .unwrap_or_else(|e| panic!("show-prompt --offset {offset}: {e}"));
+    json(&output)["commit"].as_str().unwrap().to_string()
+}
+
+/// A, its child B and X on another branch were all committed in one second
+/// and share a session. `show-prompt` must name B before A on every run, and
+/// give X the same place every run (unrelated tied commits go by SHA). It used
+/// to name A as the latest in about a quarter of runs.
+#[test]
+fn show_prompt_same_second_commits_follow_history_past_an_unrelated_branch() {
+    let (repo, commit_a, note, session) = repo_with_same_second_ai_commit();
+    let main = repo.current_branch();
+
+    repo.git_og(&["checkout", "-q", "-b", "other", "HEAD~1"])
+        .unwrap();
+    let commit_x = same_second_commit_with_note(&repo, "X", &note);
+    repo.git_og(&["checkout", "-q", &main]).unwrap();
+    let commit_b = same_second_commit_with_note(&repo, "B", &note);
+
+    // B before A always; X by SHA among whatever is ready when it is its turn.
+    let expected: Vec<&String> = if commit_x < commit_b {
+        vec![&commit_x, &commit_b, &commit_a]
+    } else if commit_x < commit_a {
+        vec![&commit_b, &commit_x, &commit_a]
+    } else {
+        vec![&commit_b, &commit_a, &commit_x]
+    };
+
+    for run in 0..8 {
+        for (offset, sha) in expected.iter().enumerate() {
+            assert_eq!(
+                &show_prompt_commit(&repo, &session, offset),
+                *sha,
+                "run {run}, offset {offset}: expected order {expected:?} (A={commit_a} B={commit_b} X={commit_x})"
+            );
+        }
+    }
+    let err = repo
+        .autter(&["show-prompt", &session, "--offset", "3"])
+        .expect_err("only three commits carry the session");
+    assert!(err.contains("found 3 time(s)"), "{err}");
+}
+
+/// A merge commit made in the same second as both parents is the latest.
+#[test]
+fn show_prompt_same_second_merge_commit_is_latest() {
+    let (repo, commit_a, note, session) = repo_with_same_second_ai_commit();
+    let main = repo.current_branch();
+
+    repo.git_og(&["checkout", "-q", "-b", "other", "HEAD~1"])
+        .unwrap();
+    let commit_x = same_second_commit_with_note(&repo, "X", &note);
+    repo.git_og(&["checkout", "-q", &main]).unwrap();
+    repo.git_og_with_env(&["merge", "--no-ff", "-m", "M", "other"], &SAME_SECOND)
+        .unwrap();
+    let commit_m = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let handle = autter::git::repository::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("find repository");
+    autter::git::refs::notes_add(&handle, &commit_m, &note).expect("add note");
+
+    let parents_by_sha = if commit_a < commit_x {
+        [&commit_a, &commit_x]
+    } else {
+        [&commit_x, &commit_a]
+    };
+    for run in 0..6 {
+        assert_eq!(
+            show_prompt_commit(&repo, &session, 0),
+            commit_m,
+            "run {run}: the merge descends from both A and X"
+        );
+        assert_eq!(&show_prompt_commit(&repo, &session, 1), parents_by_sha[0]);
+        assert_eq!(&show_prompt_commit(&repo, &session, 2), parents_by_sha[1]);
+    }
+}
+
+/// Ordering commits that share a second must not cost a git process per pair
+/// of them: 41 tied commits used to take hundreds of `git merge-base` calls.
+#[test]
+fn show_prompt_git_process_count_stays_linear_for_same_second_commits() {
+    const TIED_COMMITS: usize = 40;
+    let (repo, commit_a, note, session) = repo_with_same_second_ai_commit();
+    let mut tip = commit_a.clone();
+    for n in 0..TIED_COMMITS {
+        tip = same_second_commit_with_note(&repo, &format!("c{n}"), &note);
+    }
+
+    let trace = repo.path().join("git-trace.log");
+    let trace_path = trace.to_str().unwrap().to_string();
+    let output = repo
+        .autter_with_env(&["show-prompt", &session], &[("GIT_TRACE", &trace_path)])
+        .expect("show-prompt");
+    assert_eq!(
+        json(&output)["commit"].as_str(),
+        Some(tip.as_str()),
+        "the tip of the chain is the latest occurrence"
+    );
+    assert_eq!(
+        show_prompt_commit(&repo, &session, TIED_COMMITS),
+        commit_a,
+        "the first commit of the chain is the oldest occurrence"
+    );
+
+    let log = fs::read_to_string(&trace).expect("git wrote its trace");
+    let git_processes = log
+        .lines()
+        .filter(|line| line.contains("trace: built-in: git"))
+        .count();
+    let pairwise = log
+        .lines()
+        .filter(|line| line.contains("merge-base"))
+        .count();
+    assert!(
+        git_processes > 0,
+        "the trace should list git processes:\n{log}"
+    );
+    assert!(
+        pairwise <= 1,
+        "ordering {} tied commits ran `git merge-base` {pairwise} times",
+        TIED_COMMITS + 1
+    );
+    // One note read per matching commit, plus a handful to find and order them.
+    assert!(
+        git_processes <= 2 * (TIED_COMMITS + 1) + 12,
+        "show-prompt ran {git_processes} git processes for {} tied commits",
+        TIED_COMMITS + 1
+    );
+}
+
 /// One committed AI line (line 2) under a known-human line, so blame has a
 /// prompt to point at.
 fn repo_with_ai_line() -> TestRepo {

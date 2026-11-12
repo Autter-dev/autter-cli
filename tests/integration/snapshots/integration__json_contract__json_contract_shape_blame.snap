@@ -3,6 +3,15 @@ source: tests/integration/json_contract.rs
 expression: shape_text(&document)
 ---
 {
+  "category_counts": {
+    "ai": "integer",
+    "human": "integer",
+    "unknown": "integer",
+    "untracked": "integer"
+  },
+  "line_categories": {
+    "<key>": "string"
+  },
   "lines": {
     "<key>": "string"
   },

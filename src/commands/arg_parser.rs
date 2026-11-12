@@ -21,8 +21,9 @@ pub struct GlobalFlags {
     pub json: bool,
     pub quiet: bool,
     pub no_color: bool,
-    /// `--strict`: `stats`, `status` and `doctor` exit 3/4 when nothing was
-    /// captured or capture is broken (see `commands::output`).
+    /// `--strict`: `stats` and `status` exit 3 when Autter has no record of
+    /// what was added, and `doctor` exits 4 when capture is broken (see
+    /// `commands::output`).
     pub strict: bool,
     /// Resolved `-C <path>` value, if supplied. The caller chdirs into it.
     pub change_dir: Option<String>,
@@ -156,6 +157,23 @@ pub fn merge_global_flags(f: &GlobalFlags) {
     }
     if f.strict {
         g.strict = true;
+    }
+}
+
+/// Record `--json` when it appears anywhere in `args` before a `--`
+/// separator. Called before a command's own parsing (and before the
+/// dispatcher contacts the background service), so a failure that happens
+/// first is still reported as a JSON document.
+pub fn merge_json_flag_from(args: &[String]) {
+    if args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--json")
+    {
+        merge_global_flags(&GlobalFlags {
+            json: true,
+            ..Default::default()
+        });
     }
 }
 
@@ -402,8 +420,11 @@ autter stats [commit|<a>..<b>]
                       (captured | nothing_captured | no_additions), and
                       `record`: whether the commit has an Autter record and,
                       if not, why
-  --strict            Exit 3 when lines were added and none is attributed to
-                      AI or a known human (also AUTTER_STRICT=1)
+  --strict            Exit 3 when lines were added and Autter has no record
+                      of them (every added line is unknown): capture missed
+                      the commit. A recorded commit typed entirely by hand
+                      exits 0. A merge commit is judged on the lines it adds
+                      itself (also AUTTER_STRICT=1)
   --ignore <pat>      Ignore files matching the given pattern(s)
   --wait[=secs]       Wait for the authorship note (default 30s); exit 1 if still pending
   --coverage [range]  Which commits have an Autter record (default: the last
@@ -500,8 +521,10 @@ autter status [--json] [--strict]
   Show uncommitted AI authorship status since the last commit (debug).
 
   --json     One JSON document with lines, percent, capture and checkpoints
-  --strict   Exit 3 when there are uncommitted changes and none is
-             attributed to AI or a known human (also AUTTER_STRICT=1)",
+  --strict   Exit 3 when there are uncommitted changes, no checkpoint was
+             recorded for them and the background service is not running, so
+             a commit made now would get no record. Changes typed by hand
+             while capture is working exit 0 (also AUTTER_STRICT=1)",
     },
     HelpEntry {
         name: "show",
@@ -553,7 +576,9 @@ autter show-prompt <id> [--commit <rev> | --offset <n>]
 
   --commit <rev>   Look in that commit's note only
   --offset <n>     Skip n occurrences, newest first (0 = most recent);
-                   cannot be combined with --commit",
+                   cannot be combined with --commit. Commits made in the
+                   same second are ordered by history (a commit before its
+                   ancestors); unrelated ones by ascending commit SHA",
     },
     HelpEntry {
         name: "config",
@@ -580,7 +605,7 @@ autter config [<key> | set <key> <value> | unset <key>]
         name: "doctor",
         aliases: &[],
         summary: "Validate the autter setup end-to-end",
-        body: "autter doctor [--json] [--strict] [--skip-trace2-checks]
+        body: "autter doctor [--json] [--strict] [--skip-trace2-checks] [--report <file>]
 
   Run setup validation checks: git and config, the background service,
   trace2 capture, a real end-to-end checkpoint round-trip, AI agent hooks,
@@ -593,7 +618,12 @@ autter config [<key> | set <key> <value> | unset <key>]
   --json                 Machine-readable single-line JSON report
                          (capture_ok, and an error object when it fails)
   --strict               Exit 4 when capture is broken (also AUTTER_STRICT=1)
-  --skip-trace2-checks   Skip the trace2 event-capture self-check",
+  --skip-trace2-checks   Skip the trace2 event-capture self-check
+  --report <file>        Also write a support report to <file>: these
+                         results, service start timings, the lock file,
+                         the last 200 lines of the service log, git and OS
+                         versions, and whether this runs elevated. No
+                         source code, file contents or tokens.",
     },
     HelpEntry {
         name: "sync",
@@ -602,6 +632,7 @@ autter config [<key> | set <key> <value> | unset <key>]
         body: "autter sync status [--json]
 autter sync purge --force
 autter sync import --yes
+autter sync retry
 autter sync open
 
   Show local upload queues, the last confirmed metrics batch, and the next
@@ -613,6 +644,9 @@ autter sync open
   `import` uploads the held backlog: records queued before you connected this
   machine, or by an older autter version. Held records never upload on their
   own. Without --yes it only shows what is held.
+
+  `retry` queues usage-metrics events again that were set aside because the
+  server failed on them every time. Set-aside events are kept, not uploaded.
 
   An empty queue does not confirm upload of every local change.
   Status exits 0 when upload is off or no problem is detected. It exits 1
@@ -1011,8 +1045,9 @@ pub fn print_overview() {
     eprintln!();
     eprintln!("Global flags (available on most commands):");
     eprintln!("  --json        One JSON document on stdout, with schema_version");
-    eprintln!("  --strict      stats/status/doctor: exit 3 when nothing was captured,");
-    eprintln!("                4 when capture is broken (also AUTTER_STRICT=1)");
+    eprintln!("  --strict      stats/status: exit 3 when nothing was captured (Autter has");
+    eprintln!("                no record of the added lines); doctor: exit 4 when");
+    eprintln!("                capture is broken (also AUTTER_STRICT=1)");
     eprintln!("  --quiet       Suppress non-essential output");
     eprintln!("  --no-color    Disable colored output");
     eprintln!("  -C <path>     Run as if autter was started in <path>");
@@ -1036,7 +1071,8 @@ pub const EXIT_CODES_HELP: &str = "Exit codes:
   0   Success
   1   Runtime error
   2   Usage error (bad flags, outside a repository)
-  3   Nothing captured (stats, status; only with --strict)
+  3   Nothing captured: Autter has no record of the added lines
+      (stats, status; only with --strict)
   4   Capture is broken (doctor; only with --strict)
 
 With --json, a failure prints {\"schema_version\":1,\"error\":{\"code\",\"message\",\"exit_code\"}}.

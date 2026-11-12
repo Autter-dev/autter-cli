@@ -8,7 +8,7 @@ use crate::api::{ApiClient, ApiContext, CasObject, CasUploadRequest};
 use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::metrics::db::MetricsDatabase;
-use crate::metrics::sync_state::MetricsSyncState;
+use crate::metrics::sync_state::{FailedBatchAction, MetricsSyncState};
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::split_metrics_envelopes;
 use serde_json::{Value, json};
@@ -557,7 +557,11 @@ fn flush_metrics(events: &[MetricEvent]) {
     // queue instead of trying (and timing out) again on every tick; the
     // durable replay retries them on its backoff schedule.
     let mut state = MetricsSyncState::load();
-    if state.backoff_active(unix_now_secs()) {
+    let now = unix_now_secs();
+    if state.clamp_backoff(now) {
+        state.save();
+    }
+    if state.backoff_active(now) {
         store_metrics_in_db(events);
         return;
     }
@@ -584,7 +588,7 @@ fn flush_metrics(events: &[MetricEvent]) {
                     // Older versions recorded metrics failures in the shared
                     // cloud-sync failure record; drop any left behind.
                     crate::auth::notice::clear_upload_failure_for("metrics");
-                    state.record_success(unix_now_secs(), chunk.len(), 0);
+                    state.record_success(unix_now_secs(), chunk.len());
                     state_changed = true;
                     continue;
                 }
@@ -664,6 +668,11 @@ fn flush_stored_metrics() {
 
     let now = unix_now_secs();
     let mut state = MetricsSyncState::load();
+    // A clock that stepped backward must not leave the retry time far in the
+    // future: the wait is bounded by the backoff, counted from now.
+    if state.clamp_backoff(now) {
+        state.save();
+    }
     if state.backoff_active(now) {
         return;
     }
@@ -677,7 +686,10 @@ fn flush_stored_metrics() {
         return;
     }
 
-    let outcome = replay_metrics_batch(db, &mut state, now, &mut |batch| {
+    // The clock is read when each answer arrives, not before the request: a
+    // request that takes a minute to fail must still be followed by the full
+    // backoff.
+    let outcome = replay_metrics_batch(db, &mut state, &unix_now_secs, &mut |batch| {
         client.upload_metrics_classified(batch)
     });
     if outcome.is_empty() {
@@ -696,8 +708,9 @@ fn flush_stored_metrics() {
         rejected = outcome.retried,
         dropped_oversized = outcome.dropped_oversized,
         dropped_invalid = outcome.dropped_invalid,
+        set_aside = outcome.set_aside,
         next_batch = state.batch_limit(),
-        remaining = pending.saturating_sub(outcome.accepted + dropped),
+        remaining = pending.saturating_sub(outcome.accepted + dropped + outcome.set_aside),
         "metrics: replayed durable queue batch"
     );
 }
@@ -715,6 +728,9 @@ pub(crate) struct ReplayOutcome {
     /// Events that can't be parsed or that the server refused to validate;
     /// dropped.
     pub dropped_invalid: usize,
+    /// Single events the server failed on every time; moved out of the
+    /// queue and kept.
+    pub set_aside: usize,
     /// The failure that ended the pass, if one did.
     pub failure: Option<MetricsUploadFailure>,
 }
@@ -725,7 +741,41 @@ impl ReplayOutcome {
             && self.retried == 0
             && self.dropped_oversized == 0
             && self.dropped_invalid == 0
+            && self.set_aside == 0
             && self.failure.is_none()
+    }
+}
+
+/// Delete rows the server can never accept, and count them in `state` right
+/// away: the count must not depend on how the rest of the pass goes.
+fn drop_undeliverable(
+    db: &std::sync::Mutex<MetricsDatabase>,
+    state: &mut MetricsSyncState,
+    ids: &[i64],
+    why: &str,
+) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    match db
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .delete_records(ids)
+    {
+        Ok(()) => {
+            state.record_dropped(ids.len());
+            tracing::warn!(
+                dropped = ids.len(),
+                dropped_total = state.dropped_total,
+                reason = why,
+                "metrics: dropped events that can never upload"
+            );
+            ids.len()
+        }
+        Err(error) => {
+            tracing::warn!(%error, reason = why, "metrics: failed to drop undeliverable events");
+            0
+        }
     }
 }
 
@@ -733,10 +783,14 @@ impl ReplayOutcome {
 /// `state` with the result. The first failed request ends the pass: the rest
 /// of the batch waits for the backoff, at the smaller size if the failure
 /// says a smaller batch could succeed.
+///
+/// `clock` returns unix seconds. It is read when an answer arrives, so the
+/// backoff after a failure starts when the failure was seen, however long the
+/// request took.
 pub(crate) fn replay_metrics_batch(
     db: &std::sync::Mutex<MetricsDatabase>,
     state: &mut MetricsSyncState,
-    now: i64,
+    clock: &dyn Fn() -> i64,
     upload: &mut dyn FnMut(&MetricsBatch) -> Result<MetricsUploadResponse, MetricsUploadFailure>,
 ) -> ReplayOutcome {
     let mut outcome = ReplayOutcome {
@@ -771,15 +825,8 @@ pub(crate) fn replay_metrics_batch(
         }
     }
 
-    if !unparseable_ids.is_empty()
-        && db
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .delete_records(&unparseable_ids)
-            .is_ok()
-    {
-        outcome.dropped_invalid += unparseable_ids.len();
-    }
+    outcome.dropped_invalid +=
+        drop_undeliverable(db, state, &unparseable_ids, "not a metric event");
     if events.is_empty() {
         return outcome;
     }
@@ -793,14 +840,20 @@ pub(crate) fn replay_metrics_batch(
     let mut accepted_ids: Vec<i64> = Vec::new();
     let mut retry_ids: Vec<i64> = Vec::new();
     let mut retry_errors: Vec<String> = Vec::new();
-    let mut poisoned_ids: Vec<i64> = Vec::new();
     let mut invalid_ids: Vec<i64> = Vec::new();
+    // The server answered at least one request with a 200.
+    let mut answered = false;
+    // The largest request for which the server said "retry later" for some
+    // rows: it ran out of time, so the next batch must be smaller than this.
+    let mut out_of_time_size: Option<usize> = None;
     for envelope in envelopes {
         let ids = &uploaded_ids[id_offset..id_offset + envelope.len()];
         id_offset += envelope.len();
         let size = envelope.len();
-        match upload(&MetricsBatch::new(envelope)) {
+        let batch = MetricsBatch::new(envelope);
+        match upload(&batch) {
             Ok(response) => {
+                answered = true;
                 accepted_ids.extend(
                     response
                         .successful_indices(ids.len())
@@ -819,6 +872,9 @@ pub(crate) fn replay_metrics_batch(
                         invalid_ids.push(id);
                         envelope_invalid += 1;
                     } else {
+                        if crate::api::metrics::is_retry_later(&error.error) {
+                            out_of_time_size = Some(out_of_time_size.unwrap_or(0).max(size));
+                        }
                         retry_ids.push(id);
                         retry_errors.push(error.error.clone());
                     }
@@ -831,14 +887,26 @@ pub(crate) fn replay_metrics_batch(
                 }
             }
             Err(failure) => {
+                let now = clock();
                 // Poison message: a lone event the server rejects by size can
-                // never upload through the size-limited endpoint. Drop it
-                // loudly instead of wedging thousands of events behind it.
+                // never upload through the size-limited endpoint. It is
+                // deleted so it cannot wedge thousands of events behind it,
+                // and the deletion is logged and counted.
                 if ids.len() == 1 && failure.http_status() == Some(413) {
-                    poisoned_ids.push(ids[0]);
+                    let bytes = serde_json::to_vec(&batch)
+                        .map(|body| body.len())
+                        .unwrap_or(0);
                     tracing::warn!(
                         record_id = ids[0],
-                        "metrics: dropping oversized event the server cannot accept (HTTP 413)"
+                        request_bytes = bytes,
+                        error = %failure.summary(),
+                        "metrics: a single event is too large for the server (HTTP 413)"
+                    );
+                    outcome.dropped_oversized += drop_undeliverable(
+                        db,
+                        state,
+                        ids,
+                        "single event refused as too large (HTTP 413)",
                     );
                     continue;
                 }
@@ -849,56 +917,103 @@ pub(crate) fn replay_metrics_batch(
                     events = size,
                     "metrics: durable queue upload failed; retained for retry"
                 );
-                state.record_failure(now, &failure, size);
-                outcome.failure = Some(failure);
-                break;
+                match state.record_batch_failure(now, &failure, size, ids[0]) {
+                    FailedBatchAction::Retry => {
+                        outcome.failure = Some(failure);
+                        break;
+                    }
+                    FailedBatchAction::SetAside => {
+                        // The same single event got the same error every
+                        // time. It is kept, out of the queue, so the events
+                        // behind it can upload.
+                        let reason = failure.summary();
+                        let moved = db
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .set_aside(ids, &reason, now);
+                        match moved {
+                            Ok(moved) if moved > 0 => {
+                                state.record_set_aside(moved);
+                                outcome.set_aside += moved;
+                                tracing::warn!(
+                                    record_id = ids[0],
+                                    error = %reason,
+                                    set_aside_total = state.set_aside_total,
+                                    "metrics: set aside an event the server fails on every time; it is kept on this computer"
+                                );
+                                continue;
+                            }
+                            Ok(_) => {
+                                outcome.failure = Some(failure);
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "metrics: failed to set aside a failing event");
+                                outcome.failure = Some(failure);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    if !accepted_ids.is_empty()
-        || !retry_ids.is_empty()
-        || !poisoned_ids.is_empty()
-        || !invalid_ids.is_empty()
-    {
+    if !accepted_ids.is_empty() || !retry_ids.is_empty() {
         let mut lock = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match lock.finish_upload(&accepted_ids, &retry_ids) {
             Ok(()) => {
                 outcome.accepted = accepted_ids.len();
                 outcome.retried = retry_ids.len();
-                // Permanently undeliverable rows (oversized singles rejected by
-                // size, events refused by validation) are deleted so they can't
-                // wedge the queue behind them.
-                let mut dropped_ids = poisoned_ids.clone();
-                dropped_ids.extend(invalid_ids.iter().copied());
-                if lock.delete_records(&dropped_ids).is_ok() {
-                    outcome.dropped_oversized = poisoned_ids.len();
-                    outcome.dropped_invalid += invalid_ids.len();
-                }
             }
             Err(error) => {
                 tracing::warn!(%error, "metrics: failed to update durable queue after upload");
             }
         }
     }
+    // Events refused by validation are deleted so they can't wedge the queue
+    // behind them.
+    outcome.dropped_invalid += drop_undeliverable(
+        db,
+        state,
+        &invalid_ids,
+        "the server refused to validate them",
+    );
 
-    if outcome.failure.is_none() {
-        if accepted_ids.is_empty() && !retry_ids.is_empty() {
-            // The server answered but took none of the events, for a reason
-            // a retry may fix. Wait before trying again; size isn't the issue.
-            let failure = MetricsUploadFailure::NotAccepted {
-                count: retry_ids.len(),
-                error: retry_errors.first().cloned().unwrap_or_default(),
-            };
-            state.record_failure(now, &failure, outcome.requested);
-            outcome.failure = Some(failure);
-        } else {
-            state.record_success(
-                now,
-                outcome.accepted,
-                outcome.dropped_oversized + outcome.dropped_invalid,
-            );
-        }
+    if outcome.failure.is_some() {
+        // Requests before the one that failed may have uploaded events.
+        state.uploaded_total += outcome.accepted as u64;
+        return outcome;
+    }
+    let now = clock();
+    if accepted_ids.is_empty() && !retry_ids.is_empty() {
+        // The server answered but took none of the events, for a reason a
+        // retry may fix. Wait before trying again. When the reason is that it
+        // ran out of time, the failure also halves the batch.
+        let failure = MetricsUploadFailure::NotAccepted {
+            count: retry_ids.len(),
+            error: retry_errors
+                .iter()
+                .find(|error| crate::api::metrics::is_retry_later(error))
+                .or(retry_errors.first())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        state.record_failure(now, &failure, out_of_time_size.unwrap_or(outcome.requested));
+        state.repeated_failure = None;
+        outcome.failure = Some(failure);
+    } else if let Some(size) = out_of_time_size {
+        // Part of the batch was written and the rest came back "retry
+        // later": the server ran out of time, so send less next time.
+        tracing::info!(
+            events = size,
+            accepted = outcome.accepted,
+            retry_later = outcome.retried,
+            "metrics: the server ran out of time on this batch; the next one is smaller"
+        );
+        state.record_partial_success(now, outcome.accepted, size);
+    } else if answered || outcome.dropped_oversized > 0 {
+        state.record_success(now, outcome.accepted);
     }
     outcome
 }
@@ -1793,7 +1908,7 @@ mod tests {
                     break;
                 }
                 now = now.max(state.next_attempt_at);
-                let outcome = replay_metrics_batch(&db, &mut state, now, &mut |batch| {
+                let outcome = replay_metrics_batch(&db, &mut state, &|| now, &mut |batch| {
                     client.upload_metrics_classified(batch)
                 });
                 if let Some(failure) = &outcome.failure
@@ -1837,7 +1952,7 @@ mod tests {
         fn a_failure_ends_the_pass_and_backs_off_without_losing_events() {
             let (db, _dir) = queue_with(30);
             let mut state = MetricsSyncState::default();
-            let outcome = replay_metrics_batch(&db, &mut state, 50, &mut |_| {
+            let outcome = replay_metrics_batch(&db, &mut state, &|| 50, &mut |_| {
                 Err(MetricsUploadFailure::Http {
                     status: 500,
                     body: r#"{"error":"Data-plane operation failed"}"#.to_string(),
@@ -1859,7 +1974,7 @@ mod tests {
         fn a_lone_event_refused_as_too_large_is_dropped() {
             let (db, _dir) = queue_with(1);
             let mut state = MetricsSyncState::default();
-            let outcome = replay_metrics_batch(&db, &mut state, 0, &mut |_| {
+            let outcome = replay_metrics_batch(&db, &mut state, &|| 0, &mut |_| {
                 Err(MetricsUploadFailure::Http {
                     status: 413,
                     body: String::new(),
@@ -1876,11 +1991,266 @@ mod tests {
             );
         }
 
+        fn set_aside(db: &Mutex<MetricsDatabase>) -> usize {
+            db.lock().unwrap().count_set_aside().unwrap()
+        }
+
+        fn http(status: u16) -> MetricsUploadFailure {
+            MetricsUploadFailure::Http {
+                status,
+                body: r#"{"error":"Data-plane operation failed"}"#.to_string(),
+            }
+        }
+
+        fn ok() -> Result<MetricsUploadResponse, MetricsUploadFailure> {
+            Ok(MetricsUploadResponse { errors: Vec::new() })
+        }
+
+        /// A request that takes a minute to fail. The backoff used to be
+        /// counted from before the request, so the 5-second wait was already
+        /// over when the failure arrived and the retry fired on the next
+        /// tick.
+        #[test]
+        fn the_backoff_starts_when_the_failure_is_seen_not_when_the_request_started() {
+            let (db, _dir) = queue_with(10);
+            let mut state = MetricsSyncState::default();
+            let clock = std::cell::Cell::new(1_000_i64);
+            let outcome = replay_metrics_batch(&db, &mut state, &|| clock.get(), &mut |_| {
+                clock.set(clock.get() + 60);
+                Err(MetricsUploadFailure::Timeout {
+                    after_secs: Some(60),
+                })
+            });
+            assert!(outcome.failure.is_some());
+            assert_eq!(state.last_failure.as_ref().unwrap().at, 1_060);
+            assert_eq!(state.next_attempt_at, 1_065);
+            assert!(
+                state.backoff_active(clock.get()),
+                "the queue still waits after a slow failure"
+            );
+        }
+
+        /// Two events that each fill a request on their own: the first is
+        /// refused as too large and dropped, the second fails. The drop used
+        /// to be counted only when the whole pass succeeded.
+        #[test]
+        fn a_dropped_oversized_event_is_counted_even_when_the_pass_then_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut queue = MetricsDatabase::open_at(&dir.path().join("metrics.db")).unwrap();
+            let big = |index: u32| {
+                let mut attrs = std::collections::HashMap::new();
+                attrs.insert(
+                    "0".to_string(),
+                    serde_json::Value::String("x".repeat(2_500_000)),
+                );
+                serde_json::to_string(&MetricEvent {
+                    timestamp: 1_760_000_000 + index,
+                    event_id: 1,
+                    values: Default::default(),
+                    attrs,
+                })
+                .unwrap()
+            };
+            queue.insert_events(&[big(0), big(1)]).unwrap();
+            let db = Mutex::new(queue);
+            let mut state = MetricsSyncState::default();
+            let mut calls = 0;
+            let outcome = replay_metrics_batch(&db, &mut state, &|| 100, &mut |batch| {
+                calls += 1;
+                assert_eq!(batch.events.len(), 1, "each event is its own request");
+                Err(if calls == 1 { http(413) } else { http(503) })
+            });
+            assert_eq!(calls, 2);
+            assert_eq!(outcome.dropped_oversized, 1);
+            assert_eq!(queued(&db), 1, "the second event is kept for retry");
+            assert_eq!(set_aside(&db), 0);
+            assert_eq!(state.dropped_total, 1, "the drop is counted");
+            assert_eq!(state.last_failure.as_ref().unwrap().http_status, Some(503));
+            let status = UsageMetricsStatus::from_state(&state, 1, 100);
+            assert!(
+                status.summary_line().contains("1 dropped as unacceptable"),
+                "{}",
+                status.summary_line()
+            );
+        }
+
+        #[test]
+        fn a_queued_row_that_is_not_an_event_is_counted_when_dropped() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut queue = MetricsDatabase::open_at(&dir.path().join("metrics.db")).unwrap();
+            queue.insert_events(&["not json".to_string()]).unwrap();
+            let db = Mutex::new(queue);
+            let mut state = MetricsSyncState::default();
+            let outcome =
+                replay_metrics_batch(&db, &mut state, &|| 0, &mut |_| panic!("nothing to upload"));
+            assert_eq!(outcome.dropped_invalid, 1);
+            assert_eq!(queued(&db), 0);
+            assert_eq!(state.dropped_total, 1);
+        }
+
+        /// The server wrote the first 400 events and answered "retry later"
+        /// for the rest (its 20-second write budget ran out). The same full
+        /// batch used to be sent again.
+        #[test]
+        fn retry_later_for_part_of_a_batch_halves_the_next_one() {
+            let (db, _dir) = queue_with(1000);
+            let mut state = MetricsSyncState::default();
+            let mut sizes = Vec::new();
+            let outcome = replay_metrics_batch(&db, &mut state, &|| 100, &mut |batch| {
+                sizes.push(batch.events.len());
+                Ok(MetricsUploadResponse {
+                    errors: (400..batch.events.len())
+                        .map(|index| MetricsUploadError {
+                            index,
+                            error: "retry later: the server ran out of time writing this batch"
+                                .to_string(),
+                        })
+                        .collect(),
+                })
+            });
+            assert_eq!(outcome.accepted, 400);
+            assert_eq!(outcome.retried, 600);
+            assert!(outcome.failure.is_none(), "progress is not a failure");
+            assert_eq!(queued(&db), 600, "the rest is kept");
+            assert_eq!(state.batch_limit(), 500, "the next batch is half the size");
+            assert!(!state.backoff_active(100));
+            assert_eq!(state.uploaded_total, 400);
+
+            // The next pass sends 500 events, not 1,000.
+            replay_metrics_batch(&db, &mut state, &|| 101, &mut |batch| {
+                sizes.push(batch.events.len());
+                ok()
+            });
+            assert_eq!(sizes, vec![1000, 500]);
+            assert_eq!(queued(&db), 100);
+        }
+
+        #[test]
+        fn retry_later_for_a_whole_batch_halves_it_and_backs_off() {
+            let (db, _dir) = queue_with(1000);
+            let mut state = MetricsSyncState::default();
+            let outcome = replay_metrics_batch(&db, &mut state, &|| 100, &mut |batch| {
+                Ok(MetricsUploadResponse {
+                    errors: (0..batch.events.len())
+                        .map(|index| MetricsUploadError {
+                            index,
+                            error: "retry later: the server ran out of time writing this batch"
+                                .to_string(),
+                        })
+                        .collect(),
+                })
+            });
+            assert_eq!(queued(&db), 1000, "nothing dropped");
+            assert_eq!(state.batch_limit(), 500);
+            assert!(state.backoff_active(100));
+            let failure = outcome.failure.expect("nothing was accepted");
+            assert_eq!(failure.kind(), MetricsFailureKind::TooLarge);
+            let record = state.last_failure.as_ref().unwrap();
+            assert_eq!(record.batch_size, 1000);
+            assert!(record.error.contains("retry later"), "{}", record.error);
+        }
+
+        /// Drive the queue until it is empty or `passes` run out, moving the
+        /// clock to each retry time. The server fails with HTTP 500 for any
+        /// request that contains an event `is_bad` says is bad.
+        fn drain(
+            db: &Mutex<MetricsDatabase>,
+            state: &mut MetricsSyncState,
+            passes: usize,
+            is_bad: &dyn Fn(&MetricEvent) -> bool,
+        ) -> (Vec<usize>, i64) {
+            let mut sizes = Vec::new();
+            let mut now = 1_000;
+            for _ in 0..passes {
+                if queued(db) == 0 {
+                    break;
+                }
+                now = now.max(state.next_attempt_at);
+                replay_metrics_batch(db, state, &|| now, &mut |batch| {
+                    sizes.push(batch.events.len());
+                    if batch.events.iter().any(is_bad) {
+                        Err(http(500))
+                    } else {
+                        ok()
+                    }
+                });
+            }
+            (sizes, now - 1_000)
+        }
+
+        /// The reported bug: the server answers HTTP 500 for the same rows
+        /// every time. The first 1,000 rows were re-read and re-sent forever,
+        /// so nothing behind them uploaded. Now the batch is narrowed down to
+        /// the failing rows, they are set aside (kept), and the rest drains.
+        #[test]
+        fn a_server_error_tied_to_two_events_sets_them_aside_and_the_rest_drains() {
+            let (db, _dir) = queue_with(1200);
+            let bad = [1_760_000_000 + 3, 1_760_000_000 + 700];
+            let mut state = MetricsSyncState::default();
+            let (sizes, elapsed) = drain(&db, &mut state, 400, &|event| {
+                bad.contains(&event.timestamp)
+            });
+
+            assert_eq!(queued(&db), 0, "the queue drained past the failing rows");
+            assert_eq!(set_aside(&db), 2, "the two failing events are kept");
+            assert_eq!(state.set_aside_total, 2);
+            assert_eq!(state.uploaded_total, 1198);
+            assert_eq!(state.dropped_total, 0, "nothing was deleted");
+            assert_eq!(
+                &sizes[..5],
+                &[1000, 1000, 1000, 500, 250],
+                "three identical failures, then the batch is halved: {sizes:?}"
+            );
+            assert!(elapsed < 3600, "isolation is bounded: took {elapsed}s");
+            assert_eq!(
+                db.lock()
+                    .unwrap()
+                    .last_set_aside_reason()
+                    .unwrap()
+                    .as_deref(),
+                Some(r#"HTTP 500: {"error":"Data-plane operation failed"}"#)
+            );
+
+            // doctor and sync status say how many, and what to do.
+            let status = UsageMetricsStatus::from_state(&state, 0, 0).with_set_aside(2, None);
+            assert!(!status.failing);
+            assert!(status.summary_line().contains("2 set aside"));
+
+            // `autter sync retry` queues them again; with the server fixed
+            // they upload.
+            assert_eq!(db.lock().unwrap().release_set_aside().unwrap(), 2);
+            assert_eq!(queued(&db), 2);
+            drain(&db, &mut state, 5, &|_| false);
+            assert_eq!(queued(&db), 0);
+            assert_eq!(state.uploaded_total, 1200);
+        }
+
+        /// When the server fails on everything (an outage), events are still
+        /// never deleted, and few are set aside: the wait between attempts
+        /// keeps growing.
+        #[test]
+        fn a_server_that_fails_on_everything_loses_nothing() {
+            let (db, _dir) = queue_with(50);
+            let mut state = MetricsSyncState::default();
+            let mut now = 1_000;
+            while now < 1_000 + 2 * 3600 {
+                now = now.max(state.next_attempt_at) + 3;
+                replay_metrics_batch(&db, &mut state, &|| now, &mut |_| Err(http(500)));
+            }
+            assert_eq!(queued(&db) + set_aside(&db), 50, "every event is kept");
+            assert_eq!(state.dropped_total, 0);
+            assert!(
+                set_aside(&db) <= 4,
+                "two hours of failures set aside {} events",
+                set_aside(&db)
+            );
+        }
+
         #[test]
         fn retryable_per_event_errors_with_nothing_accepted_back_off() {
             let (db, _dir) = queue_with(3);
             let mut state = MetricsSyncState::default();
-            let outcome = replay_metrics_batch(&db, &mut state, 0, &mut |batch| {
+            let outcome = replay_metrics_batch(&db, &mut state, &|| 0, &mut |batch| {
                 Ok(MetricsUploadResponse {
                     errors: (0..batch.events.len())
                         .map(|index| MetricsUploadError {
