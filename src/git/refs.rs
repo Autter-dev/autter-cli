@@ -123,7 +123,7 @@ fn parse_cat_file_batch_output_with_oids(
     Ok(results)
 }
 
-fn batch_read_blob_contents(
+pub(crate) fn batch_read_blob_contents(
     repo: &Repository,
     blob_oids: &[String],
 ) -> Result<HashMap<String, String>, AutterError> {
@@ -296,6 +296,12 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
         }
     }
     deduped_entries.reverse();
+    // Bind every note to the commit it is written for (note_integrity.rs).
+    // This is the one place every git-notes write goes through, including
+    // rewrites after rebase, amend and cherry-pick, so each is stamped again
+    // for its new commit.
+    let deduped_entries =
+        crate::authorship::note_integrity::stamp_note_entries(repo, &deduped_entries);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -562,7 +568,9 @@ pub fn commits_with_authorship_notes(
 pub fn get_authorship(repo: &Repository, commit_sha: &str) -> Option<AuthorshipLog> {
     let content = show_authorship_note(repo, commit_sha)?;
     let mut authorship_log = AuthorshipLog::deserialize_from_string(&content).ok()?;
-    // Keep metadata aligned with the commit where this note is attached.
+    // Keep metadata aligned with the commit where this note is attached. The
+    // recorded value is not lost: the integrity check reads the raw note
+    // (note_integrity.rs), and stats and blame skip notes that fail it.
     authorship_log.metadata.base_commit_sha = commit_sha.to_string();
     Some(authorship_log)
 }
@@ -603,7 +611,9 @@ pub fn get_reference_as_authorship_log_v3(
         )));
     }
 
-    // Keep metadata aligned with the commit where this note is attached.
+    // Keep metadata aligned with the commit where this note is attached. The
+    // recorded value is not lost: the integrity check reads the raw note
+    // (note_integrity.rs), and stats and blame skip notes that fail it.
     authorship_log.metadata.base_commit_sha = commit_sha.to_string();
 
     Ok(authorship_log)

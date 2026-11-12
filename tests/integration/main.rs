@@ -103,6 +103,7 @@ mod merge_rebase;
 mod metrics_queue_state;
 mod multi_repo_workspace;
 mod non_utf8_files;
+mod note_integrity_check;
 mod notes_backend_mode_switch;
 mod notes_merge_mixed_fanout;
 mod onboard_setup_report;

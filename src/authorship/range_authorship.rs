@@ -457,7 +457,9 @@ fn calculate_range_stats_direct(
     // Special case: single commit range (start == end)
     if start_sha == end_sha {
         let stats = stats_for_commit_stats(repo, &end_sha, ignore_patterns)?;
-        let recorded = crate::git::notes_api::read_note(repo, &end_sha).is_some();
+        // A note that fails the integrity check is no record (note_integrity.rs).
+        let recorded = crate::git::notes_api::read_note(repo, &end_sha).is_some()
+            && crate::authorship::note_integrity::failed_note(repo, &end_sha).is_none();
         let lines_without_record = if recorded { 0 } else { stats.unknown_additions };
         return Ok((stats, lines_without_record));
     }

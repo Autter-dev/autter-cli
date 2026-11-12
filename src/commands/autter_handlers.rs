@@ -137,6 +137,7 @@ pub fn handle_autter(args: &[String]) {
             | "doctor"
             | "sync"
             | "upgrade"
+            | "verify"
             | "install-hooks"
             | "install"
             | "uninstall-hooks"
@@ -383,6 +384,9 @@ pub fn handle_autter(args: &[String]) {
         "upgrade" => {
             commands::upgrade::run_with_args(&args[1..]);
         }
+        "verify" => {
+            commands::verify::handle_verify(&args[1..]);
+        }
         "flush-metrics-db" => {
             commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
         }
@@ -509,6 +513,7 @@ const AUTTER_COMMANDS: &[&str] = &[
     "uninstall",
     "uninstall-hooks",
     "upgrade",
+    "verify",
     "version",
     "whoami",
     "wrapped",

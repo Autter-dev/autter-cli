@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autter.dev/schemas/autter-cli.schema.json",
   "title": "autter CLI --json output",
-  "description": "Every reporting command prints exactly one JSON document on stdout with --json. Each document has schema_version (currently 1); fields are only ever added. A failed command still prints one document, with an `error` object, and exits non-zero. Each command's document is one entry of $defs: stats, stats_range, status, log, show, blame, diff, whoami, doctor, sync_status. A document that failed before the command produced anything is an `error_only` document.",
+  "description": "Every reporting command prints exactly one JSON document on stdout with --json. Each document has schema_version (currently 1); fields are only ever added. A failed command still prints one document, with an `error` object, and exits non-zero. Each command's document is one entry of $defs: stats, stats_range, status, log, show, blame, diff, whoami, doctor, sync_status, verify. A document that failed before the command produced anything is an `error_only` document.",
   "$defs": {
     "schema_version": {
       "description": "Version of this contract. Bumped only for a change that breaks a reader.",
@@ -27,11 +27,12 @@
             "check_failed",
             "nothing_captured",
             "capture_broken",
+            "integrity_failed",
             "runtime_error"
           ]
         },
         "message": { "type": "string" },
-        "exit_code": { "type": "integer", "enum": [1, 2, 3, 4] }
+        "exit_code": { "type": "integer", "enum": [1, 2, 3, 4, 5] }
       }
     },
     "error_only": {
@@ -577,6 +578,52 @@
           }
         },
         "ok": { "type": "boolean" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "integrity_status": {
+      "description": "Result of the integrity check of one commit's authorship note. verified: written for this commit and unchanged. legacy: written before the integrity check (no integrity member); its commit and line ranges were still checked. missing: no note. pending_rewrite: git copied another commit's note here during a rebase or amend and autter has not rewritten it yet (same patch). rebound_by_older_autter: an autter release older than the check moved the note here. unavailable: the commit or its files are not in this clone (a shallow or partial clone). wrong_commit, content_mismatch, range_out_of_bounds and digest_mismatch are failures: the note belongs to another commit or was changed after autter wrote it. New statuses may be added; treat one you do not know as a warning.",
+      "type": "string",
+      "enum": [
+        "verified",
+        "legacy",
+        "missing",
+        "pending_rewrite",
+        "rebound_by_older_autter",
+        "unavailable",
+        "wrong_commit",
+        "content_mismatch",
+        "range_out_of_bounds",
+        "digest_mismatch"
+      ]
+    },
+    "verify": {
+      "description": "autter verify [<rev|range>] --json: the integrity check of authorship notes. Exits 5 (integrity_failed) when a note fails, with this report next to error. Warnings exit 0, also with --strict for now (a later release will fail legacy and missing notes under --strict).",
+      "type": "object",
+      "required": ["schema_version", "range", "commits", "counts", "failed", "results"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "range": { "type": "string", "description": "The revision or range as given (HEAD by default)." },
+        "commits": { "type": "integer" },
+        "counts": {
+          "type": "object",
+          "description": "Number of commits per status; statuses with no commit are left out.",
+          "additionalProperties": { "type": "integer" }
+        },
+        "failed": { "type": "integer" },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["commit", "status", "detail"],
+            "properties": {
+              "commit": { "type": "string" },
+              "status": { "$ref": "#/$defs/integrity_status" },
+              "detail": { "type": "string" },
+              "recorded_commit": { "type": "string", "description": "The commit the note says it was written for, when that is another one." }
+            }
+          }
+        },
         "error": { "$ref": "#/$defs/error" }
       }
     }

@@ -718,7 +718,15 @@ pub fn stats_for_commit_stats(
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<CommitStats, AutterError> {
-    let authorship_log = get_authorship(repo, commit_sha);
+    let mut authorship_log = get_authorship(repo, commit_sha);
+    // A note that belongs to another commit or was changed after autter wrote
+    // it is not trusted: its lines count as unknown (note_integrity.rs).
+    if authorship_log.is_some()
+        && let Some(failure) = crate::authorship::note_integrity::failed_note(repo, commit_sha)
+    {
+        crate::authorship::note_integrity::report_failure(&failure);
+        authorship_log = None;
+    }
     stats_for_commit_stats_with_authorship(
         repo,
         commit_sha,

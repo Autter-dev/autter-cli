@@ -1052,6 +1052,7 @@ impl Repository {
         let mut foreign_prompts_cache: HashMap<String, Option<PromptRecord>> = HashMap::new();
 
         let mut result_hunks: Vec<BlameHunk> = Vec::new();
+        let failed = untrusted_note_commits(self, hunks.iter().map(|h| h.commit_sha.clone()));
 
         for hunk in hunks {
             // Get or fetch the authorship log for this commit
@@ -1059,7 +1060,11 @@ impl Repository {
             {
                 cached.clone()
             } else {
-                let authorship = get_reference_as_authorship_log_v3(self, &hunk.commit_sha).ok();
+                let authorship = if failed.contains(&hunk.commit_sha) {
+                    None
+                } else {
+                    get_reference_as_authorship_log_v3(self, &hunk.commit_sha).ok()
+                };
                 commit_authorship_cache.insert(hunk.commit_sha.clone(), authorship.clone());
                 authorship
             };
@@ -1140,6 +1145,21 @@ impl Repository {
     }
 }
 
+/// Commits among `commits` whose authorship note fails the integrity check
+/// (note_integrity.rs). Each is reported once on stderr; blame treats its
+/// lines as unknown.
+fn untrusted_note_commits(
+    repo: &Repository,
+    commits: impl Iterator<Item = String>,
+) -> HashSet<String> {
+    let commits: Vec<String> = commits.collect::<HashSet<_>>().into_iter().collect();
+    let failed = crate::authorship::note_integrity::failed_notes(repo, &commits);
+    for failure in failed.values() {
+        crate::authorship::note_integrity::report_failure(failure);
+    }
+    failed.into_keys().collect()
+}
+
 #[allow(clippy::type_complexity)]
 fn overlay_ai_authorship(
     repo: &Repository,
@@ -1179,13 +1199,19 @@ fn overlay_ai_authorship(
     let mut simulated_authorship_logs: HashMap<String, AuthorshipLog> = HashMap::new();
     // Cache for foreign prompts to avoid repeated grepping
     let mut foreign_prompts_cache: HashMap<String, Option<PromptRecord>> = HashMap::new();
+    let failed = untrusted_note_commits(repo, blame_hunks.iter().map(|h| h.commit_sha.clone()));
     for hunk in blame_hunks {
         // Check if we've already looked up this commit's authorship
         let authorship_log = if let Some(cached) = commit_authorship_cache.get(&hunk.commit_sha) {
             cached.clone()
         } else {
-            // Try to get authorship log for this commit
-            let authorship = get_reference_as_authorship_log_v3(repo, &hunk.commit_sha).ok();
+            // Try to get authorship log for this commit. A note that fails the
+            // integrity check is not used: its lines show as unknown.
+            let authorship = if failed.contains(&hunk.commit_sha) {
+                None
+            } else {
+                get_reference_as_authorship_log_v3(repo, &hunk.commit_sha).ok()
+            };
             commit_authorship_cache.insert(hunk.commit_sha.clone(), authorship.clone());
             authorship
         };
