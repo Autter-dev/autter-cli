@@ -152,6 +152,18 @@ pub fn resolve_stash_target_oid_for_worktree(
     oids.into_iter().rev().nth(index)
 }
 
+/// The stash stack as `git stash list` shows it, newest first: index `n` is
+/// `stash@{n}`. Empty when the stash reflog does not exist (no stashes).
+pub fn read_stash_stack_for_worktree(worktree: &Path) -> Option<Vec<String>> {
+    let common_dir = common_dir_for_worktree(worktree)?;
+    if !common_dir.join("logs").join("refs/stash").exists() {
+        return Some(Vec::new());
+    }
+    let mut oids = read_reflog_new_oids(&common_dir, "refs/stash")?;
+    oids.reverse();
+    Some(oids)
+}
+
 pub fn latest_reflog_old_oid_for_worktree(worktree: &Path, refname: &str) -> Option<String> {
     let common_dir = common_dir_for_worktree(worktree)?;
     read_reflog_entries(&common_dir, refname)?

@@ -1244,10 +1244,9 @@ fn test_stash_note_copied_to_another_stash_is_not_restored() {
     ])
     .unwrap();
 
-    // Applied by SHA: the daemon can resolve `stash@{0}` of a `pop` only
-    // after git has already moved the stack, to the entry below it.
-    repo.git(&["stash", "apply", &plain_stash]).unwrap();
+    repo.git(&["stash", "pop"]).unwrap();
     repo.sync_daemon();
+    assert_eq!(stash_sha(&repo), ai_stash);
     repo.git(&["add", "."]).unwrap();
     let commit = repo.commit("after stash").unwrap().commit_sha;
     let mut file = repo.filename("app.txt");

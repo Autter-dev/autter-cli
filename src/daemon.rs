@@ -9,8 +9,8 @@ use crate::git::cli_parser::{
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
     HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
-    head_reflog_entry_written_by, latest_reflog_old_oid_for_worktree,
-    latest_worktree_head_reflog_move, read_head_state_for_worktree, read_ref_oid_for_worktree,
+    head_reflog_entry_written_by, is_valid_git_oid, latest_worktree_head_reflog_move,
+    read_head_state_for_worktree, read_ref_oid_for_worktree, read_stash_stack_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -1172,6 +1172,45 @@ fn explicit_rebase_branch_ref_name(branch_spec: &str) -> Option<String> {
     Some(format!("refs/heads/{}", branch_spec))
 }
 
+/// The key `TraceIngressState::family_stash_stacks` uses for the repository
+/// family of `worktree`: its canonical common dir, shared by all worktrees
+/// (and their one stash stack).
+fn stash_family_key(worktree: &Path) -> Option<String> {
+    let common_dir = common_dir_for_worktree(worktree)?;
+    let family = common_dir.canonicalize().unwrap_or(common_dir);
+    Some(family.to_string_lossy().to_string())
+}
+
+/// The stash subcommand of a `git stash` invocation (`push` when none is
+/// given), or `None` for any other command.
+fn stash_subcommand_for_argv(argv: &[String]) -> Option<String> {
+    let parsed = parse_git_cli_args(trace_invocation_args(argv));
+    if parsed.command.as_deref() != Some("stash") {
+        return None;
+    }
+    Some(
+        parsed
+            .command_args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "push".to_string()),
+    )
+}
+
+/// True for the stash subcommands that take an entry off the stash stack when
+/// they succeed: `pop`, `drop` and `branch`.
+fn stash_subcommand_removes_entry(subcommand: &str) -> bool {
+    matches!(subcommand, "pop" | "drop" | "branch")
+}
+
+/// Resolve the target of `git stash apply` at any point of the command.
+///
+/// `apply` leaves the stash stack as it is, so `stash@{n}` names the same
+/// stash before and after git runs. `pop`, `drop` and `branch` remove their
+/// entry, and the daemon reads the repo while git is already running, so for
+/// them a read of `stash@{n}` here can see the stack after git moved it and
+/// name the stash below the one acted on. Those are resolved when the command
+/// has finished, by `resolve_stash_target_oid_for_terminal_payload`.
 fn resolve_stash_target_oid_for_command(
     worktree: &Path,
     argv: &[String],
@@ -1181,6 +1220,13 @@ fn resolve_stash_target_oid_for_command(
         return Ok(None);
     }
     if !stash_requires_target_resolution(&parsed.command_args) {
+        return Ok(None);
+    }
+    if parsed
+        .command_args
+        .first()
+        .is_some_and(|subcommand| stash_subcommand_removes_entry(subcommand))
+    {
         return Ok(None);
     }
 
@@ -1200,15 +1246,48 @@ fn resolve_stash_target_oid_for_command(
 }
 
 fn stash_target_spec_is_top_of_stack(target_spec: Option<&str>) -> bool {
-    matches!(
-        target_spec.unwrap_or("stash@{0}"),
-        "stash@{0}" | "refs/stash" | "stash"
-    )
+    stash_target_spec_index(target_spec) == Some(0)
 }
 
-fn inferred_top_stash_sha_from_rewrite_history(
-    worktree: &Path,
-) -> Result<Option<String>, AutterError> {
+/// The stack position a stash reference names: `stash@{n}`, `refs/stash@{n}`
+/// or a bare `n` (git reads it as `stash@{n}`), with no reference, `stash`
+/// and `refs/stash` meaning the top.
+fn stash_target_spec_index(target_spec: Option<&str>) -> Option<usize> {
+    let spec = target_spec.unwrap_or("stash@{0}");
+    if matches!(spec, "stash" | "refs/stash") {
+        return Some(0);
+    }
+    if !spec.is_empty() && spec.bytes().all(|byte| byte.is_ascii_digit()) {
+        return spec.parse().ok();
+    }
+    spec.strip_prefix("refs/stash@{")
+        .or_else(|| spec.strip_prefix("stash@{"))?
+        .strip_suffix('}')?
+        .parse()
+        .ok()
+}
+
+/// The stash at `index` of a stack that, with that entry taken out, is
+/// `after`; the first of `before_candidates` that fits.
+///
+/// A candidate that does not fit was read too late (git had already moved the
+/// stack) or is out of date, and is skipped rather than trusted.
+fn stash_removed_from_stack(
+    index: usize,
+    after: &[String],
+    before_candidates: &[Vec<String>],
+) -> Option<String> {
+    before_candidates.iter().find_map(|before| {
+        if before.len() != after.len() + 1 || index >= before.len() {
+            return None;
+        }
+        let (above, rest) = before.split_at(index);
+        let (removed, below) = rest.split_first()?;
+        (above == &after[..index] && below == &after[index..]).then(|| removed.clone())
+    })
+}
+
+fn inferred_stash_stack_from_rewrite_history(worktree: &Path) -> Result<Vec<String>, AutterError> {
     let repo = discover_repository_in_path_no_git_exec(worktree)?;
     let events = repo.storage.read_rewrite_events()?;
     let mut stack: Vec<String> = Vec::new();
@@ -1243,7 +1322,15 @@ fn inferred_top_stash_sha_from_rewrite_history(
             StashOperation::Apply | StashOperation::List => {}
         }
     }
-    Ok(stack.last().cloned())
+    Ok(stack)
+}
+
+fn inferred_top_stash_sha_from_rewrite_history(
+    worktree: &Path,
+) -> Result<Option<String>, AutterError> {
+    Ok(inferred_stash_stack_from_rewrite_history(worktree)?
+        .last()
+        .cloned())
 }
 
 /// Recover the top stash sha from the daemon's own rewrite history.
@@ -1259,10 +1346,23 @@ fn recover_top_stash_target_oid_from_history(worktree: &Path) -> Option<String> 
         .flatten()
 }
 
+/// Resolve the target of a finished `git stash` command from the repo state
+/// it left.
+///
+/// `apply` is read off the stack directly. For `pop`, `drop` and `branch`,
+/// which take their entry off the stack, the stack as git left it is compared
+/// with stacks from before the command: `before_candidates` (in order of
+/// preference), then the stack the daemon's rewrite history implies. The
+/// target is the entry whose removal turns one of those into the stack now.
+/// When none fits, the target is unknown and this errors, rather than guess
+/// a stash whose attribution would then be restored in place of the right
+/// one. A command that failed (a `pop` that stopped on a conflict) keeps its
+/// entry on the stack, where it is read directly.
 fn resolve_stash_target_oid_for_terminal_payload(
     worktree: &Path,
     argv: &[String],
-    ref_changes: &[crate::daemon::domain::RefChange],
+    exit_code: i32,
+    before_candidates: &[Vec<String>],
 ) -> Result<Option<String>, AutterError> {
     let parsed = parse_git_cli_args(trace_invocation_args(argv));
     if parsed.command.as_deref() != Some("stash") {
@@ -1272,44 +1372,56 @@ fn resolve_stash_target_oid_for_terminal_payload(
         return Ok(None);
     }
 
+    let subcommand = parsed
+        .command_args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("push");
     let target_spec = stash_target_spec(&parsed.command_args);
-    match parsed.command_args.first().map(String::as_str).unwrap_or("push") {
-        "apply" => resolve_stash_target_oid_for_worktree(worktree, target_spec)
+    if !stash_subcommand_removes_entry(subcommand) {
+        return resolve_stash_target_oid_for_worktree(worktree, target_spec)
             .ok_or_else(|| {
                 AutterError::Generic(format!(
-                    "failed to resolve stash apply target oid from terminal repo state (spec={:?}, worktree={})",
-                    target_spec,
+                    "failed to resolve stash {subcommand} target oid from terminal repo state (spec={target_spec:?}, worktree={})",
                     worktree.display()
                 ))
             })
-            .map(Some),
-        "pop" | "drop" | "branch" => {
-            if let Some(target_oid) = ref_changes
-                .iter()
-                .rfind(|change| change.reference == "refs/stash")
-                .map(|change| change.old.trim().to_string())
-                .filter(|oid| !oid.is_empty() && !is_zero_oid(oid))
-            {
-                return Ok(Some(target_oid));
-            }
-            if stash_target_spec_is_top_of_stack(target_spec) {
-                if let Some(target_oid) =
-                    latest_reflog_old_oid_for_worktree(worktree, "refs/stash")
-                {
-                    return Ok(Some(target_oid));
-                }
-                // Reflog lookup missed too; recover the top stash sha from history.
-                return Ok(recover_top_stash_target_oid_from_history(worktree));
-            }
-            Err(AutterError::Generic(format!(
-                "failed to resolve stash {:?} target oid from terminal state for non-top stash reference (spec={:?}, worktree={})",
-                parsed.command_args.first().map(String::as_str).unwrap_or("stash"),
-                target_spec,
-                worktree.display()
-            )))
-        }
-        _ => Ok(None),
+            .map(Some);
     }
+
+    let unresolved = |reason: &str| {
+        AutterError::Generic(format!(
+            "failed to resolve stash {subcommand} target oid: {reason} (spec={target_spec:?}, worktree={})",
+            worktree.display()
+        ))
+    };
+    if let Some(spec) = target_spec
+        && is_valid_git_oid(spec)
+    {
+        return Ok(Some(spec.to_string()));
+    }
+    let index =
+        stash_target_spec_index(target_spec).ok_or_else(|| unresolved("not a stash reference"))?;
+    let after = read_stash_stack_for_worktree(worktree)
+        .ok_or_else(|| unresolved("stash stack unreadable"))?;
+    if exit_code != 0 {
+        // git drops the entry only once the stash applied cleanly.
+        return Ok(after.get(index).cloned());
+    }
+    if let Some(target) = stash_removed_from_stack(index, &after, before_candidates) {
+        return Ok(Some(target));
+    }
+    if let Ok(history) = inferred_stash_stack_from_rewrite_history(worktree) {
+        let history_newest_first = history.into_iter().rev().collect::<Vec<_>>();
+        if let Some(target) =
+            stash_removed_from_stack(index, &after, std::slice::from_ref(&history_newest_first))
+        {
+            return Ok(Some(target));
+        }
+    }
+    Err(unresolved(
+        "no stack from before the command fits the stack it left",
+    ))
 }
 
 fn resolve_rebase_original_head_for_worktree(worktree: &Path) -> Option<String> {
@@ -4867,6 +4979,13 @@ struct TraceIngressState {
     root_reflog_refs: HashMap<String, Vec<String>>,
     root_head_reflog_start_offsets: HashMap<String, u64>,
     root_family_reflog_start_offsets: HashMap<String, HashMap<String, u64>>,
+    /// For a `git stash pop`/`drop`/`branch` root: stacks of stashes from
+    /// before git moved the stack, if it had not by the time the daemon
+    /// looked (newest first, see `read_stash_stack_for_worktree`).
+    root_stash_stacks_before: HashMap<String, Vec<Vec<String>>>,
+    /// Per repository family: the stash stack as the last `git stash` command
+    /// the daemon saw finish left it.
+    family_stash_stacks: HashMap<String, Vec<String>>,
     root_last_activity_ns: HashMap<String, u64>,
     /// Roots whose start event was identified as definitely read-only. All
     /// subsequent events for these roots (including exit) take the fast path.
@@ -5620,6 +5739,7 @@ impl ActorDaemonCoordinator {
             || ingress.root_reflog_refs.contains_key(root)
             || ingress.root_head_reflog_start_offsets.contains_key(root)
             || ingress.root_family_reflog_start_offsets.contains_key(root)
+            || ingress.root_stash_stacks_before.contains_key(root)
     }
 
     fn mark_trace_root_activity(&self, root_sid: &str) -> Result<(), AutterError> {
@@ -5782,6 +5902,7 @@ impl ActorDaemonCoordinator {
         ingress.root_reflog_refs.remove(root_sid);
         ingress.root_head_reflog_start_offsets.remove(root_sid);
         ingress.root_family_reflog_start_offsets.remove(root_sid);
+        ingress.root_stash_stacks_before.remove(root_sid);
         ingress.root_last_activity_ns.remove(root_sid);
         ingress.root_definitely_read_only.remove(root_sid);
         ingress.root_open_connections.remove(root_sid);
@@ -6347,6 +6468,7 @@ impl ActorDaemonCoordinator {
                     ingress.root_reflog_refs.remove(&root);
                     ingress.root_head_reflog_start_offsets.remove(&root);
                     ingress.root_family_reflog_start_offsets.remove(&root);
+                    ingress.root_stash_stacks_before.remove(&root);
                     ingress.root_last_activity_ns.remove(&root);
                     ingress.root_definitely_read_only.remove(&root);
                 }
@@ -6431,6 +6553,7 @@ impl ActorDaemonCoordinator {
                 ingress.root_reflog_refs.remove(&root);
                 ingress.root_head_reflog_start_offsets.remove(&root);
                 ingress.root_family_reflog_start_offsets.remove(&root);
+                ingress.root_stash_stacks_before.remove(&root);
             }
             return false;
         };
@@ -6446,6 +6569,27 @@ impl ActorDaemonCoordinator {
                 .insert(root.clone(), repo_context_from_head_state(state));
         }
         let pre_repo = ingress.root_pre_repo.get(&root).cloned();
+        if !ingress.root_stash_stacks_before.contains_key(&root)
+            && effective_primary.as_deref() == Some("stash")
+            && stash_subcommand_for_argv(&effective_argv)
+                .is_some_and(|subcommand| stash_subcommand_removes_entry(&subcommand))
+        {
+            // Stacks the stash stack may have had before this command took its
+            // entry off: the stack now (git may not have moved it yet), and the
+            // stack the last stash command left.
+            let mut before = Vec::new();
+            if let Some(stack) = read_stash_stack_for_worktree(&worktree) {
+                before.push(stack);
+            }
+            if let Some(stack) = stash_family_key(&worktree)
+                .and_then(|family| ingress.family_stash_stacks.get(&family))
+            {
+                before.push(stack.clone());
+            }
+            ingress
+                .root_stash_stacks_before
+                .insert(root.clone(), before);
+        }
         if should_capture_mutation && !target_repo_only {
             let contextual_refs = if let Some(repo) = pre_repo.as_ref() {
                 tracked_reflog_refs_for_command(
@@ -6716,10 +6860,16 @@ impl ActorDaemonCoordinator {
                 }
             }
             if object.get("autter_stash_target_oid").is_none() {
+                let before = ingress
+                    .root_stash_stacks_before
+                    .get(&root)
+                    .cloned()
+                    .unwrap_or_default();
                 match resolve_stash_target_oid_for_terminal_payload(
                     &worktree,
                     &effective_argv,
-                    terminal_ref_changes.as_deref().unwrap_or(&[]),
+                    terminal_exit_code.unwrap_or(0),
+                    &before,
                 ) {
                     Ok(Some(stash_target_oid)) => {
                         object.remove("autter_stash_target_oid_error");
@@ -6745,6 +6895,12 @@ impl ActorDaemonCoordinator {
                         );
                     }
                 }
+            }
+            if effective_primary.as_deref() == Some("stash")
+                && let Some(family) = stash_family_key(&worktree)
+                && let Some(stack) = read_stash_stack_for_worktree(&worktree)
+            {
+                ingress.family_stash_stacks.insert(family, stack);
             }
             if object.get("autter_carryover_snapshot_id").is_none() {
                 let terminal_time_ns = object
@@ -6814,6 +6970,7 @@ impl ActorDaemonCoordinator {
             ingress.root_reflog_refs.remove(&root);
             ingress.root_head_reflog_start_offsets.remove(&root);
             ingress.root_family_reflog_start_offsets.remove(&root);
+            ingress.root_stash_stacks_before.remove(&root);
         }
         // Payload was fully augmented for a mutating command; tell the caller
         // to stamp a sequence number and enqueue it.
@@ -7404,6 +7561,11 @@ impl ActorDaemonCoordinator {
             }),
             StashOperation::Pop | StashOperation::Drop | StashOperation::Branch => {
                 cmd.stash_target_oid.clone().or_else(|| {
+                    // `refs/stash` moving names the entry taken off only when
+                    // that entry was the top one.
+                    if !stash_target_spec_is_top_of_stack(stash_ref) {
+                        return None;
+                    }
                     cmd.ref_changes
                         .iter()
                         .rfind(|change| change.reference == "refs/stash")
@@ -7467,6 +7629,32 @@ impl ActorDaemonCoordinator {
         }
 
         Ok(Self::resolve_stash_head_for_event(semantic_head, cmd))
+    }
+
+    /// `git stash branch` checks out the commit the stash was made on (its
+    /// first parent) before it applies the stash, so the stash's attribution
+    /// belongs on that commit, not on the HEAD the command started from.
+    fn resolve_stash_branch_head_for_event(
+        cmd: &crate::daemon::domain::NormalizedCommand,
+        stash_sha: Option<&str>,
+        semantic_head: Option<&String>,
+    ) -> Result<Option<String>, AutterError> {
+        let post_head = cmd
+            .post_repo
+            .as_ref()
+            .and_then(|repo| repo.head.clone())
+            .filter(|head| !head.trim().is_empty());
+        if cmd.exit_code != 0 {
+            // It may have stopped before or after checking the commit out;
+            // HEAD as it left it is where any applied changes landed.
+            return Ok(post_head
+                .or_else(|| Self::resolve_stash_restore_head_for_event(semantic_head, cmd)));
+        }
+        Self::resolve_stash_create_head_for_event(
+            cmd,
+            stash_sha,
+            post_head.as_ref().or(semantic_head),
+        )
     }
 
     fn resolve_stash_restore_head_for_event(
@@ -8137,9 +8325,14 @@ impl ActorDaemonCoordinator {
                             stash_sha.as_deref(),
                             head.as_ref(),
                         )?,
-                        StashOperation::Apply | StashOperation::Pop | StashOperation::Branch => {
+                        StashOperation::Apply | StashOperation::Pop => {
                             Self::resolve_stash_restore_head_for_event(head.as_ref(), cmd)
                         }
+                        StashOperation::Branch => Self::resolve_stash_branch_head_for_event(
+                            cmd,
+                            stash_sha.as_deref(),
+                            head.as_ref(),
+                        )?,
                         StashOperation::Drop | StashOperation::List => None,
                     };
                     let pathspecs = if matches!(operation, StashOperation::Create) {
@@ -13291,38 +13484,114 @@ mod tests {
         tmp
     }
 
+    fn oids(prefixes: &[char]) -> Vec<String> {
+        prefixes
+            .iter()
+            .map(|prefix| prefix.to_string().repeat(40))
+            .collect()
+    }
+
+    fn stash_argv(args: &[&str]) -> Vec<String> {
+        ["git", "stash"]
+            .iter()
+            .chain(args)
+            .map(|arg| arg.to_string())
+            .collect()
+    }
+
     // When the last stash is popped, git deletes both refs/stash and its reflog,
-    // so the on-disk resolvers find nothing. Both payload resolvers must recover
-    // the target sha from the daemon's rewrite history instead of erroring.
+    // so the on-disk resolvers find nothing. The terminal resolver recovers the
+    // target sha from the daemon's rewrite history instead of erroring.
     #[test]
     fn stash_pop_target_oid_recovers_from_history_when_ref_and_reflog_absent() {
         let stash_sha = "1111111111111111111111111111111111111111";
         let tmp = init_repo_with_stash_create_event(stash_sha);
         let worktree = tmp.path();
-        let argv = vec!["git".to_string(), "stash".to_string(), "pop".to_string()];
-
-        let from_command = resolve_stash_target_oid_for_command(worktree, &argv).unwrap();
-        assert_eq!(from_command.as_deref(), Some(stash_sha));
+        let argv = stash_argv(&["pop"]);
 
         let from_terminal =
-            resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).unwrap();
+            resolve_stash_target_oid_for_terminal_payload(worktree, &argv, 0, &[]).unwrap();
         assert_eq!(from_terminal.as_deref(), Some(stash_sha));
     }
 
-    // A non-top-of-stack reference cannot be recovered from history, so it still
-    // surfaces as an error rather than being silently dropped.
+    // `pop`, `drop` and `branch` are not resolved while git runs: by then git
+    // may have taken the entry off the stack, and `stash@{n}` would name the
+    // stash below it.
+    #[test]
+    fn stash_entry_removing_commands_are_not_resolved_while_git_runs() {
+        let tmp = init_repo_with_stash_create_event("1111111111111111111111111111111111111111");
+        for args in [&["pop"][..], &["drop", "stash@{1}"], &["branch", "topic"]] {
+            let argv = stash_argv(args);
+            assert_eq!(
+                resolve_stash_target_oid_for_command(tmp.path(), &argv).unwrap(),
+                None,
+                "{args:?}"
+            );
+        }
+    }
+
+    // A non-top-of-stack reference that no stack from before the command
+    // explains surfaces as an error rather than a guess.
     #[test]
     fn stash_drop_non_top_reference_still_errors_without_on_disk_state() {
         let tmp = init_repo_with_stash_create_event("2222222222222222222222222222222222222222");
         let worktree = tmp.path();
-        let argv = vec![
-            "git".to_string(),
-            "stash".to_string(),
-            "drop".to_string(),
-            "stash@{2}".to_string(),
-        ];
+        let argv = stash_argv(&["drop", "stash@{2}"]);
 
-        assert!(resolve_stash_target_oid_for_command(worktree, &argv).is_err());
-        assert!(resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).is_err());
+        assert!(resolve_stash_target_oid_for_terminal_payload(worktree, &argv, 0, &[]).is_err());
+    }
+
+    #[test]
+    fn stash_target_spec_index_reads_stash_references() {
+        assert_eq!(stash_target_spec_index(None), Some(0));
+        assert_eq!(stash_target_spec_index(Some("stash")), Some(0));
+        assert_eq!(stash_target_spec_index(Some("refs/stash")), Some(0));
+        assert_eq!(stash_target_spec_index(Some("stash@{0}")), Some(0));
+        assert_eq!(stash_target_spec_index(Some("stash@{3}")), Some(3));
+        assert_eq!(stash_target_spec_index(Some("refs/stash@{2}")), Some(2));
+        assert_eq!(stash_target_spec_index(Some("1")), Some(1));
+        assert_eq!(stash_target_spec_index(Some("stash@{x}")), None);
+        assert_eq!(stash_target_spec_index(Some("HEAD")), None);
+    }
+
+    #[test]
+    fn stash_removed_from_stack_names_the_entry_taken_off() {
+        let before = oids(&['a', 'b', 'c']);
+        // Top entry popped.
+        assert_eq!(
+            stash_removed_from_stack(0, &oids(&['b', 'c']), std::slice::from_ref(&before)),
+            Some(before[0].clone())
+        );
+        // stash@{1} popped.
+        assert_eq!(
+            stash_removed_from_stack(1, &oids(&['a', 'c']), std::slice::from_ref(&before)),
+            Some(before[1].clone())
+        );
+        // Last entry popped.
+        assert_eq!(
+            stash_removed_from_stack(0, &[], &[oids(&['a'])]),
+            Some(before[0].clone())
+        );
+    }
+
+    #[test]
+    fn stash_removed_from_stack_skips_stacks_read_after_git_moved_it() {
+        let after = oids(&['a', 'c']);
+        // A read made after git popped stash@{1} sees the stack it left, which
+        // does not explain the pop; the stack the last stash command left does.
+        let read_late = after.clone();
+        let left_by_last_stash = oids(&['a', 'b', 'c']);
+        assert_eq!(
+            stash_removed_from_stack(1, &after, &[read_late.clone(), left_by_last_stash]),
+            Some("b".repeat(40))
+        );
+        // Without a stack that fits, the target stays unknown rather than
+        // naming the entry below it.
+        assert_eq!(stash_removed_from_stack(1, &after, &[read_late]), None);
+        // A stack that differs elsewhere does not fit either.
+        assert_eq!(
+            stash_removed_from_stack(1, &after, &[oids(&['d', 'b', 'c'])]),
+            None
+        );
     }
 }
