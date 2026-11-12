@@ -602,6 +602,7 @@ autter config [<key> | set <key> <value> | unset <key>]
         body: "autter sync status [--json]
 autter sync purge --force
 autter sync import --yes
+autter sync retry
 autter sync open
 
   Show local upload queues, the last confirmed metrics batch, and the next
@@ -613,6 +614,9 @@ autter sync open
   `import` uploads the held backlog: records queued before you connected this
   machine, or by an older autter version. Held records never upload on their
   own. Without --yes it only shows what is held.
+
+  `retry` queues usage-metrics events again that were set aside because the
+  server failed on them every time. Set-aside events are kept, not uploaded.
 
   An empty queue does not confirm upload of every local change.
   Status exits 0 when upload is off or no problem is detected. It exits 1

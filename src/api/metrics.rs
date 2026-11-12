@@ -32,6 +32,13 @@ pub enum MetricsUploadFailure {
     NotAccepted { count: usize, error: String },
 }
 
+/// True for the per-event answer the server gives for rows it did not get to
+/// within its write budget ("retry later: the server ran out of time writing
+/// this batch"). The rows are fine; the batch was too big to finish in time.
+pub fn is_retry_later(message: &str) -> bool {
+    message == "retry later" || message.starts_with("retry later:")
+}
+
 /// What a failure kind means for the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +68,10 @@ impl MetricsUploadFailure {
             },
             Self::Network { .. } => MetricsFailureKind::Network,
             Self::InvalidResponse { .. } => MetricsFailureKind::InvalidResponse,
+            // The server ran out of time before it wrote any event.
+            Self::NotAccepted { error, .. } if is_retry_later(error) => {
+                MetricsFailureKind::TooLarge
+            }
             Self::NotAccepted { .. } => MetricsFailureKind::Rejected,
         }
     }
@@ -78,6 +89,29 @@ impl MetricsUploadFailure {
             self.kind(),
             MetricsFailureKind::Timeout | MetricsFailureKind::TooLarge
         )
+    }
+
+    /// The failure could be caused by the events in the request, so sending
+    /// the same events again would fail the same way: an HTTP 5xx or 4xx
+    /// that is not about the login, the size, the rate or a gateway. A
+    /// timeout, a network error or an unreadable answer says nothing about
+    /// the events, and neither does 408, 429, 502, 503 or 504.
+    pub fn may_depend_on_rows(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => {
+                !matches!(*status, 401 | 403 | 408 | 413 | 429 | 502 | 503 | 504)
+            }
+            _ => false,
+        }
+    }
+
+    /// What identifies "the same failure again": the kind and the HTTP
+    /// status. The body is left out because it can carry a request id.
+    pub fn signature(&self) -> String {
+        match self.http_status() {
+            Some(status) => format!("http_{status}"),
+            None => format!("{:?}", self.kind()).to_ascii_lowercase(),
+        }
     }
 
     /// Short description for `autter doctor` and `autter sync status`, e.g.
@@ -318,6 +352,61 @@ mod tests {
             status,
             body: String::new(),
         }
+    }
+
+    #[test]
+    fn retry_later_means_the_batch_was_too_big_to_finish() {
+        let message = "retry later: the server ran out of time writing this batch";
+        assert!(is_retry_later(message));
+        assert!(is_retry_later("retry later"));
+        assert!(!is_retry_later("rate limited, retry later"));
+        assert!(!is_retry_later("invalid metric event: invalid_timestamp"));
+
+        let out_of_time = MetricsUploadFailure::NotAccepted {
+            count: 1000,
+            error: message.to_string(),
+        };
+        assert_eq!(out_of_time.kind(), MetricsFailureKind::TooLarge);
+        assert!(out_of_time.should_split());
+
+        let other = MetricsUploadFailure::NotAccepted {
+            count: 3,
+            error: "rate limited".to_string(),
+        };
+        assert_eq!(other.kind(), MetricsFailureKind::Rejected);
+        assert!(!other.should_split());
+    }
+
+    #[test]
+    fn only_some_http_errors_can_depend_on_the_events_sent() {
+        for (status, depends) in [
+            (500, true),
+            (400, true),
+            (422, true),
+            (401, false),
+            (403, false),
+            (408, false),
+            (413, false),
+            (429, false),
+            (502, false),
+            (503, false),
+            (504, false),
+        ] {
+            assert_eq!(http(status).may_depend_on_rows(), depends, "HTTP {status}");
+        }
+        assert!(!MetricsUploadFailure::Timeout { after_secs: None }.may_depend_on_rows());
+        // The body (which can carry a request id) is not part of "the same
+        // failure again".
+        let a = MetricsUploadFailure::Http {
+            status: 500,
+            body: "request 1".to_string(),
+        };
+        let b = MetricsUploadFailure::Http {
+            status: 500,
+            body: "request 2".to_string(),
+        };
+        assert_eq!(a.signature(), b.signature());
+        assert_ne!(a.signature(), http(502).signature());
     }
 
     #[test]

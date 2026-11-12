@@ -99,6 +99,7 @@ mod local_mode_privacy;
 mod log;
 mod memory_command;
 mod merge_rebase;
+mod metrics_queue_state;
 mod multi_repo_workspace;
 mod non_utf8_files;
 mod notes_backend_mode_switch;
