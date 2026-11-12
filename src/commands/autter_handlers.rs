@@ -168,6 +168,10 @@ pub fn handle_autter(args: &[String]) {
             args[0].as_str() == "checkpoint" || crate::config::collection_consented_now();
         match init_daemon_telemetry_handle_with(allow_spawn) {
             DaemonTelemetryInitResult::Connected | DaemonTelemetryInitResult::Skipped => {}
+            // A command that does not exist fails as one whether or not the
+            // service is up (`autter stat --json` is a usage error with its
+            // one JSON document), so it is left to the dispatcher below.
+            DaemonTelemetryInitResult::Failed(_) if !is_autter_command(args[0].as_str()) => {}
             DaemonTelemetryInitResult::Failed(err) => {
                 eprintln!(
                     "error: failed to connect to autter background service: {}",
@@ -441,6 +445,77 @@ pub fn handle_autter(args: &[String]) {
             );
         }
     }
+}
+
+/// Every command the dispatcher in [`handle_autter`] has an arm for. Keep the
+/// two in step: a command missing here is reported as unknown when the
+/// background service cannot be reached.
+const AUTTER_COMMANDS: &[&str] = &[
+    "--help",
+    "--version",
+    "-h",
+    "-v",
+    "ask",
+    "badge",
+    "bg",
+    "blame",
+    "blame-analysis",
+    "checkpoint",
+    "ci",
+    "config",
+    "context",
+    "d",
+    "daemon",
+    "dash",
+    "dashboard",
+    "debug",
+    "diff",
+    "doctor",
+    "effective-ignore-patterns",
+    "exchange-nonce",
+    "fetch-authorship-notes",
+    "fetch-notes",
+    "fetch_authorship_notes",
+    "file-changes",
+    "flush-metrics-db",
+    "git-hooks",
+    "git-path",
+    "help",
+    "install",
+    "install-hooks",
+    "log",
+    "login",
+    "logout",
+    "logs",
+    "mcp",
+    "memory",
+    "memory-hook",
+    "notes",
+    "onboard",
+    "onboarding",
+    "personal-dashboard",
+    "personal_dashboard",
+    "push-authorship-notes",
+    "push_authorship_notes",
+    "setup",
+    "show",
+    "show-prompt",
+    "squash-authorship",
+    "stats",
+    "status",
+    "sync",
+    "telemetry",
+    "threads",
+    "uninstall",
+    "uninstall-hooks",
+    "upgrade",
+    "version",
+    "whoami",
+    "wrapped",
+];
+
+fn is_autter_command(command: &str) -> bool {
+    AUTTER_COMMANDS.contains(&command)
 }
 
 /// The commands whose `--json` output is a documented contract
@@ -1933,6 +2008,31 @@ mod checkpoint_exit_policy_tests {
             assert!(!checkpoint_runs_in_hook(preset, false, false), "{preset}");
             assert!(checkpoint_runs_in_hook(preset, true, false), "{preset}");
             assert!(checkpoint_runs_in_hook(preset, false, true), "{preset}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_list_tests {
+    use super::is_autter_command;
+
+    #[test]
+    fn every_documented_command_is_a_known_command() {
+        for command in crate::commands::arg_parser::documented_commands() {
+            assert!(
+                is_autter_command(command),
+                "`autter {command}` is documented but missing from AUTTER_COMMANDS"
+            );
+        }
+        for command in ["version", "help", "memory-hook", "notes", "checkpoint"] {
+            assert!(is_autter_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_typo_is_not_a_command() {
+        for command in ["stat", "bogus", "", "--json", "checkpoints"] {
+            assert!(!is_autter_command(command), "{command}");
         }
     }
 }
