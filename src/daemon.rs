@@ -9,7 +9,8 @@ use crate::git::cli_parser::{
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
     HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
-    latest_reflog_old_oid_for_worktree, read_head_state_for_worktree, read_ref_oid_for_worktree,
+    head_reflog_entry_written_by, latest_reflog_old_oid_for_worktree,
+    latest_worktree_head_reflog_move, read_head_state_for_worktree, read_ref_oid_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -2466,15 +2467,27 @@ fn attempt_materialize_commit_chain_authorship(
     Ok(())
 }
 
-fn resolve_reset_old_head_for_base(worktree: &Path, base_commit: &str) -> Option<String> {
-    read_ref_oid_for_worktree(worktree, "ORIG_HEAD")
-        .filter(|oid| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid))
-        .or_else(|| {
-            resolve_worktree_head_reflog_old_oid_for_new_head(worktree, base_commit)
-                .ok()
-                .flatten()
-                .filter(|oid| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid))
-        })
+/// Where HEAD was before it last moved to `base_commit`, read from the
+/// repository when the move itself was never seen, and whether that move was a
+/// reset. Only a reset undoes commits whose work can still be in the tree: a
+/// `checkout` back to a branch, a rebase or a merge also leave HEAD on a commit
+/// other commits descend from, and rebuilding "undone" work from those commits
+/// would hand their attribution to whatever is typed next. Such a move can
+/// still have carried uncommitted work along, which is why it is returned.
+fn resolve_reset_old_head_for_base(worktree: &Path, base_commit: &str) -> Option<(String, bool)> {
+    let usable = |oid: &String| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid);
+    match latest_worktree_head_reflog_move(worktree, base_commit) {
+        Ok(Some(moved)) => {
+            let by_reset = head_reflog_entry_written_by("reset", &moved.message);
+            Some(moved.old)
+                .filter(usable)
+                .map(|old_head| (old_head, by_reset))
+        }
+        // No reflog says how HEAD got here; ORIG_HEAD is all there is.
+        Ok(None) | Err(_) => read_ref_oid_for_worktree(worktree, "ORIG_HEAD")
+            .filter(usable)
+            .map(|old_head| (old_head, true)),
+    }
 }
 
 fn read_reset_recovery_final_state(
@@ -2580,15 +2593,20 @@ fn recover_reset_working_log_for_commit_replay(
         return Ok(false);
     }
 
-    let old_head = latest_reset_for_base_commit(repo, base_commit)?
-        .map(|reset| reset.old_head_sha)
-        .or_else(|| resolve_reset_old_head_for_base(worktree, base_commit));
-    let Some(old_head) = old_head else {
-        return Ok(false);
+    let (old_head, undone_by_reset) = match latest_reset_for_base_commit(repo, base_commit)? {
+        // `reset --hard` threw the undone work away. There is nothing to recover.
+        Some(reset) if reset.kind == ResetKind::Hard => return Ok(false),
+        Some(reset) => (reset.old_head_sha, true),
+        None => match resolve_reset_old_head_for_base(worktree, base_commit) {
+            Some(moved) => moved,
+            None => return Ok(false),
+        },
     };
     if !repo_is_ancestor(repo, base_commit, &old_head) {
         return Ok(false);
     }
+    // Uncommitted work left under the old HEAD that matches the tree exactly
+    // travelled with the move, whatever kind of move it was.
     if restore_matching_old_head_reset_snapshot(
         repo,
         base_commit,
@@ -2598,6 +2616,9 @@ fn recover_reset_working_log_for_commit_replay(
         final_state_override,
     )? {
         return Ok(true);
+    }
+    if !undone_by_reset {
+        return Ok(false);
     }
 
     if let Err(error) =
@@ -3008,22 +3029,26 @@ fn apply_rewrite_side_effect(
             carryover_snapshot,
             reset_pathspecs,
         )?;
-        coordinator.record_recent_replay_prerequisite(
-            &prerequisite_family,
-            RecentReplayPrerequisite::Reset {
-                target_head: reset.new_head_sha.clone(),
-                old_head: reset.old_head_sha.clone(),
-                pathspecs: reset_pathspecs
-                    .map(|paths| paths.to_vec())
-                    .unwrap_or_default(),
-                final_state: carryover_snapshot.cloned(),
-                working_log_snapshot: capture_recent_working_log_snapshot(
-                    &repo,
-                    &reset.new_head_sha,
-                    Some(author.clone()),
-                )?,
-            },
-        )?;
+        // `reset --hard` threw the undone work away, so the next commit has
+        // nothing of it to recover.
+        if reset.kind != ResetKind::Hard {
+            coordinator.record_recent_replay_prerequisite(
+                &prerequisite_family,
+                RecentReplayPrerequisite::Reset {
+                    target_head: reset.new_head_sha.clone(),
+                    old_head: reset.old_head_sha.clone(),
+                    pathspecs: reset_pathspecs
+                        .map(|paths| paths.to_vec())
+                        .unwrap_or_default(),
+                    final_state: carryover_snapshot.cloned(),
+                    working_log_snapshot: capture_recent_working_log_snapshot(
+                        &repo,
+                        &reset.new_head_sha,
+                        Some(author.clone()),
+                    )?,
+                },
+            )?;
+        }
     }
     if !rewrite_event_needs_authorship_processing(&repo, &rewrite_event)? {
         repo.storage.append_rewrite_event(rewrite_event)?;

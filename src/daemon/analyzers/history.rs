@@ -5,8 +5,9 @@ use crate::daemon::domain::{
 use crate::error::AutterError;
 use crate::git::cli_parser::{explicit_rebase_branch_arg, parse_git_cli_args};
 use crate::git::repo_state::{
-    is_valid_git_oid, resolve_reflog_old_oid_for_ref_new_oid_in_worktree,
-    resolve_worktree_head_reflog_old_oid_for_new_head,
+    HeadReflogLanding, head_reflog_entry_written_by, is_valid_git_oid,
+    resolve_reflog_old_oid_for_ref_new_oid_in_worktree,
+    resolve_worktree_head_reflog_old_oid_for_new_head, worktree_head_reflog_landings,
 };
 #[cfg(test)]
 use std::fs;
@@ -260,38 +261,56 @@ fn head_change(
         return Some((orig_head, new_head));
     }
 
-    if let Some(old_head) = old_head_from_worktree_head_reflog(cmd, &new_head) {
+    if let Some(pre_head) = non_empty_opt(cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()))
+        && pre_head != new_head
+    {
+        // The snapshots taken around the command show HEAD moving. The reflog
+        // names the exact commit it moved from.
+        let old_head = old_head_from_worktree_head_reflog(cmd, &new_head).unwrap_or(pre_head);
         return Some((old_head, new_head));
     }
 
-    let old_head = non_empty_opt(
-        cmd.pre_repo
-            .as_ref()
-            .and_then(|repo| repo.head.clone())
-            .or_else(|| {
-                cmd.pre_repo
-                    .as_ref()
-                    .and_then(|repo| repo.branch.as_deref())
-                    .and_then(|branch| refs.get(&format!("refs/heads/{}", branch)).cloned())
-            })
-            .or_else(|| {
-                cmd.post_repo
-                    .as_ref()
-                    .and_then(|repo| repo.branch.as_deref())
-                    .and_then(|branch| refs.get(&format!("refs/heads/{}", branch)).cloned())
-            }),
-    );
-    let old_head = old_head?;
-
-    if old_head == new_head {
-        if let Some(alternate_old_head) = old_head_from_refs(cmd, refs)
-            && alternate_old_head != new_head
-        {
-            return Some((alternate_old_head, new_head));
-        }
+    // From here on HEAD is where the "before" snapshot found it, or there is no
+    // such snapshot. Either the command did not move HEAD, or the snapshot was
+    // taken late, after the command had already moved it. Only the second case
+    // is a HEAD move, and it has to be shown by something this command did:
+    // any older reflog entry that left HEAD on the same commit (a `checkout`
+    // back to the branch, an earlier `reset`) says nothing about this command.
+    let tracked_head = old_head_from_refs(cmd, refs);
+    if tracked_head.as_deref() == Some(new_head.as_str()) {
+        // The branch was already here after the last command that moved it.
         return None;
     }
-    Some((old_head, new_head))
+
+    let landings = head_reflog_landings(cmd, &new_head).unwrap_or_default();
+    if landings.is_empty() {
+        // The reflog has nothing on this commit. The ref state is all there is
+        // to go on.
+        return tracked_head.map(|old_head| (old_head, new_head));
+    }
+    let command = cmd.primary_command.as_deref().unwrap_or_default();
+    for landing in landings {
+        let own_entry = head_reflog_entry_written_by(command, &landing.message);
+        if landing.old != new_head {
+            // The newest entry that moved HEAD here. It is this command's move
+            // only if this command can have written it.
+            return own_entry.then_some((landing.old, new_head));
+        }
+        if own_entry && command == "reset" {
+            // `git reset` writes an entry even when it stays on the commit.
+            return None;
+        }
+        // An entry that left HEAD where it was: a branch created or switched
+        // on the same commit, or the closing entry of a rebase. Look past it.
+    }
+    None
+}
+
+/// The HEAD reflog entries that left HEAD at `new_head`, newest first, entries
+/// that did not move HEAD included. `None` when the reflog cannot be read.
+fn head_reflog_landings(cmd: &NormalizedCommand, new_head: &str) -> Option<Vec<HeadReflogLanding>> {
+    let worktree = cmd.worktree.as_deref()?;
+    worktree_head_reflog_landings(worktree, new_head).ok()
 }
 
 fn branch_ref_hint(cmd: &NormalizedCommand) -> Option<String> {
@@ -1035,6 +1054,305 @@ mod tests {
             "cherry-pick -n creates no commit, got {:?}",
             result.events
         );
+    }
+
+    const OID_MAIN: &str = "1111111111111111111111111111111111111111";
+    const OID_FEATURE: &str = "2222222222222222222222222222222222222222";
+    const OID_UNDONE: &str = "3333333333333333333333333333333333333333";
+
+    /// A command on `main` whose before and after snapshots both show HEAD at
+    /// `OID_MAIN`, in a worktree with the given HEAD reflog.
+    fn command_on_unmoved_main(
+        primary: &str,
+        argv: &[&str],
+        worktree: &std::path::Path,
+        reflog: &[(&str, &str, &str)],
+    ) -> NormalizedCommand {
+        let logs = worktree.join(".git").join("logs");
+        fs::create_dir_all(&logs).expect("create logs");
+        let contents: String = reflog
+            .iter()
+            .map(|(old, new, message)| {
+                format!("{old} {new} Test User <test@example.com> 0 +0000\t{message}\n")
+            })
+            .collect();
+        fs::write(logs.join("HEAD"), contents).expect("write HEAD reflog");
+
+        let mut cmd = command(primary, argv);
+        cmd.ref_changes.clear();
+        cmd.worktree = Some(worktree.to_path_buf());
+        cmd.pre_repo = Some(crate::daemon::domain::RepoContext {
+            head: Some(OID_MAIN.to_string()),
+            branch: Some("main".to_string()),
+            detached: false,
+        });
+        cmd.post_repo = cmd.pre_repo.clone();
+        cmd
+    }
+
+    fn reset_events(
+        cmd: &NormalizedCommand,
+        refs: &std::collections::HashMap<String, String>,
+    ) -> Vec<SemanticEvent> {
+        HistoryAnalyzer
+            .analyze(cmd, AnalysisView { refs })
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| matches!(event, SemanticEvent::Reset { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn reset_that_stays_on_head_is_not_a_move_from_the_branch_visited_before() {
+        let dir = tempdir().expect("tempdir");
+        // `git checkout main` after a commit on `feature`, then `git reset`.
+        let cmd = command_on_unmoved_main(
+            "reset",
+            &["git", "reset"],
+            dir.path(),
+            &[
+                (OID_MAIN, OID_FEATURE, "commit: on feature"),
+                (
+                    OID_FEATURE,
+                    OID_MAIN,
+                    "checkout: moving from feature to main",
+                ),
+                (OID_MAIN, OID_MAIN, "reset: moving to HEAD"),
+            ],
+        );
+
+        let events = reset_events(&cmd, &Default::default());
+        assert!(events.is_empty(), "HEAD did not move, got {:?}", events);
+    }
+
+    #[test]
+    fn reset_of_paths_does_not_inherit_the_checkout_that_brought_head_here() {
+        let dir = tempdir().expect("tempdir");
+        // `git reset -- file` writes no reflog entry at all, so the newest entry
+        // that left HEAD on this commit is the checkout.
+        let cmd = command_on_unmoved_main(
+            "reset",
+            &["git", "reset", "--", "file.txt"],
+            dir.path(),
+            &[
+                (OID_MAIN, OID_FEATURE, "commit: on feature"),
+                (
+                    OID_FEATURE,
+                    OID_MAIN,
+                    "checkout: moving from feature to main",
+                ),
+            ],
+        );
+
+        let events = reset_events(&cmd, &Default::default());
+        assert!(events.is_empty(), "HEAD did not move, got {:?}", events);
+    }
+
+    #[test]
+    fn reset_of_paths_does_not_repeat_an_earlier_reset_to_the_same_commit() {
+        let dir = tempdir().expect("tempdir");
+        // `git reset --soft HEAD~1`, then `git reset -- file`. The second reset
+        // writes no reflog entry; the first one's was already applied, which
+        // the ref state shows.
+        let cmd = command_on_unmoved_main(
+            "reset",
+            &["git", "reset", "--", "file.txt"],
+            dir.path(),
+            &[(OID_UNDONE, OID_MAIN, "reset: moving to HEAD~1")],
+        );
+        let refs = std::collections::HashMap::from([(
+            "refs/heads/main".to_string(),
+            OID_MAIN.to_string(),
+        )]);
+
+        let events = reset_events(&cmd, &refs);
+        assert!(events.is_empty(), "HEAD did not move, got {:?}", events);
+    }
+
+    #[test]
+    fn reset_seen_late_is_still_read_from_its_own_reflog_entry() {
+        let dir = tempdir().expect("tempdir");
+        // The "before" snapshot was taken after `git reset --soft HEAD~1` had
+        // already moved HEAD. The ref state still has the branch on the commit
+        // that was undone, and the reflog entry is this reset's own.
+        let cmd = command_on_unmoved_main(
+            "reset",
+            &["git", "reset", "--soft", "HEAD~1"],
+            dir.path(),
+            &[(OID_UNDONE, OID_MAIN, "reset: moving to HEAD~1")],
+        );
+        let refs = std::collections::HashMap::from([(
+            "refs/heads/main".to_string(),
+            OID_UNDONE.to_string(),
+        )]);
+
+        let events = reset_events(&cmd, &refs);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SemanticEvent::Reset {
+                    kind: ResetKind::Soft,
+                    old_head,
+                    new_head,
+                }] if old_head == OID_UNDONE && new_head == OID_MAIN
+            ),
+            "expected the reset from the undone commit, got {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn reset_looks_past_a_branch_created_on_the_same_commit() {
+        let dir = tempdir().expect("tempdir");
+        // `git reset --soft HEAD~1` seen late, then `git checkout -b topic`
+        // before the reset was analyzed. The checkout left HEAD on the commit.
+        let cmd = command_on_unmoved_main(
+            "reset",
+            &["git", "reset", "--soft", "HEAD~1"],
+            dir.path(),
+            &[
+                (OID_UNDONE, OID_MAIN, "reset: moving to HEAD~1"),
+                (OID_MAIN, OID_MAIN, "checkout: moving from main to topic"),
+            ],
+        );
+
+        let events = reset_events(&cmd, &Default::default());
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SemanticEvent::Reset { old_head, new_head, .. }]
+                    if old_head == OID_UNDONE && new_head == OID_MAIN
+            ),
+            "expected the reset from the undone commit, got {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn rebase_seen_late_is_read_past_its_closing_reflog_entry() {
+        let dir = tempdir().expect("tempdir");
+        // A rebase ends with an entry that leaves HEAD where the last pick put
+        // it. The move is the pick before it.
+        let cmd = command_on_unmoved_main(
+            "rebase",
+            &["git", "rebase", "onto"],
+            dir.path(),
+            &[
+                (OID_FEATURE, OID_UNDONE, "rebase (start): checkout onto"),
+                (OID_UNDONE, OID_MAIN, "rebase (pick): message"),
+                (
+                    OID_MAIN,
+                    OID_MAIN,
+                    "rebase (finish): returning to refs/heads/main",
+                ),
+            ],
+        );
+        let refs = std::collections::HashMap::from([(
+            "refs/heads/main".to_string(),
+            OID_FEATURE.to_string(),
+        )]);
+
+        let result = HistoryAnalyzer
+            .analyze(&cmd, AnalysisView { refs: &refs })
+            .unwrap();
+        assert!(
+            result.events.iter().any(|event| matches!(
+                event,
+                SemanticEvent::RebaseComplete { new_head, .. } if new_head == OID_MAIN
+            )),
+            "expected the rebase to be reported, got {:?}",
+            result.events
+        );
+    }
+
+    #[test]
+    fn merge_abort_is_not_a_head_move() {
+        let dir = tempdir().expect("tempdir");
+        // `git merge --abort` resets to HEAD, which writes an entry that does
+        // not move HEAD.
+        let cmd = command_on_unmoved_main(
+            "merge",
+            &["git", "merge", "--abort"],
+            dir.path(),
+            &[
+                (
+                    OID_FEATURE,
+                    OID_MAIN,
+                    "checkout: moving from feature to main",
+                ),
+                (OID_MAIN, OID_MAIN, "reset: moving to HEAD"),
+            ],
+        );
+
+        let result = HistoryAnalyzer
+            .analyze(
+                &cmd,
+                AnalysisView {
+                    refs: &Default::default(),
+                },
+            )
+            .unwrap();
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::RefUpdated { .. })),
+            "HEAD did not move, got {:?}",
+            result.events
+        );
+    }
+
+    #[test]
+    fn reflog_entries_are_matched_to_the_command_that_writes_them() {
+        assert!(head_reflog_entry_written_by("commit", "commit: message"));
+        assert!(head_reflog_entry_written_by(
+            "commit",
+            "commit (amend): message"
+        ));
+        assert!(head_reflog_entry_written_by(
+            "reset",
+            "reset: moving to HEAD~1"
+        ));
+        assert!(head_reflog_entry_written_by(
+            "cherry-pick",
+            "cherry-pick: message"
+        ));
+        assert!(head_reflog_entry_written_by(
+            "cherry-pick",
+            "commit (cherry-pick): message"
+        ));
+        assert!(head_reflog_entry_written_by(
+            "merge",
+            "merge feature: Fast-forward"
+        ));
+        assert!(head_reflog_entry_written_by(
+            "rebase",
+            "rebase (finish): done"
+        ));
+        // A script's own action is accepted for any command.
+        assert!(head_reflog_entry_written_by(
+            "reset",
+            "restack: moving branch"
+        ));
+
+        assert!(!head_reflog_entry_written_by(
+            "reset",
+            "checkout: moving from feature to main"
+        ));
+        assert!(!head_reflog_entry_written_by("reset", "commit: message"));
+        assert!(!head_reflog_entry_written_by(
+            "commit",
+            "reset: moving to HEAD~1"
+        ));
+        assert!(!head_reflog_entry_written_by(
+            "cherry-pick",
+            "commit: message"
+        ));
+        assert!(!head_reflog_entry_written_by(
+            "merge",
+            "checkout: moving from feature to main"
+        ));
     }
 
     #[test]

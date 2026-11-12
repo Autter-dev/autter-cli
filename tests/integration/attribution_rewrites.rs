@@ -9,6 +9,10 @@
 //! - `git cherry-pick -n` onto a tree with uncommitted AI work keeps both the
 //!   picked lines' attribution and the live work's, in other files and in the
 //!   same file.
+//! - A `git reset` that leaves HEAD where it is (no target, or only paths) is
+//!   not a move from the branch checked out before, and keeps live AI work.
+//! - Lines typed after switching back from a branch with AI commits, or after
+//!   `git reset --hard` threw an AI commit away, are not that AI's.
 //! - A conflicted cherry-pick persists what it was picking, so `--continue`
 //!   still works after the background service restarts.
 //! - A rebase onto a branch that renamed the file moves attribution to the new
@@ -233,6 +237,273 @@ fn cherry_pick_no_commit_onto_staged_ai_work_in_same_file_keeps_both() {
         "Line 2".unattributed_human(),
         "Line 3".unattributed_human(),
         "Picked AI line".ai(),
+    ]);
+}
+
+/// An AI agent's edit of one file: the "before" checkpoint every agent preset
+/// takes, the write, and the "after" checkpoint.
+fn ai_edit(repo: &TestRepo, name: &str, contents: &str) {
+    repo.autter(&["checkpoint", "human", name]).unwrap();
+    fs::write(repo.path().join(name), contents).unwrap();
+    repo.autter(&["checkpoint", "mock_ai", name]).unwrap();
+}
+
+/// The rewrite events the background service recorded for the repository.
+fn rewrite_log(repo: &TestRepo) -> String {
+    let git_dir = repo
+        .git(&["rev-parse", "--absolute-git-dir"])
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::read_to_string(
+        std::path::Path::new(&git_dir)
+            .join("ai")
+            .join("rewrite_log"),
+    )
+    .unwrap_or_default()
+}
+
+/// Commits a base `name`, then an AI commit on a `feature` branch that adds a
+/// line to it, and returns to the main branch. Returns the AI commit.
+fn ai_commit_on_visited_branch(repo: &TestRepo, name: &str) -> String {
+    fs::write(repo.path().join(name), "Line 1\nLine 2\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename(name);
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    ai_edit(repo, name, "Line 1\nLine 2\nLine 3\nFeature AI line\n");
+    repo.stage_all_and_commit("AI change on feature").unwrap();
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".ai(),
+    ]);
+    let source = head_sha(repo);
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+    source
+}
+
+#[test]
+fn reset_that_keeps_head_after_branch_visit_keeps_live_ai_attribution() {
+    let repo = TestRepo::new();
+    ai_commit_on_visited_branch(&repo, "unstage.txt");
+
+    // Live AI work on main, staged and then unstaged again. `git reset` with no
+    // target leaves HEAD where it is.
+    ai_edit(
+        &repo,
+        "unstage.txt",
+        "Live AI line\nLine 1\nLine 2\nLine 3\n",
+    );
+    repo.git(&["add", "unstage.txt"]).unwrap();
+    repo.git(&["reset"]).unwrap();
+    repo.stage_all_and_commit("Commit live AI work").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("unstage.txt");
+    file.assert_committed_lines(lines![
+        "Live AI line".ai(),
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+    let log = rewrite_log(&repo);
+    assert!(
+        !log.contains("\"reset\""),
+        "a reset that did not move HEAD must not be recorded as a move, got:\n{}",
+        log
+    );
+}
+
+#[test]
+fn reset_of_paths_after_branch_visit_keeps_live_ai_attribution() {
+    let repo = TestRepo::new();
+    ai_commit_on_visited_branch(&repo, "paths.txt");
+
+    // `git reset -- <path>` only touches the index.
+    ai_edit(&repo, "paths.txt", "Live AI line\nLine 1\nLine 2\nLine 3\n");
+    repo.git(&["add", "paths.txt"]).unwrap();
+    repo.git(&["reset", "--", "paths.txt"]).unwrap();
+    repo.stage_all_and_commit("Commit live AI work").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("paths.txt");
+    file.assert_committed_lines(lines![
+        "Live AI line".ai(),
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+    let log = rewrite_log(&repo);
+    assert!(
+        !log.contains("\"reset\""),
+        "a reset that did not move HEAD must not be recorded as a move, got:\n{}",
+        log
+    );
+}
+
+#[test]
+fn reset_of_paths_after_undoing_a_commit_keeps_later_ai_work() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("undo.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("undo.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+    ]);
+
+    ai_edit(&repo, "undo.txt", "Line 1\nLine 2\nFirst AI line\n");
+    repo.stage_all_and_commit("First AI commit").unwrap();
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "First AI line".ai(),
+    ]);
+
+    // Undo the commit, keep working, then unstage the file. The second reset
+    // moves nothing and must not replay the first one over the newer work.
+    repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
+    ai_edit(
+        &repo,
+        "undo.txt",
+        "Line 1\nLine 2\nFirst AI line\nSecond AI line\n",
+    );
+    repo.git(&["add", "undo.txt"]).unwrap();
+    repo.git(&["reset", "--", "undo.txt"]).unwrap();
+    repo.stage_all_and_commit("Both AI lines").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "First AI line".ai(),
+        "Second AI line".ai(),
+    ]);
+}
+
+#[test]
+fn cherry_pick_no_commit_onto_staged_ai_work_then_reset_keeps_both() {
+    let repo = TestRepo::new();
+    let source = ai_commit_on_visited_branch(&repo, "unstaged.txt");
+
+    ai_edit(
+        &repo,
+        "unstaged.txt",
+        "Live AI line\nLine 1\nLine 2\nLine 3\n",
+    );
+    repo.git(&["add", "unstaged.txt"]).unwrap();
+    repo.git(&["cherry-pick", "-n", &source]).unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.path().join("unstaged.txt")).unwrap(),
+        "Live AI line\nLine 1\nLine 2\nLine 3\nFeature AI line\n",
+        "cherry-pick -n should merge the picked line into the live work"
+    );
+
+    // Unstage everything, then commit it all again.
+    repo.git(&["reset"]).unwrap();
+    repo.stage_all_and_commit("Live work and pick").unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("unstaged.txt");
+    file.assert_committed_lines(lines![
+        "Live AI line".ai(),
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+        "Feature AI line".ai(),
+    ]);
+}
+
+#[test]
+fn line_typed_after_visiting_a_branch_with_an_ai_commit_is_not_the_ais() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("visited.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("visited.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+    let main_branch = repo.current_branch();
+
+    // The AI rewrites line 2 on a feature branch.
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    ai_edit(&repo, "visited.txt", "Line 1\nAI version\nLine 3\n");
+    repo.stage_all_and_commit("AI change on feature").unwrap();
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "AI version".ai(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    // Back on main, the same line is rewritten in a plain editor, with some
+    // of the AI's words: no checkpoint. Checking main out again is not a reset
+    // that undid the feature commit, so nothing of that commit is "recovered"
+    // into this one.
+    repo.git(&["checkout", &main_branch]).unwrap();
+    fs::write(&file_path, "Line 1\nMain version\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Change on main").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Main version".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+}
+
+#[test]
+fn line_typed_after_hard_reset_of_an_ai_commit_is_not_the_ais() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("discarded.txt");
+
+    fs::write(&file_path, "Line 1\nLine 2\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("discarded.txt");
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Line 2".unattributed_human(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    ai_edit(&repo, "discarded.txt", "Line 1\nAI version\nLine 3\n");
+    repo.stage_all_and_commit("AI change").unwrap();
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "AI version".ai(),
+        "Line 3".unattributed_human(),
+    ]);
+
+    // Throw the AI commit away and write the line by hand instead, with some
+    // of the AI's words.
+    repo.git(&["reset", "--hard", "HEAD~1"]).unwrap();
+    fs::write(&file_path, "Line 1\nHand version\nLine 3\n").unwrap();
+    repo.stage_all_and_commit("Change by hand").unwrap();
+    repo.sync_daemon();
+
+    file.assert_committed_lines(lines![
+        "Line 1".unattributed_human(),
+        "Hand version".unattributed_human(),
+        "Line 3".unattributed_human(),
     ]);
 }
 
