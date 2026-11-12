@@ -975,7 +975,10 @@ fn sync_fetch_remote_supports_lazy_blobs(
     }
 }
 
-fn stable_patch_id_for_commit(repo: &Repository, commit_sha: &str) -> Result<String, AutterError> {
+pub(crate) fn stable_patch_id_for_commit(
+    repo: &Repository,
+    commit_sha: &str,
+) -> Result<String, AutterError> {
     let mut show_args = repo.global_args_for_exec();
     show_args.extend(
         [

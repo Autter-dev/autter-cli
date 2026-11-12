@@ -1,3 +1,4 @@
+use crate::ci::ci_context::stable_patch_id_for_commit;
 use crate::config;
 use crate::daemon::domain::RepoContext;
 use crate::daemon::git_backend::GitBackend;
@@ -9,7 +10,8 @@ use crate::git::cli_parser::{
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
     HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
-    latest_reflog_old_oid_for_worktree, read_head_state_for_worktree, read_ref_oid_for_worktree,
+    head_reflog_path_messages_for_worktree, latest_reflog_old_oid_for_worktree,
+    read_head_state_for_worktree, read_ref_oid_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -3443,6 +3445,12 @@ fn strict_cherry_pick_mappings_from_command(
             Err(err) => last_err = err.to_string(),
         }
     }
+    if let [source_commit] = source_commits.as_slice()
+        && let Some(original_head) =
+            recover_single_cherry_pick_by_content(worktree, source_commit, new_head, context)
+    {
+        return Ok((original_head, source_commits, vec![new_head.to_string()]));
+    }
     Err(AutterError::Generic(format!(
         "{} failed to reconstruct cherry-pick commits new={} expected_count={}: {}",
         context,
@@ -3450,6 +3458,55 @@ fn strict_cherry_pick_mappings_from_command(
         source_commits.len(),
         last_err
     )))
+}
+
+/// Recover a single-commit pick whose HEAD reflog entry does not say
+/// "cherry-pick", for example when a hook amends the picked commit or an
+/// inherited `GIT_REFLOG_ACTION` renames the entry. Accept it when the reflog
+/// moved HEAD from the parent of `new_head` to `new_head` and the new commit
+/// applies the same patch as the source commit. Returns the original head.
+fn recover_single_cherry_pick_by_content(
+    worktree: &Path,
+    source_commit: &str,
+    new_head: &str,
+    context: &str,
+) -> Option<String> {
+    let repo = find_repository_in_path(&worktree.to_string_lossy()).ok()?;
+    let original_head = repo
+        .find_commit(new_head.to_string())
+        .ok()?
+        .parent(0)
+        .ok()?
+        .id();
+    let messages =
+        head_reflog_path_messages_for_worktree(worktree, &original_head, new_head).ok()??;
+    let content_matches = matches!(
+        (
+            stable_patch_id_for_commit(&repo, source_commit),
+            stable_patch_id_for_commit(&repo, new_head),
+        ),
+        (Ok(source), Ok(new)) if source == new
+    );
+    // Only the action part of each reflog message: the rest is the commit subject.
+    let reflog_actions = messages
+        .iter()
+        .map(|message| {
+            message
+                .split_once(": ")
+                .map_or(message.as_str(), |(action, _)| action)
+        })
+        .collect::<Vec<_>>();
+    crate::observability::log_message(
+        "cherry-pick HEAD reflog entry without cherry-pick action",
+        "warn",
+        Some(serde_json::json!({
+            "component": "daemon",
+            "phase": context,
+            "reflog_actions": reflog_actions,
+            "content_matches": content_matches,
+        })),
+    );
+    content_matches.then_some(original_head)
 }
 
 /// Match source commits to new commits by commit subject (first line of message).

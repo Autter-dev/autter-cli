@@ -75,6 +75,48 @@ fn test_single_commit_cherry_pick() {
     }
 }
 
+/// An inherited `GIT_REFLOG_ACTION` replaces "cherry-pick" in the HEAD reflog
+/// entry. The daemon must still map the picked commit by its content.
+#[test]
+fn test_single_commit_cherry_pick_with_custom_reflog_action() {
+    let repo = TestRepo::new();
+
+    let mut file = repo.filename("file.txt");
+    file.set_contents(crate::lines!["Initial content"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    file.assert_committed_lines(crate::lines!["Initial content".human()]);
+
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    file.insert_at(1, crate::lines!["AI feature line".ai()]);
+    repo.stage_all_and_commit("Add AI feature").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "Initial content".human(),
+        "AI feature line".ai(),
+    ]);
+    let feature_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    repo.git_with_env(
+        &["cherry-pick", &feature_commit],
+        &[("GIT_REFLOG_ACTION", "custom-tool")],
+        None,
+    )
+    .unwrap();
+
+    let reflog_subject = repo.git(&["reflog", "-1", "--format=%gs", "HEAD"]).unwrap();
+    assert!(
+        !reflog_subject.contains("cherry-pick"),
+        "reflog entry should not name cherry-pick: {reflog_subject}"
+    );
+
+    file.assert_committed_lines(crate::lines![
+        "Initial content".human(),
+        "AI feature line".ai(),
+    ]);
+}
+
 #[test]
 fn test_cherry_pick_preserves_human_only_commit_note_metadata() {
     let repo = TestRepo::new();
