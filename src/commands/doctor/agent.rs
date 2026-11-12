@@ -72,6 +72,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("google-antigravity", "antigravity"),
     ("antigravity-pre", "antigravity"),
     ("antigravity-post", "antigravity"),
+    ("kiro-cli", "kiro"),
+    ("aws-kiro", "kiro"),
     ("intellij", "jetbrains"),
     ("jetbrains-ides", "jetbrains"),
     ("visualstudio", "visual-studio"),
@@ -223,6 +225,15 @@ pub(super) fn simulation_for(
                 post: call,
                 pre_names_file: true,
             }
+        }
+        "kiro" => {
+            // Envelope from https://kiro.dev/docs/hooks/types/; the tool_input
+            // field name is UNCONFIRMED (see presets/kiro.rs).
+            let call = |event: &str| {
+                json!({"hook_event_name": event, "cwd": cwd, "session_id": session,
+                       "tool_name": "fs_write", "tool_input": {"path": file}})
+            };
+            same("kiro", call("PreToolUse"), call("PostToolUse"))
         }
         "windsurf" => {
             let call = |action: &str| {

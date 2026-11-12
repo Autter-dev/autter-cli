@@ -95,6 +95,7 @@ mod issue_1204_multi_agent;
 mod jetbrains_download;
 mod jetbrains_ide_types;
 mod json_contract;
+mod kiro;
 mod local_mode_privacy;
 mod log;
 mod memory_command;

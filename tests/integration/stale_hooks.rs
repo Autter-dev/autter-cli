@@ -32,6 +32,7 @@ const SHELL_HOOK_PRESETS: &[&str] = &[
     "droid",
     "github-copilot",
     "firebender",
+    "kiro",
 ];
 
 struct HookRun {
