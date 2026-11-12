@@ -1696,7 +1696,7 @@ fn handle_stats(args: &[String]) {
 /// The `--strict` failure message for `stats`.
 fn nothing_captured_message(what: &str) -> String {
     format!(
-        "nothing captured: no added line in {what} is attributed to AI or a known human (--strict). Run `autter doctor` to check capture."
+        "nothing captured: autter has no record of the lines added in {what} (--strict). Run `autter doctor` to check capture."
     )
 }
 

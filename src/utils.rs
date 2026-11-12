@@ -143,6 +143,20 @@ pub fn is_interactive_terminal() -> bool {
     *IS_TERMINAL.get_or_init(|| std::io::stdin().is_terminal())
 }
 
+/// Whether a test asked for terminal-only output (`AUTTER_TEST_FORCE_TTY`)
+/// from a command whose stdout is a pipe. Only builds for tests read the
+/// variable; a release build ignores it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_forces_tty() -> bool {
+    std::env::var_os("AUTTER_TEST_FORCE_TTY").is_some()
+}
+
+/// Release builds never read `AUTTER_TEST_FORCE_TTY`.
+#[cfg(not(any(test, feature = "test-support")))]
+pub fn test_forces_tty() -> bool {
+    false
+}
+
 /// Returns true if the process is running inside a background AI agent environment.
 pub fn is_in_background_agent() -> bool {
     !matches!(
@@ -530,6 +544,72 @@ pub fn unescape_git_path(path: &str) -> String {
         // If invalid UTF-8, try lossy conversion
         String::from_utf8_lossy(e.as_bytes()).into_owned()
     })
+}
+
+#[cfg(test)]
+mod test_only_env_tests {
+    use std::path::Path;
+
+    /// Every Rust source file under `dir`.
+    fn rust_sources(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read source directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+
+    /// `AUTTER_TEST_FORCE_TTY` makes commands print terminal-only output into
+    /// a pipe. It is for tests: a release build must not read it. The only
+    /// read is `test_forces_tty`, which is compiled in for `test` and
+    /// `test-support` builds alone.
+    #[test]
+    fn force_tty_variable_is_read_only_behind_the_test_gate() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&src, &mut sources);
+
+        // Built from parts so this test does not match itself.
+        let variable = ["AUTTER_TEST", "FORCE_TTY"].join("_");
+        let read = format!("var_os(\"{variable}\")");
+        let mut readers = Vec::new();
+        for path in &sources {
+            let text = std::fs::read_to_string(path).expect("read source file");
+            if text.contains(&read) {
+                readers.push(
+                    path.strip_prefix(&src)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+        assert_eq!(
+            readers,
+            vec!["utils.rs".to_string()],
+            "only utils::test_forces_tty may read {variable}"
+        );
+
+        let utils = std::fs::read_to_string(src.join("utils.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let gated = format!(
+            "#[cfg(any(test, feature = \"test-support\"))]\npub fn test_forces_tty() -> bool {{\n    std::env::{read}.is_some()\n}}"
+        );
+        assert!(
+            utils.contains(&gated),
+            "the read of {variable} must sit behind the test gate"
+        );
+        assert!(
+            utils.contains(
+                "#[cfg(not(any(test, feature = \"test-support\")))]\npub fn test_forces_tty() -> bool {\n    false\n}"
+            ),
+            "a release build must answer false without reading the environment"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2,8 +2,8 @@
 //! prints exactly one JSON document on stdout that validates against
 //! `docs/schemas/autter-cli.schema.json`, carries `schema_version`, and exits
 //! with the documented codes (0 success, 1 runtime error, 2 usage error,
-//! 3 nothing captured and 4 capture broken, the last two only with
-//! `--strict`). The shape of each document is snapshotted so a schema change
+//! 3 nothing captured, meaning autter has no record of the added lines, and
+//! 4 capture broken, the last two only with `--strict`). The shape of each document is snapshotted so a schema change
 //! is always deliberate.
 
 use crate::repos::test_file::ExpectedLineExt;
@@ -238,15 +238,55 @@ pub(crate) fn repo_with_ai_commit() -> TestRepo {
     repo
 }
 
-/// A repo whose last commit adds lines with no checkpoint at all.
-fn repo_with_uncaptured_commit() -> TestRepo {
+/// A repo whose last commit was typed by hand while capture was working: no
+/// checkpoint at all, but autter recorded the commit. Its lines are untracked.
+fn repo_with_hand_typed_commit() -> TestRepo {
     let repo = TestRepo::new();
     fs::write(repo.path().join("first.txt"), "first\n").unwrap();
     repo.stage_all_and_commit("First").unwrap();
-    fs::write(repo.path().join("plain.txt"), "typed by hand\nno capture\n").unwrap();
-    repo.stage_all_and_commit("Uncaptured").unwrap();
+    let mut first = repo.filename("first.txt");
+    first.assert_committed_lines(crate::lines!["first".unattributed_human()]);
+    fs::write(repo.path().join("plain.txt"), "typed by hand\nno agent\n").unwrap();
+    repo.stage_all_and_commit("Typed by hand").unwrap();
+    let mut plain = repo.filename("plain.txt");
+    plain.assert_committed_lines(crate::lines![
+        "typed by hand".unattributed_human(),
+        "no agent".unattributed_human(),
+    ]);
     repo
 }
+
+/// A repo whose last commit capture missed: made with plain git, which the
+/// background service never sees, so the commit has no authorship record. Its
+/// lines are unknown.
+fn repo_with_unrecorded_commit() -> TestRepo {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("first.txt"), "first\n").unwrap();
+    repo.stage_all_and_commit("First").unwrap();
+    let mut first = repo.filename("first.txt");
+    first.assert_committed_lines(crate::lines!["first".unattributed_human()]);
+    fs::write(
+        repo.path().join("plain.txt"),
+        "capture missed\nthis commit\n",
+    )
+    .unwrap();
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "Made while autter was not recording"])
+        .unwrap();
+    let head = repo.git_og(&["rev-parse", "HEAD"]).unwrap();
+    assert!(
+        repo.read_authorship_note(head.trim()).is_none(),
+        "nothing observed the commit, so it has no record"
+    );
+    repo
+}
+
+/// An address nothing listens on: commands run with it see the background
+/// service as not running.
+const SERVICE_DOWN: (&str, &str) = (
+    "AUTTER_DAEMON_CONTROL_SOCKET",
+    "/nonexistent/autter-test/control.sock",
+);
 
 // ---------------------------------------------------------------------------
 // 1. Every reporting command: --json, one document, schema, snapshot
@@ -330,23 +370,29 @@ fn stats_json_reports_the_four_labels_and_capture() {
     // The original fields are still there for existing readers.
     assert_eq!(document["ai_additions"], 2);
 
-    let uncaptured = repo_with_uncaptured_commit();
-    let document = parse_document(&run(&uncaptured, &["stats", "--json"], &[]), "stats");
+    // Typed by hand with capture working: recorded, so its lines are
+    // untracked and capture did not miss it.
+    let hand_typed = repo_with_hand_typed_commit();
+    let document = parse_document(&run(&hand_typed, &["stats", "--json"], &[]), "stats");
+    assert_eq!(document["capture"]["status"], "captured", "{document}");
+    assert_eq!(document["capture"]["note_present"], true, "{document}");
+    assert_eq!(document["record"]["status"], "recorded", "{document}");
+    assert_eq!(document["lines"]["ai"], 0);
+    assert_eq!(document["lines"]["human"], 0);
+    assert_eq!(document["lines"]["untracked"], 2, "{document}");
+    assert_eq!(document["lines"]["unknown"], 0, "{document}");
+
+    // No record at all: the lines are unknown and nothing was captured.
+    let unrecorded = repo_with_unrecorded_commit();
+    let document = parse_document(&run(&unrecorded, &["stats", "--json"], &[]), "stats");
     assert_eq!(
         document["capture"]["status"], "nothing_captured",
         "{document}"
     );
-    assert_eq!(document["lines"]["ai"], 0);
-    assert_eq!(document["lines"]["human"], 0);
-    let unattributed = document["lines"]["untracked"].as_u64().unwrap()
-        + document["lines"]["unknown"].as_u64().unwrap();
-    assert_eq!(unattributed, 2, "{document}");
-    // Untracked when there is a note, Unknown when there is none.
-    if document["capture"]["note_present"] == true {
-        assert_eq!(document["lines"]["untracked"], 2);
-    } else {
-        assert_eq!(document["lines"]["unknown"], 2);
-    }
+    assert_eq!(document["capture"]["note_present"], false, "{document}");
+    assert_ne!(document["record"]["status"], "recorded", "{document}");
+    assert_eq!(document["lines"]["untracked"], 0, "{document}");
+    assert_eq!(document["lines"]["unknown"], 2, "{document}");
 }
 
 #[test]
@@ -391,10 +437,32 @@ fn doctor_json_is_valid_and_strict_exits_4_when_capture_is_broken() {
 // 2. Exit codes
 // ---------------------------------------------------------------------------
 
+/// Exit 3 means capture missed the commit (no authorship record), not that
+/// the commit has no AI lines.
 #[test]
 fn stats_strict_exits_3_only_when_nothing_was_captured() {
-    let uncaptured = repo_with_uncaptured_commit();
+    let uncaptured = repo_with_unrecorded_commit();
     let captured = repo_with_ai_commit();
+
+    // A commit typed by hand, with no agent and no editor extension, on a
+    // machine where capture works: it has a record, so it passes.
+    let hand_typed = repo_with_hand_typed_commit();
+    for args in [
+        &["stats", "--strict"][..],
+        &["stats", "--json", "--strict"][..],
+        &["stats", "HEAD", "--strict"][..],
+    ] {
+        let result = run(&hand_typed, args, &[]);
+        assert_eq!(
+            result.code, 0,
+            "{args:?} on a recorded hand-typed commit: {}{}",
+            result.stdout, result.stderr
+        );
+    }
+    assert_eq!(
+        run(&hand_typed, &["stats"], &[("AUTTER_STRICT", "1")]).code,
+        0
+    );
 
     // Default behaviour is unchanged.
     assert_eq!(run(&uncaptured, &["stats"], &[]).code, 0);
@@ -432,7 +500,7 @@ fn stats_strict_exits_3_only_when_nothing_was_captured() {
 
 #[test]
 fn stats_json_strict_prints_a_json_error_object() {
-    let repo = repo_with_uncaptured_commit();
+    let repo = repo_with_unrecorded_commit();
     let result = run(&repo, &["stats", "--json", "--strict"], &[]);
     assert_eq!(result.code, 3);
     let document = parse_document(&result, "stats --json --strict");
@@ -442,11 +510,12 @@ fn stats_json_strict_prints_a_json_error_object() {
     assert!(document["error"]["message"].is_string());
     // The report is kept next to the error.
     assert_eq!(document["capture"]["status"], "nothing_captured");
+    assert_eq!(document["lines"]["unknown"], 2, "{document}");
 }
 
 #[test]
 fn stats_strict_passes_a_commit_with_no_additions() {
-    let repo = repo_with_uncaptured_commit();
+    let repo = repo_with_hand_typed_commit();
     repo.git(&["commit", "--allow-empty", "-m", "empty"])
         .unwrap();
     let result = run(&repo, &["stats", "--json", "--strict"], &[]);
@@ -457,25 +526,171 @@ fn stats_strict_passes_a_commit_with_no_additions() {
 
 #[test]
 fn stats_range_strict() {
-    let repo = repo_with_uncaptured_commit();
+    // Every added line in the range comes from a commit with no record.
+    let repo = repo_with_unrecorded_commit();
     let result = run(&repo, &["stats", "HEAD~1..HEAD", "--json", "--strict"], &[]);
     assert_eq!(result.code, 3, "{}{}", result.stdout, result.stderr);
     let document = parse_document(&result, "range strict");
     assert_valid(&document, "stats_range", "range strict");
     assert_eq!(document["error"]["code"], "nothing_captured");
+    assert_eq!(document["lines"]["unknown"], 2, "{document}");
 
     let captured = repo_with_ai_commit();
     assert_eq!(
         run(&captured, &["stats", "HEAD~1..HEAD", "--strict"], &[]).code,
         0
     );
+
+    // A range of recorded commits typed by hand passes: capture worked.
+    let hand_typed = repo_with_hand_typed_commit();
+    let result = run(
+        &hand_typed,
+        &["stats", "HEAD~1..HEAD", "--json", "--strict"],
+        &[],
+    );
+    assert_eq!(result.code, 0, "{}{}", result.stdout, result.stderr);
+    let document = parse_document(&result, "hand-typed range");
+    assert_eq!(document["capture"]["status"], "captured", "{document}");
+    assert_eq!(document["lines"]["untracked"], 2, "{document}");
 }
 
+/// `stats --strict` on a merge commit judges the lines the merge itself adds:
+/// none for a clean merge (pass), the conflict resolution otherwise.
+#[test]
+fn stats_strict_judges_a_merge_commit_on_its_own_lines() {
+    let repo = TestRepo::new();
+    let path = repo.path().join("app.txt");
+    fs::write(&path, "shared\nline two\n").unwrap();
+    repo.stage_all_and_commit("Base").unwrap();
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "line two".unattributed_human(),
+    ]);
+    let main = repo.current_branch();
+
+    // A clean merge: the branch only adds a file of its own.
+    repo.git(&["checkout", "-b", "clean"]).unwrap();
+    fs::write(repo.path().join("side.txt"), "side\n").unwrap();
+    repo.stage_all_and_commit("Side file").unwrap();
+    let mut side = repo.filename("side.txt");
+    side.assert_committed_lines(crate::lines!["side".unattributed_human()]);
+    repo.git(&["checkout", &main]).unwrap();
+    fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+    repo.stage_all_and_commit("Main file").unwrap();
+    repo.git(&["merge", "--no-ff", "-m", "Clean merge", "clean"])
+        .unwrap();
+    side.assert_committed_lines(crate::lines!["side".unattributed_human()]);
+
+    let clean = run(&repo, &["stats", "--json", "--strict"], &[]);
+    assert_eq!(clean.code, 0, "{}{}", clean.stdout, clean.stderr);
+    let document = parse_document(&clean, "clean merge");
+    assert_eq!(document["capture"]["status"], "no_additions", "{document}");
+    assert_eq!(document["lines"]["added"], 0, "{document}");
+
+    // A conflicting merge: both sides rewrite line two.
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    fs::write(&path, "shared\nfeature two\n").unwrap();
+    repo.stage_all_and_commit("Feature rewrites line two")
+        .unwrap();
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "feature two".unattributed_human(),
+    ]);
+    repo.git(&["checkout", &main]).unwrap();
+    fs::write(&path, "shared\nmain two\n").unwrap();
+    repo.stage_all_and_commit("Main rewrites line two").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "main two".unattributed_human(),
+    ]);
+    assert!(
+        repo.git(&["merge", "feature"]).is_err(),
+        "both branches changed line two, so the merge conflicts"
+    );
+
+    // The resolution is a line neither parent has. It is committed with plain
+    // git, so capture misses the merge commit.
+    fs::write(&path, "shared\nresolved by hand\n").unwrap();
+    repo.git_og(&["add", "app.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Merge feature, resolved"])
+        .unwrap();
+    let merge = repo.git_og(&["rev-parse", "HEAD"]).unwrap();
+    assert!(repo.read_authorship_note(merge.trim()).is_none());
+
+    let missed = run(&repo, &["stats", "--json", "--strict"], &[]);
+    assert_eq!(missed.code, 3, "{}{}", missed.stdout, missed.stderr);
+    let document = parse_document(&missed, "unrecorded merge");
+    assert_eq!(document["error"]["code"], "nothing_captured", "{document}");
+    assert_eq!(document["lines"]["added"], 1, "{document}");
+    assert_eq!(document["lines"]["unknown"], 1, "{document}");
+    assert_eq!(
+        run(&repo, &["stats", "--json"], &[]).code,
+        0,
+        "without --strict nothing changes"
+    );
+}
+
+/// A merge whose conflict an agent resolved: the merge's own line is AI.
+#[test]
+fn stats_counts_an_ai_conflict_resolution_in_a_merge_commit() {
+    let repo = TestRepo::new();
+    let path = repo.path().join("app.txt");
+    fs::write(&path, "shared\nline two\n").unwrap();
+    repo.stage_all_and_commit("Base").unwrap();
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "line two".unattributed_human(),
+    ]);
+    let main = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    fs::write(&path, "shared\nfeature two\n").unwrap();
+    repo.stage_all_and_commit("Feature rewrites line two")
+        .unwrap();
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "feature two".unattributed_human(),
+    ]);
+    repo.git(&["checkout", &main]).unwrap();
+    fs::write(&path, "shared\nmain two\n").unwrap();
+    repo.stage_all_and_commit("Main rewrites line two").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "main two".unattributed_human(),
+    ]);
+    assert!(repo.git(&["merge", "feature"]).is_err());
+
+    // The agent writes a resolution neither side had. Staged first: a
+    // checkpoint skips files git still lists as unmerged.
+    fs::write(&path, "shared\nresolved by the agent\n").unwrap();
+    repo.git(&["add", "app.txt"]).unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    repo.stage_all_and_commit("Merge feature, resolved by AI")
+        .unwrap();
+    file.assert_committed_lines(crate::lines![
+        "shared".unattributed_human(),
+        "resolved by the agent".ai(),
+    ]);
+
+    let result = run(&repo, &["stats", "--json", "--strict"], &[]);
+    assert_eq!(result.code, 0, "{}{}", result.stdout, result.stderr);
+    let document = parse_document(&result, "AI-resolved merge");
+    assert_eq!(document["capture"]["status"], "captured", "{document}");
+    assert_eq!(document["lines"]["added"], 1, "{document}");
+    assert_eq!(document["lines"]["ai"], 1, "{document}");
+}
+
+/// `status --strict` follows the same rule as `stats --strict`: exit 3 only
+/// when a commit of the working tree would get no record.
 #[test]
 fn status_strict_exits_3_for_uncaptured_changes() {
     let repo = TestRepo::new();
     fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
     repo.stage_all_and_commit("Initial").unwrap();
+    let mut tracked = repo.filename("tracked.txt");
+    tracked.assert_committed_lines(crate::lines!["one".unattributed_human()]);
 
     // Clean tree: nothing to capture.
     let clean = run(&repo, &["status", "--json", "--strict"], &[]);
@@ -485,15 +700,32 @@ fn status_strict_exits_3_for_uncaptured_changes() {
         "no_additions"
     );
 
-    // A change no checkpoint saw.
+    // A change typed by hand, which no checkpoint saw, while the background
+    // service is running: the commit it goes into will be recorded. Passes.
     fs::write(repo.path().join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
     assert_eq!(run(&repo, &["status"], &[]).code, 0, "default unchanged");
-    let strict = run(&repo, &["status", "--json", "--strict"], &[]);
+    let typed = run(&repo, &["status", "--json", "--strict"], &[]);
+    assert_eq!(typed.code, 0, "{}{}", typed.stdout, typed.stderr);
+    let document = parse_document(&typed, "status hand-typed");
+    assert_valid(&document, "status", "status hand-typed");
+    assert_eq!(document["capture"]["status"], "captured", "{document}");
+    assert_eq!(document["lines"]["untracked"], 2, "{document}");
+    assert_eq!(document["lines"]["unknown"], 0, "{document}");
+
+    // The same change with the background service not running: a commit made
+    // now would get no record.
+    assert_eq!(
+        run(&repo, &["status"], &[SERVICE_DOWN]).code,
+        0,
+        "default unchanged"
+    );
+    let strict = run(&repo, &["status", "--json", "--strict"], &[SERVICE_DOWN]);
     assert_eq!(strict.code, 3, "{}{}", strict.stdout, strict.stderr);
     let document = parse_document(&strict, "status strict");
     assert_valid(&document, "status", "status strict");
     assert_eq!(document["error"]["code"], "nothing_captured");
     assert_eq!(document["lines"]["unknown"], 2, "{document}");
+    assert_eq!(document["lines"]["untracked"], 0, "{document}");
 
     // Once an AI checkpoint covers it, strict passes.
     repo.autter(&["checkpoint", "mock_ai", "tracked.txt"])
@@ -504,6 +736,38 @@ fn status_strict_exits_3_for_uncaptured_changes() {
         parse_document(&captured, "status captured")["capture"]["status"],
         "captured"
     );
+    // A checkpoint is a record whether or not the service is up right now.
+    assert_eq!(run(&repo, &["status", "--strict"], &[SERVICE_DOWN]).code, 0);
+}
+
+/// A working tree whose only change is a new file git does not track yet is
+/// still a change: `status --strict` must not treat it as a clean tree.
+#[test]
+fn status_strict_sees_files_git_does_not_track_yet() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
+    repo.stage_all_and_commit("Initial").unwrap();
+    let mut tracked = repo.filename("tracked.txt");
+    tracked.assert_committed_lines(crate::lines!["one".unattributed_human()]);
+
+    // A new file, never `git add`ed, with nothing recording.
+    fs::write(repo.path().join("new.txt"), "brand\nnew\nfile\n").unwrap();
+    let missed = run(&repo, &["status", "--json", "--strict"], &[SERVICE_DOWN]);
+    assert_eq!(missed.code, 3, "{}{}", missed.stdout, missed.stderr);
+    let document = parse_document(&missed, "new file, service down");
+    assert_eq!(document["lines"]["added"], 3, "{document}");
+    assert_eq!(document["lines"]["unknown"], 3, "{document}");
+    assert_eq!(document["stats"]["git_diff_added_lines"], 3, "{document}");
+
+    // The same file written by an agent: captured.
+    repo.autter(&["checkpoint", "mock_ai", "new.txt"]).unwrap();
+    let captured = run(&repo, &["status", "--json", "--strict"], &[SERVICE_DOWN]);
+    assert_eq!(captured.code, 0, "{}{}", captured.stdout, captured.stderr);
+    let document = parse_document(&captured, "new AI file");
+    assert_eq!(document["capture"]["status"], "captured", "{document}");
+    assert_eq!(document["lines"]["added"], 3, "{document}");
+    assert_eq!(document["lines"]["ai"], 3, "{document}");
+    assert_eq!(document["stats"]["git_diff_added_lines"], 3, "{document}");
 }
 
 #[test]
@@ -574,7 +838,7 @@ fn an_unknown_revision_is_a_runtime_error_with_a_json_error() {
 
 #[test]
 fn json_errors_are_one_document_on_stdout_and_text_on_stderr() {
-    let repo = repo_with_uncaptured_commit();
+    let repo = repo_with_unrecorded_commit();
     let result = run(&repo, &["stats", "--json", "--strict"], &[]);
     assert_eq!(result.stdout.trim().lines().count(), 1, "{}", result.stdout);
     assert!(

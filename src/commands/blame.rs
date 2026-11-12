@@ -570,8 +570,28 @@ impl Repository {
         }
     }
 
+    /// Blame a file and print the result (unless `options.no_output`).
+    ///
+    /// When printing for `autter blame` in a repository with no commits yet,
+    /// this stops with the message `autter status` and `autter stats` use
+    /// there, instead of returning git's "no such ref: HEAD". Errors that are
+    /// not git's (a path outside the repository, a bad line range) are
+    /// returned as they are.
     #[allow(clippy::type_complexity)]
     pub fn blame(
+        &self,
+        file_path: &str,
+        options: &AutterBlameOptions,
+    ) -> Result<(HashMap<u32, String>, HashMap<String, PromptRecord>), AutterError> {
+        let result = self.blame_and_print(file_path, options);
+        if matches!(result, Err(AutterError::GitCliError { .. })) && !options.no_output {
+            crate::commands::exit_if_no_commits(self, "blame");
+        }
+        result
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn blame_and_print(
         &self,
         file_path: &str,
         options: &AutterBlameOptions,
@@ -622,6 +642,7 @@ impl Repository {
             output_json_format(
                 self,
                 &line_authors,
+                &line_categories,
                 &prompt_records,
                 &authorship_logs,
                 &prompt_commits,
@@ -1387,9 +1408,81 @@ struct BlameMetadata {
 /// JSON output structure for blame
 #[derive(Debug, Serialize)]
 struct JsonBlameOutput {
+    /// AI lines only: `"<line>"` or `"<start>-<end>"` -> prompt id.
     lines: std::collections::BTreeMap<String, String>,
+    /// Every blamed line: `"<line>"` or `"<start>-<end>"` -> `ai`, `human`,
+    /// `untracked` or `unknown`, the names `stats --json` uses under `lines`.
+    line_categories: std::collections::BTreeMap<String, &'static str>,
+    /// How many blamed lines are in each category.
+    category_counts: CategoryCounts,
     prompts: HashMap<String, PromptRecordWithOtherFiles>,
     metadata: BlameMetadata,
+}
+
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+struct CategoryCounts {
+    ai: u32,
+    human: u32,
+    untracked: u32,
+    unknown: u32,
+}
+
+/// Group consecutive lines that share a value into `"<line>"` or
+/// `"<start>-<end>"` keys. `lines` is sorted by line number.
+fn group_line_ranges<T: Clone + PartialEq>(
+    lines: &[(u32, T)],
+) -> std::collections::BTreeMap<String, T> {
+    let mut ranges = std::collections::BTreeMap::new();
+    let mut current: Option<(u32, u32, T)> = None;
+    let key = |start: u32, end: u32| {
+        if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        }
+    };
+    for (line, value) in lines {
+        match &mut current {
+            Some((_, end, current_value)) if *current_value == *value && *line == *end + 1 => {
+                *end = *line;
+            }
+            _ => {
+                if let Some((start, end, done)) = current.take() {
+                    ranges.insert(key(start, end), done);
+                }
+                current = Some((*line, *line, value.clone()));
+            }
+        }
+    }
+    if let Some((start, end, done)) = current {
+        ranges.insert(key(start, end), done);
+    }
+    ranges
+}
+
+/// The category of every blamed line as ranges, and the count per category.
+fn json_line_categories(
+    line_categories: &HashMap<u32, LineCategory>,
+) -> (
+    std::collections::BTreeMap<String, &'static str>,
+    CategoryCounts,
+) {
+    let mut lines: Vec<(u32, &'static str)> = line_categories
+        .iter()
+        .map(|(line, category)| (*line, category.json_name()))
+        .collect();
+    lines.sort_by_key(|(line, _)| *line);
+
+    let mut counts = CategoryCounts::default();
+    for category in line_categories.values() {
+        match category {
+            LineCategory::Ai => counts.ai += 1,
+            LineCategory::Human => counts.human += 1,
+            LineCategory::Untracked => counts.untracked += 1,
+            LineCategory::Unknown => counts.unknown += 1,
+        }
+    }
+    (group_line_ranges(&lines), counts)
 }
 
 /// Read model that patches PromptRecord with other_files and commits fields
@@ -1436,6 +1529,7 @@ fn get_files_for_prompt_hash(
 fn output_json_format(
     repo: &Repository,
     line_authors: &HashMap<u32, String>,
+    line_categories: &HashMap<u32, LineCategory>,
     prompt_records: &HashMap<String, PromptRecord>,
     authorship_logs: &[AuthorshipLog],
     prompt_commits: &HashMap<String, Vec<String>>,
@@ -1452,41 +1546,8 @@ fn output_json_format(
     ai_lines.sort_by_key(|(line, _)| *line);
 
     // Group consecutive lines with the same prompt_id into ranges
-    let mut lines_map: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-
-    if !ai_lines.is_empty() {
-        let mut range_start = ai_lines[0].0;
-        let mut range_end = ai_lines[0].0;
-        let mut current_prompt_id = ai_lines[0].1.clone();
-
-        for (line, prompt_id) in ai_lines.iter().skip(1) {
-            if *prompt_id == current_prompt_id && *line == range_end + 1 {
-                // Extend current range
-                range_end = *line;
-            } else {
-                // Save current range and start new one
-                let range_key = if range_start == range_end {
-                    range_start.to_string()
-                } else {
-                    format!("{}-{}", range_start, range_end)
-                };
-                lines_map.insert(range_key, current_prompt_id.clone());
-
-                range_start = *line;
-                range_end = *line;
-                current_prompt_id = prompt_id.clone();
-            }
-        }
-
-        // Don't forget the last range
-        let range_key = if range_start == range_end {
-            range_start.to_string()
-        } else {
-            format!("{}-{}", range_start, range_end)
-        };
-        lines_map.insert(range_key, current_prompt_id);
-    }
+    let lines_map = group_line_ranges(&ai_lines);
+    let (line_categories, category_counts) = json_line_categories(line_categories);
 
     // Only include prompts that are actually referenced in lines
     let referenced_prompt_ids: std::collections::HashSet<&String> = lines_map.values().collect();
@@ -1521,6 +1582,8 @@ fn output_json_format(
 
     let output = JsonBlameOutput {
         lines: lines_map,
+        line_categories,
+        category_counts,
         prompts: filtered_prompts,
         metadata: BlameMetadata {
             is_logged_in,
@@ -2043,8 +2106,7 @@ fn output_default_format(
     // AI lines, with references `show-prompt` and `blame --why` take. Shown on
     // a terminal (and with `--show-prompt`), so piped output stays one line
     // per source line like `git blame`.
-    let interactive =
-        io::stdout().is_terminal() || std::env::var_os("AUTTER_TEST_FORCE_TTY").is_some();
+    let interactive = io::stdout().is_terminal() || crate::utils::test_forces_tty();
     if (interactive || options.show_prompt) && !shown_prompts.is_empty() {
         output.push_str(&format_prompt_legend(
             &shown_prompts,
