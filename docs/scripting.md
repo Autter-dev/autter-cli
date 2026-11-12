@@ -265,6 +265,11 @@ The same holds for the other ways attribution comes back:
   written by autter 3.8.1 or earlier, is restored as before, so stashes made
   before an upgrade keep their AI lines; a stamped note with its stamp removed
   looks the same and is restored too.
+- **`autter notes backfill`** (and the automatic backfill when a machine moves
+  off the `http` notes backend) copies notes from the local notes database
+  into `refs/notes/ai` as stored, without a new stamp. A note changed in the
+  database still fails `autter verify` after the copy, and the command lists
+  it on stderr; a note written before the integrity check stays `legacy`.
 
 This is an integrity check, not tamper evidence. It catches notes copied to
 another commit, moved, or edited by hand. Not caught:

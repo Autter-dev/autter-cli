@@ -1280,3 +1280,116 @@ fn test_unstamped_stash_note_from_older_autter_still_restores() {
     assert_status(&repo, &commit, "verified");
 }
 
+// ---------------------------------------------------------------------------
+// Notes backfill from the notes database
+// ---------------------------------------------------------------------------
+//
+// `autter notes backfill` copies notes that exist only in the notes database
+// into refs/notes/ai. It writes them as stored, without a new stamp, so a
+// note changed in the database still fails and a legacy note stays legacy.
+
+/// Commit an AI line, then move its note from git into the notes database as
+/// `db_note(note)`. Returns the commit.
+fn note_only_in_db(repo: &TestRepo, db_note: impl Fn(&str) -> String) -> String {
+    let file_path = repo.path().join("app.txt");
+    fs::write(&file_path, "human one\n").unwrap();
+    repo.autter(&["checkpoint", "mock_known_human", "app.txt"])
+        .unwrap();
+    fs::write(&file_path, "human one\nai one\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "app.txt"]).unwrap();
+    let commit = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+
+    let note = raw_note(repo, &commit);
+    repo.git_og(&["notes", "--ref=ai", "remove", &commit])
+        .unwrap();
+    let db_path = repo
+        .test_home_path()
+        .join(".autter")
+        .join("internal")
+        .join("notes-db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let mut db = autter::notes::db::NotesDatabase::open_at_path(&db_path).unwrap();
+    db.cache_synced_notes(&[(commit.clone(), db_note(&note))])
+        .unwrap();
+    drop(db);
+    commit
+}
+
+/// Run `autter notes backfill`: (stdout, stderr).
+fn backfill(repo: &TestRepo) -> (String, String) {
+    let out = repo
+        .autter_command(&["notes", "backfill"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_backfilled_note_verifies() {
+    let repo = TestRepo::new();
+    let commit = note_only_in_db(&repo, |note| note.to_string());
+    let db_note = raw_note_from_db_seed(&repo, &commit);
+
+    let (stdout, stderr) = backfill(&repo);
+    assert!(stdout.contains("Backfilled 1 authorship note "), "{stdout}");
+    assert!(!stderr.contains("integrity check"), "{stderr}");
+    assert_eq!(raw_note(&repo, &commit).trim(), db_note.trim());
+    assert_status(&repo, &commit, "verified");
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+}
+
+/// The note as `note_only_in_db` seeded it.
+fn raw_note_from_db_seed(repo: &TestRepo, commit: &str) -> String {
+    let db_path = repo
+        .test_home_path()
+        .join(".autter")
+        .join("internal")
+        .join("notes-db");
+    let db = autter::notes::db::NotesDatabase::open_at_path(&db_path).unwrap();
+    db.get_notes(&[commit]).unwrap().remove(commit).unwrap()
+}
+
+/// A note changed in the notes database is written unchanged and still fails:
+/// it is not stamped valid on the way into git.
+#[test]
+fn test_backfilled_tampered_note_still_fails() {
+    let repo = TestRepo::new();
+    let commit = note_only_in_db(&repo, |note| {
+        assert!(note.contains("mock_ai"), "{note}");
+        note.replace("mock_ai", "forged_ai")
+    });
+
+    let (stdout, stderr) = backfill(&repo);
+    assert!(stdout.contains("Backfilled 1 authorship note "), "{stdout}");
+    let note = raw_note(&repo, &commit);
+    assert!(note.contains("forged_ai"), "{note}");
+    assert_status(&repo, &commit, "digest_mismatch");
+    assert!(
+        stderr.contains("1 of them fails the integrity check") && stderr.contains(&commit),
+        "{stderr}"
+    );
+    assert_blame_distrusts_note(&repo, &repo.filename("app.txt"), "app.txt");
+    assert_eq!(ai_additions(&repo, &commit), 0);
+}
+
+/// A note written before the integrity check stays legacy: stamping it on
+/// the way into git would make an unchecked note verified.
+#[test]
+fn test_backfilled_legacy_note_stays_legacy() {
+    let repo = TestRepo::new();
+    let commit = note_only_in_db(&repo, strip_integrity);
+
+    let (stdout, _) = backfill(&repo);
+    assert!(stdout.contains("Backfilled 1 authorship note "), "{stdout}");
+    assert!(read_integrity(&raw_note(&repo, &commit)).is_none());
+    assert_status(&repo, &commit, "legacy");
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+}

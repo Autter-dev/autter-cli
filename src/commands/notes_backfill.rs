@@ -39,7 +39,8 @@ pub fn handle_notes_backfill(args: &[String]) {
     };
 
     match crate::git::notes_backfill::backfill_local_notes(&repo) {
-        Ok(written) => {
+        Ok(outcome) => {
+            let written = outcome.written;
             // Mark the automatic run as done too, so it doesn't repeat the scan.
             let marker = crate::git::notes_backfill::auto_backfill_marker_path(&repo);
             if let Some(parent) = marker.parent() {
@@ -56,6 +57,19 @@ pub fn handle_notes_backfill(args: &[String]) {
                     written,
                     if written == 1 { "" } else { "s" }
                 );
+            }
+            if !outcome.failed.is_empty() {
+                let failed = outcome.failed.len();
+                eprintln!(
+                    "warning: {} of them {} the integrity check and {} written unchanged; stats and blame count {} lines as unknown. Run `autter verify <commit>` for details:",
+                    failed,
+                    if failed == 1 { "fails" } else { "fail" },
+                    if failed == 1 { "was" } else { "were" },
+                    if failed == 1 { "its" } else { "their" },
+                );
+                for r in &outcome.failed {
+                    eprintln!("  {} {}", r.commit, r.status.as_str());
+                }
             }
         }
         Err(e) => {
@@ -76,4 +90,8 @@ fn print_help() {
     eprintln!("note only in the local notes database. This copies those notes into");
     eprintln!("refs/notes/ai for commits in the current repository. Existing local");
     eprintln!("notes are never overwritten; running it again writes nothing new.");
+    eprintln!();
+    eprintln!("Notes are copied as stored, without a new integrity stamp: a note that");
+    eprintln!("fails `autter verify` still fails after the copy (it is listed), and a");
+    eprintln!("note written before the integrity check stays legacy.");
 }

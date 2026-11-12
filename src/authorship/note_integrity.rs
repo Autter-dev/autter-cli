@@ -58,6 +58,10 @@
 //! `refs/notes/ai-stash`, stamped for the stash commit
 //! ([`seal_stash_note`]); `stash pop`/`apply` checks it
 //! ([`check_stash_note`]) and does not restore one that fails.
+//!
+//! **Notes copied from the notes database** (`autter notes backfill`) are
+//! written as stored, without a new stamp, so a failing or legacy note is not
+//! turned into a verified one (`git::notes_backfill`).
 
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
