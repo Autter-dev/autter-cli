@@ -170,9 +170,13 @@ pub struct PercentBreakdown {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureStatus {
-    /// At least one added line is attributed to AI or a known human.
+    /// Autter has a record for at least one added line: the line is AI,
+    /// human, or untracked (recorded, with no agent or editor extension
+    /// behind it). A commit typed entirely by hand while capture was working
+    /// is `Captured`.
     Captured,
-    /// Lines were added, and none of them is attributed: `--strict` exits 3.
+    /// Lines were added and Autter has no record for any of them (every added
+    /// line is Unknown): capture missed them. `--strict` exits 3.
     NothingCaptured,
     /// Nothing was added, so there was nothing to capture.
     NoAdditions,
@@ -210,6 +214,10 @@ impl StatsSummary {
     /// (a commit range, the working tree): `unknown_lines` of the lines
     /// without attestation have no record behind them and are Unknown; the
     /// rest are Untracked.
+    ///
+    /// Capture status: `NothingCaptured` only when lines were added and every
+    /// one of them is Unknown. A line Autter recorded as untracked is still a
+    /// line it recorded.
     pub fn with_unknown_lines(stats: &CommitStats, unknown_lines: u32, note_present: bool) -> Self {
         let unattributed = stats.unknown_additions;
         let unknown = unknown_lines.min(unattributed);
@@ -225,7 +233,7 @@ impl StatsSummary {
         let pct = |n| crate::commands::output::percent(n, lines.added);
         let status = if lines.added == 0 {
             CaptureStatus::NoAdditions
-        } else if lines.ai + lines.human == 0 {
+        } else if lines.ai + lines.human + lines.untracked == 0 {
             CaptureStatus::NothingCaptured
         } else {
             CaptureStatus::Captured
@@ -729,13 +737,11 @@ pub fn stats_for_commit_stats_with_authorship(
     let parent_count = commit_obj.parent_count()?;
 
     if parent_count > 1 {
-        return stats_for_commit_stats_from_hunks(
-            repo,
-            commit_sha,
-            ignore_patterns,
-            &[],
-            authorship_log,
-        );
+        let mut parents = Vec::with_capacity(parent_count);
+        for index in 0..parent_count {
+            parents.push(commit_obj.parent(index)?.id());
+        }
+        return stats_for_merge_commit(repo, commit_sha, &parents, ignore_patterns, authorship_log);
     }
 
     let parent_sha = if parent_count == 0 {
@@ -765,6 +771,79 @@ pub fn stats_for_commit_stats_with_parent_and_authorship(
     let from_ref = parent_sha.unwrap_or("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
     let hunks = get_diff_with_line_numbers(repo, from_ref, commit_sha)?;
     stats_for_commit_stats_from_hunks(repo, commit_sha, ignore_patterns, &hunks, authorship_log)
+}
+
+/// Stats for a merge commit: only the lines the merge itself introduced, that
+/// is, the lines of its tree that are in none of its parents (a conflict
+/// resolution, an edit made while merging). What the merged branches brought
+/// in belongs to their own commits and is not counted again here.
+///
+/// A merge with no lines of its own reports no additions, so `--strict` has
+/// nothing to judge and passes. One with such lines is judged on them like any
+/// other commit. Deleted lines are not counted for a merge.
+fn stats_for_merge_commit(
+    repo: &Repository,
+    commit_sha: &str,
+    parents: &[String],
+    ignore_patterns: &[String],
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+) -> Result<CommitStats, AutterError> {
+    let added_lines_by_file = merge_commit_own_lines(repo, commit_sha, parents, ignore_patterns)?;
+    let git_diff_added_lines = added_lines_by_file
+        .values()
+        .map(|lines| lines.len() as u32)
+        .sum();
+    let (ai_accepted, known_human_accepted, ai_accepted_by_tool) =
+        accepted_lines_from_attestations(authorship_log, &added_lines_by_file, false);
+
+    Ok(stats_from_authorship_log(
+        authorship_log,
+        git_diff_added_lines,
+        0,
+        ai_accepted,
+        known_human_accepted,
+        &ai_accepted_by_tool,
+    ))
+}
+
+/// Per file, the sorted line numbers of `commit_sha` that are added relative
+/// to every one of `parents`: the `++` lines of git's combined diff.
+fn merge_commit_own_lines(
+    repo: &Repository,
+    commit_sha: &str,
+    parents: &[String],
+    ignore_patterns: &[String],
+) -> Result<HashMap<String, Vec<u32>>, AutterError> {
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
+    let mut own: Option<HashMap<String, Vec<u32>>> = None;
+    for parent in parents {
+        let mut added = repo.diff_added_lines(parent, commit_sha, None)?;
+        added.retain(|file, lines| {
+            lines.sort_unstable();
+            lines.dedup();
+            !lines.is_empty() && !should_ignore_file_with_matcher(file, &ignore_matcher)
+        });
+        let remaining = match own.take() {
+            None => added,
+            Some(previous) => previous
+                .into_iter()
+                .filter_map(|(file, lines)| {
+                    let also_added = added.get(&file)?;
+                    let kept: Vec<u32> = lines
+                        .into_iter()
+                        .filter(|line| also_added.binary_search(line).is_ok())
+                        .collect();
+                    (!kept.is_empty()).then_some((file, kept))
+                })
+                .collect(),
+        };
+        let done = remaining.is_empty();
+        own = Some(remaining);
+        if done {
+            break;
+        }
+    }
+    Ok(own.unwrap_or_default())
 }
 
 #[doc(hidden)]
@@ -1204,6 +1283,28 @@ mod tests {
     }
 
     #[test]
+    fn capture_status_is_nothing_captured_only_without_a_record() {
+        let status = |stats: &CommitStats, note_present: bool| {
+            StatsSummary::from_stats(stats, note_present).capture.status
+        };
+        // Typed by hand, and Autter recorded the commit: capture worked.
+        assert_eq!(status(&stats_with(0, 5, 0), true), CaptureStatus::Captured);
+        // The same lines with no record: capture missed the commit.
+        assert_eq!(
+            status(&stats_with(0, 5, 0), false),
+            CaptureStatus::NothingCaptured
+        );
+        // AI or known-human lines are captured either way.
+        assert_eq!(status(&stats_with(0, 2, 3), true), CaptureStatus::Captured);
+        assert_eq!(status(&stats_with(0, 0, 3), false), CaptureStatus::Captured);
+        assert_eq!(status(&stats_with(1, 0, 0), true), CaptureStatus::Captured);
+        assert_eq!(
+            status(&stats_with(0, 0, 0), false),
+            CaptureStatus::NoAdditions
+        );
+    }
+
+    #[test]
     fn a_range_splits_unattested_lines_into_untracked_and_unknown() {
         // 6 lines without attestation, 4 of them from commits with no record.
         let stats = stats_with(1, 6, 3);
@@ -1218,6 +1319,11 @@ mod tests {
             summary.lines.added
         );
         assert_eq!(summary.capture.status, CaptureStatus::Captured);
+
+        // Every added line comes from a commit with no record.
+        let all_unknown = StatsSummary::with_unknown_lines(&stats_with(0, 6, 0), 6, true);
+        assert_eq!(all_unknown.lines.unknown, 6);
+        assert_eq!(all_unknown.capture.status, CaptureStatus::NothingCaptured);
 
         let text = render_stats_output_split(&stats, false, 4);
         assert!(

@@ -321,6 +321,12 @@ pub fn pending_work(repo: &Repository) -> Option<usize> {
     family_status(repo).map(|status| status.pending_work())
 }
 
+/// Whether the background service answers for this repository. It is what
+/// writes a commit's record, so while it is down a commit gets none.
+pub fn service_is_running(repo: &Repository) -> bool {
+    family_status(repo).is_some()
+}
+
 /// Checkpoints queued in the background service for this repository.
 pub fn queued_checkpoints(repo: &Repository) -> Option<usize> {
     family_status(repo).map(|status| status.queued_checkpoints)

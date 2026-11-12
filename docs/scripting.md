@@ -45,7 +45,7 @@ for a command that failed before producing anything).
 | `sync_unhealthy` | 1 | `sync status` found an upload problem |
 | `check_failed` | 1 | `doctor` found a failed check |
 | `runtime_error` | 1 | Anything else that went wrong |
-| `nothing_captured` | 3 | `--strict`: nothing was captured |
+| `nothing_captured` | 3 | `--strict`: lines were added and autter has no record of them |
 | `capture_broken` | 4 | `--strict`: capture is broken (`doctor`) |
 
 ### Line labels
@@ -61,27 +61,36 @@ terminal output uses:
 | `lines.unknown` | The commit has no authorship note at all, so autter has no data |
 
 `lines.ai + lines.human + lines.untracked + lines.unknown = lines.added`.
-`percent` has each label's share of the added lines with one decimal, and
-`capture.status` is `captured` (at least one AI or known-human line),
-`nothing_captured` (lines were added and none is attributed) or `no_additions`.
-The original fields (`ai_additions`, `human_additions`, `unknown_additions`, …)
+`percent` has each label's share of the added lines with one decimal. The
+original fields (`ai_additions`, `human_additions`, `unknown_additions`, …)
 are still there for existing readers. `autter stats` also has `record`, which
 says whether the commit has an Autter record and, if not, why; lines without
 attribution are Untracked when it is recorded and Unknown when it is not.
 
-```json
-{
-  "schema_version": 1,
-  "commit": "3f2a…",
-  "human_additions": 1, "unknown_additions": 0, "ai_additions": 2, "ai_accepted": 2,
-  "git_diff_deleted_lines": 0, "git_diff_added_lines": 3,
-  "tool_model_breakdown": { "claude::claude-sonnet-4-5": { "ai_additions": 2, "ai_accepted": 2 } },
-  "lines": { "added": 3, "deleted": 0, "ai": 2, "human": 1, "untracked": 0, "unknown": 0 },
-  "percent": { "ai": 66.7, "human": 33.3, "untracked": 0.0, "unknown": 0.0 },
-  "capture": { "status": "captured", "note_present": true },
-  "record": { "status": "recorded" }
-}
-```
+The label follows the commit that added the line, in every command. In a range
+(`autter stats <a>..<b>`) a line added by a commit with no authorship note is
+`unknown` even when other commits in the range have one, the same as
+`autter stats <that commit>` and `autter blame` report it.
+
+`autter status` counts every uncommitted line a commit of the whole working
+tree would add: edits to tracked files and new files git does not track yet
+(ignored files excluded), whether or not a checkpoint saw them, so
+`lines.added` equals `stats.git_diff_added_lines`. A line no checkpoint
+attributes is `untracked`. With no checkpoints at all it is `untracked` while
+the background service is running and `unknown` when it is not, because a
+commit made then would get no record.
+
+`capture.status` says whether autter has a record of what was added:
+
+| `capture.status` | Meaning |
+|---|---|
+| `captured` | Autter has a record for at least one added line: it is `ai`, `human` or `untracked` |
+| `nothing_captured` | Lines were added and every one of them is `unknown`: capture missed them. `--strict` exits 3 |
+| `no_additions` | Nothing was added |
+
+A commit typed entirely by hand while capture was working has a record and
+only `untracked` lines: it is `captured`. To require AI or known-human lines,
+check `lines.ai` and `lines.human` yourself.
 
 ### `blame --json`
 
@@ -124,7 +133,7 @@ authorship note.
 | 0 | Success |
 | 1 | Runtime error |
 | 2 | Usage error (bad flags, outside a repository) |
-| 3 | Nothing captured (`stats`, `status`; only with `--strict`) |
+| 3 | Nothing captured: autter has no record of the added lines (`stats`, `status`; only with `--strict`) |
 | 4 | Capture is broken (`doctor`; only with `--strict`) |
 
 `autter --help` prints the same table.
@@ -136,10 +145,30 @@ captured, and `doctor` exits 1 when any check fails. With `--strict` (or
 `AUTTER_STRICT=1` in the environment):
 
 - `autter stats [<commit>|<a>..<b>] --strict` exits **3** when lines were added
-  and none of them is attributed to AI or a known human. A commit that adds no
-  lines passes.
-- `autter status --strict` exits **3** when there are uncommitted changes and
-  none of them is attributed.
+  and autter has no record of any of them: capture missed the commit (the
+  background service was not running, the commit was made before autter was set
+  up, or it was made on a machine without autter). "Has a record" means the
+  commit has an authorship note, which is what `record.status` = `recorded` and
+  `capture.note_present` report; every added line is then `ai`, `human` or
+  `untracked`, never `unknown`.
+  - A commit with AI lines exits 0.
+  - A commit typed entirely by hand, with no agent and no editor extension,
+    exits 0 when it has a record: capture worked and found no agent. Its lines
+    are `untracked` and `capture.status` is `captured`.
+  - The same commit with no record exits 3: its lines are `unknown`.
+  - A commit that adds no lines passes.
+  - A merge commit is judged on the lines it adds itself: the lines of the
+    merge that are in none of its parents (a conflict resolution, an edit made
+    while merging). What the merged branches added belongs to their own
+    commits. A merge with no lines of its own has nothing to capture and
+    passes; one with such lines follows the rules above.
+  - A range exits 3 when every added line comes from a commit with no record.
+    One recorded commit that still contributes lines is enough to pass; use
+    `lines.unknown` to require that none is missing.
+- `autter status --strict` exits **3** when there are uncommitted changes, no
+  checkpoint was recorded for them and the background service is not running,
+  so a commit made now would get no record. Changes typed by hand while the
+  service is running exit 0, and so do changes a checkpoint covers.
 - `autter doctor --strict` exits **4** when a check that capture depends on
   fails (background service, git trace2, the end-to-end checkpoint, agent
   hooks), and 1 when only other checks fail. The report has `capture_ok`.
@@ -187,7 +216,7 @@ jobs:
           set -e
 
           if [ "$code" -eq 3 ]; then
-            echo "::error::Nothing in this pull request was captured by autter. Run 'autter doctor' on the machine that wrote it."
+            echo "::error::autter has no record of anything in this pull request. Run 'autter doctor' on the machine that wrote it."
             exit 1
           elif [ "$code" -ne 0 ]; then
             echo "::error::autter stats failed: $(jq -r '.error.message' stats.json)"
@@ -203,5 +232,6 @@ jobs:
 ```
 
 To only fail when nothing was captured, keep the `--strict` call and drop the
-percentage check. To check a single commit, use `autter stats <sha> --json
+percentage check. A pull request written by hand on a machine where autter is
+working passes: exit 3 means autter has no record, not that no AI was used. To check a single commit, use `autter stats <sha> --json
 --strict` instead of a range.

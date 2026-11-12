@@ -575,3 +575,45 @@ fn blame_json_gives_every_line_a_category() {
         "{json}"
     );
 }
+
+/// `autter status` counts every uncommitted line: a new file git does not
+/// track yet and a hand edit no checkpoint saw. It used to print
+/// `1 AI (100%) · 0 added` for an AI-written new file plus a hand edit.
+#[test]
+fn status_counts_new_files_and_hand_edits() {
+    let repo = TestRepo::new();
+    let hand_path = repo.path().join("hand.txt");
+    fs::write(&hand_path, "By hand\n").unwrap();
+    repo.stage_all_and_commit("Initial").unwrap();
+    let mut hand = repo.filename("hand.txt");
+    hand.assert_committed_lines(lines!["By hand".unattributed_human()]);
+
+    // A line typed by hand in a tracked file: no checkpoint at all.
+    fs::write(&hand_path, "By hand\nLive typed\n").unwrap();
+    // An agent creates a file git does not track yet.
+    repo.autter(&["checkpoint", "human", "agent.txt"]).unwrap();
+    fs::write(repo.path().join("agent.txt"), "Live AI\n").unwrap();
+    repo.autter(&["checkpoint", "mock_ai", "agent.txt"])
+        .unwrap();
+
+    let json = json_object(
+        &repo
+            .autter(&["status", "--json"])
+            .expect("autter status --json"),
+    );
+    assert_eq!(json["lines"]["added"], 2, "{json}");
+    assert_eq!(json["lines"]["ai"], 1, "{json}");
+    assert_eq!(json["lines"]["untracked"], 1, "{json}");
+    assert_eq!(json["lines"]["unknown"], 0, "{json}");
+    assert_eq!(
+        json["stats"]["git_diff_added_lines"], json["lines"]["added"],
+        "the added total and its breakdown must agree: {json}"
+    );
+    assert_eq!(json["percent"]["ai"], 50.0, "{json}");
+
+    let status = repo.autter(&["status"]).expect("autter status");
+    assert!(
+        status.contains("1 untracked (50%) \u{00B7} 1 AI (50%) \u{00B7} 2 added, 0 deleted"),
+        "{status}"
+    );
+}

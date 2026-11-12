@@ -197,14 +197,14 @@ It computes % AI code, AI lines generated vs committed, acceptance rates, and hu
 
 ### Scripting and CI
 
-Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `whoami`, `doctor`, `sync status`) takes `--json` and prints exactly one JSON document on stdout, with a `schema_version` and, on failure, an `error` object. Fields are only ever added. With `--strict` (or `AUTTER_STRICT=1`), `stats` and `status` fail when nothing was captured and `doctor` fails when capture is broken:
+Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `whoami`, `doctor`, `sync status`) takes `--json` and prints exactly one JSON document on stdout, with a `schema_version` and, on failure, an `error` object. Fields are only ever added. With `--strict` (or `AUTTER_STRICT=1`), `stats` and `status` fail when autter has no record of the lines that were added (capture missed them; a recorded commit typed by hand passes) and `doctor` fails when capture is broken:
 
 | Exit code | Meaning |
 |---|---|
 | 0 | Success |
 | 1 | Runtime error |
 | 2 | Usage error (bad flags, outside a repository) |
-| 3 | Nothing captured (`stats`, `status`; only with `--strict`) |
+| 3 | Nothing captured: autter has no record of the added lines (`stats`, `status`; only with `--strict`) |
 | 4 | Capture is broken (`doctor`; only with `--strict`) |
 
 ```bash

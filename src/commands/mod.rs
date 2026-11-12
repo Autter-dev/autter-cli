@@ -57,7 +57,8 @@ pub mod wrapped;
 ///   unknown subcommand, missing required argument, unparseable flag value,
 ///   or a reporting command run outside a git repository).
 /// * [`EXIT_NOTHING_CAPTURED`] (`3`) — only with `--strict`: `stats`/`status`
-///   found nothing captured.
+///   found lines Autter has no record of (capture missed them). Lines typed
+///   by hand in a recorded commit are not that.
 /// * [`EXIT_CAPTURE_BROKEN`] (`4`) — only with `--strict`: `doctor` found
 ///   capture broken.
 ///

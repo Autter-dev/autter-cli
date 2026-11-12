@@ -43,7 +43,7 @@
       }
     },
     "lines": {
-      "description": "Added lines by label. ai + human + untracked + unknown = added. Untracked: the commit has an authorship note that does not attest the line. Unknown: there is no authorship note (no data).",
+      "description": "Added lines by label. ai + human + untracked + unknown = added. Untracked: the commit that added the line has an authorship note that does not attest it. Unknown: that commit has no authorship note (no data). In a range the label follows each line's own commit.",
       "type": "object",
       "required": ["added", "deleted", "ai", "human", "untracked", "unknown"],
       "properties": {
@@ -71,7 +71,7 @@
       "required": ["status", "note_present"],
       "properties": {
         "status": {
-          "description": "captured: at least one added line is AI or known human. nothing_captured: lines were added and none is (--strict exits 3). no_additions: nothing to capture.",
+          "description": "captured: autter has a record for at least one added line (it is ai, human or untracked); a recorded commit typed entirely by hand is captured. nothing_captured: lines were added and autter has no record of any of them, every added line is unknown (--strict exits 3). no_additions: nothing to capture.",
           "type": "string",
           "enum": ["captured", "nothing_captured", "no_additions"]
         },
@@ -213,7 +213,7 @@
       }
     },
     "status": {
-      "description": "autter status --json: uncommitted changes in the files checkpoints touched (with no checkpoints, every change to a tracked file, all unknown).",
+      "description": "autter status --json: every uncommitted change, tracked files and new files git does not track yet, whether or not a checkpoint saw it. Lines no checkpoint attributes are untracked; with no checkpoints and the background service not running they are unknown.",
       "type": "object",
       "required": [
         "schema_version",

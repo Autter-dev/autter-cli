@@ -35,8 +35,10 @@ fn write_file(repo: &TestRepo, path: &str, contents: &str) {
 /// Migrated from src/commands/status.rs test_get_working_dir_diff_stats_post_filter_equivalence
 ///
 /// Creates two files, commits them, then modifies both. A checkpoint is created
-/// covering only a.txt. The status command should report the correct diff stats
-/// for the checkpointed file (a.txt adds 2 lines).
+/// covering only a.txt. The status command reports every uncommitted line:
+/// a.txt's two AI lines and the line typed by hand in b.txt, which no
+/// checkpoint saw. (It used to leave b.txt out, so a hand edit next to an AI
+/// edit was not counted at all.)
 #[test]
 fn test_working_dir_diff_stats_single_file_checkpoint() {
     let repo = TestRepo::new();
@@ -49,23 +51,26 @@ fn test_working_dir_diff_stats_single_file_checkpoint() {
     write_file(&repo, "a.txt", "L1\nL2\nL3\nL4\nL5\n");
     write_file(&repo, "b.txt", "hello\nworld\n");
 
-    // Checkpoint only a.txt -- the status command scopes its diff to checkpointed files
+    // Checkpoint only a.txt
     repo.autter(&["checkpoint", "mock_ai", "a.txt"]).unwrap();
 
     let status = status_json(&repo);
 
-    // a.txt adds 2 lines (L4, L5). b.txt is not in the checkpoint, so excluded.
+    // a.txt adds 2 lines (L4, L5), attributed to AI. b.txt adds 1 line that no
+    // checkpoint covers: it is counted, as untracked.
     assert_eq!(
-        status.stats.git_diff_added_lines, 2,
-        "should count only a.txt additions (2 lines)"
+        status.stats.git_diff_added_lines, 3,
+        "should count a.txt's 2 lines and b.txt's hand-typed line"
     );
+    assert_eq!(status.stats.ai_additions, 2);
+    assert_eq!(status.stats.unknown_additions, 1);
 }
 
 /// Migrated from src/commands/status.rs test_get_working_dir_diff_stats_post_filter_exclusion
 ///
-/// Verifies that only checkpointed files are counted in status diff stats.
+/// A file no checkpoint touched is still part of the uncommitted changes.
 /// When only a.txt is checkpointed but both a.txt and b.txt are modified,
-/// only a.txt's additions should appear.
+/// b.txt's addition is counted and is not attributed to the agent.
 #[test]
 fn test_working_dir_diff_stats_exclusion_by_checkpoint() {
     let repo = TestRepo::new();
@@ -83,10 +88,14 @@ fn test_working_dir_diff_stats_exclusion_by_checkpoint() {
 
     let status = status_json(&repo);
 
-    // a.txt adds 2 lines; b.txt adds 1 line but should be excluded
+    // a.txt adds 2 lines; b.txt adds 1 line, counted but not as AI
     assert_eq!(
-        status.stats.git_diff_added_lines, 2,
-        "should only count a.txt additions, not b.txt"
+        status.stats.git_diff_added_lines, 3,
+        "should count b.txt's addition as well as a.txt's"
+    );
+    assert_eq!(
+        status.stats.ai_additions, 2,
+        "only the checkpointed lines are AI"
     );
 }
 
@@ -142,7 +151,7 @@ fn test_working_dir_diff_stats_no_changes_returns_zero() {
 /// Migrated from src/commands/status.rs test_get_working_dir_diff_stats_post_filter_with_rename
 ///
 /// Verifies that renamed files are handled correctly in the status diff stats.
-/// A file is renamed (staged) and another file is modified. Both are checkpointed.
+/// A file is renamed (staged) and gains a line; the new name is checkpointed.
 /// With --no-renames (used internally by the diff stats function), old_name.txt
 /// is reported as a delete and new_name.txt as a new file with all 4 lines added.
 #[test]
@@ -165,16 +174,18 @@ fn test_working_dir_diff_stats_with_rename() {
 
     let status = status_json(&repo);
 
-    // With --no-renames, new_name.txt is a new file with 4 added lines.
-    // old_name.txt deletion is not in the pathspec set (only new_name.txt was
-    // checkpointed and old_name.txt no longer exists), so deleted lines are 0.
+    // With --no-renames, new_name.txt is a new file with 4 added lines, and
+    // old_name.txt is a deleted file with 3 lines. The deletion is part of the
+    // uncommitted changes whether or not a checkpoint names the old path, so
+    // its lines are counted (status used to leave out every file no
+    // checkpoint touched).
     assert_eq!(
         status.stats.git_diff_added_lines, 4,
         "should count new_name.txt as 4 added lines (new file after --no-renames)"
     );
     assert_eq!(
-        status.stats.git_diff_deleted_lines, 0,
-        "old_name.txt deletion is filtered out because it is not in the checkpoint pathspecs"
+        status.stats.git_diff_deleted_lines, 3,
+        "the 3 lines of the deleted old_name.txt are uncommitted deletions"
     );
 }
 

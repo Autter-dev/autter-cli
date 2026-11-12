@@ -27,8 +27,9 @@ use serde::Serialize;
 /// that breaks a reader (a removed or retyped field); added fields keep it.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// `--strict`: the command ran, but nothing was captured for what it looked
-/// at (`stats`, `status`).
+/// `--strict`: the command ran, and Autter has no record of the lines added
+/// in what it looked at (`stats`, `status`): capture missed them. A commit
+/// with a record and no AI lines is not this; it exits 0.
 pub const EXIT_NOTHING_CAPTURED: i32 = 3;
 
 /// `--strict`: capture itself is broken (`doctor`: a background service,
@@ -53,7 +54,7 @@ pub enum ErrorKind {
     SyncUnhealthy,
     /// A setup check failed that does not break capture (`doctor`).
     CheckFailed,
-    /// `--strict`: nothing was captured.
+    /// `--strict`: nothing was captured (no Autter record of the added lines).
     NothingCaptured,
     /// `--strict`: capture is broken.
     CaptureBroken,
