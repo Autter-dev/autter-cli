@@ -222,7 +222,14 @@ fn run_doctor(options: &DoctorOptions) -> DoctorOutput {
         "background service",
         crate::diagnostics::ensure_daemon_ready_for_self_checks(),
     );
+    // Only when doctor actually started or restarted it: a slow service that
+    // answered when doctor waited was left alone and says so in its summary.
+    let doctor_fixed_service = daemon_check
+        .details
+        .iter()
+        .any(|d| d.starts_with(crate::diagnostics::DOCTOR_FIX_DETAIL_PREFIX));
     if daemon_check.status == DoctorStatus::Passed
+        && doctor_fixed_service
         && let Some(initial) = initial_service_state.as_ref()
         && matches!(
             initial.state,

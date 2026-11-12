@@ -377,8 +377,15 @@ impl LockFile {
     /// Try to acquire an exclusive lock on the given path.
     /// Returns `Some(LockFile)` if successful, `None` if another process holds the lock.
     pub fn try_acquire(path: &std::path::Path) -> Option<Self> {
+        Self::try_acquire_or_error(path).ok()
+    }
+
+    /// [`Self::try_acquire`], with the reason when the lock was not taken:
+    /// held by another process (`WouldBlock` on Unix, a sharing violation on
+    /// Windows) or the file could not be opened (permissions).
+    pub fn try_acquire_or_error(path: &std::path::Path) -> std::io::Result<Self> {
         let file = try_lock_exclusive(path)?;
-        Some(Self { _file: file })
+        Ok(Self { _file: file })
     }
 }
 
@@ -392,30 +399,28 @@ impl Drop for LockFile {
 
 #[cfg(unix)]
 #[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+fn try_lock_exclusive(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(path)
-        .ok()?;
+        .open(path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
-    Some(file)
+    Ok(file)
 }
 
 #[cfg(windows)]
 #[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+fn try_lock_exclusive(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .share_mode(0)
         .open(path)
-        .ok()
 }
 
 /// Windows-specific flag to prevent console window creation

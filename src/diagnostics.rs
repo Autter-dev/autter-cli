@@ -231,12 +231,187 @@ impl GitDiagnosticTarget {
     }
 }
 
+/// Prefix of the detail line that says doctor started or restarted the
+/// service. `autter doctor` reads it to tell "fixed by doctor" from "healthy".
+pub const DOCTOR_FIX_DETAIL_PREFIX: &str = "doctor fix: ";
+
+/// Before restarting a service that did not answer, doctor keeps probing it
+/// for this long (scaled to the machine, up to [`SERVICE_CONFIRM_WINDOW_MAX`]).
+/// A restart drops the work in flight, and on a loaded machine one failed
+/// probe usually means slow, not stuck.
+const SERVICE_CONFIRM_WINDOW: Duration = if cfg!(windows) {
+    Duration::from_secs(10)
+} else {
+    Duration::from_secs(5)
+};
+const SERVICE_CONFIRM_WINDOW_MAX: Duration = Duration::from_secs(30);
+/// Connect and reply budget of each confirmation probe: longer than the
+/// first probe's, scaled to the machine, at most [`SERVICE_CONFIRM_PROBE_MAX`].
+const SERVICE_CONFIRM_PROBE: Duration = if cfg!(windows) {
+    Duration::from_secs(4)
+} else {
+    Duration::from_secs(2)
+};
+const SERVICE_CONFIRM_PROBE_MAX: Duration = Duration::from_secs(10);
+const SERVICE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
+/// Unresponsive probes in a row, the first one included, before a restart.
+const SERVICE_CONFIRM_MIN_PROBES: usize = 3;
+
+/// What doctor does about the background service, given what its probes saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceVerdict {
+    /// Healthy now (possibly after being slow): leave it alone.
+    Healthy,
+    /// Unresponsive, but not for long enough yet: probe again.
+    KeepProbing,
+    /// Not running: start it (nothing in flight to lose).
+    Start,
+    /// Runs an outdated binary, or stayed unresponsive for the whole window.
+    Restart,
+}
+
+/// Decide from the probe results so far (oldest first, the first probe
+/// included) and the time since the first probe. Only the latest result and
+/// how long the service has been unresponsive matter: a service that answers
+/// once is left alone, one that never answers for `window` (and at least
+/// [`SERVICE_CONFIRM_MIN_PROBES`] probes) is restarted.
+pub(crate) fn service_verdict(
+    probes: &[crate::commands::daemon::DaemonHealthState],
+    waited: Duration,
+    window: Duration,
+) -> ServiceVerdict {
+    use crate::commands::daemon::DaemonHealthState as State;
+    match probes.last() {
+        None => ServiceVerdict::KeepProbing,
+        Some(State::Healthy) => ServiceVerdict::Healthy,
+        Some(State::Outdated) => ServiceVerdict::Restart,
+        Some(State::NotRunning) => ServiceVerdict::Start,
+        Some(State::Unresponsive) => {
+            let unresponsive = probes
+                .iter()
+                .rev()
+                .take_while(|state| **state == State::Unresponsive)
+                .count();
+            if unresponsive >= SERVICE_CONFIRM_MIN_PROBES && waited >= window {
+                ServiceVerdict::Restart
+            } else {
+                ServiceVerdict::KeepProbing
+            }
+        }
+    }
+}
+
+/// The outcome of probing an unhealthy-looking service until
+/// [`service_verdict`] decides.
+struct ServiceConfirmation {
+    health: crate::commands::daemon::DaemonHealth,
+    initial: crate::commands::daemon::DaemonHealthState,
+    verdict: ServiceVerdict,
+    waited: Duration,
+    probes: usize,
+    probe_timeout: Duration,
+}
+
+impl ServiceConfirmation {
+    /// What doctor saw and why it acts (or not), for the check's details.
+    fn explanation(&self) -> Option<String> {
+        use crate::commands::daemon::DaemonHealthState as State;
+        let waited = self.waited.as_secs_f64();
+        match (self.initial, self.verdict) {
+            (State::Unresponsive, ServiceVerdict::Healthy) => Some(format!(
+                "the service did not answer the first probe but answered after doctor waited {waited:.1}s ({} probes): it is slow, not stuck, so doctor did not restart it",
+                self.probes
+            )),
+            (State::Unresponsive, ServiceVerdict::Restart) => Some(format!(
+                "the service did not answer for {waited:.1}s ({} probes of up to {:.1}s each), so doctor restarted it",
+                self.probes,
+                self.probe_timeout.as_secs_f64()
+            )),
+            (_, ServiceVerdict::Restart) => Some(
+                "doctor restarted the service because it runs an older autter binary than the one installed"
+                    .to_string(),
+            ),
+            (State::Unresponsive, ServiceVerdict::Start) => Some(format!(
+                "the service stopped while doctor waited {waited:.1}s for it to answer, so doctor started it"
+            )),
+            _ => None,
+        }
+    }
+}
+
+fn service_confirm_budgets() -> (Duration, Duration) {
+    let scale = machine_timeout_scale();
+    (
+        scale_timeout(SERVICE_CONFIRM_WINDOW, scale).min(SERVICE_CONFIRM_WINDOW_MAX),
+        scale_timeout(SERVICE_CONFIRM_PROBE, scale).min(SERVICE_CONFIRM_PROBE_MAX),
+    )
+}
+
+/// Probe the service again, with a longer budget, until [`service_verdict`]
+/// decides. Returns at once for a healthy, stopped or outdated service.
+fn confirm_service_state(
+    config: &crate::daemon::DaemonConfig,
+    initial: crate::commands::daemon::DaemonHealth,
+) -> ServiceConfirmation {
+    let (window, probe_timeout) = service_confirm_budgets();
+    let started = Instant::now();
+    let initial_state = initial.state;
+    let mut states = vec![initial.state];
+    let mut health = initial;
+    loop {
+        let verdict = service_verdict(&states, started.elapsed(), window);
+        if verdict != ServiceVerdict::KeepProbing {
+            let confirmation = ServiceConfirmation {
+                health,
+                initial: initial_state,
+                verdict,
+                waited: started.elapsed(),
+                probes: states.len(),
+                probe_timeout,
+            };
+            if states.len() > 1 {
+                record_timing(format!(
+                    "service confirmation: {:?} -> {:?} after {:.1}s, {} probes",
+                    initial_state,
+                    verdict,
+                    confirmation.waited.as_secs_f64(),
+                    confirmation.probes
+                ));
+            }
+            return confirmation;
+        }
+        std::thread::sleep(SERVICE_CONFIRM_INTERVAL);
+        health = crate::commands::daemon::probe_daemon_health_within(
+            config,
+            probe_timeout,
+            probe_timeout,
+        );
+        states.push(health.state);
+    }
+}
+
+/// Timings measured during this run (service start, probes), for
+/// `autter doctor --report`.
+static TIMINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_timing(line: String) {
+    if let Ok(mut timings) = TIMINGS.lock() {
+        timings.push(line);
+    }
+}
+
+pub(crate) fn recorded_timings() -> Vec<String> {
+    TIMINGS.lock().map(|t| t.clone()).unwrap_or_default()
+}
+
 /// Doctor/debug readiness for the background service.
 ///
 /// The verdict comes from [`crate::commands::daemon::probe_daemon_health`],
 /// the same probe `autter bg status` reports, so the two commands agree. Like
 /// before, this also fixes what it can: a stopped service is started and an
-/// unresponsive or outdated one restarted, and the result is re-probed.
+/// outdated one restarted. An unresponsive one is probed again with a longer
+/// budget first and only restarted when it stays unresponsive (see
+/// [`service_verdict`]); the result is re-probed.
 pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
     use crate::commands::daemon::{DaemonHealthState, probe_daemon_health};
 
@@ -253,7 +428,13 @@ pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
         }
     };
 
+    let probed_at = Instant::now();
     let initial = probe_daemon_health(&config);
+    record_timing(format!(
+        "service health probe: {:?} in {:.2}s",
+        initial.state,
+        probed_at.elapsed().as_secs_f64()
+    ));
     let mut details = initial.details(&config);
     details.push(format!("initial state: {}", initial.summary));
 
@@ -268,40 +449,74 @@ pub fn ensure_daemon_ready_for_self_checks() -> DiagnosticCheckResult {
         );
     }
 
-    let fix = match initial.state {
-        DaemonHealthState::Healthy => None,
-        DaemonHealthState::NotRunning => Some((
-            "starting the background service",
-            crate::commands::daemon::ensure_daemon_running(check_timeout(DEBUG_CHECK_TIMEOUT))
-                .map(|_| ()),
-        )),
-        DaemonHealthState::Outdated | DaemonHealthState::Unresponsive => Some((
-            "restarting the background service",
-            crate::commands::daemon::restart_daemon(&config),
-        )),
+    let confirmation = confirm_service_state(&config, initial);
+    details.extend(confirmation.explanation());
+    let fix = match confirmation.verdict {
+        ServiceVerdict::Healthy | ServiceVerdict::KeepProbing => None,
+        ServiceVerdict::Start => Some(("starting the background service", {
+            let started = Instant::now();
+            let result =
+                crate::commands::daemon::ensure_daemon_running(service_start_timeout()).map(|_| ());
+            record_timing(format!(
+                "service start: {} after {:.1}s",
+                if result.is_ok() { "ready" } else { "failed" },
+                started.elapsed().as_secs_f64()
+            ));
+            result
+        })),
+        ServiceVerdict::Restart => Some(("restarting the background service", {
+            let started = Instant::now();
+            let result = crate::commands::daemon::restart_daemon(&config);
+            record_timing(format!(
+                "service restart: {} after {:.1}s",
+                if result.is_ok() { "ready" } else { "failed" },
+                started.elapsed().as_secs_f64()
+            ));
+            result
+        })),
     };
+    let fixed = fix.is_some();
     if let Some((action, result)) = fix {
-        details.push(format!("doctor fix: {action}"));
+        details.push(format!("{DOCTOR_FIX_DETAIL_PREFIX}{action}"));
         if let Err(err) = result {
             details.push(format!("fix failed: {err}"));
         }
     }
 
-    let health = if initial.is_healthy() {
-        initial
-    } else {
+    let health = if fixed {
         let after = probe_daemon_health(&config);
         details.push(format!("state after fix: {}", after.summary));
         after
+    } else {
+        confirmation.health
     };
 
     if health.is_healthy() {
-        DiagnosticCheckResult::passed(&health.summary, details, commands)
+        let summary = if confirmation.initial == DaemonHealthState::Unresponsive && !fixed {
+            format!(
+                "{} (slow: it answered after {:.1}s, so doctor did not restart it)",
+                health.summary,
+                confirmation.waited.as_secs_f64()
+            )
+        } else {
+            health.summary.clone()
+        };
+        DiagnosticCheckResult::passed(summary, details, commands)
     } else {
         let remediation = daemon_failure_remediation(cfg!(windows), &details);
         DiagnosticCheckResult::failed(&health.summary, details, commands)
             .with_remediation(remediation)
     }
+}
+
+/// How long doctor lets a service it starts take to get ready: the machine's
+/// check budget, but never less than a fresh start needs on this platform
+/// (much longer on Windows).
+fn service_start_timeout() -> Duration {
+    check_timeout(DEBUG_CHECK_TIMEOUT).max(crate::commands::daemon::first_readiness_timeout(
+        cfg!(windows),
+        std::env::var_os("CI").is_some(),
+    ))
 }
 
 /// What to do about a background service that stayed unhealthy after
@@ -320,42 +535,265 @@ fn daemon_failure_remediation(windows: bool, details: &[String]) -> String {
         .unwrap_or_else(|| REMEDIATION_DAEMON_FAILED.to_string())
 }
 
+/// A service that started less than this long ago is still on its first
+/// readiness: its first trace event can lag (UNVERIFIED ON WINDOWS).
+const FIRST_READINESS_WINDOW: Duration = Duration::from_secs(120);
+/// No single ingestion probe waits longer than this, however slow the machine.
+const INGESTION_BUDGET_MAX: Duration = Duration::from_secs(60);
+
+/// How long one trace2 ingestion probe may take: `git init` plus the service
+/// recording its event.
+///
+/// UNVERIFIED ON WINDOWS: users there saw this probe time out at the old
+/// fixed 3s. Starting git.exe (and autter.exe as its trace target's peer)
+/// with antivirus scanning each start can take seconds, and a service that
+/// has just started can take longer still for its first event. So Windows
+/// gets 10s, 30s right after a start, on top of the machine-speed scaling.
+pub(crate) fn trace2_ingestion_budget(
+    windows: bool,
+    first_readiness: bool,
+    scale: f64,
+) -> Duration {
+    let base = match (windows, first_readiness) {
+        (true, true) => Duration::from_secs(30),
+        (true, false) => Duration::from_secs(10),
+        (false, _) => DEBUG_CHECK_TIMEOUT,
+    };
+    scale_timeout(base, scale).min(INGESTION_BUDGET_MAX)
+}
+
+/// The second, longer try after an ingestion probe missed its budget.
+fn trace2_ingestion_retry_budget(first: Duration) -> Duration {
+    first.mul_f64(1.5).min(INGESTION_BUDGET_MAX)
+}
+
+/// What one failed trace2 ingestion probe measured.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IngestionProbeFailure {
+    pub error: String,
+    /// How long `git init` ran; `None` when it never started.
+    pub git_elapsed: Option<Duration>,
+    /// `git init` ran out of time.
+    pub git_timed_out: bool,
+    /// `git init` ran but failed.
+    pub git_failed: bool,
+    /// How long doctor then waited for the service to record the event.
+    pub waited_for_service: Duration,
+    /// Events the service had recorded for the probe repository, when its
+    /// status request answered.
+    pub latest_seq: Option<u64>,
+}
+
+impl IngestionProbeFailure {
+    fn measured(&self) -> String {
+        let git = match self.git_elapsed {
+            None => "git init did not start".to_string(),
+            Some(elapsed) if self.git_timed_out => {
+                format!("git init ran {:.1}s and was stopped", elapsed.as_secs_f64())
+            }
+            Some(elapsed) if self.git_failed => {
+                format!("git init failed after {:.1}s", elapsed.as_secs_f64())
+            }
+            Some(elapsed) => format!("git init took {:.1}s", elapsed.as_secs_f64()),
+        };
+        match (
+            self.git_elapsed.is_some() && !self.git_timed_out && !self.git_failed,
+            self.latest_seq,
+        ) {
+            (false, _) => git,
+            (true, Some(seq)) => format!(
+                "{git}, then the service had recorded {seq} event(s) for it after {:.1}s",
+                self.waited_for_service.as_secs_f64()
+            ),
+            (true, None) => format!(
+                "{git}, then the service did not answer status requests for {:.1}s",
+                self.waited_for_service.as_secs_f64()
+            ),
+        }
+    }
+}
+
+/// Why trace2 ingestion failed, for the summary and the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngestionFailure {
+    /// Doctor could not set up the probe, or `git init` failed.
+    Setup,
+    /// `git init` itself did not finish in time.
+    GitSlow,
+    /// The service is up and answering, started recently, and has not
+    /// recorded the event yet: it is still getting ready, not broken.
+    NotProcessedYet,
+    /// The service answers, but the event never arrived.
+    NotReceived,
+    /// The service did not answer status requests.
+    ServiceSilent,
+}
+
+pub(crate) fn classify_ingestion_failure(
+    failure: &IngestionProbeFailure,
+    service_answering: bool,
+    recently_started: bool,
+) -> IngestionFailure {
+    if failure.git_timed_out {
+        return IngestionFailure::GitSlow;
+    }
+    if failure.git_elapsed.is_none() || failure.git_failed {
+        return IngestionFailure::Setup;
+    }
+    match failure.latest_seq {
+        Some(0) if service_answering && recently_started => IngestionFailure::NotProcessedYet,
+        Some(_) => IngestionFailure::NotReceived,
+        None => IngestionFailure::ServiceSilent,
+    }
+}
+
+fn ingestion_failure_summary(kind: IngestionFailure) -> &'static str {
+    match kind {
+        IngestionFailure::NotProcessedYet => {
+            "the background service is running but has not processed its first git event yet"
+        }
+        IngestionFailure::GitSlow => "git took too long to run the trace2 ingestion probe",
+        IngestionFailure::ServiceSilent => {
+            "the background service did not answer while git trace2 events were checked"
+        }
+        IngestionFailure::Setup | IngestionFailure::NotReceived => {
+            "git trace2 events are not reaching the background service"
+        }
+    }
+}
+
+/// UNVERIFIED ON WINDOWS. The Windows text says what was measured and names
+/// the two causes seen there that a restart does not fix.
+pub(crate) fn trace2_ingestion_remediation(
+    windows: bool,
+    kind: IngestionFailure,
+    failure: &IngestionProbeFailure,
+    budget: Duration,
+) -> String {
+    let measured = format!(
+        "measured: {} (budget {:.1}s)",
+        failure.measured(),
+        budget.as_secs_f64()
+    );
+    match (windows, kind) {
+        (_, IngestionFailure::NotProcessedYet) => format!(
+            "the background service started moments ago and is still getting ready ({measured}). Run `autter doctor` again in a minute; if this check still fails, run `{}`",
+            crate::commands::daemon::RESTART_COMMAND
+        ),
+        (true, _) => format!(
+            "{measured}. On Windows the usual causes are antivirus scanning git.exe or autter.exe every time they start (in Windows Security, add exclusions for your Git folder and %USERPROFILE%\\.autter\\bin), or git running as a different user or elevation than the background service (git in an Administrator window cannot report to a service started from a normal window, or the reverse: use normal windows for both). If a trace2 config check failed, run `autter install --system`; otherwise run `{}`, then `autter doctor`",
+            crate::commands::daemon::RESTART_COMMAND
+        ),
+        (false, IngestionFailure::GitSlow) => format!(
+            "{measured}. git is slow on this machine: re-run with a longer budget, `AUTTER_DOCTOR_TIMEOUT_SCALE=5 autter doctor`"
+        ),
+        (false, _) => format!("{REMEDIATION_TRACE2_INGESTION} ({measured})"),
+    }
+}
+
+/// How long ago the running service started, from its pid file.
+fn service_age(config: &crate::daemon::DaemonConfig) -> Option<Duration> {
+    let started_ns = read_daemon_started_at_ns(config).ok()??;
+    let now_ns = system_time_to_unix_nanos(SystemTime::now())?;
+    let age_ns = u64::try_from(now_ns.checked_sub(started_ns)?).ok()?;
+    Some(Duration::from_nanos(age_ns))
+}
+
 /// End-to-end trace2 ingestion: a real `git init` must reach the background
 /// service through the global trace2 config. Separate from service health on
 /// purpose: a healthy service with missing trace2 config used to fail the
 /// "background service" check and suggest a restart that could not help.
 pub fn check_daemon_trace2_ingestion(git_program: &str) -> DiagnosticCheckResult {
+    trace2_ingestion_check(git_program).0
+}
+
+/// [`check_daemon_trace2_ingestion`], with why it failed.
+///
+/// A probe that misses its budget is tried again with a longer one; only a
+/// service that then also stays unresponsive (see [`service_verdict`]) is
+/// restarted. It used to be restarted after one missed budget, dropping the
+/// work in flight of a service that was only slow.
+fn trace2_ingestion_check(git_program: &str) -> (DiagnosticCheckResult, Option<IngestionFailure>) {
+    use crate::commands::daemon::probe_daemon_health;
+
     let mut commands = Vec::new();
     let mut details = Vec::new();
     let config = match crate::daemon::DaemonConfig::from_env_or_default_paths() {
         Ok(config) => config,
         Err(err) => {
-            return DiagnosticCheckResult::failed(
-                "trace2 ingestion could not be inspected",
-                vec![format!("failed to determine daemon paths: {}", err)],
-                commands,
-            )
-            .with_remediation(REMEDIATION_DAEMON_PATHS);
+            return (
+                DiagnosticCheckResult::failed(
+                    "trace2 ingestion could not be inspected",
+                    vec![format!("failed to determine daemon paths: {}", err)],
+                    commands,
+                )
+                .with_remediation(REMEDIATION_DAEMON_PATHS),
+                Some(IngestionFailure::Setup),
+            );
         }
     };
 
-    match run_daemon_trace2_ingestion_probe(
-        &mut commands,
-        git_program,
-        &config,
-        Instant::now() + check_timeout(DEBUG_CHECK_TIMEOUT),
-    ) {
-        Ok(mut probe_details) => {
-            details.append(&mut probe_details);
-            DiagnosticCheckResult::passed(
-                "background service is ingesting git trace2 events",
-                details,
-                commands,
-            )
+    let age = service_age(&config);
+    let recently_started = age.is_some_and(|age| age < FIRST_READINESS_WINDOW);
+    let budget = trace2_ingestion_budget(cfg!(windows), recently_started, machine_timeout_scale());
+    let retry_budget = trace2_ingestion_retry_budget(budget);
+    if let Some(age) = age {
+        details.push(format!("service started {:.0}s ago", age.as_secs_f64()));
+    }
+
+    let passed = |details: Vec<String>, commands: Vec<CommandRecord>, summary: &str| {
+        (
+            DiagnosticCheckResult::passed(summary, details, commands),
+            None,
+        )
+    };
+    const PASSED: &str = "background service is ingesting git trace2 events";
+
+    let mut last_failure = IngestionProbeFailure::default();
+    for (attempt, budget) in [(1, budget), (2, retry_budget)] {
+        match run_daemon_trace2_ingestion_probe(&mut commands, git_program, &config, budget) {
+            Ok(mut probe_details) => {
+                details.append(&mut probe_details);
+                if attempt == 1 {
+                    return passed(details, commands, PASSED);
+                }
+                details.push(
+                    "passed on the second try with a longer budget: the service was slow, not stuck, so doctor did not restart it"
+                        .to_string(),
+                );
+                return passed(
+                    details,
+                    commands,
+                    "background service is ingesting git trace2 events (slowly: it passed on the second try)",
+                );
+            }
+            Err(failure) => {
+                details.push(format!(
+                    "trace2 ingestion probe {attempt} (budget {:.1}s) failed: {}; {}",
+                    budget.as_secs_f64(),
+                    failure.error,
+                    failure.measured()
+                ));
+                last_failure = failure;
+            }
         }
-        Err(first_err) => {
-            details.push(format!("trace2 ingestion probe failed: {first_err}"));
-            details.push("restarting the background service and retrying".to_string());
+    }
+
+    // Restart only a service that stays unresponsive. One that answers
+    // requests gains nothing from a restart but losing its work in flight.
+    let health = probe_daemon_health(&config);
+    let mut service_answering = health.is_healthy();
+    if !service_answering {
+        let confirmation = confirm_service_state(&config, health);
+        details.extend(confirmation.explanation());
+        service_answering = confirmation.verdict == ServiceVerdict::Healthy;
+        if matches!(
+            confirmation.verdict,
+            ServiceVerdict::Restart | ServiceVerdict::Start
+        ) {
+            details.push(format!(
+                "{DOCTOR_FIX_DETAIL_PREFIX}restarting the background service and retrying"
+            ));
             if let Err(err) = crate::commands::daemon::restart_daemon(&config) {
                 details.push(format!("restart failed: {err}"));
             }
@@ -363,29 +801,42 @@ pub fn check_daemon_trace2_ingestion(git_program: &str) -> DiagnosticCheckResult
                 &mut commands,
                 git_program,
                 &config,
-                Instant::now() + check_timeout(DEBUG_CHECK_TIMEOUT),
+                retry_budget,
             ) {
                 Ok(mut probe_details) => {
                     details.append(&mut probe_details);
                     details.push("passed after restart".to_string());
-                    DiagnosticCheckResult::passed(
-                        "background service is ingesting git trace2 events",
-                        details,
-                        commands,
-                    )
+                    return passed(details, commands, PASSED);
                 }
-                Err(retry_err) => {
-                    details.push(format!("probe failed after restart: {retry_err}"));
-                    DiagnosticCheckResult::failed(
-                        "git trace2 events are not reaching the background service",
-                        details,
-                        commands,
-                    )
-                    .with_remediation(REMEDIATION_TRACE2_INGESTION)
+                Err(failure) => {
+                    details.push(format!(
+                        "probe failed after restart: {}; {}",
+                        failure.error,
+                        failure.measured()
+                    ));
+                    service_answering = probe_daemon_health(&config).is_healthy();
+                    last_failure = failure;
                 }
             }
         }
+    } else {
+        details.push(
+            "the background service answers requests, so doctor did not restart it".to_string(),
+        );
     }
+
+    let kind = classify_ingestion_failure(&last_failure, service_answering, recently_started);
+    record_timing(format!(
+        "trace2 ingestion probe failed ({kind:?}): {}",
+        last_failure.measured()
+    ));
+    let remediation =
+        trace2_ingestion_remediation(cfg!(windows), kind, &last_failure, retry_budget);
+    (
+        DiagnosticCheckResult::failed(ingestion_failure_summary(kind), details, commands)
+            .with_remediation(remediation),
+        Some(kind),
+    )
 }
 
 /// Service readiness plus trace2 ingestion, combined for `autter debug`.
@@ -815,26 +1266,59 @@ fn run_daemon_trace2_ingestion_probe(
     commands: &mut Vec<CommandRecord>,
     git_program: &str,
     config: &crate::daemon::DaemonConfig,
-    deadline: Instant,
-) -> Result<Vec<String>, String> {
+    budget: Duration,
+) -> Result<Vec<String>, IngestionProbeFailure> {
+    let deadline = Instant::now() + budget;
     let probe_path =
         debug_self_check_root().join(format!("daemon-probe-{}", crate::uuid::generate_v4()));
+    let mut failure = IngestionProbeFailure::default();
 
     let result = (|| -> Result<Vec<String>, String> {
         fs::create_dir_all(&probe_path)
             .map_err(|e| format!("failed to create {}: {}", probe_path.display(), e))?;
-        run_required_until(
+        let git_started = Instant::now();
+        let git = run_required_until(
             commands,
             git_program,
             &["init", "."],
             Some(&probe_path),
             deadline,
-        )?;
+        );
+        let git_elapsed = git_started.elapsed();
+        failure.git_elapsed = Some(git_elapsed);
+        if let Err(err) = git {
+            let timed_out = commands.last().is_some_and(|record| record.timed_out);
+            failure.git_timed_out = timed_out;
+            failure.git_failed = !timed_out;
+            if err.starts_with("command timed out before start") {
+                failure.git_elapsed = None;
+            }
+            return Err(err);
+        }
+        record_timing(format!(
+            "trace2 probe: git init took {:.2}s",
+            git_elapsed.as_secs_f64()
+        ));
 
-        let status = wait_for_daemon_family_status(config, &probe_path, 1, deadline)?;
+        let waited = Instant::now();
+        let status = wait_for_daemon_family_status(config, &probe_path, 1, deadline);
+        failure.waited_for_service = waited.elapsed();
+        let status = status.map_err(|(err, latest_seq)| {
+            failure.latest_seq = latest_seq;
+            err
+        })?;
+        record_timing(format!(
+            "trace2 probe: service recorded the event after {:.2}s",
+            failure.waited_for_service.as_secs_f64()
+        ));
         Ok(vec![
             format!("daemon trace2 probe repo: {}", probe_path.display()),
             format!("daemon trace2 probe latest_seq: {}", status.latest_seq),
+            format!(
+                "daemon trace2 probe git init: {:.2}s, event recorded after {:.2}s",
+                git_elapsed.as_secs_f64(),
+                failure.waited_for_service.as_secs_f64()
+            ),
             format!(
                 "daemon trace2 probe last_error: {}",
                 status.last_error.unwrap_or_else(|| "<none>".to_string())
@@ -842,11 +1326,16 @@ fn run_daemon_trace2_ingestion_probe(
         ])
     })();
 
-    if result.is_ok() {
-        let _ = fs::remove_dir_all(&probe_path);
+    match result {
+        Ok(details) => {
+            let _ = fs::remove_dir_all(&probe_path);
+            Ok(details)
+        }
+        Err(error) => {
+            failure.error = error;
+            Err(failure)
+        }
     }
-
-    result
 }
 
 fn run_autter_checkpoint(
@@ -1117,18 +1606,23 @@ fn self_check_blame_options(commit_sha: &str) -> AutterBlameOptions {
     }
 }
 
+/// Poll the service until it has recorded `expected_min_seq` events for the
+/// repository. On timeout, the error and the last event count it reported
+/// (`None` when it never answered).
 fn wait_for_daemon_family_status(
     config: &crate::daemon::DaemonConfig,
     repo_path: &Path,
     expected_min_seq: u64,
     deadline: Instant,
-) -> Result<FamilyStatus, String> {
+) -> Result<FamilyStatus, (String, Option<u64>)> {
     let mut last_error = None;
+    let mut last_seq = None;
 
     while Instant::now() < deadline {
         match read_daemon_family_status(config, repo_path) {
             Ok(status) if status.latest_seq >= expected_min_seq => return Ok(status),
             Ok(status) => {
+                last_seq = Some(status.latest_seq);
                 last_error = Some(format!(
                     "latest_seq={}, expected at least {}, last_error={}",
                     status.latest_seq,
@@ -1141,9 +1635,12 @@ fn wait_for_daemon_family_status(
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    Err(format!(
-        "timed out waiting for daemon family status: {}",
-        last_error.unwrap_or_else(|| format!("no status for {}", repo_path.display()))
+    Err((
+        format!(
+            "timed out waiting for daemon family status: {}",
+            last_error.unwrap_or_else(|| format!("no status for {}", repo_path.display()))
+        ),
+        last_seq,
     ))
 }
 
@@ -1699,8 +2196,16 @@ pub fn verify_capture() -> Vec<CaptureIssue> {
     }
 
     if service_ok {
-        let ingestion = check_daemon_trace2_ingestion(&git_cmd);
-        if ingestion.status == DiagnosticStatus::Failed {
+        let (ingestion, failure) = trace2_ingestion_check(&git_cmd);
+        if failure == Some(IngestionFailure::NotProcessedYet) {
+            // A service that has just started and answers requests but has
+            // not recorded its first event is still starting, not a failed
+            // start (UNVERIFIED ON WINDOWS, where this was reported).
+            eprintln!(
+                "Note: {}. This is common right after it starts on Windows; run `autter doctor` in a minute to confirm commits reach it.",
+                ingestion.summary
+            );
+        } else if ingestion.status == DiagnosticStatus::Failed {
             issues.push(issue_from_check(ingestion, REMEDIATION_TRACE2_INGESTION));
         }
     }
@@ -1798,6 +2303,228 @@ fn trace2_targets_are_stale_autter(targets: &[String], expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_restarts_only_a_service_that_stays_unresponsive() {
+        use crate::commands::daemon::DaemonHealthState::*;
+        let window = Duration::from_secs(5);
+        let secs = Duration::from_secs;
+
+        // One failed probe on a loaded machine: wait and probe again.
+        assert_eq!(
+            service_verdict(&[Unresponsive], secs(0), window),
+            ServiceVerdict::KeepProbing
+        );
+        // It answers on a later probe: slow, not stuck. No restart.
+        assert_eq!(
+            service_verdict(&[Unresponsive, Unresponsive, Healthy], secs(2), window),
+            ServiceVerdict::Healthy
+        );
+        // Unresponsive for the whole window, but too few probes yet (each
+        // probe waited its long budget): keep probing.
+        assert_eq!(
+            service_verdict(&[Unresponsive, Unresponsive], secs(6), window),
+            ServiceVerdict::KeepProbing
+        );
+        // Enough probes, but not for long enough.
+        assert_eq!(
+            service_verdict(&[Unresponsive; 4], secs(3), window),
+            ServiceVerdict::KeepProbing
+        );
+        // Stayed unresponsive: restart.
+        assert_eq!(
+            service_verdict(&[Unresponsive; 3], secs(5), window),
+            ServiceVerdict::Restart
+        );
+        // Answered once and then went silent again: the silent streak starts
+        // over, it does not count the earlier failures.
+        assert_eq!(
+            service_verdict(
+                &[Unresponsive, Unresponsive, Healthy, Unresponsive],
+                secs(9),
+                window
+            ),
+            ServiceVerdict::KeepProbing
+        );
+        // A service that stopped is started; an outdated one is restarted at
+        // once (waiting cannot make it current); a healthy one is left alone.
+        assert_eq!(
+            service_verdict(&[Unresponsive, NotRunning], secs(1), window),
+            ServiceVerdict::Start
+        );
+        assert_eq!(
+            service_verdict(&[NotRunning], secs(0), window),
+            ServiceVerdict::Start
+        );
+        assert_eq!(
+            service_verdict(&[Outdated], secs(0), window),
+            ServiceVerdict::Restart
+        );
+        assert_eq!(
+            service_verdict(&[Healthy], secs(0), window),
+            ServiceVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn the_output_says_doctor_waited_and_why_it_restarted() {
+        use crate::commands::daemon::DaemonHealthState::*;
+        let confirmation = |initial, verdict| ServiceConfirmation {
+            health: crate::commands::daemon::DaemonHealth {
+                state: initial,
+                control_socket: false,
+                control_answers: false,
+                trace_socket: false,
+                lock_held: true,
+                pid: None,
+                binary_outdated: false,
+                summary: String::new(),
+                remediation: None,
+            },
+            initial,
+            verdict,
+            waited: Duration::from_millis(6200),
+            probes: 5,
+            probe_timeout: Duration::from_secs(2),
+        };
+        let restarted = confirmation(Unresponsive, ServiceVerdict::Restart)
+            .explanation()
+            .unwrap();
+        assert!(restarted.contains("did not answer for 6.2s"), "{restarted}");
+        assert!(restarted.contains("5 probes"), "{restarted}");
+        assert!(restarted.contains("so doctor restarted it"), "{restarted}");
+        let slow = confirmation(Unresponsive, ServiceVerdict::Healthy)
+            .explanation()
+            .unwrap();
+        assert!(slow.contains("waited 6.2s"), "{slow}");
+        assert!(slow.contains("did not restart it"), "{slow}");
+        assert!(
+            confirmation(Healthy, ServiceVerdict::Healthy)
+                .explanation()
+                .is_none()
+        );
+        assert!(
+            confirmation(Outdated, ServiceVerdict::Restart)
+                .explanation()
+                .unwrap()
+                .contains("older autter binary")
+        );
+    }
+
+    // Windows: best guesses for reports that cannot be reproduced here; the
+    // tests pin the decisions, not Windows behaviour.
+
+    #[test]
+    fn windows_gets_a_longer_trace2_probe_budget_on_top_of_machine_scaling() {
+        let secs = Duration::from_secs;
+        assert_eq!(trace2_ingestion_budget(false, false, 1.0), secs(3));
+        assert_eq!(trace2_ingestion_budget(false, true, 1.0), secs(3));
+        assert_eq!(trace2_ingestion_budget(true, false, 1.0), secs(10));
+        assert_eq!(trace2_ingestion_budget(true, true, 1.0), secs(30));
+        // Scaled for a slow machine, but capped.
+        assert_eq!(trace2_ingestion_budget(true, false, 2.0), secs(20));
+        assert_eq!(
+            trace2_ingestion_budget(true, true, 10.0),
+            INGESTION_BUDGET_MAX
+        );
+        // The retry is longer than the first try.
+        assert_eq!(trace2_ingestion_retry_budget(secs(10)), secs(15));
+        assert_eq!(
+            trace2_ingestion_retry_budget(secs(50)),
+            INGESTION_BUDGET_MAX
+        );
+    }
+
+    fn probe_failure(git_secs: Option<f64>, seq: Option<u64>) -> IngestionProbeFailure {
+        IngestionProbeFailure {
+            error: "timed out".to_string(),
+            git_elapsed: git_secs.map(Duration::from_secs_f64),
+            waited_for_service: Duration::from_millis(2500),
+            latest_seq: seq,
+            ..IngestionProbeFailure::default()
+        }
+    }
+
+    #[test]
+    fn a_service_that_has_not_processed_its_first_event_is_not_a_failed_start() {
+        use IngestionFailure::*;
+        let no_event = probe_failure(Some(0.4), Some(0));
+        // Up, answering, started moments ago, nothing recorded yet.
+        assert_eq!(
+            classify_ingestion_failure(&no_event, true, true),
+            NotProcessedYet
+        );
+        // Same counts on a service that has run for a while: the event is
+        // not arriving.
+        assert_eq!(
+            classify_ingestion_failure(&no_event, true, false),
+            NotReceived
+        );
+        // Not answering: neither.
+        assert_eq!(
+            classify_ingestion_failure(&no_event, false, true),
+            NotReceived
+        );
+        assert_eq!(
+            classify_ingestion_failure(&probe_failure(Some(0.4), None), true, true),
+            ServiceSilent
+        );
+        let mut slow_git = probe_failure(Some(10.0), None);
+        slow_git.git_timed_out = true;
+        assert_eq!(classify_ingestion_failure(&slow_git, true, true), GitSlow);
+        assert_eq!(
+            classify_ingestion_failure(&probe_failure(None, None), true, true),
+            Setup
+        );
+
+        assert!(ingestion_failure_summary(NotProcessedYet).contains("is running"));
+        let fix = trace2_ingestion_remediation(
+            false,
+            NotProcessedYet,
+            &no_event,
+            Duration::from_secs(30),
+        );
+        assert!(fix.contains("again in a minute"), "{fix}");
+    }
+
+    #[test]
+    fn windows_trace2_remediation_says_what_was_measured_and_the_likely_causes() {
+        let mut failure = probe_failure(Some(9.96), None);
+        failure.git_timed_out = true;
+        let fix = trace2_ingestion_remediation(
+            true,
+            IngestionFailure::GitSlow,
+            &failure,
+            Duration::from_secs(10),
+        );
+        assert!(fix.contains("git init ran 10.0s and was stopped"), "{fix}");
+        assert!(fix.contains("budget 10.0s"), "{fix}");
+        assert!(fix.contains("antivirus"), "{fix}");
+        assert!(fix.contains("git.exe or autter.exe"), "{fix}");
+        assert!(fix.contains("different user or elevation"), "{fix}");
+
+        let fix = trace2_ingestion_remediation(
+            true,
+            IngestionFailure::NotReceived,
+            &probe_failure(Some(1.3), Some(0)),
+            Duration::from_secs(10),
+        );
+        assert!(fix.contains("git init took 1.3s"), "{fix}");
+        assert!(
+            fix.contains("recorded 0 event(s) for it after 2.5s"),
+            "{fix}"
+        );
+
+        // Elsewhere the old advice stays, with the measurement added.
+        let fix = trace2_ingestion_remediation(
+            false,
+            IngestionFailure::NotReceived,
+            &probe_failure(Some(0.1), Some(0)),
+            Duration::from_secs(3),
+        );
+        assert!(fix.starts_with(REMEDIATION_TRACE2_INGESTION), "{fix}");
+        assert!(!fix.contains("antivirus"), "{fix}");
+    }
 
     #[test]
     fn daemon_remediation_names_the_windows_cause_when_the_fix_attempt_shows_one() {
