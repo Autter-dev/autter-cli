@@ -2608,6 +2608,17 @@ mod tests {
         assert_eq!(timeout_scale_from_env(None), None);
     }
 
+    /// How long the partial-output tests let `stdout_stderr_sleep_command`
+    /// run before timing it out. It must outlast the shell's startup so
+    /// "out" and "err" are written first: `sh` starts in milliseconds, but a
+    /// cold `powershell.exe` on a busy Windows CI runner can take over a
+    /// second, and with 300 ms the test failed whenever it had not printed
+    /// yet. The timeout ends the 60 s sleep either way.
+    #[cfg(not(windows))]
+    const PARTIAL_OUTPUT_TIMEOUT: Duration = Duration::from_millis(300);
+    #[cfg(windows)]
+    const PARTIAL_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
+
     #[cfg(not(windows))]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
         (
@@ -2689,8 +2700,7 @@ mod tests {
     #[test]
     fn test_run_logged_command_with_timeout_reports_partial_output() {
         let (program, args) = stdout_stderr_sleep_command();
-        let record =
-            run_logged_command_with_timeout(program, &args, None, Duration::from_millis(300));
+        let record = run_logged_command_with_timeout(program, &args, None, PARTIAL_OUTPUT_TIMEOUT);
 
         assert!(record.timed_out, "{record:?}");
         assert_eq!(record.stdout, "out");

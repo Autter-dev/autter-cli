@@ -10378,11 +10378,20 @@ fn handle_trace_connection_actor_reader<R: Read>(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(sid) = parsed.get("sid").and_then(Value::as_str) {
-            let root_sid = trace_root_sid(sid).to_string();
-            if observed_roots.insert(root_sid.clone()) {
-                let _ = coordinator.trace_root_connection_opened(&root_sid);
-            }
+        // Only the root process's own connection says when a command is over.
+        // Its child processes (e.g. the `git maintenance run --auto` that every
+        // `git commit` spawns, or the picks of a rebase) write on connections
+        // of their own, and the handler threads race: a child's connection can
+        // be read and closed before the root's first line is read at all.
+        // Counting it would make that close look like the root process went
+        // away and synthesize an exit for a command that is still being read,
+        // finalizing it without its real post-command state (no commit, so no
+        // authorship note).
+        if let Some(sid) = parsed.get("sid").and_then(Value::as_str)
+            && trace_root_sid(sid) == sid
+            && observed_roots.insert(sid.to_string())
+        {
+            let _ = coordinator.trace_root_connection_opened(sid);
         }
         // Only enqueue payloads for mutating commands.  Read-only invocations
         // (status, diff, stash list, worktree list, …) are handled inline by
@@ -13420,6 +13429,85 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(coord.is_shutting_down());
+    }
+
+    /// Feeds `lines` to the trace connection reader as one connection and
+    /// returns the root sids it synthesized a connection-close exit for.
+    fn close_fallbacks_after_trace_connection(
+        coord: &Arc<ActorDaemonCoordinator>,
+        rx: &mut mpsc::Receiver<Value>,
+        lines: &[Value],
+    ) -> Vec<String> {
+        let mut input = Vec::new();
+        for line in lines {
+            input.extend(serde_json::to_vec(line).unwrap());
+            input.push(b'\n');
+        }
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        handle_trace_connection_actor_reader(&mut reader, coord.clone()).unwrap();
+        let mut fallbacks = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            if payload
+                .get("autter_connection_close_fallback")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                fallbacks.push(payload["sid"].as_str().unwrap().to_string());
+            }
+        }
+        fallbacks
+    }
+
+    /// Every `git commit` spawns `git maintenance run --auto`, which reports on
+    /// a trace connection of its own. When that connection is read and closed
+    /// before the commit's own connection is read at all, the commit has not
+    /// ended: no exit may be made up for it, or it is finalized without its new
+    /// HEAD and never gets an authorship note.
+    #[tokio::test]
+    async fn closing_a_child_process_connection_does_not_end_its_root_command() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(crate::config::Config::get().git_cmd())
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let worktree = repo.path().to_string_lossy().to_string();
+
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        let (tx, mut rx) = mpsc::channel::<Value>(64);
+        coord.trace_ingest_tx.set(tx).unwrap();
+
+        let root = "20261112T120000.000000Z-Hcommit-P00000001";
+        let child = format!("{root}/20261112T120000.010000Z-Hcommit-P00000002");
+        let child_connection = [
+            json!({
+                "event": "start",
+                "sid": child,
+                "argv": ["git", "maintenance", "run", "--auto", "--quiet", "--detach"],
+                "worktree": worktree,
+            }),
+            json!({"event": "exit", "sid": child, "code": 0}),
+            json!({"event": "atexit", "sid": child, "code": 0}),
+        ];
+        assert_eq!(
+            close_fallbacks_after_trace_connection(&coord, &mut rx, &child_connection),
+            Vec::<String>::new(),
+            "a child's connection closing must not end the root command"
+        );
+
+        // The root's own connection still ends it when the process dies
+        // without reporting an exit.
+        let root_connection = [json!({
+            "event": "start",
+            "sid": root,
+            "argv": ["git", "commit", "-m", "msg"],
+            "worktree": worktree,
+        })];
+        assert_eq!(
+            close_fallbacks_after_trace_connection(&coord, &mut rx, &root_connection),
+            vec![root.to_string()],
+        );
     }
 
     /// Concurrent enqueues from multiple threads must never deadlock or
