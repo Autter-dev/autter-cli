@@ -22,6 +22,34 @@
 //! unknown member and keep reading new notes, and notes written before this
 //! existed read as [`IntegrityStatus::Legacy`].
 //!
+//! **A removed stamp.** Anyone can delete the `integrity` member, edit the
+//! note, and have it read as legacy. So an unstamped note passes as legacy
+//! only when it can be one:
+//!
+//! * its metadata's `autter_version` names autter 3.8.0 or later: every such
+//!   release stamps every note it writes, so the stamp was removed
+//!   ([`IntegrityStatus::StampRemoved`], a failure);
+//! * its commit comes after stamping began, meaning it descends from a commit
+//!   whose note is stamped (commit topology, not dates; see
+//!   `note_stamp_floor`), and it has no readable `autter_version`: also
+//!   [`IntegrityStatus::StampRemoved`];
+//! * its commit comes after stamping began and its `autter_version` names a
+//!   release older than 3.8.0: [`IntegrityStatus::UnstampedByOlderAutter`],
+//!   a warning (a failure under `autter verify --strict`), because a teammate
+//!   who has not upgraded writes exactly this, and the version cannot be
+//!   checked: whoever removes a stamp can edit it too. This mirrors
+//!   [`IntegrityStatus::ReboundByOlderAutter`];
+//! * otherwise (older release, or no version, on a commit before stamping
+//!   began or with no stamped notes in the repository): legacy.
+//!
+//! The paths that legitimately write unstamped notes after stamping began
+//! all stay out of the failure: `autter notes backfill` copies notes as
+//! stored, so a pre-3.8.0 note keeps its old version and an old commit; a
+//! note rebound by an older autter keeps a stamp and is not unstamped; a
+//! teammate on an older autter writes its own older version; and every
+//! rewrite this autter performs (rebase, amend, cherry-pick, `autter ci`)
+//! stamps the note it writes.
+//!
 //! **What it does not do.** On its own this is an integrity check, not tamper
 //! evidence: anyone who can write the repository can rewrite a note and
 //! recompute every field. In connected mode the server keeps every version of
@@ -61,7 +89,12 @@
 //! **Stash notes.** `git stash` saves the working log as a note in
 //! `refs/notes/ai-stash`, stamped for the stash commit
 //! ([`seal_stash_note`]); `stash pop`/`apply` checks it
-//! ([`check_stash_note`]) and does not restore one that fails.
+//! ([`check_stash_note`]) and does not restore one that fails. An unstamped
+//! stash note is not restored when it says autter 3.8.2 or later wrote it
+//! (the first release that stamps stash notes), or has no version and the
+//! stash was made on a commit at or after the first stamped commit. One that
+//! says 3.8.1 or earlier is restored, since 3.8.0 and 3.8.1 stamped commit
+//! notes but not stash notes.
 //!
 //! **Notes copied from the notes database** (`autter notes backfill`) are
 //! written as stored, without a new stamp, so a failing or legacy note is not
@@ -157,6 +190,18 @@ pub enum IntegrityStatus {
     /// local check but the server has no record of it yet (notes upload in
     /// the background). A warning; a failure with `--require-record`.
     NotRecorded,
+    /// The note has no integrity stamp, but it cannot have been written
+    /// before stamping existed: its metadata says autter 3.8.0 or later wrote
+    /// it (every such release stamps every note), or it has no readable
+    /// autter version and its commit descends from a commit whose note is
+    /// stamped. The stamp was removed.
+    StampRemoved,
+    /// The note has no integrity stamp and its metadata says an autter older
+    /// than 3.8.0 wrote it, but its commit descends from a commit whose note
+    /// is stamped. A teammate on an older autter writes such notes; so does
+    /// anyone who removes a stamp and edits the version. A warning, but a
+    /// failure under `autter verify --strict`.
+    UnstampedByOlderAutter,
 }
 
 impl IntegrityStatus {
@@ -175,6 +220,8 @@ impl IntegrityStatus {
             IntegrityStatus::CarriedFailure => "carried_failure",
             IntegrityStatus::ChangedAfterRecorded => "changed_after_recorded",
             IntegrityStatus::NotRecorded => "not_recorded",
+            IntegrityStatus::StampRemoved => "stamp_removed",
+            IntegrityStatus::UnstampedByOlderAutter => "unstamped_by_older_autter",
         }
     }
 
@@ -190,6 +237,7 @@ impl IntegrityStatus {
                 | IntegrityStatus::DigestMismatch
                 | IntegrityStatus::CarriedFailure
                 | IntegrityStatus::ChangedAfterRecorded
+                | IntegrityStatus::StampRemoved
         )
     }
 
@@ -203,8 +251,68 @@ impl IntegrityStatus {
                 | IntegrityStatus::ReboundByOlderAutter
                 | IntegrityStatus::Unavailable
                 | IntegrityStatus::NotRecorded
+                | IntegrityStatus::UnstampedByOlderAutter
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unstamped notes: which autter says it wrote them
+// ---------------------------------------------------------------------------
+
+/// The first release that stamps every authorship note it writes.
+pub const FIRST_STAMPING_RELEASE: (u64, u64, u64) = (3, 8, 0);
+
+/// The first release that stamps every stash note it writes.
+pub const FIRST_STASH_STAMPING_RELEASE: (u64, u64, u64) = (3, 8, 2);
+
+/// What an unstamped note's `autter_version` says about who wrote it,
+/// compared with the first release that would have stamped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionClaim {
+    /// A release that stamps (this version or later): the stamp was removed.
+    Stamping(String),
+    /// A release older than that: it may well be legacy.
+    Older(String),
+    /// No version, or one that is not a release number.
+    Unknown,
+}
+
+/// `autter_version` as `(major, minor, patch)`. Release builds write
+/// `3.9.1`, debug builds `development:3.9.1`; a pre-release or build suffix
+/// is ignored. `None` for anything else (`development` alone, missing).
+fn release_of(version: &str) -> Option<(u64, u64, u64)> {
+    let version = version.trim();
+    let version = version.strip_prefix("development:").unwrap_or(version);
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+        Some(p) => p.parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// What `log`'s `autter_version` claims, against `first_stamping`.
+pub fn version_claim(log: &AuthorshipLog, first_stamping: (u64, u64, u64)) -> VersionClaim {
+    let Some(version) = log.metadata.autter_version.as_deref() else {
+        return VersionClaim::Unknown;
+    };
+    match release_of(version) {
+        Some(release) if release >= first_stamping => VersionClaim::Stamping(version.to_string()),
+        Some(_) => VersionClaim::Older(version.to_string()),
+        None => VersionClaim::Unknown,
+    }
+}
+
+fn release_name((major, minor, patch): (u64, u64, u64)) -> String {
+    format!("{major}.{minor}.{patch}")
 }
 
 /// One commit's result, with a sentence saying why.
@@ -695,6 +803,53 @@ fn verify_notes_once(
             &patch_ids,
         ));
     }
+
+    // An unstamped note that passed as legacy (or as a copy git made during
+    // a rewrite) on a commit made after stamping began cannot simply be
+    // trusted as legacy: see `note_stamp_floor`.
+    let unstamped: Vec<String> = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status,
+                IntegrityStatus::Legacy | IntegrityStatus::PendingRewrite
+            )
+        })
+        .filter(|r| {
+            parsed
+                .get(r.commit.as_str())
+                .is_some_and(|p| p.split.integrity.is_none() && !p.split.integrity_moved)
+        })
+        .map(|r| r.commit.clone())
+        .collect();
+    if !unstamped.is_empty() {
+        let after = crate::authorship::note_stamp_floor::after_stamping(repo, &unstamped);
+        for r in results.iter_mut().filter(|r| after.contains(&r.commit)) {
+            let Some(log) = parsed.get(r.commit.as_str()).and_then(|p| p.log.as_ref()) else {
+                continue;
+            };
+            let copied = match (&r.recorded_commit, r.status) {
+                (Some(from), IntegrityStatus::PendingRewrite) => {
+                    format!(" (git copied it from {} during a rewrite)", short(from))
+                }
+                _ => String::new(),
+            };
+            match version_claim(log, FIRST_STAMPING_RELEASE) {
+                VersionClaim::Older(version) => {
+                    r.status = IntegrityStatus::UnstampedByOlderAutter;
+                    r.detail = format!(
+                        "the note has no integrity stamp and says autter {version} wrote it{copied}, but its commit comes after commits whose notes are stamped: written by a teammate on an older autter, or its stamp was removed and its version edited"
+                    );
+                }
+                VersionClaim::Unknown | VersionClaim::Stamping(_) => {
+                    r.status = IntegrityStatus::StampRemoved;
+                    r.detail = format!(
+                        "the note has no integrity stamp and no autter version{copied}, but its commit comes after commits whose notes are stamped, so it was not written before stamping began: the stamp was removed"
+                    );
+                }
+            }
+        }
+    }
     Ok(results)
 }
 
@@ -901,6 +1056,18 @@ fn check_one(
             )
         }
         None => {
+            // Every release since stamping began stamps every note it writes,
+            // so a note that says one of them wrote it had its stamp removed.
+            if let VersionClaim::Stamping(version) = version_claim(log, FIRST_STAMPING_RELEASE) {
+                return result(
+                    IntegrityStatus::StampRemoved,
+                    format!(
+                        "the note has no integrity stamp but says autter {version} wrote it; autter {} and later stamp every note they write, so the stamp was removed",
+                        release_name(FIRST_STAMPING_RELEASE)
+                    ),
+                    None,
+                );
+            }
             if !recorded.is_empty() && recorded != commit {
                 return moved(recorded);
             }
@@ -1155,6 +1322,7 @@ pub fn failure_notice(result: &CommitIntegrity) -> String {
             IntegrityStatus::ContentMismatch => "does not match this commit's files",
             IntegrityStatus::CarriedFailure => "was carried from a note that failed the check",
             IntegrityStatus::ChangedAfterRecorded => "was changed after the server recorded it",
+            IntegrityStatus::StampRemoved => "had its integrity stamp removed",
             _ => "was changed after autter wrote it",
         },
         short(&result.commit)
@@ -1383,8 +1551,11 @@ pub enum StashNoteCheck {
     /// Stamped for this stash and unchanged since.
     Verified,
     /// No integrity member: written by an autter older than stash-note
-    /// stamping (3.8.1 and earlier). Restored as before; a stamped note with
-    /// its member removed looks the same, which this check cannot tell apart.
+    /// stamping (3.8.1 and earlier). Restored as before. A note with its
+    /// member removed is not this but `Failed` when its metadata names a
+    /// release that stamps stash notes, or has no version and the stash was
+    /// made after stamping began; one whose version was also edited to an
+    /// older release still reads as this.
     Legacy,
     /// The note does not belong to this stash or was changed after autter
     /// wrote it; the reason completes "its record ...".
@@ -1402,7 +1573,7 @@ pub fn check_stash_note(repo: &Repository, stash_sha: &str, note: &str) -> Stash
         );
     }
     let integrity = match split.integrity {
-        None => return StashNoteCheck::Legacy,
+        None => return check_unstamped_stash_note(repo, stash_sha, &split.body),
         Some(Err(e)) => {
             return StashNoteCheck::Failed(format!("has an unreadable integrity record ({e})"));
         }
@@ -1455,6 +1626,46 @@ pub fn check_stash_note(repo: &Repository, stash_sha: &str, note: &str) -> Stash
         }
     }
     StashNoteCheck::Verified
+}
+
+/// A stash note without a stamp is restored as one written before stash
+/// notes were stamped (3.8.1 and earlier), unless that cannot be: its
+/// metadata says a release that stamps stash notes wrote it, or it has no
+/// readable autter version and the commit the stash was made on comes at or
+/// after a commit whose note is stamped (`note_stamp_floor`). A note that
+/// says an older release wrote it is restored: 3.8.0 and 3.8.1 stamped
+/// commit notes but not stash notes, so such a stash on a stamped commit is
+/// ordinary.
+fn check_unstamped_stash_note(repo: &Repository, stash_sha: &str, body: &str) -> StashNoteCheck {
+    let Ok(log) = AuthorshipLog::deserialize_from_string(body) else {
+        return StashNoteCheck::Legacy;
+    };
+    match version_claim(&log, FIRST_STASH_STAMPING_RELEASE) {
+        VersionClaim::Older(_) => StashNoteCheck::Legacy,
+        VersionClaim::Stamping(version) => StashNoteCheck::Failed(format!(
+            "has no integrity stamp but says autter {version} wrote it; autter {} and later stamp every stash note, so the stamp was removed",
+            release_name(FIRST_STASH_STAMPING_RELEASE)
+        )),
+        VersionClaim::Unknown => {
+            let base_query = format!("{stash_sha}^1");
+            let base = batch_check(repo, std::slice::from_ref(&base_query))
+                .ok()
+                .and_then(|found| found.get(&base_query).map(|(_, oid)| oid.clone()));
+            match base {
+                Some(base)
+                    if crate::authorship::note_stamp_floor::at_or_after_stamping(
+                        repo, &base,
+                    ) =>
+                {
+                    StashNoteCheck::Failed(
+                        "has no integrity stamp and no autter version, but the stash was made on a commit after stamping began, so the stamp was removed"
+                            .to_string(),
+                    )
+                }
+                _ => StashNoteCheck::Legacy,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,9 +1851,59 @@ mod tests {
             RangeOutOfBounds,
             DigestMismatch,
             CarriedFailure,
+            ChangedAfterRecorded,
+            NotRecorded,
+            StampRemoved,
+            UnstampedByOlderAutter,
         ] {
             assert!(!(s.is_failure() && s.is_warning()), "{}", s.as_str());
             assert_eq!(s == Verified, !s.is_failure() && !s.is_warning());
         }
+        assert!(StampRemoved.is_failure());
+        assert!(UnstampedByOlderAutter.is_warning());
+    }
+
+    fn log_with_version(version: Option<&str>) -> AuthorshipLog {
+        let mut log = AuthorshipLog::deserialize_from_string(NOTE).unwrap();
+        log.metadata.autter_version = version.map(str::to_string);
+        log
+    }
+
+    #[test]
+    fn version_claims_compare_with_the_first_stamping_release() {
+        let claim = |v: Option<&str>| version_claim(&log_with_version(v), FIRST_STAMPING_RELEASE);
+        assert_eq!(
+            claim(Some("3.9.1")),
+            VersionClaim::Stamping("3.9.1".to_string())
+        );
+        assert_eq!(
+            claim(Some("3.8.0")),
+            VersionClaim::Stamping("3.8.0".to_string())
+        );
+        assert_eq!(
+            claim(Some("development:3.9.1")),
+            VersionClaim::Stamping("development:3.9.1".to_string())
+        );
+        assert_eq!(
+            claim(Some("4.0.0-rc.1")),
+            VersionClaim::Stamping("4.0.0-rc.1".to_string())
+        );
+        assert_eq!(
+            claim(Some("3.7.1")),
+            VersionClaim::Older("3.7.1".to_string())
+        );
+        assert_eq!(
+            claim(Some("2.4.0")),
+            VersionClaim::Older("2.4.0".to_string())
+        );
+        assert_eq!(claim(Some("development")), VersionClaim::Unknown);
+        assert_eq!(claim(Some("")), VersionClaim::Unknown);
+        assert_eq!(claim(Some("3.x")), VersionClaim::Unknown);
+        assert_eq!(claim(None), VersionClaim::Unknown);
+        // Stash notes were stamped from 3.8.2.
+        let stash =
+            |v: &str| version_claim(&log_with_version(Some(v)), FIRST_STASH_STAMPING_RELEASE);
+        assert_eq!(stash("3.8.1"), VersionClaim::Older("3.8.1".to_string()));
+        assert_eq!(stash("3.8.2"), VersionClaim::Stamping("3.8.2".to_string()));
     }
 }

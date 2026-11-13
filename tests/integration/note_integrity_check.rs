@@ -19,6 +19,7 @@ const FAILURES: &[&str] = &[
     "range_out_of_bounds",
     "digest_mismatch",
     "carried_failure",
+    "stamp_removed",
 ];
 
 const NOTICE_PREFIX: &str = "Autter's record for";
@@ -31,14 +32,14 @@ fn rev(repo: &TestRepo, r: &str) -> String {
     repo.git_og(&["rev-parse", r]).unwrap().trim().to_string()
 }
 
-fn raw_note(repo: &TestRepo, commit: &str) -> String {
+pub(crate) fn raw_note(repo: &TestRepo, commit: &str) -> String {
     repo.sync_daemon();
     repo.git_og(&["notes", "--ref=ai", "show", commit])
         .unwrap_or_else(|e| panic!("commit {commit} should have a note: {e}"))
 }
 
 /// Replace `commit`'s note with `content`, byte for byte (no git cleanup).
-fn write_raw_note(repo: &TestRepo, commit: &str, content: &str) {
+pub(crate) fn write_raw_note(repo: &TestRepo, commit: &str, content: &str) {
     let git_dir = repo
         .git_og(&["rev-parse", "--absolute-git-dir"])
         .unwrap()
@@ -135,6 +136,42 @@ fn ai_additions(repo: &TestRepo, commit: &str) -> u64 {
         .unwrap_or_else(|| panic!("no stats JSON: {stdout}"));
     let doc: Value = serde_json::from_str(line).unwrap();
     doc["ai_additions"].as_u64().unwrap()
+}
+
+/// `note` as an autter older than the integrity check wrote it: no
+/// `integrity` member, and `autter_version` set to `version` (or removed,
+/// for `None`). Notes from before 3.8.0 look like this, and so does a
+/// stamped note whose stamp was removed and version edited.
+pub(crate) fn as_unstamped_note(note: &str, version: Option<&str>) -> String {
+    let body = strip_integrity(note);
+    let key = "\"autter_version\": \"";
+    let start = body
+        .find(key)
+        .unwrap_or_else(|| panic!("note has no autter_version:\n{body}"));
+    let value_start = start + key.len();
+    let value_end = value_start + body[value_start..].find('"').unwrap();
+    match version {
+        Some(version) => format!("{}{}{}", &body[..value_start], version, &body[value_end..]),
+        None => {
+            let line_start = body[..start].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = value_end + body[value_end..].find('\n').map_or(0, |i| i + 1);
+            format!("{}{}", &body[..line_start], &body[line_end..])
+        }
+    }
+}
+
+/// Replace every note in `refs/notes/ai` with `as_unstamped_note(note,
+/// version)`: a repository whose notes all predate the integrity check.
+pub(crate) fn make_every_note_unstamped(repo: &TestRepo, version: &str) {
+    repo.sync_daemon();
+    let list = repo.git_og(&["notes", "--ref=ai", "list"]).unwrap();
+    for line in list.lines() {
+        let Some(commit) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        let note = raw_note(repo, commit);
+        write_raw_note(repo, commit, &as_unstamped_note(&note, Some(version)));
+    }
 }
 
 /// The attestation section's first range line with its ranges replaced.
@@ -358,7 +395,7 @@ fn test_legacy_note_with_lines_past_the_file_fails_range_check() {
     let commit = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
     file.assert_committed_lines(crate::lines!["ai one".ai(), "human two".human()]);
 
-    let legacy = strip_integrity(&raw_note(&repo, &commit));
+    let legacy = as_unstamped_note(&raw_note(&repo, &commit), Some("3.7.1"));
     write_raw_note(&repo, &commit, &replace_first_range(&legacy, "1-40"));
 
     assert_status(&repo, &commit, "range_out_of_bounds");
@@ -397,7 +434,8 @@ fn test_note_without_integrity_member_is_legacy() {
     let commit = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
     file.assert_committed_lines(crate::lines!["ai one".ai(), "human two".human()]);
 
-    write_raw_note(&repo, &commit, &strip_integrity(&raw_note(&repo, &commit)));
+    let note = raw_note(&repo, &commit);
+    write_raw_note(&repo, &commit, &as_unstamped_note(&note, Some("3.7.1")));
 
     assert_status(&repo, &commit, "legacy");
     file.assert_committed_lines(crate::lines!["ai one".ai(), "human two".human()]);
@@ -1266,7 +1304,7 @@ fn test_unstamped_stash_note_from_older_autter_still_restores() {
     let repo = TestRepo::new();
     let stash = stash_an_ai_edit(&repo);
     let note = raw_stash_note(&repo, &stash);
-    write_raw_stash_note(&repo, &stash, &strip_integrity(&note));
+    write_raw_stash_note(&repo, &stash, &as_unstamped_note(&note, Some("3.8.1")));
     assert!(read_integrity(&raw_stash_note(&repo, &stash)).is_none());
 
     let commit = pop_and_commit(&repo);
@@ -1379,11 +1417,12 @@ fn test_backfilled_tampered_note_still_fails() {
 }
 
 /// A note written before the integrity check stays legacy: stamping it on
-/// the way into git would make an unchecked note verified.
+/// the way into git would make an unchecked note verified. Later commits
+/// with stamped notes do not change that: the old commit comes before them.
 #[test]
 fn test_backfilled_legacy_note_stays_legacy() {
     let repo = TestRepo::new();
-    let commit = note_only_in_db(&repo, strip_integrity);
+    let commit = note_only_in_db(&repo, |note| as_unstamped_note(note, Some("3.7.1")));
 
     let (stdout, _) = backfill(&repo);
     assert!(stdout.contains("Backfilled 1 authorship note "), "{stdout}");
@@ -1391,4 +1430,382 @@ fn test_backfilled_legacy_note_stays_legacy() {
     assert_status(&repo, &commit, "legacy");
     let mut file = repo.filename("app.txt");
     file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+
+    // Stamping begins after the backfilled commit.
+    let mut later = repo.filename("later.txt");
+    later.set_contents(crate::lines!["ai later".ai()]);
+    let stamped = repo.stage_all_and_commit("later").unwrap().commit_sha;
+    later.assert_committed_lines(crate::lines!["ai later".ai()]);
+    assert_status(&repo, &stamped, "verified");
+    assert_status(&repo, &commit, "legacy");
+    let (code, doc, _) = verify_json(&repo, &commit, &["--strict"]);
+    assert_eq!(code, 0, "{doc}");
+    file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+}
+
+/// A stamped note copied into the notes database with its stamp removed is
+/// written as stored by the backfill, and fails like any note whose stamp
+/// was removed.
+#[test]
+fn test_backfilled_note_with_its_stamp_removed_fails() {
+    let repo = TestRepo::new();
+    let commit = note_only_in_db(&repo, strip_integrity);
+
+    let (stdout, stderr) = backfill(&repo);
+    assert!(stdout.contains("Backfilled 1 authorship note "), "{stdout}");
+    assert_status(&repo, &commit, "stamp_removed");
+    assert!(
+        stderr.contains("1 of them fails the integrity check") && stderr.contains(&commit),
+        "{stderr}"
+    );
+    assert_eq!(ai_additions(&repo, &commit), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Notes whose stamp was removed
+// ---------------------------------------------------------------------------
+//
+// A note without an `integrity` member used to read as legacy whatever it
+// said, so removing the stamp from a note and editing it passed `autter
+// verify`, also with `--strict`. An unstamped note now passes as legacy only
+// when it can be one: its `autter_version` names a release older than 3.8.0
+// (autter 3.8.0 and later stamp every note), and, when its commit descends
+// from a commit whose note is stamped, it is a warning
+// (`unstamped_by_older_autter`, a failure under `--strict`).
+
+fn stats_json(repo: &TestRepo, commit: &str) -> Value {
+    repo.sync_daemon();
+    let out = repo
+        .autter_command(&["stats", commit, "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("no stats JSON: {stdout}"));
+    serde_json::from_str(line).unwrap()
+}
+
+/// An AI commit (stamped) that comes before the commits under test, so
+/// stamping began before them.
+fn stamped_base_commit(repo: &TestRepo) -> String {
+    let mut base = repo.filename("base.txt");
+    base.set_contents(crate::lines!["base ai".ai(), "base human"]);
+    let commit = repo
+        .stage_all_and_commit("stamped base")
+        .unwrap()
+        .commit_sha;
+    base.assert_committed_lines(crate::lines!["base ai".ai(), "base human".human()]);
+    assert_status(repo, &commit, "verified");
+    commit
+}
+
+/// Five AI lines and one human line in `app.txt` (83% AI). Returns the commit.
+fn five_of_six_ai_lines(repo: &TestRepo) -> String {
+    let mut file = repo.filename("app.txt");
+    file.set_contents(crate::lines![
+        "ai 1".ai(),
+        "ai 2".ai(),
+        "ai 3".ai(),
+        "ai 4".ai(),
+        "ai 5".ai(),
+        "human 6"
+    ]);
+    let commit = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
+    file.assert_committed_lines(crate::lines![
+        "ai 1".ai(),
+        "ai 2".ai(),
+        "ai 3".ai(),
+        "ai 4".ai(),
+        "ai 5".ai(),
+        "human 6".human()
+    ]);
+    commit
+}
+
+/// The reported case: a 3.9.1 note's stamp removed and an attestation edited
+/// (five AI lines down to two, 83% to 33%) passed as legacy, also with
+/// `--strict`, and stats reported 33% AI. It now fails with `stamp_removed`
+/// (exit 5, with and without `--strict`) and its lines count as unknown.
+#[test]
+fn test_note_with_its_stamp_removed_and_ranges_edited_fails() {
+    let repo = TestRepo::new();
+    let mut readme = repo.filename("README.md");
+    readme.set_contents(crate::lines!["readme"]);
+    repo.stage_all_and_commit("readme").unwrap();
+    readme.assert_committed_lines(crate::lines!["readme".human()]);
+    let base = stamped_base_commit(&repo);
+    let commit = five_of_six_ai_lines(&repo);
+    assert_status(&repo, &commit, "verified");
+    let stats = stats_json(&repo, &commit);
+    assert_eq!(stats["ai_additions"], 5, "{stats}");
+
+    let note = raw_note(&repo, &commit);
+    assert!(
+        note.contains("\"autter_version\": \"development:"),
+        "{note}"
+    );
+    let edited = replace_first_range(&strip_integrity(&note), "1-2");
+    assert!(edited.contains(" 1-2\n"), "{edited}");
+    write_raw_note(&repo, &commit, &edited);
+
+    assert_status(&repo, &commit, "stamp_removed");
+    let (code, doc, _) = verify_json(&repo, &commit, &["--strict"]);
+    assert_eq!(code, 5, "{doc}");
+    assert_eq!(doc["results"][0]["status"], "stamp_removed", "{doc}");
+    assert_eq!(doc["error"]["code"], "integrity_failed", "{doc}");
+    let detail = doc["results"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("stamp was removed"), "{detail}");
+
+    // Not 2 of 6 (33%) AI: the note is not trusted, so all six are unknown.
+    let stats = stats_json(&repo, &commit);
+    assert_eq!(stats["ai_additions"], 0, "{stats}");
+    assert_eq!(stats["unknown_additions"], 6, "{stats}");
+    assert_blame_distrusts_note(&repo, &repo.filename("app.txt"), "app.txt");
+    let out = repo.autter_command(&["stats", &commit]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(NOTICE_PREFIX) && stderr.contains("had its integrity stamp removed"),
+        "{stderr}"
+    );
+
+    // A range over both commits fails on the tampered one only.
+    let (code, doc, _) = verify_json(&repo, &format!("{base}~1..{commit}"), &[]);
+    assert_eq!(code, 5, "{doc}");
+    assert_eq!(doc["counts"]["verified"], 1, "{doc}");
+    assert_eq!(doc["counts"]["stamp_removed"], 1, "{doc}");
+    assert_eq!(doc["failed"], 1, "{doc}");
+    assert_status(&repo, &base, "verified");
+}
+
+/// The very first stamped commit has no stamped commit before it; its note
+/// says which autter wrote it, and every autter since 3.8.0 stamps.
+#[test]
+fn test_first_stamped_note_with_its_stamp_removed_fails() {
+    let repo = TestRepo::new();
+    let commit = five_of_six_ai_lines(&repo);
+    let note = raw_note(&repo, &commit);
+    write_raw_note(&repo, &commit, &strip_integrity(&note));
+
+    assert_status(&repo, &commit, "stamp_removed");
+    assert_eq!(ai_additions(&repo, &commit), 0);
+}
+
+/// Removing the stamp and the version too: the note no longer says who wrote
+/// it, but its commit comes after a stamped commit, so it was not written
+/// before stamping began.
+#[test]
+fn test_stamp_and_version_removed_after_stamping_fails() {
+    let repo = TestRepo::new();
+    stamped_base_commit(&repo);
+    let commit = five_of_six_ai_lines(&repo);
+    let note = raw_note(&repo, &commit);
+    let edited = replace_first_range(&as_unstamped_note(&note, None), "1-2");
+    assert!(!edited.contains("autter_version"), "{edited}");
+    write_raw_note(&repo, &commit, &edited);
+
+    assert_status(&repo, &commit, "stamp_removed");
+    assert_eq!(ai_additions(&repo, &commit), 0);
+    assert_blame_distrusts_note(&repo, &repo.filename("app.txt"), "app.txt");
+}
+
+/// A repository whose notes all predate the integrity check (no stamps,
+/// autter 3.7.1) verifies as legacy, also with `--strict`, and its lines are
+/// still used. A note with no version at all is legacy there too: nothing
+/// in the repository is stamped.
+#[test]
+fn test_repository_with_only_pre_3_8_notes_is_legacy() {
+    let repo = TestRepo::new();
+    let mut one = repo.filename("one.txt");
+    one.set_contents(crate::lines!["ai one".ai(), "human one"]);
+    let first = repo.stage_all_and_commit("one").unwrap().commit_sha;
+    one.assert_committed_lines(crate::lines!["ai one".ai(), "human one".human()]);
+    let mut two = repo.filename("two.txt");
+    two.set_contents(crate::lines!["human two", "ai two".ai()]);
+    let second = repo.stage_all_and_commit("two").unwrap().commit_sha;
+    two.assert_committed_lines(crate::lines!["human two".human(), "ai two".ai()]);
+
+    make_every_note_unstamped(&repo, "3.7.1");
+    let note = raw_note(&repo, &second);
+    write_raw_note(&repo, &second, &as_unstamped_note(&note, None));
+
+    assert_status(&repo, &first, "legacy");
+    assert_status(&repo, &second, "legacy");
+    let (code, doc, stderr) = verify_json(&repo, &format!("{first}..{second}"), &["--strict"]);
+    assert_eq!(code, 0, "{doc}");
+    assert_eq!(doc["counts"]["legacy"], 1, "{doc}");
+    assert_eq!(doc["failed"], 0, "{doc}");
+    assert!(
+        stderr.contains("a later release will fail them"),
+        "{stderr}"
+    );
+    let (code, doc, _) = verify_json(&repo, &first, &["--strict"]);
+    assert_eq!(code, 0, "{doc}");
+    one.assert_committed_lines(crate::lines!["ai one".ai(), "human one".human()]);
+    two.assert_committed_lines(crate::lines!["human two".human(), "ai two".ai()]);
+    assert_eq!(ai_additions(&repo, &second), 1);
+}
+
+/// A teammate still on autter 3.7 commits after this machine started
+/// stamping: their unstamped notes say 3.7.1. That is
+/// `unstamped_by_older_autter`, a warning whose lines still count, and a
+/// failure only under `--strict`, like `rebound_by_older_autter`: the version
+/// cannot be checked, and someone who removes a stamp can edit it too.
+///
+/// "After" is topology, not dates: a 3.7.1 note on a branch that forked
+/// before the first stamped commit stays legacy even though it was committed
+/// later.
+#[test]
+fn test_older_autter_teammate_after_stamping_warns_and_fails_only_under_strict() {
+    let repo = TestRepo::new();
+    // A history from before the upgrade: every note from 3.7.1.
+    let mut old = repo.filename("old.txt");
+    old.set_contents(crate::lines!["old ai".ai(), "old human"]);
+    let fork_point = repo.stage_all_and_commit("old").unwrap().commit_sha;
+    old.assert_committed_lines(crate::lines!["old ai".ai(), "old human".human()]);
+    make_every_note_unstamped(&repo, "3.7.1");
+    let main = repo.current_branch();
+    repo.git(&["branch", "side"]).unwrap();
+
+    // This machine upgrades: the next commit's note is stamped.
+    let stamped = stamped_base_commit(&repo);
+
+    // A teammate on 3.7 commits on top of it.
+    let mut team = repo.filename("team.txt");
+    team.set_contents(crate::lines!["team ai".ai(), "team human"]);
+    let teammate = repo.stage_all_and_commit("teammate").unwrap().commit_sha;
+    team.assert_committed_lines(crate::lines!["team ai".ai(), "team human".human()]);
+    let note = raw_note(&repo, &teammate);
+    write_raw_note(&repo, &teammate, &as_unstamped_note(&note, Some("3.7.1")));
+
+    // Another teammate on 3.7 commits later, on a branch from before stamping.
+    repo.git(&["checkout", "side"]).unwrap();
+    let mut side = repo.filename("side.txt");
+    side.set_contents(crate::lines!["side ai".ai(), "side human"]);
+    let side_commit = repo.stage_all_and_commit("side").unwrap().commit_sha;
+    side.assert_committed_lines(crate::lines!["side ai".ai(), "side human".human()]);
+    let note = raw_note(&repo, &side_commit);
+    write_raw_note(
+        &repo,
+        &side_commit,
+        &as_unstamped_note(&note, Some("3.7.1")),
+    );
+    repo.git(&["checkout", &main]).unwrap();
+
+    assert_status(&repo, &fork_point, "legacy");
+    assert_status(&repo, &stamped, "verified");
+    assert_status(&repo, &side_commit, "legacy");
+    assert_status(&repo, &teammate, "unstamped_by_older_autter");
+    let (_, _, doc) = status_of(&repo, &teammate);
+    let detail = doc["results"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("3.7.1"), "{detail}");
+
+    // Its lines are still used, as a warning's are.
+    team.assert_committed_lines(crate::lines!["team ai".ai(), "team human".human()]);
+    assert_eq!(ai_additions(&repo, &teammate), 1);
+
+    // --strict fails it, and only it.
+    let (code, doc, _) = verify_json(&repo, &teammate, &["--strict"]);
+    assert_eq!(code, 5, "{doc}");
+    assert_eq!(doc["failed"], 1, "{doc}");
+    let (code, doc, _) = verify_json(&repo, &side_commit, &["--strict"]);
+    assert_eq!(code, 0, "{doc}");
+    let out = repo
+        .autter_command(&["verify", &teammate, "--strict"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("FAIL") && stdout.contains("unstamped_by_older_autter"),
+        "{stdout}"
+    );
+
+    // When the stamped commit's own note is changed back to a 3.7.1 one,
+    // nothing in the history is stamped any more and the teammate's note is
+    // legacy again (the cached floor is rebuilt, not reused).
+    let note = raw_note(&repo, &stamped);
+    write_raw_note(&repo, &stamped, &as_unstamped_note(&note, Some("3.7.1")));
+    assert_status(&repo, &stamped, "legacy");
+    assert_status(&repo, &teammate, "legacy");
+    old.assert_committed_lines(crate::lines!["old ai".ai(), "old human".human()]);
+}
+
+/// Rewrites stamp what they write: a branch whose notes are all from 3.7.1,
+/// rebased onto commits with stamped notes, gets notes that verify (not
+/// `stamp_removed` or `unstamped_by_older_autter`); amending and
+/// cherry-picking a stamped commit leave notes that verify.
+#[test]
+fn test_rewrites_after_stamping_began_verify() {
+    let repo = TestRepo::new();
+    let main = feature_behind_main(&repo);
+    make_every_note_unstamped(&repo, "3.7.1");
+    repo.git(&["checkout", &main]).unwrap();
+    let stamped = stamped_base_commit(&repo);
+    repo.git(&["checkout", "feature"]).unwrap();
+    assert_status(&repo, &rev(&repo, "HEAD"), "legacy");
+
+    repo.git(&["rebase", &main]).unwrap();
+    repo.sync_daemon();
+    assert_feature_lines(&repo);
+    assert_verified(&repo, &["HEAD~1", "HEAD"]);
+    assert_status(&repo, &stamped, "verified");
+
+    // Amend a stamped commit.
+    repo.git(&["commit", "--amend", "-m", "feature two, reworded"])
+        .unwrap();
+    repo.sync_daemon();
+    assert_feature_lines(&repo);
+    assert_verified(&repo, &["HEAD"]);
+
+    // Cherry-pick a stamped commit onto main.
+    let picked = rev(&repo, "HEAD~1");
+    repo.git(&["checkout", &main]).unwrap();
+    repo.git(&["cherry-pick", &picked]).unwrap();
+    repo.sync_daemon();
+    let mut one = repo.filename("one.txt");
+    one.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+    assert_verified(&repo, &["HEAD"]);
+}
+
+/// A stash note with its stamp removed is not restored: the release that
+/// wrote it stamps every stash note. (Until now it restored like a note
+/// from 3.8.1.)
+#[test]
+fn test_stash_note_with_its_stamp_removed_is_not_restored() {
+    let repo = TestRepo::new();
+    let stash = stash_an_ai_edit(&repo);
+    let note = raw_stash_note(&repo, &stash);
+    write_raw_stash_note(&repo, &stash, &strip_integrity(&note));
+
+    let commit = pop_and_commit(&repo);
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "untracked line".unattributed_human(),
+        "ai line".unattributed_human()
+    ]);
+    assert_eq!(ai_additions(&repo, &commit), 0);
+}
+
+/// A stash note with its stamp and version removed, made on a commit after
+/// stamping began, is not restored either.
+#[test]
+fn test_stash_note_without_stamp_or_version_after_stamping_is_not_restored() {
+    let repo = TestRepo::new();
+    stamped_base_commit(&repo);
+    let stash = stash_an_ai_edit(&repo);
+    let note = raw_stash_note(&repo, &stash);
+    write_raw_stash_note(&repo, &stash, &as_unstamped_note(&note, None));
+
+    let commit = pop_and_commit(&repo);
+    let mut file = repo.filename("app.txt");
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "untracked line".unattributed_human(),
+        "ai line".unattributed_human()
+    ]);
+    assert_eq!(ai_additions(&repo, &commit), 0);
 }

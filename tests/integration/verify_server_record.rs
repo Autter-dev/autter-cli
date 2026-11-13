@@ -848,10 +848,8 @@ fn test_ci_rerun_on_the_same_merge_writes_one_note() {
 fn test_legacy_notes_on_unchanged_commits_are_not_restamped() {
     let repo = TestRepo::new();
     let (main, commits) = feature_on_top_of_main(&repo);
-    for commit in &commits {
-        let legacy = autter::authorship::note_integrity::strip_integrity(&raw_note(&repo, commit));
-        write_raw_note(&repo, commit, &legacy);
-    }
+    // Every note in the repository as autter 3.7.1 wrote it.
+    crate::note_integrity_check::make_every_note_unstamped(&repo, "3.7.1");
     let before = notes_of(&repo, &commits);
     assert!(read_integrity(&before[0].1).is_none());
 
