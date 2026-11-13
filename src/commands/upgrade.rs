@@ -530,109 +530,145 @@ fn try_mock_releases(base: &str, channel: UpdateChannel) -> Option<Result<Channe
     )
 }
 
+/// `autter upgrade` on Windows: run install.ps1 and wait for it, so its
+/// output is the user's and its exit code decides ours. The binary this
+/// process runs is in the installer's way (Windows does not replace a running
+/// program), so the background service is stopped and the binary renamed
+/// aside first, and put back if the installer leaves none (see
+/// `binary_swap`). The service is started again if it was running.
+#[cfg(windows)]
+fn run_install_script_attached(script_content: &str, tag: &str) -> Result<(), String> {
+    use crate::commands::binary_swap;
+
+    let pid = std::process::id();
+    let autter_dir = dirs::home_dir()
+        .ok_or_else(|| "Could not determine home directory".to_string())?
+        .join(".autter");
+    let log_dir = autter_dir.join("upgrade-logs");
+    fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log directory: {}", e))?;
+    let script_path = log_dir.join(format!("install-{}.ps1", pid));
+    fs::write(&script_path, script_content)
+        .map_err(|e| format!("Failed to write install script: {}", e))?;
+    let exe = autter_dir.join("bin").join("autter.exe");
+
+    let host = binary_swap::SystemHost::new();
+    let result = binary_swap::run_installer_with_binary_aside(&host, &exe, pid, || {
+        let run = |shell: &str| {
+            Command::new(shell)
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(&script_path)
+                .env(AUTTER_RELEASE_ENV, tag)
+                // Debug builds read AUTTER=git as "run as git".
+                .env_remove("AUTTER")
+                .status()
+        };
+        let status = run("pwsh")
+            .or_else(|_| run("powershell"))
+            .map_err(|e| format!("Failed to run installation script: {}", e))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Installation script failed with exit code: {}",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ))
+        }
+    });
+    let _ = fs::remove_file(&script_path);
+    result
+}
+
+/// The background service's own self-upgrade on Windows: the service process
+/// is exiting, so the installer runs detached, logs to
+/// ~/.autter/upgrade-logs, and starts the service again when it is done.
+#[cfg(windows)]
+fn run_install_script_detached(script_content: &str, tag: &str) -> Result<(), String> {
+    if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() {
+        // Best effort: stop the daemon before we hand off to the detached installer.
+        let _ = crate::commands::daemon::stop_daemon(&daemon_config, Duration::from_secs(10));
+    }
+
+    let pid = std::process::id();
+    let log_dir = dirs::home_dir()
+        .ok_or_else(|| "Could not determine home directory".to_string())?
+        .join(".autter")
+        .join("upgrade-logs");
+    fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log directory: {}", e))?;
+
+    let log_file = log_dir.join(format!("upgrade-{}.log", pid));
+    let log_path_str = log_file.to_string_lossy().to_string();
+
+    let script_path = log_dir.join(format!("install-{}.ps1", pid));
+    fs::write(&script_path, script_content)
+        .map_err(|e| format!("Failed to write install script: {}", e))?;
+    let script_path_str = script_path.to_string_lossy().to_string();
+
+    fs::write(&log_file, format!("Starting upgrade at PID {}\n", pid))
+        .map_err(|e| format!("Failed to create log file: {}", e))?;
+
+    // Runs the script with a transcript. A failure is logged and also ends
+    // the wrapper with exit code 1 (it used to be caught and exit 0).
+    let ps_wrapper = format!(
+        "$logFile = '{}'; \
+         $failed = $false; \
+         Start-Transcript -Path $logFile -Append -Force | Out-Null; \
+         Write-Host 'Running verified install script...'; \
+         try {{ \
+              $ErrorActionPreference = 'Continue'; \
+              & '{}'; \
+              Write-Host 'Install script completed'; \
+          }} catch {{ \
+              $failed = $true; \
+              Write-Host \"Error: $_\"; \
+              Write-Host \"Stack trace: $($_.ScriptStackTrace)\"; \
+          }} finally {{ \
+              if ($env:{} -eq '1') {{ \
+                  $daemonExe = Join-Path $HOME '.autter\\bin\\autter.exe'; \
+                  if (Test-Path $daemonExe) {{ try {{ & $daemonExe bg start *> $null }} catch {{ }} }} \
+              }}; \
+              Stop-Transcript | Out-Null; \
+              Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue; \
+          }}; \
+         if ($failed) {{ exit 1 }}",
+        log_path_str, script_path_str, AUTTER_RESTART_DAEMON_AFTER_INSTALL_ENV, script_path_str
+    );
+
+    let spawn_powershell = |exe: &str| -> std::io::Result<std::process::Child> {
+        let mut cmd = Command::new(exe);
+        cmd.arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(&ps_wrapper)
+            .env(AUTTER_RELEASE_ENV, tag)
+            .env(AUTTER_RESTART_DAEMON_AFTER_INSTALL_ENV, "1")
+            .env(AUTTER_DAEMON_UPGRADE_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Hide the spawned console to prevent any host/UI bleed-through
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.spawn()
+    };
+
+    spawn_powershell("pwsh")
+        .or_else(|_| spawn_powershell("powershell"))
+        .map(|_| ())
+        .map_err(|e| format!("Failed to run installation script: {}", e))
+}
+
 fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
-        if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() {
-            // Best effort: stop the daemon before we hand off to the detached installer.
-            // The install script also has a fallback kill path so old released binaries
-            // can still recover, but stopping here makes upgrades complete sooner.
-            let _ = crate::commands::daemon::stop_daemon(&daemon_config, Duration::from_secs(10));
-        }
-
-        // On Windows, we need to run the installer detached because the current autter
-        // binary and shims are in use and need to be replaced. The installer will wait
-        // for the files to be released before proceeding.
-        let pid = std::process::id();
-        let log_dir = dirs::home_dir()
-            .ok_or_else(|| "Could not determine home directory".to_string())?
-            .join(".autter")
-            .join("upgrade-logs");
-
-        // Ensure the log directory exists
-        fs::create_dir_all(&log_dir)
-            .map_err(|e| format!("Failed to create log directory: {}", e))?;
-
-        let log_file = log_dir.join(format!("upgrade-{}.log", pid));
-        let log_path_str = log_file.to_string_lossy().to_string();
-
-        // Write the install script to a temp file
-        let script_path = log_dir.join(format!("install-{}.ps1", pid));
-        fs::write(&script_path, script_content)
-            .map_err(|e| format!("Failed to write install script: {}", e))?;
-        let script_path_str = script_path.to_string_lossy().to_string();
-
-        // Create log file with initial message
-        fs::write(&log_file, format!("Starting upgrade at PID {}\n", pid))
-            .map_err(|e| format!("Failed to create log file: {}", e))?;
-
-        // PowerShell wrapper that executes the script file with logging
-        let ps_wrapper = format!(
-            "$logFile = '{}'; \
-             Start-Transcript -Path $logFile -Append -Force | Out-Null; \
-             Write-Host 'Running verified install script...'; \
-             try {{ \
-                  $ErrorActionPreference = 'Continue'; \
-                  & '{}'; \
-                  Write-Host 'Install script completed'; \
-              }} catch {{ \
-                  Write-Host \"Error: $_\"; \
-                  Write-Host \"Stack trace: $($_.ScriptStackTrace)\"; \
-              }} finally {{ \
-                  if ($env:{} -eq '1') {{ \
-                      $daemonExe = Join-Path $HOME '.autter\\bin\\autter.exe'; \
-                      if (Test-Path $daemonExe) {{ try {{ & $daemonExe bg start *> $null }} catch {{ }} }} \
-                  }}; \
-                  Stop-Transcript | Out-Null; \
-                  Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue; \
-              }}",
-            log_path_str, script_path_str, AUTTER_RESTART_DAEMON_AFTER_INSTALL_ENV, script_path_str
-        );
-
-        let spawn_powershell = |exe: &str| -> std::io::Result<std::process::Child> {
-            let mut cmd = Command::new(exe);
-            cmd.arg("-NoProfile")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-Command")
-                .arg(&ps_wrapper)
-                .env(AUTTER_RELEASE_ENV, tag);
-
-            // Hide the spawned console to prevent any host/UI bleed-through
-            cmd.creation_flags(CREATE_NO_WINDOW);
-
-            if silent {
-                cmd.env(AUTTER_RESTART_DAEMON_AFTER_INSTALL_ENV, "1");
-                cmd.env(AUTTER_DAEMON_UPGRADE_ENV, "1");
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-            }
-
-            cmd.spawn()
-        };
-
-        let spawn_result = spawn_powershell("pwsh").or_else(|_| spawn_powershell("powershell"));
-
-        match spawn_result {
-            Ok(_) => {
-                if !silent {
-                    println!(
-                        "{}",
-                        paint(
-                            "1;33",
-                            "Note: The installation is running in the background on Windows."
-                        )
-                    );
-                    println!(
-                        "This allows the current autter process to exit and release file locks."
-                    );
-                    println!("Check the log file for progress: {}", log_path_str);
-                    println!(
-                        "The installer will stop lingering autter background processes if needed, but active git commands can still delay completion."
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => Err(format!("Failed to run installation script: {}", e)),
+        if silent {
+            run_install_script_detached(script_content, tag)
+        } else {
+            run_install_script_attached(script_content, tag)
         }
     }
 
@@ -850,19 +886,14 @@ fn run_impl_with_url(
 
     match run_install_script(&script_content, &release.tag, false) {
         Ok(()) => {
-            // On Windows, we spawn the installer in the background and can't verify success
-            #[cfg(not(windows))]
-            {
-                println!(
-                    "{} Successfully installed {}!",
-                    paint("1;32", "✓"),
-                    release.tag
-                );
-                // Rewrite the hooks of agents already set up so they call the
-                // new binary. Windows installs finish in the background; there
-                // the first command after the install does it instead.
-                crate::mdm::hook_refresh::refresh_with_installed_binary();
-            }
+            println!(
+                "{} Successfully installed {}!",
+                paint("1;32", "✓"),
+                release.tag
+            );
+            // Rewrite the hooks of agents already set up so they call the
+            // new binary.
+            crate::mdm::hook_refresh::refresh_with_installed_binary();
 
             log_message(
                 "upgraded",
@@ -876,6 +907,12 @@ fn run_impl_with_url(
             );
         }
         Err(err) => {
+            // On Windows the error already says what is installed now and
+            // what to do (the installer may have got as far as replacing
+            // the binary).
+            #[cfg(windows)]
+            eprintln!("{err}");
+            #[cfg(not(windows))]
             eprintln!("{}", upgrade_failure_message(&err));
             std::process::exit(1);
         }

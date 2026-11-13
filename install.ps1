@@ -40,8 +40,13 @@ $dryRun = ($env:AUTTER_INSTALL_DRY_RUN -eq '1')
 # no operator that chains them.
 $NpmFallbackHint = "This is usually temporary: wait a minute and run the installer again.`nIf it keeps failing on this network, install with npm instead (needs Node.js 18+):`n  npm install -g @autter/cli`n  autter onboard"
 
+# Set when the background service was running and was stopped to replace
+# its binary: it is started again at the end, on whatever binary is then in
+# place (also when the install fails and the previous binary stays).
+$serviceWasRunning = $false
+
 function Start-DaemonIfRequested {
-    if ($env:AUTTER_RESTART_DAEMON_AFTER_INSTALL -ne '1') {
+    if ($env:AUTTER_RESTART_DAEMON_AFTER_INSTALL -ne '1' -and -not $serviceWasRunning) {
         return
     }
     # A dry run starts nothing, also when it stops on an error.
@@ -137,80 +142,122 @@ function Stop-AutterBackgroundService {
     }
 }
 
-function Get-AutterManagedProcesses {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstallDir
-    )
-
-    $targetPaths = @(
-        (Normalize-PathString (Join-Path $InstallDir 'autter.exe')),
-        (Normalize-PathString (Join-Path $InstallDir 'git.exe'))
-    )
-
-    $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            $_.ProcessId -ne $PID -and
-            $_.ExecutablePath -and
-            ($targetPaths -contains (Normalize-PathString $_.ExecutablePath))
-        })
-
-    return $processes
-}
-
-function Stop-AutterManagedProcesses {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstallDir
-    )
-
-    $processes = @(Get-AutterManagedProcesses -InstallDir $InstallDir)
-    if ($processes.Count -eq 0) {
-        return $false
-    }
-
-    $pids = @($processes | Sort-Object ProcessId -Unique | Select-Object -ExpandProperty ProcessId)
-    Write-Warning ("Stopping lingering autter processes: {0}" -f ($pids -join ', '))
-
-    foreach ($managedPid in $pids) {
-        try {
-            Stop-Process -Id $managedPid -Force -ErrorAction Stop
-        } catch { }
-    }
-
-    return $true
-}
-
 function Wait-ForFileAvailable {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$InstallDir,
-        [Parameter(Mandatory = $false)][int]$MaxWaitSeconds = 300,
-        [Parameter(Mandatory = $false)][int]$RetryIntervalSeconds = 5,
-        [Parameter(Mandatory = $false)][int]$ForceKillAfterSeconds = 20
+        [Parameter(Mandatory = $false)][int]$MaxWaitSeconds = 10
     )
 
-    $elapsed = 0
-    $autterExe = Join-Path $InstallDir 'autter.exe'
-
-    [void](Stop-AutterBackgroundService -AutterExe $autterExe)
-
-    while ($elapsed -lt $MaxWaitSeconds) {
+    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+    while ((Get-Date) -lt $deadline) {
         if (Test-FileAvailable -Path $Path) {
             return $true
         }
+        Start-Sleep -Milliseconds 250
+    }
+    return (Test-FileAvailable -Path $Path)
+}
 
-        if ($elapsed -ge $ForceKillAfterSeconds) {
-            [void](Stop-AutterBackgroundService -AutterExe $autterExe -Hard)
-            [void](Stop-AutterManagedProcesses -InstallDir $InstallDir)
-        }
+# Stop the background service before its binary is replaced, the way
+# `autter bg shutdown` does, and wait for it to let go of the file. Returns
+# whether a service was running, so it is started again afterwards. A file
+# that stays held is not fatal: Install-ExecutableFile renames it aside.
+function Stop-ServiceForReplace {
+    param(
+        [Parameter(Mandatory = $true)][string]$AutterExe
+    )
 
-        if (-not (Test-FileAvailable -Path $Path)) {
-            if ($elapsed -eq 0) {
-                Write-Host "Waiting for file to be available: $Path" -ForegroundColor Yellow
-            }
-            Start-Sleep -Seconds $RetryIntervalSeconds
-            $elapsed += $RetryIntervalSeconds
+    if (-not (Test-Path -LiteralPath $AutterExe)) {
+        return $false
+    }
+    $wasRunning = Stop-AutterBackgroundService -AutterExe $AutterExe
+    if ($wasRunning) {
+        Write-Host 'Stopped the autter background service to replace its binary.'
+        if (-not (Wait-ForFileAvailable -Path $AutterExe -MaxWaitSeconds 15)) {
+            [void](Stop-AutterBackgroundService -AutterExe $AutterExe -Hard)
+            [void](Wait-ForFileAvailable -Path $AutterExe -MaxWaitSeconds 5)
         }
     }
-    return $false
+    return $wasRunning
+}
+
+# Put $Source at $Destination. Windows does not replace or delete an .exe that
+# a running process has open (the background service, a git command run
+# through autter, `autter upgrade` itself), but it does rename one. So the
+# file in place is renamed aside to <name>.old (or <name>.<pid>.old) and the
+# new one moved in; if that fails, the old one is moved back. The aside file
+# is deleted by Remove-LeftoverExecutables once nothing runs it.
+# Returns @{ Error = $null or why it failed; Aside = $null or the aside path }.
+function Install-ExecutableFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $aside = $null
+    if (Test-Path -LiteralPath $Destination) {
+        $aside = "$Destination.old"
+        if (Test-Path -LiteralPath $aside) {
+            try {
+                Remove-Item -LiteralPath $aside -Force -ErrorAction Stop
+            } catch {
+                $aside = "$Destination.$PID.old"
+            }
+        }
+        try {
+            [IO.File]::Move($Destination, $aside)
+        } catch {
+            return [PSCustomObject]@{ Error = $_.Exception.Message; Aside = $null }
+        }
+    }
+    try {
+        [IO.File]::Move($Source, $Destination)
+    } catch {
+        $reason = $_.Exception.Message
+        if ($aside) {
+            try {
+                [IO.File]::Move($aside, $Destination)
+            } catch {
+                $reason += " The previous file could not be put back either: rename $aside to $Destination."
+            }
+        }
+        return [PSCustomObject]@{ Error = $reason; Aside = $null }
+    }
+    return [PSCustomObject]@{ Error = $null; Aside = $aside }
+}
+
+# Put the previous binary back after the new one failed its check.
+function Restore-PreviousExecutable {
+    param(
+        [Parameter(Mandatory = $false)][string]$Aside,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    if (-not $Aside -or -not (Test-Path -LiteralPath $Aside)) {
+        return $false
+    }
+    try {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        [IO.File]::Move($Aside, $Destination)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Delete binaries renamed aside by earlier installs that nothing runs any
+# more. One still running stays until the next install (the background
+# service also deletes them when it starts).
+function Remove-LeftoverExecutables {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir
+    )
+
+    foreach ($pattern in @('autter.exe.*old', 'git.exe.*old')) {
+        foreach ($leftover in @(Get-ChildItem -LiteralPath $InstallDir -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+            try { Remove-Item -LiteralPath $leftover.FullName -Force -ErrorAction Stop } catch { }
+        }
+    }
 }
 
 function Verify-Checksum {
@@ -511,7 +558,7 @@ if ($dryRun) {
     }
 
     if (Test-Path -LiteralPath $dryExe) {
-        [void]$drySteps.Add("replace $dryExe (the autter background service is stopped first, so the file is free)")
+        [void]$drySteps.Add("replace $dryExe (the autter background service is stopped first and started again afterwards; a file still in use is renamed aside to autter.exe.old)")
     } else {
         [void]$drySteps.Add("install it as $dryExe")
     }
@@ -917,15 +964,15 @@ Verify-Checksum -File $tmpFile -BinaryName $downloadedBinaryName
 
 $finalExe = Join-Path $installDir 'autter.exe'
 
-# Wait for autter.exe to be available if it exists and is in use
-if (Test-Path -LiteralPath $finalExe) {
-    if (-not (Wait-ForFileAvailable -Path $finalExe -InstallDir $installDir -MaxWaitSeconds 300 -RetryIntervalSeconds 5)) {
-        Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
-        Write-ErrorAndExit "Timeout waiting for $finalExe to be available. Please close any running autter processes and try again."
-    }
-}
+# Stop the background service first; it is started again (on the new
+# binary) by Start-DaemonIfRequested below.
+$serviceWasRunning = Stop-ServiceForReplace -AutterExe $finalExe
 
-Move-Item -Force -Path $tmpFile -Destination $finalExe
+$swap = Install-ExecutableFile -Source $tmpFile -Destination $finalExe
+if ($swap.Error) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+    Write-ErrorAndExit ("Could not replace {0}: the file is in use ({1})`nThe autter background service, a git command run through autter, or another program (such as an antivirus scan) still has it open, and Windows does not replace a running program.`nThe previous autter is still installed and works.`nFix: run 'autter bg shutdown', then run the installer again." -f $finalExe, $swap.Error)
+}
 try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
 # This installer now owns the binary: drop the npm package's marker, so the
 # background service updates it again and `autter upgrade` stops pointing at npm.
@@ -941,25 +988,29 @@ try {
 } catch {
     $versionError = $_.Exception.Message
 }
-if ($versionError) {
+if ($versionError -or $versionExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($installedVersion)) {
+    $versionDetail = if ($versionError) { " $versionError" } else { "`n$installedVersion" }
     Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
-    Write-ErrorAndExit "The autter binary could not run on this system: $versionError"
-}
-if ($versionExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($installedVersion)) {
-    Remove-Item -Force -ErrorAction SilentlyContinue $finalExe
-    Write-ErrorAndExit "The autter binary could not run on this system:`n$installedVersion"
+    if (Restore-PreviousExecutable -Aside $swap.Aside -Destination $finalExe) {
+        $versionDetail += "`nThe previous autter is still installed."
+    }
+    Write-ErrorAndExit "The autter binary could not run on this system:$versionDetail"
 }
 Write-Host "Installed autter $installedVersion"
 
 # Refresh git.exe for existing wrapper users (it's a copy, not a symlink on Windows)
 $gitShim = Join-Path $installDir 'git.exe'
 if (Test-Path -LiteralPath $gitShim) {
-    if (-not (Wait-ForFileAvailable -Path $gitShim -InstallDir $installDir -MaxWaitSeconds 300 -RetryIntervalSeconds 5)) {
-        Write-ErrorAndExit "Timeout waiting for $gitShim to be available. Please close any running git processes and try again."
+    $shimTmp = Join-Path $installDir "git.tmp.$PID.exe"
+    Copy-Item -Force -Path $finalExe -Destination $shimTmp
+    $shimSwap = Install-ExecutableFile -Source $shimTmp -Destination $gitShim
+    if ($shimSwap.Error) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $shimTmp
+        Write-ErrorAndExit ("autter.exe was updated, but {0} could not be replaced: the file is in use ({1})`nA git command run through autter is probably still running. The previous git.exe still works.`nFix: let running git commands finish, run 'autter bg shutdown', then run the installer again." -f $gitShim, $shimSwap.Error)
     }
-    Copy-Item -Force -Path $finalExe -Destination $gitShim
     try { Unblock-File -Path $gitShim -ErrorAction SilentlyContinue } catch { }
 }
+Remove-LeftoverExecutables -InstallDir $installDir
 
 # Login user with install token if provided
 $needLogin = $false
@@ -978,7 +1029,8 @@ if ($env:INSTALL_NONCE -and $env:API_BASE) {
 Write-Host 'IDE/agent hooks and git capture are configured during onboard (with consent)...'
 Write-Host "  Run: $finalExe onboard"
 
-# Best-effort restart only for daemon-initiated self-updates.
+# Start the background service again if it was running before (or for the
+# service's own self-update), now on the new binary. Best effort.
 Start-DaemonIfRequested
 
 $skipPathUpdate = $env:AUTTER_SKIP_PATH_UPDATE -eq '1'

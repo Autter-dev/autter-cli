@@ -325,10 +325,266 @@ function reportInstallPing(tag) {
   }).catch(() => {});
 }
 
+// --- putting the binary in place --------------------------------------------
+//
+// Windows will not replace or delete an .exe that a running process has open
+// (rename-over fails with EPERM), and the autter background service runs
+// ~/.autter/bin/autter.exe. It will rename one, though. So on Windows the
+// service is stopped first (`autter bg shutdown`, as a user would), and if the
+// file is still held the old binary is renamed aside to autter.exe.old and the
+// new one put in its place. The aside file is deleted once nothing runs it:
+// right away, or by the next install. If the swap fails anyway the old binary
+// stays where it was and the install fails, naming the cause and the fix.
+
+const SERVICE_STOP_TIMEOUT_MS = 15_000;
+const SERVICE_START_TIMEOUT_MS = 90_000;
+const RELEASE_WAIT_MS = 10_000;
+const ASIDE_SUFFIX = '.old';
+
+// The binary could not be put in place. The previous one is still installed.
+class SwapError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'SwapError';
+    this.code = 'AUTTER_SWAP_FAILED';
+    this.inUse = isInUseError(cause);
+    this.cause = cause;
+  }
+}
+
+// The errors Windows gives for a file another process has open.
+function isInUseError(err) {
+  return Boolean(err) && ['EPERM', 'EACCES', 'EBUSY'].includes(err.code);
+}
+
+function reinstallCommand(packageVersion = pkg.version) {
+  return packageVersion === DEV_VERSION
+    ? 'npm install -g @autter/cli'
+    : `npm install -g @autter/cli@${packageVersion}`;
+}
+
+function swapErrorMessage(dest, err) {
+  const code = (err && err.code) || 'unknown error';
+  if (isInUseError(err)) {
+    return [
+      `could not replace ${dest}: the file is in use (${code}).`,
+      'The autter background service or another autter command still has it open, and Windows does not replace a running program.',
+      'The previous autter is still installed and works.',
+      `Fix: run \`autter bg shutdown\`, then run the install again: ${reinstallCommand()}`,
+    ].join('\n');
+  }
+  return [
+    `could not put the new autter binary at ${dest} (${(err && err.message) || code}).`,
+    'The previous autter is still installed and works.',
+  ].join('\n');
+}
+
+// Leftovers of earlier swaps next to `dest`: autter.exe.old, autter.exe.<pid>.old.
+function leftoverBinaries(dest, fsImpl = fs) {
+  const dir = path.dirname(dest);
+  const base = path.basename(dest);
+  let names;
+  try {
+    names = fsImpl.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name === base + ASIDE_SUFFIX || (name.startsWith(`${base}.`) && name.endsWith(ASIDE_SUFFIX)))
+    .map((name) => path.join(dir, name));
+}
+
+// Delete leftovers no process runs any more; the ones still running stay.
+function removeLeftoverBinaries(dest, fsImpl = fs) {
+  for (const file of leftoverBinaries(dest, fsImpl)) {
+    try {
+      fsImpl.rmSync(file, { force: true });
+    } catch {
+      // still running: removed by a later install
+    }
+  }
+}
+
+function asidePath(dest, pid, fsImpl = fs) {
+  const plain = dest + ASIDE_SUFFIX;
+  if (!fsImpl.existsSync(plain)) return plain;
+  return `${dest}.${pid}${ASIDE_SUFFIX}`;
+}
+
+// `autter bg shutdown` on the installed binary. Exits 0 only when a service
+// was running and was asked to stop, so the result says whether to start it
+// again afterwards.
+function stopService(bin, execFile = execFileSync) {
+  try {
+    execFile(bin, ['bg', 'shutdown'], { stdio: 'ignore', timeout: SERVICE_STOP_TIMEOUT_MS, windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// `autter bg start` on the new binary. Returns null, or why it failed.
+function startService(bin, execFile = execFileSync) {
+  try {
+    execFile(bin, ['bg', 'start'], { stdio: 'ignore', timeout: SERVICE_START_TIMEOUT_MS, windowsHide: true });
+    return null;
+  } catch (err) {
+    return err.message || String(err);
+  }
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Whether no process holds `file` open for running (opening it for writing
+// then fails with EBUSY on Windows).
+function fileReleased(file, fsImpl = fs) {
+  try {
+    fsImpl.closeSync(fsImpl.openSync(file, 'r+'));
+    return true;
+  } catch (err) {
+    return !isInUseError(err);
+  }
+}
+
+// Wait for the stopped service to let go of `file`. Not fatal: renaming
+// aside works on a file that is still running.
+function waitForRelease(file, { fsImpl = fs, timeoutMs = RELEASE_WAIT_MS, sleep = sleepMs, now = Date.now } = {}) {
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    if (fileReleased(file, fsImpl)) return true;
+    if (now() >= deadline) return false;
+    sleep(200);
+  }
+}
+
+// Move the downloaded file `tmp` to `dest`. Returns { serviceWasRunning,
+// aside }: `aside` is where the previous binary went (Windows, file in use),
+// for finishInstall to delete or restore. Throws SwapError with the previous
+// binary in place and `tmp` removed.
+function replaceBinary(tmp, dest, deps = {}) {
+  const {
+    fs: fsImpl = fs,
+    platform = process.platform,
+    stopService: stop = stopService,
+    startService: start = startService,
+    waitForRelease: wait = (file) => waitForRelease(file, { fsImpl }),
+    pid = process.pid,
+    log = console.log,
+  } = deps;
+  const discardTmp = () => {
+    try {
+      fsImpl.rmSync(tmp, { force: true });
+    } catch {
+      // best effort
+    }
+  };
+
+  if (platform !== 'win32' || !fsImpl.existsSync(dest)) {
+    try {
+      fsImpl.renameSync(tmp, dest);
+    } catch (err) {
+      discardTmp();
+      throw new SwapError(swapErrorMessage(dest, err), err);
+    }
+    return { serviceWasRunning: false, aside: null };
+  }
+
+  removeLeftoverBinaries(dest, fsImpl);
+  const serviceWasRunning = stop(dest);
+  if (serviceWasRunning) {
+    log('autter: stopped the background service to replace the binary');
+    wait(dest);
+  }
+  const restartOld = () => {
+    if (serviceWasRunning) start(dest);
+  };
+
+  try {
+    fsImpl.renameSync(tmp, dest);
+    return { serviceWasRunning, aside: null };
+  } catch (err) {
+    if (!isInUseError(err)) {
+      discardTmp();
+      restartOld();
+      throw new SwapError(swapErrorMessage(dest, err), err);
+    }
+  }
+
+  // Still held: rename the running file aside, which Windows allows.
+  const aside = asidePath(dest, pid, fsImpl);
+  try {
+    fsImpl.renameSync(dest, aside);
+  } catch (err) {
+    discardTmp();
+    restartOld();
+    throw new SwapError(swapErrorMessage(dest, err), err);
+  }
+  try {
+    fsImpl.renameSync(tmp, dest);
+  } catch (err) {
+    try {
+      fsImpl.renameSync(aside, dest);
+    } catch (restoreErr) {
+      discardTmp();
+      throw new SwapError(
+        `${swapErrorMessage(dest, err)}\nThe previous binary could not be put back either (${restoreErr.message}): rename ${aside} to ${dest}.`,
+        err,
+      );
+    }
+    discardTmp();
+    restartOld();
+    throw new SwapError(swapErrorMessage(dest, err), err);
+  }
+  return { serviceWasRunning, aside };
+}
+
+// After the new binary is in place: check it runs (putting the previous one
+// back if it does not), delete the aside file, and start the background
+// service again on the new binary if it was running before.
+function finishInstall(dest, swap, deps = {}) {
+  const {
+    fs: fsImpl = fs,
+    verify = verifyBinaryRuns,
+    startService: start = startService,
+    warn = console.warn,
+  } = deps;
+  try {
+    verify(dest);
+  } catch (err) {
+    if (swap.aside) {
+      try {
+        fsImpl.rmSync(dest, { force: true });
+        fsImpl.renameSync(swap.aside, dest);
+        err.message += '\nThe previous autter is still installed.';
+      } catch {
+        // the error below still says what failed
+      }
+    }
+    if (swap.serviceWasRunning && fsImpl.existsSync(dest)) start(dest);
+    throw err;
+  }
+  if (swap.aside) {
+    try {
+      fsImpl.rmSync(swap.aside, { force: true });
+    } catch {
+      // the old process still runs it: the next install removes it
+    }
+  }
+  if (swap.serviceWasRunning) {
+    const failure = start(dest);
+    if (failure) {
+      warn(`autter: could not start the background service again (${failure}); run 'autter bg restart'`);
+    }
+  }
+}
+
 // Make sure the native binary exists at ~/.autter/bin, downloading it when
 // missing or (for a pinned package version) when a different version is
-// present. Returns { bin, downloaded }.
-async function ensureBinary() {
+// present. Returns { bin, downloaded }. `deps` replaces the file system and
+// process calls in tests.
+async function ensureBinary(deps = {}) {
   const asset = assetName(); // throws early on unsupported platforms
   const dest = binaryDest();
   let tag = releaseTag();
@@ -359,20 +615,17 @@ async function ensureBinary() {
   fs.mkdirSync(installDir(), { recursive: true });
   const tmp = path.join(installDir(), `autter.tmp.${process.pid}`);
   fs.writeFileSync(tmp, buf, { mode: 0o755 });
-  try {
-    fs.renameSync(tmp, dest);
-  } catch (err) {
-    // Windows cannot rename over a running binary; retry after removing it.
-    try {
-      fs.rmSync(dest, { force: true });
-      fs.renameSync(tmp, dest);
-    } catch {
-      fs.rmSync(tmp, { force: true });
-      throw err;
-    }
-  }
+  installDownloadedBinary(tmp, dest, deps);
 
-  if (process.platform === 'darwin') {
+  await reportInstallPing(tag);
+  return { bin: dest, downloaded: true };
+}
+
+// Put the verified download `tmp` at `dest` and check that it runs.
+function installDownloadedBinary(tmp, dest, deps = {}) {
+  const swap = replaceBinary(tmp, dest, deps);
+
+  if ((deps.platform || process.platform) === 'darwin') {
     try {
       execFileSync('xattr', ['-d', 'com.apple.quarantine', dest], { stdio: 'ignore' });
     } catch {
@@ -380,15 +633,13 @@ async function ensureBinary() {
     }
   }
 
-  verifyBinaryRuns(dest);
-
-  await reportInstallPing(tag);
-  return { bin: dest, downloaded: true };
+  finishInstall(dest, swap, deps);
+  return swap;
 }
 
 // postinstall entry point. Ordinary transient download/platform errors defer to
 // bin/autter.js, but an integrity failure must fail installation closed.
-async function main() {
+async function main({ ensure = ensureBinary } = {}) {
   if (process.env.AUTTER_NPM_SKIP_DOWNLOAD === '1') {
     console.log('autter: AUTTER_NPM_SKIP_DOWNLOAD=1, skipping binary download');
     return;
@@ -404,9 +655,16 @@ async function main() {
 
   let result;
   try {
-    result = await ensureBinary();
+    result = await ensure();
   } catch (err) {
     if (/checksums\.txt|checksum mismatch|no checksum entry/.test(err.message)) {
+      throw err;
+    }
+    // The binary was downloaded but could not be put in place (on Windows,
+    // usually because the background service still runs it). Deferring to
+    // the launcher would leave the old version installed while npm reports
+    // success, so the install fails instead; the old binary still works.
+    if (err instanceof SwapError) {
       throw err;
     }
     console.warn(`autter: could not install the native binary now (${err.message})`);
@@ -429,23 +687,34 @@ async function main() {
 
 module.exports = {
   DEV_VERSION,
+  SwapError,
   assetName,
   binaryDest,
   downloadUrl,
   ensureBinary,
+  finishInstall,
+  installDownloadedBinary,
   installMarkerPath,
+  leftoverBinaries,
   launcherNeedsInstall,
   readInstallMarker,
+  main,
   releaseTag,
+  removeLeftoverBinaries,
+  replaceBinary,
   resolveLatestTag,
   spawnFailureHelp,
+  startService,
+  stopService,
   verifyChecksum,
   writeInstallMarker,
 };
 
 if (require.main === module) {
   main().catch((err) => {
-    console.error(`autter: postinstall failed (${err.message})`);
+    const [first, ...rest] = String(err.message).split('\n');
+    console.error(`autter: postinstall failed: ${first}`);
+    for (const line of rest) console.error(`autter: ${line}`);
     process.exitCode = 1;
   });
 }

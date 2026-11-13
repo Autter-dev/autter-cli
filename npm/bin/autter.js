@@ -27,7 +27,10 @@ async function main() {
     } catch (err) {
       if (binaryExists) {
         // The binary from before still runs; install this version next time.
-        console.error(`autter: could not install this package's version of the binary (${err.message}); running the one already installed`);
+        const [first, ...rest] = String(err.message).split('\n');
+        console.error(`autter: could not install this package's version of the binary: ${first}`);
+        for (const line of rest) console.error(`autter: ${line}`);
+        console.error('autter: running the one already installed');
       } else {
         console.error(`autter: could not install the native binary: ${err.message}`);
         console.error('autter: alternative installer: curl -fsSL https://api.autter.dev/install.sh | bash');
