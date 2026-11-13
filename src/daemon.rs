@@ -10882,8 +10882,8 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
 /// After the daemon has fully shut down, attempt to install any pending update.
 ///
 /// On Unix the installer atomically replaces the binary via `mv`; on Windows
-/// the installer is spawned as a detached process that polls until the exe is
-/// unlocked.
+/// the installer is spawned as a detached process that renames the running
+/// exe aside and puts the new one in its place.
 pub(crate) fn daemon_run_pending_self_update() -> DaemonSelfUpdateOutcome {
     use crate::commands::upgrade::{
         DaemonUpdateCheckResult, check_and_install_update_if_available,
@@ -10918,6 +10918,10 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     let _lock = DaemonLock::acquire(&config.lock_path)?;
     let _active_guard = DaemonProcessActiveGuard::enter();
     write_pid_metadata(&config)?;
+    // An upgrade renames a running autter.exe aside (Windows will not
+    // replace it); delete the ones no process runs any more.
+    #[cfg(windows)]
+    crate::commands::binary_swap::remove_leftover_installed_binaries();
 
     // Initialize tracing subscriber before log file redirect so the fmt layer
     // captures stderr (fd 2). After dup2, writes go to the daemon log file.
