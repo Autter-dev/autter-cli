@@ -760,7 +760,7 @@ autter squash-authorship <base_branch> <new_sha> <old_sha>
         aliases: &[],
         summary: "Check that authorship notes belong to their commits (integrity check)",
         body: "\
-autter verify [<rev|range>] [--json] [--strict]
+autter verify [<rev|range>] [--json] [--strict] [--no-record] [--require-record]
 
   Check that each commit's authorship note was written for that commit and
   has not been changed since (default: HEAD; a range such as
@@ -771,19 +771,32 @@ autter verify [<rev|range>] [--json] [--strict]
     pending_rewrite          copied by git during a rewrite, not yet rewritten
     rebound_by_older_autter  moved here by an older autter (warning)
     unavailable              commit or files not in this clone (warning)
+    not_recorded             the server has no record of the note yet (warning)
     wrong_commit             the note belongs to a different change
     content_mismatch         the note does not describe this commit's files
     range_out_of_bounds      lines past the end of a file, or a missing file
     digest_mismatch          the note was changed after autter wrote it
     carried_failure          a rewrite carried it from a note that failed
+    changed_after_recorded   the note differs from the first version the
+                             server recorded, or the record has several
 
   Exits 5 when any note fails. Missing and legacy notes are warnings, also
   with --strict for now; a later release will fail them under --strict.
-  This is an integrity check: someone who can rewrite the note can also
-  rewrite its integrity record.
 
-  --json     One JSON document with counts and a result per commit
-  --strict   Also list commits without a note (also AUTTER_STRICT=1)",
+  In connected mode (logged in, notes synced) the server keeps every version
+  of each note it receives, and verify compares each note with that record,
+  so a later edit is visible even when the note's digest was recomputed. In
+  local-only mode this is only an integrity check: someone who can rewrite
+  the note can also rewrite its integrity record. When connected mode cannot
+  read the record (not logged in, server unreachable), verify says so on
+  stderr and does not fail.
+
+  --json            One JSON document with counts and a result per commit
+  --strict          Also list commits without a note; fail notes rebound by
+                    an older autter (also AUTTER_STRICT=1)
+  --no-record       Do not compare with the server's record
+  --require-record  Exit 5 when a note is not_recorded, or when the server's
+                    record could not be checked at all",
     },
     HelpEntry {
         name: "upgrade",

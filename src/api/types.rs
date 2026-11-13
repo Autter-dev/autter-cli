@@ -160,6 +160,41 @@ pub struct NotesReadResponse {
     pub notes: std::collections::HashMap<String, String>,
 }
 
+/// Response from `GET /worker/notes/record`: every version of each commit's
+/// note the server received. Commits without a record are absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteRecordsResponse {
+    #[serde(default)]
+    pub records: std::collections::HashMap<String, NoteRecord>,
+}
+
+/// The versions the server keeps of one commit's note, oldest first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteRecord {
+    #[serde(default)]
+    pub versions: Vec<NoteRecordVersion>,
+}
+
+/// One version of a note as the server received it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteRecordVersion {
+    /// SHA-256 (hex) of the uploaded note with trailing whitespace trimmed.
+    pub content_sha256: String,
+    /// The note's `integrity.digest`, when it had one.
+    #[serde(default)]
+    pub integrity_digest: Option<String>,
+    /// Who uploaded it (a user or API key id), when known.
+    #[serde(default)]
+    pub uploaded_by: Option<String>,
+    /// When the server received it (RFC 3339).
+    #[serde(default)]
+    pub recorded_at: String,
+    /// Copied from the notes table when the server started keeping versions:
+    /// the earliest version the server knows, not necessarily the original.
+    #[serde(default)]
+    pub seeded: bool,
+}
+
 /// Query-friendly per-commit authorship summary uploaded by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommitAuthorshipSummary {

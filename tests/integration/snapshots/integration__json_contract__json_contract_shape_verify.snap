@@ -9,6 +9,11 @@ expression: shape_text(&document)
   },
   "failed": "integer",
   "range": "string",
+  "record_check": {
+    "checked": "boolean",
+    "reason": "string",
+    "required": "boolean"
+  },
   "results": [
     {
       "commit": "string",

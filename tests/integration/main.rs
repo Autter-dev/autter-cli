@@ -165,6 +165,7 @@ mod tls_native_certs;
 mod unsupported_agents;
 mod upload_hold;
 mod utf8_filenames;
+mod verify_server_record;
 mod virtual_attribution_unit;
 mod windsurf;
 mod worktrees;

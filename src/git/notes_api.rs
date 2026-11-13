@@ -12,6 +12,8 @@ use crate::config::{Config, NotesBackendKind};
 use crate::error::AutterError;
 use crate::git::repository::Repository;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 // Re-export CommitAuthorship so callers don't need to import from refs directly.
 pub use crate::git::refs::CommitAuthorship;
@@ -34,49 +36,231 @@ pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<
     write_note_with_kind(current_backend_kind(), repo, commit_sha, content)
 }
 
+/// Commits that the rewrites in progress in this process leave at the same
+/// SHA (a no-op rebase, a pick that fast-forwards, an amend that changes
+/// nothing), and commits post-commit is processing again. Keyed by SHA, with
+/// a count so overlapping rewrites (the background service handles several
+/// repositories) do not clear each other's marks.
+fn unchanged_commits() -> &'static Mutex<HashMap<String, usize>> {
+    static UNCHANGED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    UNCHANGED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// While alive, the notes of these commits are not replaced by a different
+/// note (see [`filter_note_writes`]). Dropping it forgets
+/// them.
+#[must_use = "the mark lasts only as long as this value"]
+pub struct KeepExistingNotes {
+    commits: Vec<String>,
+}
+
+impl Drop for KeepExistingNotes {
+    fn drop(&mut self) {
+        if let Ok(mut map) = unchanged_commits().lock() {
+            for commit in &self.commits {
+                if let Some(count) = map.get_mut(commit) {
+                    *count -= 1;
+                    if *count == 0 {
+                        map.remove(commit);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mark `commits` as kept at their SHA by the rewrite in progress: a commit
+/// whose SHA did not change keeps the note it has, which was written for
+/// that very commit and is still correct.
+pub fn keep_existing_notes_for<I: IntoIterator<Item = String>>(commits: I) -> KeepExistingNotes {
+    let commits: Vec<String> = commits.into_iter().collect();
+    if let Ok(mut map) = unchanged_commits().lock() {
+        for commit in &commits {
+            *map.entry(commit.clone()).or_insert(0) += 1;
+        }
+    }
+    KeepExistingNotes { commits }
+}
+
+/// Commits in both `original` and `rewritten`: a rewrite left them at the
+/// same SHA.
+pub fn commits_kept_by_rewrite(original: &[String], rewritten: &[String]) -> Vec<String> {
+    let original: HashSet<&String> = original.iter().collect();
+    rewritten
+        .iter()
+        .filter(|c| original.contains(c))
+        .cloned()
+        .collect()
+}
+
+fn is_marked_unchanged(commit: &str) -> bool {
+    unchanged_commits()
+        .lock()
+        .map(|map| map.contains_key(commit))
+        .unwrap_or(false)
+}
+
+/// Commits whose next note upload is held: their note is provisional and
+/// autter replaces it right after (see `NotesDatabase::upsert_notes_batch_holding`).
+fn held_uploads() -> &'static Mutex<HashSet<String>> {
+    static HELD: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// How long a provisional note's upload is held when nothing replaces it.
+const PROVISIONAL_NOTE_HOLD_SECS: i64 = 120;
+
+/// Hold the upload of the next note written for `commit`: autter is about to
+/// replace it (a cherry-pick finished with a plain `git commit` gets its
+/// post-commit note, then the cherry-pick's). The server keeps every version
+/// of a note it receives, so uploading both would read as
+/// `changed_after_recorded`. The replacement releases the hold.
+pub fn hold_next_upload(commit: &str) {
+    if let Ok(mut held) = held_uploads().lock() {
+        held.insert(commit.to_string());
+    }
+}
+
+/// The commits of `entries` whose upload is held, consuming the holds.
+fn take_held_uploads(entries: &[(String, String)]) -> HashSet<String> {
+    let Ok(mut held) = held_uploads().lock() else {
+        return HashSet::new();
+    };
+    if held.is_empty() {
+        return HashSet::new();
+    }
+    entries
+        .iter()
+        .filter(|(sha, _)| held.remove(sha))
+        .map(|(sha, _)| sha.clone())
+        .collect()
+}
+
+/// Set by `autter squash-authorship`, the manual command whose purpose is to
+/// replace a commit's attribution: its write goes ahead even when the note it
+/// replaces may already be on the server (see [`filter_note_writes`]).
+static REPLACE_RECORDED_NOTES: AtomicBool = AtomicBool::new(false);
+
+/// Let this process replace a commit's own note even when that note may
+/// already be on the server. Only `autter squash-authorship` calls this: the
+/// user asked for that commit's attribution to be rewritten, so the record
+/// then shows a second version, which is what happened.
+pub fn allow_replacing_recorded_notes() {
+    REPLACE_RECORDED_NOTES.store(true, Ordering::SeqCst);
+}
+
+/// `entries` without the writes that must not happen to a commit that
+/// already has a note.
+///
+/// In connected mode every note write is uploaded, and the server keeps every
+/// version of a note it receives, so a second, different note for the same
+/// SHA reads as `changed_after_recorded` in `autter verify`. For each entry:
+///
+/// 1. no note yet: written;
+/// 2. the same note (byte for byte, or the same body with the stamp the
+///    writer would add): not written, nothing is uploaded;
+/// 3. a note that was not written for this commit (git copied it here from
+///    another commit during a rebase or amend, with `notes.rewriteRef`; it
+///    names that commit): replaced. Git's copy happens inside the git command,
+///    before autter's rewrite runs, and only in `refs/notes/ai`: it is never
+///    queued for upload, so the replacement is the first note the server sees
+///    for this SHA;
+/// 4. the commit's own note, and the commit kept its SHA through the rewrite
+///    in progress ([`keep_existing_notes_for`]: a no-op rebase, a pick that
+///    fast-forwards, an amend that changes nothing, post-commit running again):
+///    kept, also when it predates the integrity stamp;
+/// 5. the commit's own note, different content, any other write (a
+///    correction): written only when the note it replaces cannot have reached
+///    the server: the backend does not upload (`git_notes`), or the notes
+///    database holds it as queued and never sent ([`NotesDatabase::unsent_shas`],
+///    e.g. a provisional note whose upload [`hold_next_upload`] held). A note
+///    that was sent, is being sent, failed to send, or has no row here (it came
+///    from a fetch, a teammate or a CI run) is kept: the existing note stays,
+///    and the commit's record keeps one version. `autter squash-authorship`
+///    is the one exception ([`allow_replacing_recorded_notes`]).
+///
+/// `db` is the locked notes database for backends that upload; the caller
+/// holds the lock until it has written, so the uploader cannot send a note
+/// between this check and its replacement.
+fn filter_note_writes(
+    kind: NotesBackendKind,
+    repo: &Repository,
+    entries: &[(String, String)],
+    db: Option<&crate::notes::db::NotesDatabase>,
+) -> Vec<(String, String)> {
+    use crate::authorship::note_integrity::{note_written_for, strip_integrity};
+
+    let shas: Vec<String> = entries.iter().map(|(sha, _)| sha.clone()).collect();
+    let existing = match kind {
+        NotesBackendKind::Http => {
+            let refs: Vec<&str> = shas.iter().map(String::as_str).collect();
+            db.and_then(|db| db.get_notes(&refs).ok())
+                .unwrap_or_default()
+        }
+        NotesBackendKind::GitNotes | NotesBackendKind::Both => {
+            match crate::git::refs::notes_for_commits(repo, &shas) {
+                Ok(notes) => notes,
+                Err(e) => {
+                    tracing::debug!(%e, "note write: could not read existing notes");
+                    HashMap::new()
+                }
+            }
+        }
+    };
+    if existing.is_empty() {
+        return entries.to_vec();
+    }
+    let unsent: HashSet<String> = if kind.uses_http() {
+        let refs: Vec<&str> = shas.iter().map(String::as_str).collect();
+        db.and_then(|db| db.unsent_shas(&refs).ok())
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+    entries
+        .iter()
+        .filter(|(sha, new_note)| {
+            let Some(old_note) = existing.get(sha) else {
+                return true;
+            };
+            if old_note.trim_end() == new_note.trim_end() {
+                tracing::debug!(commit = %sha, "note write skipped: identical note exists");
+                return false;
+            }
+            if !note_written_for(old_note, sha) {
+                return true;
+            }
+            if strip_integrity(old_note) == strip_integrity(new_note) {
+                tracing::debug!(commit = %sha, "note write skipped: same note, already stamped");
+                return false;
+            }
+            if is_marked_unchanged(sha) {
+                tracing::debug!(commit = %sha, "note write skipped: the commit kept its SHA");
+                return false;
+            }
+            if REPLACE_RECORDED_NOTES.load(Ordering::SeqCst)
+                || !kind.uses_http()
+                || unsent.contains(sha)
+            {
+                return true;
+            }
+            tracing::debug!(
+                commit = %sha,
+                "note write skipped: the commit's note may already be on the server"
+            );
+            false
+        })
+        .cloned()
+        .collect()
+}
+
 fn write_note_with_kind(
     kind: NotesBackendKind,
     repo: &Repository,
     commit_sha: &str,
     content: &str,
 ) -> Result<(), AutterError> {
-    match kind {
-        NotesBackendKind::Http => {
-            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            let stamped = stamp_one(repo, commit_sha, content);
-            http_write_note(commit_sha, &stamped, repo_url.as_deref())
-        }
-        NotesBackendKind::GitNotes => {
-            let git_result = crate::git::refs::notes_add(repo, commit_sha, content);
-            after_git_notes_write(repo, &git_result);
-            git_result
-        }
-        NotesBackendKind::Both => {
-            // Git notes are the durable local copy; write them first. The
-            // HTTP enqueue is best-effort — a failure must not lose the git
-            // note, and the cloud copy can be backfilled with notes-migrate.
-            let git_result = crate::git::refs::notes_add(repo, commit_sha, content);
-            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            let stamped = stamp_one(repo, commit_sha, content);
-            if let Err(e) = http_write_note(commit_sha, &stamped, repo_url.as_deref()) {
-                tracing::warn!(%e, commit_sha, "both backend: cloud note enqueue failed");
-            }
-            after_git_notes_write(repo, &git_result);
-            git_result
-        }
-    }
-}
-
-/// The note as stamped for `commit_sha` (note_integrity.rs). Git-notes
-/// writes are stamped in `refs::notes_add_batch`; this covers the HTTP path.
-fn stamp_one(repo: &Repository, commit_sha: &str, content: &str) -> String {
-    crate::authorship::note_integrity::stamp_note_entries(
-        repo,
-        &[(commit_sha.to_string(), content.to_string())],
-    )
-    .pop()
-    .map(|(_, note)| note)
-    .unwrap_or_else(|| content.to_string())
+    write_notes_batch_with_kind(kind, repo, &[(commit_sha.to_string(), content.to_string())])
 }
 
 /// After a successful git-notes write, copy into `refs/notes/ai` any notes this
@@ -92,25 +276,61 @@ pub fn write_notes_batch(
     repo: &Repository,
     entries: &[(String, String)],
 ) -> Result<(), AutterError> {
+    write_notes_batch_with_kind(current_backend_kind(), repo, entries)
+}
+
+fn write_notes_batch_with_kind(
+    kind: NotesBackendKind,
+    repo: &Repository,
+    entries: &[(String, String)],
+) -> Result<(), AutterError> {
     if entries.is_empty() {
         return Ok(());
     }
-    match current_backend_kind() {
-        NotesBackendKind::Http => {
-            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            let stamped = crate::authorship::note_integrity::stamp_note_entries(repo, entries);
-            http_write_batch(&stamped, repo_url.as_deref())
+    if !kind.uses_http() {
+        let entries = filter_note_writes(kind, repo, entries, None);
+        if entries.is_empty() {
+            return Ok(());
         }
-        NotesBackendKind::GitNotes => {
-            let git_result = crate::git::refs::notes_add_batch(repo, entries);
-            after_git_notes_write(repo, &git_result);
-            git_result
-        }
-        NotesBackendKind::Both => {
-            let git_result = crate::git::refs::notes_add_batch(repo, entries);
-            let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
-            let stamped = crate::authorship::note_integrity::stamp_note_entries(repo, entries);
-            if let Err(e) = http_write_batch(&stamped, repo_url.as_deref()) {
+        let git_result = crate::git::refs::notes_add_batch(repo, &entries);
+        after_git_notes_write(repo, &git_result);
+        return git_result;
+    }
+
+    let repo_url = crate::repo_url::resolve_repo_url_from_repo(repo);
+    // Hold the notes database from the check to the write (see
+    // `filter_note_writes`). Nothing below takes it again before it is
+    // released: the git write and the stamping only run git.
+    let db = crate::notes::db::NotesDatabase::global();
+    let mut db_lock = match &db {
+        Ok(db) => db.lock().ok(),
+        Err(_) => None,
+    };
+    let entries = filter_note_writes(kind, repo, entries, db_lock.as_deref());
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let stamped = crate::authorship::note_integrity::stamp_note_entries(repo, &entries);
+    // Git notes are the durable local copy; write them first. The HTTP
+    // enqueue is best-effort for `both` — a failure must not lose the git
+    // note, and the cloud copy can be backfilled with notes-migrate.
+    let git_result =
+        (kind == NotesBackendKind::Both).then(|| crate::git::refs::notes_add_batch(repo, &entries));
+    let http_result = match db_lock.as_deref_mut() {
+        Some(db) => enqueue_notes(db, &stamped, repo_url.as_deref()),
+        None => Err(match db {
+            Err(e) => e,
+            Ok(_) => AutterError::Generic("notes-db lock poisoned".to_string()),
+        }),
+    };
+    drop(db_lock);
+    if http_result.is_ok() {
+        crate::daemon::telemetry_handle::submit_notes();
+    }
+    match git_result {
+        None => http_result,
+        Some(git_result) => {
+            if let Err(e) = http_result {
                 tracing::warn!(%e, count = entries.len(), "both backend: cloud notes enqueue failed");
             }
             after_git_notes_write(repo, &git_result);
@@ -665,21 +885,17 @@ pub fn warm_cache_for_remote(repo: &Repository, remote: &str) -> Result<(), Autt
 
 // --- HTTP backend helpers (private) ---
 
+/// Queue one note for upload as the `http` backend does (tests).
+#[cfg(test)]
 fn http_write_note(
     commit_sha: &str,
     content: &str,
     repo_url: Option<&str>,
 ) -> Result<(), AutterError> {
-    let db = crate::notes::db::NotesDatabase::global()?;
-    let mut db_lock = db
-        .lock()
-        .map_err(|e| AutterError::Generic(format!("notes-db lock: {}", e)))?;
-    db_lock.upsert_note_with_repo(commit_sha, content, repo_url)?;
-    drop(db_lock);
-    crate::daemon::telemetry_handle::submit_notes();
-    Ok(())
+    http_write_batch(&[(commit_sha.to_string(), content.to_string())], repo_url)
 }
 
+#[cfg(test)]
 fn http_write_batch(
     entries: &[(String, String)],
     repo_url: Option<&str>,
@@ -688,10 +904,20 @@ fn http_write_batch(
     let mut db_lock = db
         .lock()
         .map_err(|e| AutterError::Generic(format!("notes-db lock: {}", e)))?;
-    db_lock.upsert_notes_batch_with_repo(entries, repo_url)?;
+    enqueue_notes(&mut db_lock, entries, repo_url)?;
     drop(db_lock);
     crate::daemon::telemetry_handle::submit_notes();
     Ok(())
+}
+
+/// Queue `entries` for upload, holding the ones [`hold_next_upload`] named.
+fn enqueue_notes(
+    db: &mut crate::notes::db::NotesDatabase,
+    entries: &[(String, String)],
+    repo_url: Option<&str>,
+) -> Result<(), AutterError> {
+    let held = take_held_uploads(entries);
+    db.upsert_notes_batch_holding(entries, repo_url, &held, PROVISIONAL_NOTE_HOLD_SECS)
 }
 
 fn http_read_note(commit_sha: &str) -> Option<String> {
@@ -1340,5 +1566,199 @@ mod tests {
             std::env::remove_var("AUTTER_TEST_CONFIG_PATCH");
             std::env::remove_var("AUTTER_NOTES_BACKEND_URL");
         }
+    }
+
+    /// A note for `commit` with one AI entry covering `range` of `a.txt`.
+    fn note_for(commit: &str, range: (u32, u32)) -> String {
+        use crate::authorship::authorship_log::LineRange;
+        use crate::authorship::authorship_log_serialization::AttestationEntry;
+        let mut log = AuthorshipLog::new();
+        log.metadata.base_commit_sha = commit.to_string();
+        log.get_or_create_file("a.txt")
+            .add_entry(AttestationEntry::new(
+                "c9883b05a2487d6d".to_string(),
+                vec![LineRange::Range(range.0, range.1)],
+            ));
+        log.serialize_to_string().unwrap()
+    }
+
+    fn git_note(repo: &crate::git::test_utils::TmpRepo, commit: &str) -> Option<String> {
+        crate::git::refs::show_authorship_note(repo.autter_repo(), commit)
+    }
+
+    /// The writer's rule for a commit that already has a note (see
+    /// `filter_note_writes`), with the `both` backend and the notes database
+    /// in each state a note can be in.
+    #[test]
+    #[serial_test::serial(notes_db_env)]
+    fn writer_keeps_a_note_that_may_be_on_the_server() {
+        use crate::authorship::note_integrity::strip_integrity;
+        use crate::git::test_utils::TmpRepo;
+        use crate::notes::db::NotesDatabase;
+
+        let tmp_db = tempfile::NamedTempFile::new().expect("tmp db file");
+        NotesDatabase::install_test_db_at(tmp_db.path()).expect("install isolated notes-db");
+        let repo = TmpRepo::new().expect("TmpRepo::new");
+        repo.write_file("a.txt", "one\ntwo\nthree\n", false)
+            .expect("write file");
+        let sha = repo.commit_all("msg").expect("commit");
+        let both = NotesBackendKind::Both;
+        let first = note_for(&sha, (1, 1));
+        let correction = note_for(&sha, (1, 2));
+        let body = |n: &str| strip_integrity(n).trim_end().to_string();
+        let row = |sha: &str| {
+            NotesDatabase::global()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_note(sha)
+                .unwrap()
+        };
+
+        // Queued and never sent: a correction replaces it before it uploads.
+        write_note_with_kind(both, repo.autter_repo(), &sha, &first).unwrap();
+        write_note_with_kind(both, repo.autter_repo(), &sha, &correction).unwrap();
+        assert_eq!(body(&git_note(&repo, &sha).unwrap()), body(&correction));
+        assert_eq!(body(&row(&sha).unwrap()), body(&correction));
+
+        // Sent: kept, in git and in the queue.
+        {
+            let db = NotesDatabase::global().unwrap();
+            let mut db = db.lock().unwrap();
+            let pending = db.dequeue_pending(10).unwrap();
+            assert_eq!(pending.len(), 1);
+            db.mark_synced(std::slice::from_ref(&sha)).unwrap();
+        }
+        let sent = git_note(&repo, &sha).unwrap();
+        write_note_with_kind(both, repo.autter_repo(), &sha, &first).unwrap();
+        write_notes_batch_with_kind(both, repo.autter_repo(), &[(sha.clone(), first.clone())])
+            .unwrap();
+        assert_eq!(git_note(&repo, &sha).unwrap(), sent);
+        assert_eq!(body(&row(&sha).unwrap()), body(&correction));
+        assert!(
+            NotesDatabase::global()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .dequeue_pending(10)
+                .unwrap()
+                .is_empty(),
+            "nothing new to upload"
+        );
+
+        // The same note again: not written (also unstamped, as callers pass it).
+        write_note_with_kind(both, repo.autter_repo(), &sha, &correction).unwrap();
+        assert_eq!(git_note(&repo, &sha).unwrap(), sent);
+
+        // Being uploaded, or an upload attempted: kept.
+        let second = repo
+            .write_file("a.txt", "one\ntwo\nthree\nfour\n", false)
+            .and_then(|_| repo.commit_all("second"))
+            .expect("second commit");
+        write_note_with_kind(
+            both,
+            repo.autter_repo(),
+            &second,
+            &note_for(&second, (1, 1)),
+        )
+        .unwrap();
+        let in_flight = git_note(&repo, &second).unwrap();
+        {
+            let db = NotesDatabase::global().unwrap();
+            let mut db = db.lock().unwrap();
+            assert_eq!(db.dequeue_pending(10).unwrap().len(), 1);
+        }
+        write_note_with_kind(
+            both,
+            repo.autter_repo(),
+            &second,
+            &note_for(&second, (1, 4)),
+        )
+        .unwrap();
+        assert_eq!(git_note(&repo, &second).unwrap(), in_flight);
+        {
+            let db = NotesDatabase::global().unwrap();
+            let mut db = db.lock().unwrap();
+            db.mark_failed(std::slice::from_ref(&second), "network")
+                .unwrap();
+        }
+        write_note_with_kind(
+            both,
+            repo.autter_repo(),
+            &second,
+            &note_for(&second, (1, 4)),
+        )
+        .unwrap();
+        assert_eq!(git_note(&repo, &second).unwrap(), in_flight);
+
+        // No row at all (fetched from a teammate or CI): kept.
+        let third = repo
+            .write_file("a.txt", "one\n", false)
+            .and_then(|_| repo.commit_all("third"))
+            .expect("third commit");
+        crate::git::refs::notes_add(repo.autter_repo(), &third, &note_for(&third, (1, 1))).unwrap();
+        let fetched = git_note(&repo, &third).unwrap();
+        write_note_with_kind(both, repo.autter_repo(), &third, &note_for(&third, (1, 3))).unwrap();
+        assert_eq!(git_note(&repo, &third).unwrap(), fetched);
+        assert_eq!(row(&third), None, "nothing queued for upload");
+
+        // ...unless `autter squash-authorship` asked for it: written.
+        REPLACE_RECORDED_NOTES.store(true, Ordering::SeqCst);
+        let replaced =
+            write_note_with_kind(both, repo.autter_repo(), &third, &note_for(&third, (1, 3)));
+        REPLACE_RECORDED_NOTES.store(false, Ordering::SeqCst);
+        replaced.unwrap();
+        assert_eq!(
+            body(&git_note(&repo, &third).unwrap()),
+            body(&note_for(&third, (1, 3)))
+        );
+
+        // A note git copied here from another commit: replaced, whatever the
+        // database says (it was never queued for this commit).
+        crate::git::refs::notes_add_batch_unstamped(repo.autter_repo(), &[(third.clone(), sent)])
+            .unwrap();
+        write_note_with_kind(both, repo.autter_repo(), &third, &note_for(&third, (1, 1))).unwrap();
+        assert_eq!(
+            body(&git_note(&repo, &third).unwrap()),
+            body(&note_for(&third, (1, 1)))
+        );
+
+        // A rewrite that keeps the commit at its SHA: kept, also when unsent.
+        let fourth = repo
+            .write_file("a.txt", "x\n", false)
+            .and_then(|_| repo.commit_all("fourth"))
+            .expect("fourth commit");
+        write_note_with_kind(
+            both,
+            repo.autter_repo(),
+            &fourth,
+            &note_for(&fourth, (1, 1)),
+        )
+        .unwrap();
+        let kept = git_note(&repo, &fourth).unwrap();
+        {
+            let _keep = keep_existing_notes_for([fourth.clone()]);
+            write_note_with_kind(
+                both,
+                repo.autter_repo(),
+                &fourth,
+                &note_for(&fourth, (1, 9)),
+            )
+            .unwrap();
+        }
+        assert_eq!(git_note(&repo, &fourth).unwrap(), kept);
+
+        // `git_notes` uploads nothing: a correction is written.
+        write_note_with_kind(
+            NotesBackendKind::GitNotes,
+            repo.autter_repo(),
+            &second,
+            &note_for(&second, (1, 4)),
+        )
+        .unwrap();
+        assert_eq!(
+            body(&git_note(&repo, &second).unwrap()),
+            body(&note_for(&second, (1, 4)))
+        );
     }
 }

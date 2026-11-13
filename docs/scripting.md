@@ -223,11 +223,14 @@ autter verify origin/main..HEAD --json --strict
 | `range_out_of_bounds` | 5 | The note attributes lines past the end of a file, or lines of a file the commit does not have |
 | `digest_mismatch` | 5 | The note was changed after autter wrote it |
 | `carried_failure` | 5 | Autter derived the note, during a rebase, amend, cherry-pick or `autter ci` merge, from a note that failed the check, or an older autter rebound it from a note that fails the check. `recorded_commit` names that source commit |
+| `not_recorded` | 0 (warning); 5 with `--require-record` | Connected mode only: the note passed the local check, but the server has no record of it yet. Notes upload in the background, so a commit made a moment ago is usually not recorded yet |
+| `changed_after_recorded` | 5 | Connected mode only: the server's record of this note has more than one version, or the note here matches none of them, or only a later one. The note was changed after it was uploaded |
 
-`--json` prints `{schema_version, range, commits, counts, failed, results}`,
-each result `{commit, status, detail, recorded_commit?}`; on exit 5 the same
-report comes with `error.code` = `integrity_failed`, and `failed` counts the
-commits that made it fail.
+`--json` prints `{schema_version, range, commits, counts, failed, results,
+record_check}`, each result `{commit, status, detail, recorded_commit?,
+record?, local_status?, record_summary?}`; on exit 5 the same report comes
+with `error.code` = `integrity_failed`, and `failed` counts the commits that
+made it fail.
 
 `--strict` fails `rebound_by_older_autter` (exit 5; the status stays
 `rebound_by_older_autter` and the human report marks it `FAIL`): its digest
@@ -271,12 +274,88 @@ The same holds for the other ways attribution comes back:
   database still fails `autter verify` after the copy, and the command lists
   it on stderr; a note written before the integrity check stays `legacy`.
 
-This is an integrity check, not tamper evidence. It catches notes copied to
-another commit, moved, or edited by hand. Not caught:
+### Connected mode: checking notes against the server's record
+
+On its own the check above is an integrity check, not tamper evidence: the
+digest is not a signature, so someone who can write the repository can edit
+a note and recompute every field. In connected mode (`autter login`, notes
+synced to the platform) the server keeps every version of each note it
+receives, append-only, and never replaces the first one. `autter verify`
+then compares each note with that record, so a note edited after it was
+uploaded fails, even when its digest was recomputed and even when the
+author made the edit:
+
+- the note matches the first version and the record has no other: the
+  status is unchanged (`verified`, ...) and the result has `record:
+  "matches"`;
+- the record has more than one version, or the note here matches none of
+  them, or only a later one: `changed_after_recorded` (exit 5). The report
+  says when the first version was recorded, who uploaded it, and how many
+  versions there are. When the first version is marked `seeded`, it was
+  copied in when the server started keeping versions: the record starts at
+  that upgrade, and the note may have changed before it;
+- the note exists but the server has no record of it: `not_recorded`, a
+  warning (also with `--strict`), since notes upload in the background;
+- no note here, but the server recorded one: the status stays `missing` (a
+  warning, as before) and the result has `record: "recorded"`: the note was
+  deleted here, or not fetched (`autter fetch-notes origin`).
+
+A note matches a recorded version by its `integrity.digest` when both have
+one and the digest checked out locally, otherwise by the SHA-256 of the note
+text with trailing whitespace trimmed. A local failure (`digest_mismatch`,
+`wrong_commit`, ...) is reported as before; `changed_after_recorded` and
+`not_recorded` apply only to notes that pass the local check or are
+warnings, and `local_status` keeps what the local check said. With the
+`http` notes backend (no local git notes, notes read from the server), the
+note in hand came from the server, so the only check is whether the record
+has more than one version.
+
+The record is not checked in local-only mode, when not logged in, when the
+server cannot be reached or is older than the record (a 404), or with
+`--no-record`. The run then passes or fails on the local check alone, and
+`--json` has `record_check.checked: false` with `record_check.reason`. In
+connected mode, when the record could not be read (not logged in, server
+unreachable, a 404 or an auth error), and whenever `--require-record` is
+given, `autter verify` also prints one line on stderr, `Server record not
+checked: <reason>.`; a local-only machine, which has no record, gets no such
+line. `--require-record` makes both gaps fail with exit 5: a `not_recorded`
+note, and a run whose record could not be checked at all.
+
+autter does not write a second, different note for a commit whose note may
+already be on the server, so its own rewrites do not read as
+`changed_after_recorded`. A commit that keeps its SHA (a no-op rebase, a pick
+that fast-forwards, an amend that changes nothing, a second post-commit pass
+over the same commit) keeps the note it has, and an `autter ci` re-run that
+computes a different note for a merge commit that already has one keeps the
+first. A note written before the integrity check is kept as it is rather
+than stamped again. The same note is never written or uploaded twice, and
+notes are written with their entries in a fixed order, so the same note
+computed twice (a CI re-run in a fresh clone) is the same text. A note that
+is still queued on this machine and has never been sent can be replaced: a
+cherry-pick that stops on a conflict and is finished with a plain `git
+commit` gets a provisional note, held back from upload, and then the
+cherry-pick's; only the final one is uploaded.
+
+`autter squash-authorship` run on a commit whose note the server already has
+replaces that note on purpose, and the record then shows two versions
+(`changed_after_recorded`): that is a real change to the attribution.
+
+What the record does not catch:
+
+- in local-only mode, nothing more than the integrity check: there is no
+  record to compare with;
+- a note that was never uploaded (written in local-only mode, or not
+  uploaded yet): it is `not_recorded`, not compared;
+- an edit made before the first upload the server saw (or, for a `seeded`
+  record, before the server's upgrade);
+- someone who can change the server's record itself.
+
+Without the record, the integrity check catches notes copied to another
+commit, moved, or edited by hand. Not caught:
 
 - someone who can write to the repository and recomputes every field of the
-  note (the digest is not a signature), including a stash note; a record kept
-  outside the repository is planned for that;
+  note (the digest is not a signature), including a stash note: in
+  connected mode the server's record catches this for notes it received;
 - a note made to look rebound with a genuine stamp copied from another note
   whose commit is not in the clone, or whose claims hold: it is a warning
   without `--strict`, and a rewrite by this autter carries it like any other
@@ -291,6 +370,24 @@ to `autter ci` (or on its own after `autter fetch-notes origin`):
       - name: Check authorship notes
         run: autter verify origin/${{ github.base_ref }}..HEAD --strict
 ```
+
+In connected mode the same step also compares the notes with the server's
+record. In CI that takes an API key and notes syncing turned on
+(`AUTTER_API_KEY`, `AUTTER_NOTES_BACKEND_KIND=both`). Organisations that want
+every note to have been recorded, and the job to fail when the record cannot
+be read, add `--require-record`:
+
+```yaml
+      - name: Check authorship notes against the server record
+        run: autter verify origin/${{ github.base_ref }}..HEAD --strict --require-record
+        env:
+          AUTTER_API_KEY: ${{ secrets.AUTTER_API_KEY }}
+          AUTTER_NOTES_BACKEND_KIND: both
+```
+
+Notes upload in the background shortly after each commit, so run this
+after the notes have had time to upload (a pull request's commits normally
+have), or a just-made commit fails as `not_recorded`.
 
 ## CI behaviour
 
