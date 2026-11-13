@@ -1,0 +1,184 @@
+name: Install smoke test
+
+# Runs the install commands exactly as INSTALL.md gives them, once a day, on a
+# clean macOS, Ubuntu and Windows machine, against what is published right now:
+# the installers served from api.autter.dev, the latest GitHub release and the
+# @autter/cli package on npm. CI tests the installers in the repository; this
+# catches what CI cannot see: a release whose binary does not start, an
+# installer URL serving something else, an npm package left behind a release.
+#
+# Each job installs, then checks that `autter --version` is the latest release
+# and that `autter doctor --json` prints one JSON document for that version.
+# Doctor may report failed checks and exit non-zero here: nothing is set up on
+# a fresh machine. That is not a failure of the install.
+#
+# Not a required check, and it cannot become one by accident: it never runs on
+# a pull request or a push. A failed run notifies whoever last changed the
+# schedule; re-run it from the Actions tab (workflow_dispatch) after a fix.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-smoke
+  cancel-in-progress: true
+
+env:
+  # Don't count these runs as installs.
+  AUTTER_NO_INSTALL_PING: "1"
+
+jobs:
+  latest:
+    name: Latest release tag
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+    steps:
+      - name: Read the latest release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if ! [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected latest release tag: '${tag}'"
+            exit 1
+          fi
+          echo "Latest release: ${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  install:
+    name: ${{ matrix.name }}
+    needs: latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: curl | bash (macOS)
+            os: blacksmith-6vcpu-macos-15
+            method: script
+          - name: curl | bash (Ubuntu)
+            os: blacksmith-4vcpu-ubuntu-2204
+            method: script
+          - name: irm | iex (Windows PowerShell 5.1)
+            os: blacksmith-4vcpu-windows-2025
+            method: powershell
+          - name: one-line command from cmd.exe (Windows)
+            os: blacksmith-4vcpu-windows-2025
+            method: cmd
+          - name: npm (macOS)
+            os: blacksmith-6vcpu-macos-15
+            method: npm
+          - name: npm (Ubuntu)
+            os: blacksmith-4vcpu-ubuntu-2204
+            method: npm
+          - name: npm (Windows)
+            os: blacksmith-4vcpu-windows-2025
+            method: npm
+    env:
+      EXPECTED_TAG: ${{ needs.latest.outputs.tag }}
+      METHOD: ${{ matrix.method }}
+    steps:
+      # No checkout: everything under test is downloaded, as it is for a user.
+
+      # INSTALL.md, "macOS, Linux, and Windows with WSL".
+      - name: Install (curl | bash)
+        if: matrix.method == 'script'
+        shell: bash
+        run: curl -fsSL https://api.autter.dev/install.sh | bash
+
+      # INSTALL.md, "Windows": the form for someone already in PowerShell.
+      # It promises that autter works in that same window straight away.
+      - name: Install (irm | iex)
+        if: matrix.method == 'powershell'
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
+            throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          }
+          irm https://api.autter.dev/install.ps1 | iex
+          $version = (& autter --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $version) {
+            throw "autter does not run in the window that ran the installer (exit $LASTEXITCODE)"
+          }
+          Write-Host "autter --version in the installing window: $version"
+
+      # INSTALL.md, "Windows": the command given first, which also works from
+      # Command Prompt and Git Bash.
+      - name: Install (one-line command)
+        if: matrix.method == 'cmd'
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://api.autter.dev/install.ps1)"
+
+      # INSTALL.md, "npm (any platform, Node.js 18+)".
+      - name: Setup Node
+        if: matrix.method == 'npm'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install (npm)
+        if: matrix.method == 'npm'
+        shell: bash
+        run: npm install -g @autter/cli
+
+      - name: autter --version and autter doctor --json
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${METHOD}" in
+            script)
+              # A step is a new shell, not a new terminal: load the PATH entry
+              # the way INSTALL.md says to in a terminal that is already open.
+              source "${HOME}/.autter/env"
+              ;;
+            powershell|cmd)
+              # The installer adds its directory to the user PATH, which new
+              # terminals read. A step does not, so check the stored value
+              # and add the directory here.
+              user_path="$(powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('Path', 'User')")"
+              if ! printf '%s' "${user_path}" | grep -qiF '.autter\bin'; then
+                printf '::error::the installer did not add its bin directory to the user PATH: %s\n' "${user_path}"
+                exit 1
+              fi
+              PATH="$(cygpath -u "${USERPROFILE}")/.autter/bin:${PATH}"
+              export PATH
+              ;;
+            npm)
+              # The npm global bin directory is already on PATH.
+              ;;
+          esac
+
+          expected="${EXPECTED_TAG#v}"
+
+          version="$(autter --version)"
+          echo "autter --version: ${version}"
+          if [ "${version%%[[:space:]]*}" != "${expected}" ]; then
+            echo "::error::installed autter '${version}', but the latest release is ${EXPECTED_TAG}"
+            exit 1
+          fi
+
+          # Nothing is set up on this machine, so doctor may list failed
+          # checks and exit 1. Whatever it finds, stdout is one JSON document.
+          status=0
+          autter doctor --json > doctor.json || status=$?
+          echo "autter doctor --json exited ${status}:"
+          cat doctor.json
+          echo
+          if ! jq -e -s --arg version "${expected}" \
+            'length == 1 and .[0].schema_version == 1 and .[0].autter_version == $version and (.[0].checks | type == "array")' \
+            doctor.json > /dev/null; then
+            echo "::error::autter doctor --json did not print exactly one JSON document for autter ${expected}"
+            exit 1
+          fi
+          echo "OK: autter ${expected} installed; doctor printed one JSON document."

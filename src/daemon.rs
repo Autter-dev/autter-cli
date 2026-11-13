@@ -4,14 +4,15 @@ use crate::daemon::domain::RepoContext;
 use crate::daemon::git_backend::GitBackend;
 use crate::error::AutterError;
 use crate::git::cli_parser::{
-    ParsedGitInvocation, explicit_rebase_branch_arg, parse_git_cli_args,
-    stash_requires_target_resolution, stash_target_spec, summarize_rebase_args,
+    ParsedGitInvocation, cherry_pick_requests_no_commit, explicit_rebase_branch_arg,
+    parse_git_cli_args, stash_requires_target_resolution, stash_target_spec, summarize_rebase_args,
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
     HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
-    head_reflog_path_messages_for_worktree, latest_reflog_old_oid_for_worktree,
-    read_head_state_for_worktree, read_ref_oid_for_worktree,
+    head_reflog_entry_written_by, head_reflog_path_messages_for_worktree, is_valid_git_oid,
+    latest_worktree_head_reflog_move, read_head_state_for_worktree, read_ref_oid_for_worktree,
+    read_stash_stack_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -28,13 +29,16 @@ use crate::git::rewrite_log::{
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::LockFile;
 use crate::{
+    authorship::no_commit_pick::{
+        carry_no_commit_pick_into_working_log, forget_paths_taken_from_picked_side,
+        no_commit_pick_lines_remain, record_paths_taken_from_picked_side,
+    },
     authorship::post_commit::post_commit_with_final_state,
     authorship::rebase_authorship::{
-        committed_file_snapshot_between_commits, merge_working_log_after_squash_from_final_state,
-        prepare_working_log_after_squash_from_final_state, reconstruct_working_log_after_reset,
-        restore_virtual_attribution_carryover, restore_working_log_carryover,
-        rewrite_authorship_after_commit_amend_with_snapshot, rewrite_authorship_if_needed,
-        take_pending_no_commit_pick,
+        committed_file_snapshot_between_commits, prepare_working_log_after_squash_from_final_state,
+        reconstruct_working_log_after_reset, restore_virtual_attribution_carryover,
+        restore_working_log_carryover, rewrite_authorship_after_commit_amend_with_snapshot,
+        rewrite_authorship_if_needed, take_pending_no_commit_pick,
     },
     authorship::working_log::{AgentId, CheckpointKind},
     commands::checkpoint_agent::orchestrator::CheckpointRequest,
@@ -91,8 +95,8 @@ pub mod trace_normalizer;
 pub mod transcript_redaction;
 
 pub use control_api::{
-    BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
-    FamilyStatus, TelemetryEnvelope,
+    BashSessionQueryResponse, BashSnapshotQueryResponse, CHECKPOINT_RECEIPT_PROTOCOL,
+    CONTROL_PROTOCOL_VERSION, ControlRequest, ControlResponse, FamilyStatus, TelemetryEnvelope,
 };
 
 const PID_META_FILE: &str = "daemon.pid.json";
@@ -792,6 +796,7 @@ fn trace_command_may_mutate_refs(primary_command: Option<&str>) -> bool {
                 | "push"
                 | "rebase"
                 | "reset"
+                | "restore"
                 | "stash"
                 | "switch"
         )
@@ -1169,6 +1174,45 @@ fn explicit_rebase_branch_ref_name(branch_spec: &str) -> Option<String> {
     Some(format!("refs/heads/{}", branch_spec))
 }
 
+/// The key `TraceIngressState::family_stash_stacks` uses for the repository
+/// family of `worktree`: its canonical common dir, shared by all worktrees
+/// (and their one stash stack).
+fn stash_family_key(worktree: &Path) -> Option<String> {
+    let common_dir = common_dir_for_worktree(worktree)?;
+    let family = common_dir.canonicalize().unwrap_or(common_dir);
+    Some(family.to_string_lossy().to_string())
+}
+
+/// The stash subcommand of a `git stash` invocation (`push` when none is
+/// given), or `None` for any other command.
+fn stash_subcommand_for_argv(argv: &[String]) -> Option<String> {
+    let parsed = parse_git_cli_args(trace_invocation_args(argv));
+    if parsed.command.as_deref() != Some("stash") {
+        return None;
+    }
+    Some(
+        parsed
+            .command_args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "push".to_string()),
+    )
+}
+
+/// True for the stash subcommands that take an entry off the stash stack when
+/// they succeed: `pop`, `drop` and `branch`.
+fn stash_subcommand_removes_entry(subcommand: &str) -> bool {
+    matches!(subcommand, "pop" | "drop" | "branch")
+}
+
+/// Resolve the target of `git stash apply` at any point of the command.
+///
+/// `apply` leaves the stash stack as it is, so `stash@{n}` names the same
+/// stash before and after git runs. `pop`, `drop` and `branch` remove their
+/// entry, and the daemon reads the repo while git is already running, so for
+/// them a read of `stash@{n}` here can see the stack after git moved it and
+/// name the stash below the one acted on. Those are resolved when the command
+/// has finished, by `resolve_stash_target_oid_for_terminal_payload`.
 fn resolve_stash_target_oid_for_command(
     worktree: &Path,
     argv: &[String],
@@ -1178,6 +1222,13 @@ fn resolve_stash_target_oid_for_command(
         return Ok(None);
     }
     if !stash_requires_target_resolution(&parsed.command_args) {
+        return Ok(None);
+    }
+    if parsed
+        .command_args
+        .first()
+        .is_some_and(|subcommand| stash_subcommand_removes_entry(subcommand))
+    {
         return Ok(None);
     }
 
@@ -1197,15 +1248,48 @@ fn resolve_stash_target_oid_for_command(
 }
 
 fn stash_target_spec_is_top_of_stack(target_spec: Option<&str>) -> bool {
-    matches!(
-        target_spec.unwrap_or("stash@{0}"),
-        "stash@{0}" | "refs/stash" | "stash"
-    )
+    stash_target_spec_index(target_spec) == Some(0)
 }
 
-fn inferred_top_stash_sha_from_rewrite_history(
-    worktree: &Path,
-) -> Result<Option<String>, AutterError> {
+/// The stack position a stash reference names: `stash@{n}`, `refs/stash@{n}`
+/// or a bare `n` (git reads it as `stash@{n}`), with no reference, `stash`
+/// and `refs/stash` meaning the top.
+fn stash_target_spec_index(target_spec: Option<&str>) -> Option<usize> {
+    let spec = target_spec.unwrap_or("stash@{0}");
+    if matches!(spec, "stash" | "refs/stash") {
+        return Some(0);
+    }
+    if !spec.is_empty() && spec.bytes().all(|byte| byte.is_ascii_digit()) {
+        return spec.parse().ok();
+    }
+    spec.strip_prefix("refs/stash@{")
+        .or_else(|| spec.strip_prefix("stash@{"))?
+        .strip_suffix('}')?
+        .parse()
+        .ok()
+}
+
+/// The stash at `index` of a stack that, with that entry taken out, is
+/// `after`; the first of `before_candidates` that fits.
+///
+/// A candidate that does not fit was read too late (git had already moved the
+/// stack) or is out of date, and is skipped rather than trusted.
+fn stash_removed_from_stack(
+    index: usize,
+    after: &[String],
+    before_candidates: &[Vec<String>],
+) -> Option<String> {
+    before_candidates.iter().find_map(|before| {
+        if before.len() != after.len() + 1 || index >= before.len() {
+            return None;
+        }
+        let (above, rest) = before.split_at(index);
+        let (removed, below) = rest.split_first()?;
+        (above == &after[..index] && below == &after[index..]).then(|| removed.clone())
+    })
+}
+
+fn inferred_stash_stack_from_rewrite_history(worktree: &Path) -> Result<Vec<String>, AutterError> {
     let repo = discover_repository_in_path_no_git_exec(worktree)?;
     let events = repo.storage.read_rewrite_events()?;
     let mut stack: Vec<String> = Vec::new();
@@ -1240,7 +1324,15 @@ fn inferred_top_stash_sha_from_rewrite_history(
             StashOperation::Apply | StashOperation::List => {}
         }
     }
-    Ok(stack.last().cloned())
+    Ok(stack)
+}
+
+fn inferred_top_stash_sha_from_rewrite_history(
+    worktree: &Path,
+) -> Result<Option<String>, AutterError> {
+    Ok(inferred_stash_stack_from_rewrite_history(worktree)?
+        .last()
+        .cloned())
 }
 
 /// Recover the top stash sha from the daemon's own rewrite history.
@@ -1256,10 +1348,23 @@ fn recover_top_stash_target_oid_from_history(worktree: &Path) -> Option<String> 
         .flatten()
 }
 
+/// Resolve the target of a finished `git stash` command from the repo state
+/// it left.
+///
+/// `apply` is read off the stack directly. For `pop`, `drop` and `branch`,
+/// which take their entry off the stack, the stack as git left it is compared
+/// with stacks from before the command: `before_candidates` (in order of
+/// preference), then the stack the daemon's rewrite history implies. The
+/// target is the entry whose removal turns one of those into the stack now.
+/// When none fits, the target is unknown and this errors, rather than guess
+/// a stash whose attribution would then be restored in place of the right
+/// one. A command that failed (a `pop` that stopped on a conflict) keeps its
+/// entry on the stack, where it is read directly.
 fn resolve_stash_target_oid_for_terminal_payload(
     worktree: &Path,
     argv: &[String],
-    ref_changes: &[crate::daemon::domain::RefChange],
+    exit_code: i32,
+    before_candidates: &[Vec<String>],
 ) -> Result<Option<String>, AutterError> {
     let parsed = parse_git_cli_args(trace_invocation_args(argv));
     if parsed.command.as_deref() != Some("stash") {
@@ -1269,44 +1374,56 @@ fn resolve_stash_target_oid_for_terminal_payload(
         return Ok(None);
     }
 
+    let subcommand = parsed
+        .command_args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("push");
     let target_spec = stash_target_spec(&parsed.command_args);
-    match parsed.command_args.first().map(String::as_str).unwrap_or("push") {
-        "apply" => resolve_stash_target_oid_for_worktree(worktree, target_spec)
+    if !stash_subcommand_removes_entry(subcommand) {
+        return resolve_stash_target_oid_for_worktree(worktree, target_spec)
             .ok_or_else(|| {
                 AutterError::Generic(format!(
-                    "failed to resolve stash apply target oid from terminal repo state (spec={:?}, worktree={})",
-                    target_spec,
+                    "failed to resolve stash {subcommand} target oid from terminal repo state (spec={target_spec:?}, worktree={})",
                     worktree.display()
                 ))
             })
-            .map(Some),
-        "pop" | "drop" | "branch" => {
-            if let Some(target_oid) = ref_changes
-                .iter()
-                .rfind(|change| change.reference == "refs/stash")
-                .map(|change| change.old.trim().to_string())
-                .filter(|oid| !oid.is_empty() && !is_zero_oid(oid))
-            {
-                return Ok(Some(target_oid));
-            }
-            if stash_target_spec_is_top_of_stack(target_spec) {
-                if let Some(target_oid) =
-                    latest_reflog_old_oid_for_worktree(worktree, "refs/stash")
-                {
-                    return Ok(Some(target_oid));
-                }
-                // Reflog lookup missed too; recover the top stash sha from history.
-                return Ok(recover_top_stash_target_oid_from_history(worktree));
-            }
-            Err(AutterError::Generic(format!(
-                "failed to resolve stash {:?} target oid from terminal state for non-top stash reference (spec={:?}, worktree={})",
-                parsed.command_args.first().map(String::as_str).unwrap_or("stash"),
-                target_spec,
-                worktree.display()
-            )))
-        }
-        _ => Ok(None),
+            .map(Some);
     }
+
+    let unresolved = |reason: &str| {
+        AutterError::Generic(format!(
+            "failed to resolve stash {subcommand} target oid: {reason} (spec={target_spec:?}, worktree={})",
+            worktree.display()
+        ))
+    };
+    if let Some(spec) = target_spec
+        && is_valid_git_oid(spec)
+    {
+        return Ok(Some(spec.to_string()));
+    }
+    let index =
+        stash_target_spec_index(target_spec).ok_or_else(|| unresolved("not a stash reference"))?;
+    let after = read_stash_stack_for_worktree(worktree)
+        .ok_or_else(|| unresolved("stash stack unreadable"))?;
+    if exit_code != 0 {
+        // git drops the entry only once the stash applied cleanly.
+        return Ok(after.get(index).cloned());
+    }
+    if let Some(target) = stash_removed_from_stack(index, &after, before_candidates) {
+        return Ok(Some(target));
+    }
+    if let Ok(history) = inferred_stash_stack_from_rewrite_history(worktree) {
+        let history_newest_first = history.into_iter().rev().collect::<Vec<_>>();
+        if let Some(target) =
+            stash_removed_from_stack(index, &after, std::slice::from_ref(&history_newest_first))
+        {
+            return Ok(Some(target));
+        }
+    }
+    Err(unresolved(
+        "no stack from before the command fits the stack it left",
+    ))
 }
 
 fn resolve_rebase_original_head_for_worktree(worktree: &Path) -> Option<String> {
@@ -2265,24 +2382,133 @@ pub fn restore_recent_working_log_snapshot(
     Ok(working_log_has_tracked_state_for_base(repo, base_commit))
 }
 
-fn preceding_merge_squash_for_pending_commit(
+/// The squash events waiting for the commit about to be made on `base_commit`,
+/// oldest first. A `merge --squash` stands alone. `git cherry-pick -n` can be
+/// run several times before committing, and each run counts.
+fn preceding_merge_squashes_for_pending_commit(
     repo: &Repository,
     base_commit: &str,
-) -> Result<Option<MergeSquashEvent>, AutterError> {
-    let events = repo.storage.read_rewrite_events()?;
-    for event in events {
+) -> Result<Vec<MergeSquashEvent>, AutterError> {
+    // The rewrite log is read newest event first.
+    Ok(merge_squashes_pending_on(
+        repo.storage.read_rewrite_events()?,
+        base_commit,
+    ))
+}
+
+/// The squash events waiting for a commit on `base_commit` at the point of
+/// the rewrite log where `newest_first` starts, oldest first.
+fn merge_squashes_pending_on(
+    newest_first: impl IntoIterator<Item = RewriteLogEvent>,
+    base_commit: &str,
+) -> Vec<MergeSquashEvent> {
+    let mut pending = Vec::new();
+    for event in newest_first {
         match event {
             RewriteLogEvent::AuthorshipLogsSynced { .. } => continue,
             RewriteLogEvent::Commit { .. } | RewriteLogEvent::CommitAmend { .. } => continue,
+            // Stashing and unstashing leaves HEAD alone; what was squashed or
+            // picked before is still waiting for its commit.
+            RewriteLogEvent::Stash { .. } => continue,
             RewriteLogEvent::MergeSquash { merge_squash }
                 if merge_squash.base_head == base_commit =>
             {
-                return Ok(Some(merge_squash));
+                let newest_is_merge_squash = pending.is_empty();
+                if !merge_squash.preserve_working_log && !newest_is_merge_squash {
+                    break;
+                }
+                let stands_alone = !merge_squash.preserve_working_log;
+                pending.push(merge_squash);
+                if stands_alone {
+                    break;
+                }
             }
-            _ => return Ok(None),
+            _ => break,
         }
     }
-    Ok(None)
+    pending.reverse();
+    pending
+}
+
+/// The `git cherry-pick -n` runs still waiting for a commit on `head`.
+fn pending_no_commit_picks(
+    repo: &Repository,
+    head: &str,
+) -> Result<Vec<MergeSquashEvent>, AutterError> {
+    let mut pending = preceding_merge_squashes_for_pending_commit(repo, head)?;
+    pending.retain(|pick| pick.preserve_working_log);
+    Ok(pending)
+}
+
+/// Throws away the `git cherry-pick -n` runs pending on `head`: the next
+/// commit carries nothing of them. `stashed_as` names the stash they went into,
+/// when a stash took them away.
+fn cancel_pending_no_commit_picks(
+    repo: &Repository,
+    head: &str,
+    stashed_as: Option<&str>,
+) -> Result<(), AutterError> {
+    let mut abort = CherryPickAbortEvent::new(head.to_string());
+    if let Some(stash_sha) = stashed_as {
+        abort = abort.stashed_as(stash_sha.to_string());
+    }
+    repo.storage
+        .append_rewrite_event(RewriteLogEvent::cherry_pick_abort(abort))?;
+    forget_paths_taken_from_picked_side(repo, head);
+    Ok(())
+}
+
+/// Whether the working tree still holds any line one of `picks` brought.
+fn working_tree_holds_no_commit_picks(
+    repo: &Repository,
+    worktree: &Path,
+    head: &str,
+    picks: &[MergeSquashEvent],
+) -> Result<bool, AutterError> {
+    let read_content = |path: &str| std::fs::read_to_string(worktree.join(path)).ok();
+    for pick in picks {
+        if no_commit_pick_lines_remain(repo, pick, head, read_content)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Applying `stash_sha` on `head` brings back the `git cherry-pick -n` runs
+/// that stash took away from that commit: records them as pending again.
+fn restore_no_commit_picks_from_stash(
+    repo: &Repository,
+    head: &str,
+    stash_sha: &str,
+) -> Result<(), AutterError> {
+    let events = repo.storage.read_rewrite_events()?;
+    let Some(stashed_at) = events.iter().position(|event| {
+        matches!(
+            event,
+            RewriteLogEvent::CherryPickAbort { cherry_pick_abort }
+                if cherry_pick_abort.original_head == head
+                    && cherry_pick_abort.stashed_as.as_deref() == Some(stash_sha)
+        )
+    }) else {
+        return Ok(());
+    };
+    let picks: Vec<MergeSquashEvent> =
+        merge_squashes_pending_on(events.into_iter().skip(stashed_at + 1), head)
+            .into_iter()
+            .filter(|pick| pick.preserve_working_log)
+            .collect();
+    if picks.is_empty() {
+        return Ok(());
+    }
+    if pending_no_commit_picks(repo, head)? == picks {
+        return Ok(());
+    }
+    for pick in picks {
+        repo.storage
+            .append_rewrite_event(RewriteLogEvent::merge_squash(pick))?;
+    }
+    crate::authorship::rebase_authorship::mark_pending_no_commit_pick(repo, head)?;
+    Ok(())
 }
 
 fn latest_reset_for_base_commit(
@@ -2468,15 +2694,27 @@ fn attempt_materialize_commit_chain_authorship(
     Ok(())
 }
 
-fn resolve_reset_old_head_for_base(worktree: &Path, base_commit: &str) -> Option<String> {
-    read_ref_oid_for_worktree(worktree, "ORIG_HEAD")
-        .filter(|oid| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid))
-        .or_else(|| {
-            resolve_worktree_head_reflog_old_oid_for_new_head(worktree, base_commit)
-                .ok()
-                .flatten()
-                .filter(|oid| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid))
-        })
+/// Where HEAD was before it last moved to `base_commit`, read from the
+/// repository when the move itself was never seen, and whether that move was a
+/// reset. Only a reset undoes commits whose work can still be in the tree: a
+/// `checkout` back to a branch, a rebase or a merge also leave HEAD on a commit
+/// other commits descend from, and rebuilding "undone" work from those commits
+/// would hand their attribution to whatever is typed next. Such a move can
+/// still have carried uncommitted work along, which is why it is returned.
+fn resolve_reset_old_head_for_base(worktree: &Path, base_commit: &str) -> Option<(String, bool)> {
+    let usable = |oid: &String| oid != base_commit && is_valid_oid(oid) && !is_zero_oid(oid);
+    match latest_worktree_head_reflog_move(worktree, base_commit) {
+        Ok(Some(moved)) => {
+            let by_reset = head_reflog_entry_written_by("reset", &moved.message);
+            Some(moved.old)
+                .filter(usable)
+                .map(|old_head| (old_head, by_reset))
+        }
+        // No reflog says how HEAD got here; ORIG_HEAD is all there is.
+        Ok(None) | Err(_) => read_ref_oid_for_worktree(worktree, "ORIG_HEAD")
+            .filter(usable)
+            .map(|old_head| (old_head, true)),
+    }
 }
 
 fn read_reset_recovery_final_state(
@@ -2582,15 +2820,20 @@ fn recover_reset_working_log_for_commit_replay(
         return Ok(false);
     }
 
-    let old_head = latest_reset_for_base_commit(repo, base_commit)?
-        .map(|reset| reset.old_head_sha)
-        .or_else(|| resolve_reset_old_head_for_base(worktree, base_commit));
-    let Some(old_head) = old_head else {
-        return Ok(false);
+    let (old_head, undone_by_reset) = match latest_reset_for_base_commit(repo, base_commit)? {
+        // `reset --hard` threw the undone work away. There is nothing to recover.
+        Some(reset) if reset.kind == ResetKind::Hard => return Ok(false),
+        Some(reset) => (reset.old_head_sha, true),
+        None => match resolve_reset_old_head_for_base(worktree, base_commit) {
+            Some(moved) => moved,
+            None => return Ok(false),
+        },
     };
     if !repo_is_ancestor(repo, base_commit, &old_head) {
         return Ok(false);
     }
+    // Uncommitted work left under the old HEAD that matches the tree exactly
+    // travelled with the move, whatever kind of move it was.
     if restore_matching_old_head_reset_snapshot(
         repo,
         base_commit,
@@ -2600,6 +2843,9 @@ fn recover_reset_working_log_for_commit_replay(
         final_state_override,
     )? {
         return Ok(true);
+    }
+    if !undone_by_reset {
+        return Ok(false);
     }
 
     if let Err(error) =
@@ -2637,31 +2883,34 @@ fn seed_merge_squash_working_log_for_commit_replay(
         return Ok(());
     }
 
-    let Some(merge_squash) = preceding_merge_squash_for_pending_commit(repo, base_commit)? else {
+    let merge_squashes = preceding_merge_squashes_for_pending_commit(repo, base_commit)?;
+    let Some(newest) = merge_squashes.last() else {
         return Ok(());
     };
-    if has_tracked_state && !merge_squash.preserve_working_log {
+    if has_tracked_state && !newest.preserve_working_log {
         return Ok(());
     }
 
-    let merge_base = repo
-        .merge_base(
-            merge_squash.source_head.clone(),
-            merge_squash.base_head.clone(),
-        )
-        .ok()
-        .flatten();
-    if let Err(error) = attempt_materialize_commit_chain_authorship(
-        repo,
-        merge_base.as_deref(),
-        &merge_squash.source_head,
-        author,
-    ) {
-        tracing::debug!(
-            %error,
-            source_head = %merge_squash.source_head,
-            "failed to backfill squash prerequisite notes"
-        );
+    for source_head in merge_squashes
+        .iter()
+        .flat_map(|merge_squash| merge_squash.source_commits())
+    {
+        let merge_base = repo
+            .merge_base(source_head.clone(), base_commit.to_string())
+            .ok()
+            .flatten();
+        if let Err(error) = attempt_materialize_commit_chain_authorship(
+            repo,
+            merge_base.as_deref(),
+            &source_head,
+            author,
+        ) {
+            tracing::debug!(
+                %error,
+                %source_head,
+                "failed to backfill squash prerequisite notes"
+            );
+        }
     }
 
     tracing::debug!(
@@ -2675,22 +2924,32 @@ fn seed_merge_squash_working_log_for_commit_replay(
         );
         return Ok(());
     };
-    if has_tracked_state {
-        return merge_working_log_after_squash_from_final_state(
+    if !newest.preserve_working_log {
+        return prepare_working_log_after_squash_from_final_state(
             repo,
-            &merge_squash.source_head,
+            &newest.source_head,
             base_commit,
             final_state,
             author,
         );
     }
-    prepare_working_log_after_squash_from_final_state(
-        repo,
-        &merge_squash.source_head,
-        base_commit,
-        final_state,
-        author,
-    )
+    // `cherry-pick -n`, possibly run more than once: every picked commit
+    // brings its attribution, oldest pick first, into whatever the working log
+    // already tracks.
+    let mut replace_working_log = !has_tracked_state;
+    for pick in &merge_squashes {
+        carry_no_commit_pick_into_working_log(
+            repo,
+            pick,
+            base_commit,
+            final_state,
+            author,
+            replace_working_log,
+        )?;
+        replace_working_log = false;
+    }
+    forget_paths_taken_from_picked_side(repo, base_commit);
+    Ok(())
 }
 
 fn recover_recent_replay_prerequisites_for_commit_replay(
@@ -3010,22 +3269,26 @@ fn apply_rewrite_side_effect(
             carryover_snapshot,
             reset_pathspecs,
         )?;
-        coordinator.record_recent_replay_prerequisite(
-            &prerequisite_family,
-            RecentReplayPrerequisite::Reset {
-                target_head: reset.new_head_sha.clone(),
-                old_head: reset.old_head_sha.clone(),
-                pathspecs: reset_pathspecs
-                    .map(|paths| paths.to_vec())
-                    .unwrap_or_default(),
-                final_state: carryover_snapshot.cloned(),
-                working_log_snapshot: capture_recent_working_log_snapshot(
-                    &repo,
-                    &reset.new_head_sha,
-                    Some(author.clone()),
-                )?,
-            },
-        )?;
+        // `reset --hard` threw the undone work away, so the next commit has
+        // nothing of it to recover.
+        if reset.kind != ResetKind::Hard {
+            coordinator.record_recent_replay_prerequisite(
+                &prerequisite_family,
+                RecentReplayPrerequisite::Reset {
+                    target_head: reset.new_head_sha.clone(),
+                    old_head: reset.old_head_sha.clone(),
+                    pathspecs: reset_pathspecs
+                        .map(|paths| paths.to_vec())
+                        .unwrap_or_default(),
+                    final_state: carryover_snapshot.cloned(),
+                    working_log_snapshot: capture_recent_working_log_snapshot(
+                        &repo,
+                        &reset.new_head_sha,
+                        Some(author.clone()),
+                    )?,
+                },
+            )?;
+        }
     }
     if !rewrite_event_needs_authorship_processing(&repo, &rewrite_event)? {
         repo.storage.append_rewrite_event(rewrite_event)?;
@@ -3665,7 +3928,38 @@ fn is_cherry_pick_range_spec(arg: &str) -> bool {
 
 /// True when `git cherry-pick` was told not to commit (`-n` / `--no-commit`).
 fn cherry_pick_is_no_commit(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "-n" || arg == "--no-commit")
+    cherry_pick_requests_no_commit(args)
+}
+
+/// True for a `git cherry-pick -n <commits>` invocation, as opposed to one that
+/// continues, skips or ends a pick already under way.
+fn command_is_no_commit_cherry_pick(cmd: &crate::daemon::domain::NormalizedCommand) -> bool {
+    cmd.primary_command.as_deref() == Some("cherry-pick")
+        && cherry_pick_is_no_commit(&cmd.invoked_args)
+        && !cmd
+            .invoked_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--abort" | "--continue" | "--quit" | "--skip"))
+}
+
+/// Drops every picked commit that the next pick descends from. The attribution
+/// of a commit is read through blame from where its branch left the base, so
+/// the descendant already covers its ancestors; what is left is one commit per
+/// line of history, still in pick order.
+fn distinct_cherry_pick_lines_of_history(
+    repository: &Repository,
+    sources: Vec<String>,
+) -> Vec<String> {
+    let mut distinct: Vec<String> = Vec::with_capacity(sources.len());
+    for source in sources {
+        if let Some(previous) = distinct.last()
+            && (*previous == source || is_ancestor_commit(repository, previous, &source))
+        {
+            distinct.pop();
+        }
+        distinct.push(source);
+    }
+    distinct
 }
 
 /// Git dir of the worktree (per-worktree, so linked worktrees each get their
@@ -3860,6 +4154,344 @@ fn repo_is_ancestor(
     args.push(ancestor.to_string());
     args.push(descendant.to_string());
     exec_git(&args).is_ok()
+}
+
+/// What a command that left HEAD where it was did to uncommitted work.
+///
+/// - `git reset --hard` threw every change to a tracked file away: the
+///   attribution the working log held for those changes goes too, so text
+///   typed again afterwards starts with none, and a pending `git cherry-pick
+///   -n` is cancelled. (`--merge` and `--keep` onto HEAD itself leave the
+///   working tree alone.)
+/// - `git checkout` / `git restore` of paths that leaves the tree without any
+///   line a pending pick brought (`checkout HEAD -- .`, `restore --staged
+///   --worktree .`) cancels it. `checkout --theirs` / `restore --theirs`
+///   record the paths resolved by taking the picked side.
+/// - `git stash` that takes a pending pick away cancels it, naming the stash;
+///   applying that stash on the same commit brings the pick back.
+fn apply_tree_discard_side_effects(
+    cmd: &crate::daemon::domain::NormalizedCommand,
+    events: &[crate::daemon::domain::SemanticEvent],
+    stash_events: &[StashEvent],
+) -> Result<(), AutterError> {
+    let Some(worktree) = cmd.worktree.as_deref() else {
+        return Ok(());
+    };
+    let primary = cmd.primary_command.as_deref();
+    if !matches!(
+        primary,
+        Some("reset" | "checkout" | "switch" | "restore" | "stash")
+    ) {
+        return Ok(());
+    }
+    // A stash that stopped on a conflict was still applied.
+    if primary != Some("stash") && cmd.exit_code != 0 {
+        return Ok(());
+    }
+    let repo = find_repository_in_path(&worktree.to_string_lossy())?;
+
+    if primary == Some("stash") {
+        for stash in stash_events {
+            let (Some(head), Some(stash_sha)) =
+                (stash.head_sha.as_deref(), stash.stash_sha.as_deref())
+            else {
+                continue;
+            };
+            match stash.operation {
+                StashOperation::Create => {
+                    let picks = pending_no_commit_picks(&repo, head)?;
+                    if picks.is_empty() {
+                        continue;
+                    }
+                    // A plain stash leaves every tracked file as HEAD has it.
+                    // One that keeps something behind is checked against the
+                    // tree.
+                    let keeps_some = !stash.pathspecs.is_empty()
+                        || cmd.invoked_args.iter().any(|arg| {
+                            matches!(
+                                arg.as_str(),
+                                "-k" | "--keep-index" | "-p" | "--patch" | "-S" | "--staged"
+                            )
+                        });
+                    if !keeps_some
+                        || !working_tree_holds_no_commit_picks(&repo, worktree, head, &picks)?
+                    {
+                        cancel_pending_no_commit_picks(&repo, head, Some(stash_sha))?;
+                    }
+                }
+                StashOperation::Apply | StashOperation::Pop | StashOperation::Branch => {
+                    restore_no_commit_picks_from_stash(&repo, head, stash_sha)?;
+                }
+                StashOperation::Drop | StashOperation::List => {}
+            }
+        }
+        return Ok(());
+    }
+
+    // Only commands that left HEAD in place; a move is handled as such.
+    let post_head = cmd
+        .post_repo
+        .as_ref()
+        .and_then(|repo| repo.head.clone())
+        .or_else(|| {
+            // `restore` never moves HEAD and is not snapshotted.
+            (primary == Some("restore"))
+                .then(|| repo.head().ok()?.target().ok())
+                .flatten()
+        });
+    let Some(head) = post_head.filter(|head| is_valid_oid(head) && !is_zero_oid(head)) else {
+        return Ok(());
+    };
+    if let Some(pre_head) = cmd.pre_repo.as_ref().and_then(|repo| repo.head.as_deref())
+        && pre_head != head
+    {
+        return Ok(());
+    }
+    if events
+        .iter()
+        .any(|event| matches!(event, crate::daemon::domain::SemanticEvent::Reset { .. }))
+    {
+        return Ok(());
+    }
+
+    let picks = pending_no_commit_picks(&repo, &head)?;
+    if primary == Some("reset") {
+        if cmd.invoked_args.iter().any(|arg| arg == "--hard") {
+            if !picks.is_empty() {
+                cancel_pending_no_commit_picks(&repo, &head, None)?;
+            }
+            drop_attribution_discarded_by_hard_reset(&repo, worktree, &head)?;
+        }
+        return Ok(());
+    }
+
+    if picks.is_empty() {
+        return Ok(());
+    }
+    if let Some(pathspecs) = paths_taken_from_picked_side(cmd) {
+        return record_paths_taken_from_picked_side(&repo, &head, &pathspecs);
+    }
+    let Some(restored) = restored_paths(&repo, cmd, &head) else {
+        return Ok(());
+    };
+    // The restored files hold what the command wrote, read from where it read
+    // it, so this does not depend on what was typed since; the other files
+    // are read from the working tree.
+    let read_content = |path: &str| {
+        if !path_matches_any_pathspec(path, &restored.pathspecs) {
+            return std::fs::read_to_string(worktree.join(path)).ok();
+        }
+        match &restored.source {
+            RestoreSource::Commit(commit) => repo
+                .get_file_content(path, commit)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+            RestoreSource::Index => repo
+                .get_file_content(path, "")
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+        }
+    };
+    for pick in &picks {
+        if no_commit_pick_lines_remain(&repo, pick, &head, read_content)? {
+            return Ok(());
+        }
+    }
+    cancel_pending_no_commit_picks(&repo, &head, None)
+}
+
+/// Where `git checkout <paths>` / `git restore <paths>` took the content it
+/// wrote to the working tree from.
+enum RestoreSource {
+    Commit(String),
+    Index,
+}
+
+struct RestoredPaths {
+    source: RestoreSource,
+    /// Relative to the repository root; `.` is all of it.
+    pathspecs: Vec<String>,
+}
+
+/// The paths `git checkout [<tree-ish>] [--] <paths>` or `git restore
+/// [--source=<tree-ish>] [--staged] [--worktree] <paths>` wrote to the working
+/// tree, and where it took them from. `None` for any other command, a branch
+/// switch, and a restore of the index alone.
+fn restored_paths(
+    repo: &Repository,
+    cmd: &crate::daemon::domain::NormalizedCommand,
+    head: &str,
+) -> Option<RestoredPaths> {
+    let primary = cmd.primary_command.as_deref()?;
+    if !matches!(primary, "checkout" | "restore") {
+        return None;
+    }
+    let mut operands = Vec::new();
+    let mut after_separator = Vec::new();
+    let mut separator_seen = false;
+    let mut source = None;
+    let mut staged = false;
+    let mut worktree = false;
+    let mut args = cmd.invoked_args.iter();
+    while let Some(arg) = args.next() {
+        if separator_seen {
+            after_separator.push(arg.clone());
+        } else if arg == "--" {
+            separator_seen = true;
+        } else if matches!(arg.as_str(), "-s" | "--source") {
+            source = args.next().cloned();
+        } else if let Some(value) = arg.strip_prefix("--source=") {
+            source = Some(value.to_string());
+        } else if matches!(arg.as_str(), "-S" | "--staged") {
+            staged = true;
+        } else if matches!(arg.as_str(), "-W" | "--worktree") {
+            worktree = true;
+        } else if matches!(arg.as_str(), "--pathspec-from-file" | "--conflict") {
+            args.next();
+        } else if arg.starts_with('-') {
+            // `-b`, `-p`, `--ours`, ...: not a plain restore of paths.
+            if matches!(arg.as_str(), "-b" | "-B" | "--orphan" | "-p" | "--patch") {
+                return None;
+            }
+        } else {
+            operands.push(arg.clone());
+        }
+    }
+
+    let (source, pathspecs) = if primary == "restore" {
+        if staged && !worktree {
+            return None;
+        }
+        let pathspecs: Vec<String> = operands.into_iter().chain(after_separator).collect();
+        let source = match source {
+            Some(tree_ish) => RestoreSource::Commit(tree_ish),
+            None if staged => RestoreSource::Commit("HEAD".to_string()),
+            None => RestoreSource::Index,
+        };
+        (source, pathspecs)
+    } else if separator_seen {
+        match operands.as_slice() {
+            [] => (RestoreSource::Index, after_separator),
+            [tree_ish] => (RestoreSource::Commit(tree_ish.clone()), after_separator),
+            _ => return None,
+        }
+    } else {
+        // Without `--`, a first operand naming a commit is the tree-ish when
+        // paths follow it; otherwise every operand is a path. A lone operand
+        // naming a branch is a switch.
+        let names_commit = |name: &str| {
+            let mut args = repo.global_args_for_exec();
+            args.extend([
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                format!("{}^{{commit}}", name),
+            ]);
+            exec_git(&args).is_ok()
+        };
+        match operands.split_first() {
+            None => return None,
+            Some((first, [])) if names_commit(first) => return None,
+            Some((first, rest)) if names_commit(first) => {
+                (RestoreSource::Commit(first.clone()), rest.to_vec())
+            }
+            Some(_) => (RestoreSource::Index, operands),
+        }
+    };
+    if pathspecs.is_empty() {
+        return None;
+    }
+    let source = match source {
+        // HEAD as the command saw it: it may have moved since.
+        RestoreSource::Commit(tree_ish) if matches!(tree_ish.as_str(), "HEAD" | "@") => {
+            RestoreSource::Commit(head.to_string())
+        }
+        RestoreSource::Commit(tree_ish) => {
+            let mut args = repo.global_args_for_exec();
+            args.extend([
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                format!("{}^{{commit}}", tree_ish),
+            ]);
+            let output = exec_git(&args).ok()?;
+            RestoreSource::Commit(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        RestoreSource::Index => RestoreSource::Index,
+    };
+    Some(RestoredPaths { source, pathspecs })
+}
+
+/// Whether `path` (relative to the repository root) falls under one of
+/// `pathspecs`, `.` being the whole repository.
+fn path_matches_any_pathspec(path: &str, pathspecs: &[String]) -> bool {
+    pathspecs.iter().any(|spec| {
+        let spec = spec.trim_start_matches("./").trim_end_matches('/');
+        spec.is_empty()
+            || spec == "."
+            || path == spec
+            || path
+                .strip_prefix(spec)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// The paths of `git checkout --theirs <paths>` / `git restore --theirs
+/// <paths>`: a conflict resolved by taking the picked side. `None` for any
+/// other command.
+fn paths_taken_from_picked_side(
+    cmd: &crate::daemon::domain::NormalizedCommand,
+) -> Option<Vec<String>> {
+    if !matches!(cmd.primary_command.as_deref(), Some("checkout" | "restore"))
+        || !cmd.invoked_args.iter().any(|arg| arg == "--theirs")
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut only_paths = false;
+    let mut skip_value = false;
+    for arg in &cmd.invoked_args {
+        if only_paths {
+            paths.push(arg.clone());
+        } else if skip_value {
+            skip_value = false;
+        } else if arg == "--" {
+            only_paths = true;
+        } else if matches!(arg.as_str(), "-s" | "--source" | "--pathspec-from-file") {
+            skip_value = true;
+        } else if !arg.starts_with('-') {
+            paths.push(arg.clone());
+        }
+    }
+    Some(paths)
+}
+
+/// `git reset --hard` that left HEAD in place put every file of HEAD back and
+/// removed every file the index held that HEAD lacks: what the working log
+/// tracked for those files was thrown away with them. A file in neither,
+/// never added, is left as it was, and so is its attribution.
+fn drop_attribution_discarded_by_hard_reset(
+    repo: &Repository,
+    worktree: &Path,
+    head: &str,
+) -> Result<(), AutterError> {
+    let tracked = tracked_working_log_files(repo, head)?;
+    if tracked.is_empty() {
+        return Ok(());
+    }
+    let tree = repo.find_commit(head.to_string())?.tree()?.id();
+    let mut discarded: Vec<String> = tracked
+        .into_iter()
+        .filter(|file| {
+            repo.read_file_blob_at_tree(&tree, Path::new(file)).is_ok()
+                || !worktree.join(file).exists()
+        })
+        .collect();
+    if discarded.is_empty() {
+        return Ok(());
+    }
+    discarded.sort();
+    remove_working_log_attributions_for_pathspecs(repo, head, &discarded)
 }
 
 fn apply_reset_working_log_side_effect(
@@ -4399,6 +5031,13 @@ struct TraceIngressState {
     root_reflog_refs: HashMap<String, Vec<String>>,
     root_head_reflog_start_offsets: HashMap<String, u64>,
     root_family_reflog_start_offsets: HashMap<String, HashMap<String, u64>>,
+    /// For a `git stash pop`/`drop`/`branch` root: stacks of stashes from
+    /// before git moved the stack, if it had not by the time the daemon
+    /// looked (newest first, see `read_stash_stack_for_worktree`).
+    root_stash_stacks_before: HashMap<String, Vec<Vec<String>>>,
+    /// Per repository family: the stash stack as the last `git stash` command
+    /// the daemon saw finish left it.
+    family_stash_stacks: HashMap<String, Vec<String>>,
     root_last_activity_ns: HashMap<String, u64>,
     /// Roots whose start event was identified as definitely read-only. All
     /// subsequent events for these roots (including exit) take the fast path.
@@ -4466,6 +5105,7 @@ pub struct ActorDaemonCoordinator {
     shutdown_notify: Notify,
     shutdown_condvar: std::sync::Condvar,
     shutdown_condvar_mutex: Mutex<()>,
+    created_at: std::time::Instant,
 }
 
 struct WrapperStateEntry {
@@ -4565,6 +5205,7 @@ impl ActorDaemonCoordinator {
             shutdown_notify: Notify::new(),
             shutdown_condvar: std::sync::Condvar::new(),
             shutdown_condvar_mutex: Mutex::new(()),
+            created_at: std::time::Instant::now(),
         }
     }
 
@@ -4616,6 +5257,19 @@ impl ActorDaemonCoordinator {
         self.shutdown_action
             .store(DaemonExitAction::Restart.as_u8(), Ordering::SeqCst);
         self.request_shutdown();
+    }
+
+    /// Shut down because the service can no longer serve connections. It comes
+    /// back by itself, unless it has only just started: then the cause is
+    /// likely still there, and restarting would loop. The next autter command
+    /// starts a fresh service in that case.
+    fn request_shutdown_unhealthy(&self) {
+        let min_uptime = Duration::from_secs(daemon_min_uptime_for_self_restart());
+        if self.created_at.elapsed() >= min_uptime {
+            self.request_restart();
+        } else {
+            self.request_shutdown();
+        }
     }
 
     fn request_restart_after_update(&self) {
@@ -4812,6 +5466,7 @@ impl ActorDaemonCoordinator {
                     | "rebase"
                     | "remote"
                     | "reset"
+                    | "restore"
                     | "revert"
                     | "stash"
                     | "switch"
@@ -5136,6 +5791,7 @@ impl ActorDaemonCoordinator {
             || ingress.root_reflog_refs.contains_key(root)
             || ingress.root_head_reflog_start_offsets.contains_key(root)
             || ingress.root_family_reflog_start_offsets.contains_key(root)
+            || ingress.root_stash_stacks_before.contains_key(root)
     }
 
     fn mark_trace_root_activity(&self, root_sid: &str) -> Result<(), AutterError> {
@@ -5298,6 +5954,7 @@ impl ActorDaemonCoordinator {
         ingress.root_reflog_refs.remove(root_sid);
         ingress.root_head_reflog_start_offsets.remove(root_sid);
         ingress.root_family_reflog_start_offsets.remove(root_sid);
+        ingress.root_stash_stacks_before.remove(root_sid);
         ingress.root_last_activity_ns.remove(root_sid);
         ingress.root_definitely_read_only.remove(root_sid);
         ingress.root_open_connections.remove(root_sid);
@@ -5863,6 +6520,7 @@ impl ActorDaemonCoordinator {
                     ingress.root_reflog_refs.remove(&root);
                     ingress.root_head_reflog_start_offsets.remove(&root);
                     ingress.root_family_reflog_start_offsets.remove(&root);
+                    ingress.root_stash_stacks_before.remove(&root);
                     ingress.root_last_activity_ns.remove(&root);
                     ingress.root_definitely_read_only.remove(&root);
                 }
@@ -5947,6 +6605,7 @@ impl ActorDaemonCoordinator {
                 ingress.root_reflog_refs.remove(&root);
                 ingress.root_head_reflog_start_offsets.remove(&root);
                 ingress.root_family_reflog_start_offsets.remove(&root);
+                ingress.root_stash_stacks_before.remove(&root);
             }
             return false;
         };
@@ -5962,6 +6621,27 @@ impl ActorDaemonCoordinator {
                 .insert(root.clone(), repo_context_from_head_state(state));
         }
         let pre_repo = ingress.root_pre_repo.get(&root).cloned();
+        if !ingress.root_stash_stacks_before.contains_key(&root)
+            && effective_primary.as_deref() == Some("stash")
+            && stash_subcommand_for_argv(&effective_argv)
+                .is_some_and(|subcommand| stash_subcommand_removes_entry(&subcommand))
+        {
+            // Stacks the stash stack may have had before this command took its
+            // entry off: the stack now (git may not have moved it yet), and the
+            // stack the last stash command left.
+            let mut before = Vec::new();
+            if let Some(stack) = read_stash_stack_for_worktree(&worktree) {
+                before.push(stack);
+            }
+            if let Some(stack) = stash_family_key(&worktree)
+                .and_then(|family| ingress.family_stash_stacks.get(&family))
+            {
+                before.push(stack.clone());
+            }
+            ingress
+                .root_stash_stacks_before
+                .insert(root.clone(), before);
+        }
         if should_capture_mutation && !target_repo_only {
             let contextual_refs = if let Some(repo) = pre_repo.as_ref() {
                 tracked_reflog_refs_for_command(
@@ -6232,10 +6912,16 @@ impl ActorDaemonCoordinator {
                 }
             }
             if object.get("autter_stash_target_oid").is_none() {
+                let before = ingress
+                    .root_stash_stacks_before
+                    .get(&root)
+                    .cloned()
+                    .unwrap_or_default();
                 match resolve_stash_target_oid_for_terminal_payload(
                     &worktree,
                     &effective_argv,
-                    terminal_ref_changes.as_deref().unwrap_or(&[]),
+                    terminal_exit_code.unwrap_or(0),
+                    &before,
                 ) {
                     Ok(Some(stash_target_oid)) => {
                         object.remove("autter_stash_target_oid_error");
@@ -6261,6 +6947,12 @@ impl ActorDaemonCoordinator {
                         );
                     }
                 }
+            }
+            if effective_primary.as_deref() == Some("stash")
+                && let Some(family) = stash_family_key(&worktree)
+                && let Some(stack) = read_stash_stack_for_worktree(&worktree)
+            {
+                ingress.family_stash_stacks.insert(family, stack);
             }
             if object.get("autter_carryover_snapshot_id").is_none() {
                 let terminal_time_ns = object
@@ -6330,6 +7022,7 @@ impl ActorDaemonCoordinator {
             ingress.root_reflog_refs.remove(&root);
             ingress.root_head_reflog_start_offsets.remove(&root);
             ingress.root_family_reflog_start_offsets.remove(&root);
+            ingress.root_stash_stacks_before.remove(&root);
         }
         // Payload was fully augmented for a mutating command; tell the caller
         // to stamp a sequence number and enqueue it.
@@ -6920,6 +7613,11 @@ impl ActorDaemonCoordinator {
             }),
             StashOperation::Pop | StashOperation::Drop | StashOperation::Branch => {
                 cmd.stash_target_oid.clone().or_else(|| {
+                    // `refs/stash` moving names the entry taken off only when
+                    // that entry was the top one.
+                    if !stash_target_spec_is_top_of_stack(stash_ref) {
+                        return None;
+                    }
                     cmd.ref_changes
                         .iter()
                         .rfind(|change| change.reference == "refs/stash")
@@ -6983,6 +7681,32 @@ impl ActorDaemonCoordinator {
         }
 
         Ok(Self::resolve_stash_head_for_event(semantic_head, cmd))
+    }
+
+    /// `git stash branch` checks out the commit the stash was made on (its
+    /// first parent) before it applies the stash, so the stash's attribution
+    /// belongs on that commit, not on the HEAD the command started from.
+    fn resolve_stash_branch_head_for_event(
+        cmd: &crate::daemon::domain::NormalizedCommand,
+        stash_sha: Option<&str>,
+        semantic_head: Option<&String>,
+    ) -> Result<Option<String>, AutterError> {
+        let post_head = cmd
+            .post_repo
+            .as_ref()
+            .and_then(|repo| repo.head.clone())
+            .filter(|head| !head.trim().is_empty());
+        if cmd.exit_code != 0 {
+            // It may have stopped before or after checking the commit out;
+            // HEAD as it left it is where any applied changes landed.
+            return Ok(post_head
+                .or_else(|| Self::resolve_stash_restore_head_for_event(semantic_head, cmd)));
+        }
+        Self::resolve_stash_create_head_for_event(
+            cmd,
+            stash_sha,
+            post_head.as_ref().or(semantic_head),
+        )
     }
 
     fn resolve_stash_restore_head_for_event(
@@ -7222,13 +7946,15 @@ impl ActorDaemonCoordinator {
     /// `git cherry-pick -n` applies the picked changes without committing. Treat
     /// it like `merge --squash` so the next commit inherits the source commits'
     /// attribution instead of recording the picked lines as untracked.
+    ///
+    /// A pick that stopped on a conflict still applied everything that merged
+    /// cleanly, so it is recorded too. What it applied is worked out from the
+    /// picked commits when the next commit is made, not from the index, which
+    /// may already hold the resolution by the time this runs.
     fn synthesize_cherry_pick_no_commit_squash_event(
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<Option<MergeSquashEvent>, AutterError> {
-        if cmd.exit_code != 0 || cmd.primary_command.as_deref() != Some("cherry-pick") {
-            return Ok(None);
-        }
-        if !cherry_pick_is_no_commit(&cmd.invoked_args) {
+        if !command_is_no_commit_cherry_pick(cmd) {
             return Ok(None);
         }
         let Some(worktree) = cmd.worktree.as_deref() else {
@@ -7238,8 +7964,26 @@ impl ActorDaemonCoordinator {
         if source_refs.is_empty() {
             return Ok(None);
         }
-        let sources =
-            resolve_cherry_pick_source_refs(&source_refs, worktree, "cherry_pick_no_commit")?;
+        let stopped = cmd.exit_code != 0;
+        let sources = match resolve_cherry_pick_source_refs(
+            &source_refs,
+            worktree,
+            "cherry_pick_no_commit",
+        ) {
+            Ok(sources) => sources,
+            // A pick that failed may have failed on exactly this: a ref
+            // that names no commit. Then nothing was applied.
+            Err(error) if stopped => {
+                tracing::debug!(%error, "failed cherry-pick -n names no resolvable commits");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let applied_commits = sources.clone();
+        let sources = match find_repository_in_path(&worktree.to_string_lossy()) {
+            Ok(repository) => distinct_cherry_pick_lines_of_history(&repository, sources),
+            Err(_) => sources,
+        };
         let Some(source_head) = sources.last().cloned() else {
             return Ok(None);
         };
@@ -7257,16 +8001,18 @@ impl ActorDaemonCoordinator {
             .as_ref()
             .and_then(|repo| repo.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        Ok(Some(
-            MergeSquashEvent::new(
-                source_refs.join(" "),
-                source_head,
-                base_branch,
-                base_head,
-                HashMap::new(),
-            )
-            .with_preserved_working_log(),
-        ))
+        let mut event = MergeSquashEvent::new(
+            source_refs.join(" "),
+            source_head,
+            base_branch,
+            base_head,
+            HashMap::new(),
+        )
+        .with_preserved_working_log();
+        if sources.len() > 1 {
+            event = event.with_picked_commits(sources);
+        }
+        Ok(Some(event.with_applied_commits(applied_commits)))
     }
 
     fn rewrite_events_from_semantic_events(
@@ -7303,6 +8049,10 @@ impl ActorDaemonCoordinator {
                     if let Some(cherry_pick) =
                         self.cherry_pick_concluded_by_plain_commit(cmd, new_head)?
                     {
+                        // The commit's post-commit note is provisional: the
+                        // cherry-pick rewrite replaces it right after. Hold its
+                        // upload so the server records only the final note.
+                        crate::git::notes_api::hold_next_upload(new_head);
                         out.push(RewriteLogEvent::cherry_pick_complete(cherry_pick));
                     }
                 }
@@ -7631,9 +8381,14 @@ impl ActorDaemonCoordinator {
                             stash_sha.as_deref(),
                             head.as_ref(),
                         )?,
-                        StashOperation::Apply | StashOperation::Pop | StashOperation::Branch => {
+                        StashOperation::Apply | StashOperation::Pop => {
                             Self::resolve_stash_restore_head_for_event(head.as_ref(), cmd)
                         }
+                        StashOperation::Branch => Self::resolve_stash_branch_head_for_event(
+                            cmd,
+                            stash_sha.as_deref(),
+                            head.as_ref(),
+                        )?,
                         StashOperation::Drop | StashOperation::List => None,
                     };
                     let pathspecs = if matches!(operation, StashOperation::Create) {
@@ -8046,7 +8801,7 @@ impl ActorDaemonCoordinator {
                     .any(|arg| arg == "--abort" || arg == "--quit")
                 {
                     self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
-                } else if cmd.exit_code != 0 {
+                } else if cmd.exit_code != 0 && !command_is_no_commit_cherry_pick(cmd) {
                     let source_refs = cherry_pick_source_refs_from_command(cmd);
                     // `--continue` / `--skip` that stop on the next conflict carry no
                     // source refs of their own; keep the ones the pick started with.
@@ -8055,6 +8810,11 @@ impl ActorDaemonCoordinator {
                     }
                 }
             }
+            // `cherry-pick -n` that stopped on a conflict still applied what
+            // merged cleanly, and nothing it applies is ever committed by git
+            // itself (not even by `--continue` of a multi-commit pick): the next
+            // plain commit carries it. Fall through so it is recorded.
+            let is_stopped_no_commit_pick = command_is_no_commit_cherry_pick(cmd);
             // Fix #957: `checkout/switch --merge` exits with code 1 when it produces
             // conflict markers but HEAD still moves to the target branch.  We must not
             // return early here — fall through so apply_checkout_switch_working_log_side_effect
@@ -8083,7 +8843,7 @@ impl ActorDaemonCoordinator {
                         }
                     )
                 });
-            if !is_merge_checkout && !is_stash_restore {
+            if !is_merge_checkout && !is_stash_restore && !is_stopped_no_commit_pick {
                 return Ok(());
             }
             if is_stash_restore {
@@ -8156,6 +8916,13 @@ impl ActorDaemonCoordinator {
         let agent_env = crate::authorship::background_agent::AgentEnv::from_pairs(
             cmd.agent_env.iter().flatten(),
         );
+        let stash_events: Vec<StashEvent> = rewrite_events
+            .iter()
+            .filter_map(|event| match event {
+                RewriteLogEvent::Stash { stash } => Some(stash.clone()),
+                _ => None,
+            })
+            .collect();
         for rewrite_event in rewrite_events {
             if let Some(worktree) = cmd.worktree.as_ref() {
                 let worktree = worktree.to_string_lossy().to_string();
@@ -8170,6 +8937,8 @@ impl ActorDaemonCoordinator {
                 )?;
             }
         }
+
+        apply_tree_discard_side_effects(cmd, events, &stash_events)?;
 
         if let Some((new_head, carried_va, snapshot)) = deferred_rewrite_carryover
             && let Some(worktree) = cmd.worktree.as_ref()
@@ -8466,7 +9235,7 @@ impl ActorDaemonCoordinator {
 
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
-            ControlRequest::CheckpointRun { request } => {
+            ControlRequest::CheckpointRun { request, .. } => {
                 if let Some(worker) = &self.stream_worker
                     && let Some(stream_source) = &request.stream_source
                 {
@@ -8642,6 +9411,7 @@ impl ActorDaemonCoordinator {
                 Ok(response)
             }
             ControlRequest::Shutdown => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::Ping => Ok(ControlResponse::pong()),
         };
 
         match result {
@@ -8751,6 +9521,415 @@ impl ActorDaemonCoordinator {
     }
 }
 
+/// Pause after a listener could not serve a connection, so a listener that
+/// cannot serve does not spin.
+const LISTENER_FAILURE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// How long a listener may go without serving any connection before the
+/// service gives up and exits to be restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerFailureLimits {
+    /// Failures in a row, with no connection served in between.
+    max_consecutive: Option<u32>,
+    /// Time from the first failure of the run to the latest one.
+    max_duration: Duration,
+}
+
+/// A connection could not be handed to a handler thread (the thread could not
+/// be started, or `accept` itself failed). Nobody retries a dropped
+/// connection: checkpoints are sent once and git never resends trace events,
+/// so each failure is lost work.
+///
+/// A burst on a busy machine fails a handful of connections and then recovers,
+/// and must not restart the service. 20 failures in a row take at least a
+/// second of back-to-back failing (each one backs off 50 ms) in which not one
+/// handler thread could be started. On a quiet machine connections are rare,
+/// so the count alone could take hours: 5 seconds between the first and the
+/// latest failure, with nothing served in between, ends it too.
+const HANDOFF_FAILURE_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
+    max_consecutive: Some(20),
+    max_duration: Duration::from_secs(5),
+};
+
+/// Every control handler thread is in use. Idle connections are closed after
+/// [`CONTROL_CONNECTION_IDLE_TIMEOUT`], so a flood of them clears by itself
+/// within that time; 5 seconds more means the threads are held by requests
+/// that are not finishing. Refusals are not counted: a flood refuses hundreds
+/// of connections in a moment and must not restart the service.
+const AT_CAPACITY_LIMITS: ListenerFailureLimits = ListenerFailureLimits {
+    max_consecutive: None,
+    max_duration: Duration::from_secs(15),
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerFailureVerdict {
+    KeepServing,
+    ShutDown,
+}
+
+/// Decide whether a listener that just failed to serve a connection should
+/// keep going. `consecutive` counts this failure; `failing_for` is the time
+/// since the first failure after the last served connection.
+fn listener_failure_verdict(
+    limits: ListenerFailureLimits,
+    consecutive: u32,
+    failing_for: Duration,
+) -> ListenerFailureVerdict {
+    let too_many = limits.max_consecutive.is_some_and(|max| consecutive >= max);
+    if too_many || failing_for >= limits.max_duration {
+        ListenerFailureVerdict::ShutDown
+    } else {
+        ListenerFailureVerdict::KeepServing
+    }
+}
+
+/// A run of connections a listener failed to serve, ended by the next one it
+/// serves.
+#[derive(Debug, Default)]
+struct ListenerFailureStreak {
+    consecutive: u32,
+    first_failure_at: Option<std::time::Instant>,
+}
+
+impl ListenerFailureStreak {
+    fn record_failure(
+        &mut self,
+        limits: ListenerFailureLimits,
+        now: std::time::Instant,
+    ) -> ListenerFailureVerdict {
+        self.consecutive = self.consecutive.saturating_add(1);
+        let first = *self.first_failure_at.get_or_insert(now);
+        listener_failure_verdict(
+            limits,
+            self.consecutive,
+            now.saturating_duration_since(first),
+        )
+    }
+
+    fn record_success(&mut self) {
+        *self = Self::default();
+    }
+
+    fn failing_for(&self, now: std::time::Instant) -> Duration {
+        self.first_failure_at
+            .map(|first| now.saturating_duration_since(first))
+            .unwrap_or_default()
+    }
+}
+
+/// Record that `listener` could not hand a connection to a handler thread.
+/// Returns `true` when the listener must stop, which shuts the service down;
+/// otherwise backs off and lets it keep accepting. (The control listener
+/// counts through [`ControlConnectionGate`].)
+#[cfg(not(windows))]
+fn listener_handoff_failed(
+    listener: &str,
+    streak: &mut ListenerFailureStreak,
+    what: &str,
+    error: &dyn std::fmt::Display,
+) -> bool {
+    let verdict = record_handoff_failure(listener, streak, what, error);
+    finish_handoff_failure(verdict)
+}
+
+/// Count and log one connection `listener` could not hand to a handler.
+fn record_handoff_failure(
+    listener: &str,
+    streak: &mut ListenerFailureStreak,
+    what: &str,
+    error: &dyn std::fmt::Display,
+) -> ListenerFailureVerdict {
+    let now = std::time::Instant::now();
+    let verdict = streak.record_failure(HANDOFF_FAILURE_LIMITS, now);
+    match verdict {
+        ListenerFailureVerdict::KeepServing => {
+            tracing::error!(
+                consecutive = streak.consecutive,
+                %error,
+                "{} listener: {}",
+                listener,
+                what
+            );
+        }
+        ListenerFailureVerdict::ShutDown => {
+            tracing::error!(
+                consecutive = streak.consecutive,
+                failing_for_ms = streak.failing_for(now).as_millis() as u64,
+                %error,
+                "{} listener: {}, and no connection has been served since the first failure; \
+                 shutting the background service down so it is started again",
+                listener,
+                what
+            );
+        }
+    }
+    verdict
+}
+
+/// `true` when the listener must stop; otherwise back off before it accepts
+/// again.
+fn finish_handoff_failure(verdict: ListenerFailureVerdict) -> bool {
+    match verdict {
+        ListenerFailureVerdict::KeepServing => {
+            std::thread::sleep(LISTENER_FAILURE_BACKOFF);
+            false
+        }
+        ListenerFailureVerdict::ShutDown => true,
+    }
+}
+
+/// Whether a failed `accept` says nothing about the listener's ability to
+/// serve: the client gave up while queued, or the call was interrupted.
+#[cfg(not(windows))]
+fn accept_error_is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Start the thread that serves one accepted connection.
+fn spawn_connection_handler<F>(handler: F) -> std::io::Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(feature = "test-support")]
+    if test_support_fail_next_handler_spawn() {
+        return Err(std::io::Error::other(
+            "handler thread spawn failure injected by AUTTER_TEST_FAIL_HANDLER_SPAWNS",
+        ));
+    }
+    std::thread::Builder::new().spawn(handler).map(|_| ())
+}
+
+/// Test builds can make the first N handler-thread spawns of a daemon fail
+/// (`AUTTER_TEST_FAIL_HANDLER_SPAWNS=N`), which is otherwise only reachable by
+/// exhausting the machine's threads.
+#[cfg(feature = "test-support")]
+fn test_support_fail_next_handler_spawn() -> bool {
+    static REMAINING: std::sync::OnceLock<AtomicUsize> = std::sync::OnceLock::new();
+    let remaining = REMAINING.get_or_init(|| {
+        AtomicUsize::new(
+            std::env::var("AUTTER_TEST_FAIL_HANDLER_SPAWNS")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .unwrap_or(0),
+        )
+    });
+    remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+}
+
+/// A control connection that sends nothing for this long is closed.
+///
+/// Every connection holds a handler thread, so connections that are opened and
+/// then left idle would otherwise pin the service at its thread limit for
+/// good. Clients that send one request write it right after connecting. The
+/// one long-lived client is the shared connection a command keeps for
+/// telemetry and wrapper state (`telemetry_handle`): it can sit idle for as
+/// long as a git command runs, and it reconnects and resends when it finds
+/// its connection closed, so closing it costs one reconnect. The trace socket
+/// has no such timeout: git holds its connection for the life of a command
+/// (an open editor, a long fetch) and never reconnects.
+const CONTROL_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn control_connection_idle_timeout() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(millis) = std::env::var("AUTTER_TEST_CONTROL_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+    {
+        return Duration::from_millis(millis);
+    }
+    CONTROL_CONNECTION_IDLE_TIMEOUT
+}
+
+/// Most control handler threads alive at once. Far above real use (a client
+/// holds a connection for one short request) and far below the per-process
+/// thread limit (about 4,096 on macOS), so connections left open on the
+/// control socket cannot starve the rest of the service of threads. The same
+/// on Windows, where each one also holds a pipe instance.
+const CONTROL_MAX_HANDLER_THREADS: usize = 512;
+
+/// Each handler holds one file descriptor, so stay within half of what this
+/// process may open (macOS starts processes with 256). Windows has no such
+/// limit to read (`None`).
+fn control_handler_limit_for(open_file_limit: Option<u64>) -> usize {
+    match open_file_limit {
+        Some(limit) => usize::try_from(limit / 2)
+            .unwrap_or(usize::MAX)
+            .clamp(16, CONTROL_MAX_HANDLER_THREADS),
+        None => CONTROL_MAX_HANDLER_THREADS,
+    }
+}
+
+fn control_handler_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    if let Some(limit) = std::env::var("AUTTER_TEST_CONTROL_MAX_HANDLERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+    {
+        return limit;
+    }
+    #[cfg(windows)]
+    {
+        control_handler_limit_for(None)
+    }
+    #[cfg(not(windows))]
+    {
+        control_handler_limit_for(process_open_file_limit())
+    }
+}
+
+#[cfg(not(windows))]
+fn process_open_file_limit() -> Option<u64> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` is a valid, writable rlimit for getrlimit to fill.
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0;
+    // `rlim_t` is not 64 bits wide on every platform.
+    #[allow(clippy::unnecessary_cast)]
+    ok.then_some(limits.rlim_cur as u64)
+}
+
+/// Counts live control handler threads against a fixed limit.
+struct HandlerSlots {
+    live: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+/// One handler thread's place in [`HandlerSlots`], given back when dropped.
+struct HandlerSlot(Arc<AtomicUsize>);
+
+impl HandlerSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            live: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<HandlerSlot> {
+        self.live
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                (live < self.limit).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| HandlerSlot(self.live.clone()))
+    }
+}
+
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What to do with a control connection that was just accepted.
+enum ControlAdmission {
+    /// Serve it on a handler thread, which holds this slot.
+    Serve(HandlerSlot),
+    /// Every handler thread is busy: refuse it. `shut_down` once they have
+    /// all been busy for so long that they are stuck.
+    Refuse { shut_down: bool },
+}
+
+/// The control listener's limits, shared by every thread that accepts
+/// control connections: the one Unix listener, or all the Windows pipe
+/// workers, which together are one listener (one failure count, one handler
+/// limit), not one each.
+struct ControlConnectionGate {
+    slots: HandlerSlots,
+    /// Connections refused since the last one served.
+    at_capacity: Mutex<ListenerFailureStreak>,
+    /// Connections that could not be handed to a handler since the last one
+    /// served.
+    handoff_failures: Mutex<ListenerFailureStreak>,
+}
+
+impl ControlConnectionGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            slots: HandlerSlots::new(limit),
+            at_capacity: Mutex::new(ListenerFailureStreak::default()),
+            handoff_failures: Mutex::new(ListenerFailureStreak::default()),
+        }
+    }
+
+    fn admit(&self, now: std::time::Instant) -> ControlAdmission {
+        if let Some(slot) = self.slots.try_acquire() {
+            return ControlAdmission::Serve(slot);
+        }
+        let mut at_capacity = self
+            .at_capacity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let verdict = at_capacity.record_failure(AT_CAPACITY_LIMITS, now);
+        if verdict == ListenerFailureVerdict::ShutDown {
+            tracing::error!(
+                limit = self.slots.limit,
+                refused = at_capacity.consecutive,
+                failing_for_ms = at_capacity.failing_for(now).as_millis() as u64,
+                "control listener: every handler thread has been busy since the first \
+                 refusal; shutting the background service down so it is started again"
+            );
+            return ControlAdmission::Refuse { shut_down: true };
+        }
+        if at_capacity.consecutive == 1 || at_capacity.consecutive.is_multiple_of(1000) {
+            tracing::warn!(
+                limit = self.slots.limit,
+                refused = at_capacity.consecutive,
+                "control listener: every handler thread is busy; refusing connections"
+            );
+        }
+        ControlAdmission::Refuse { shut_down: false }
+    }
+
+    /// A connection was handed to its handler thread.
+    fn handoff_succeeded(&self) {
+        for streak in [&self.at_capacity, &self.handoff_failures] {
+            streak
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_success();
+        }
+    }
+
+    /// A connection could not be handed to a handler thread (or could not be
+    /// accepted). `true` when the listener must stop; otherwise this has
+    /// backed off and the caller keeps accepting.
+    fn handoff_failed(&self, what: &str, error: &dyn std::fmt::Display) -> bool {
+        let verdict = {
+            let mut streak = self
+                .handoff_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            record_handoff_failure("control", &mut streak, what, error)
+        };
+        finish_handoff_failure(verdict)
+    }
+}
+
+/// Tell a client its request was not taken, then close the connection.
+#[cfg(not(windows))]
+fn refuse_control_connection(mut stream: LocalSocketStream, reason: &str) {
+    let _ = stream.set_send_timeout(Some(Duration::from_millis(100)));
+    if let Ok(mut raw) = serde_json::to_vec(&ControlResponse::refused(reason)) {
+        raw.push(b'\n');
+        let _ = stream.write_all(&raw);
+        let _ = stream.flush();
+    }
+}
+
 fn control_listener_loop_actor(
     control_socket_path: PathBuf,
     coordinator: Arc<ActorDaemonCoordinator>,
@@ -8764,28 +9943,66 @@ fn control_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding control socket: {}", e)))?;
         set_socket_owner_only(&control_socket_path)?;
+        let gate = ControlConnectionGate::new(control_handler_limit());
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
+                if let Ok(stream) = stream {
+                    refuse_control_connection(stream, "the background service is shutting down");
+                }
                 break;
             }
-            let Ok(stream) = stream else {
-                continue;
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) if accept_error_is_transient(&error) => continue,
+                Err(error) => {
+                    // Out of file descriptors, most likely. Retrying at once
+                    // would spin: the connection stays queued and `accept`
+                    // fails again until something frees a descriptor.
+                    if gate
+                        .handoff_failed("failed to accept a connection, which stays queued", &error)
+                    {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let slot = match gate.admit(std::time::Instant::now()) {
+                ControlAdmission::Serve(slot) => slot,
+                ControlAdmission::Refuse { shut_down } => {
+                    refuse_control_connection(
+                        stream,
+                        "the background service is at its connection limit",
+                    );
+                    if shut_down {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
+                }
             };
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
-            if std::thread::Builder::new()
-                .spawn(move || {
-                    if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
-                        tracing::debug!(%e, "control connection error");
+            match spawn_connection_handler(move || {
+                let _slot = slot;
+                if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
+                    tracing::debug!(%e, "control connection error");
+                }
+            }) {
+                Ok(()) => gate.handoff_succeeded(),
+                Err(error) => {
+                    // Usually a transient resource limit on a busy machine, so
+                    // one failure must not take the whole service down. The
+                    // connection is gone though, and nothing resends it, so a
+                    // service that keeps failing has to stop and be restarted.
+                    if gate.handoff_failed(
+                        "failed to spawn handler thread, so its connection was dropped",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
                     }
-                })
-                .is_err()
-            {
-                // Usually a transient resource limit on a busy machine. The
-                // connection is dropped and the client retries; stopping the
-                // listener would take the whole daemon down instead.
-                tracing::error!("control listener: failed to spawn handler thread");
-                std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
         Ok(())
@@ -8795,14 +10012,21 @@ fn control_listener_loop_actor(
     {
         let mut workers = Vec::new();
         let worker_count = windows_control_pipe_worker_count();
+        let gate = Arc::new(ControlConnectionGate::new(control_handler_limit()));
         let first_connecting = windows_pipe_connecting_server(&control_socket_path, true)?;
         {
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
+            let gate = gate.clone();
             workers.push(std::thread::spawn(move || {
-                let result =
-                    windows_control_pipe_worker_loop(path, first_connecting, coord.clone(), handle);
+                let result = windows_control_pipe_worker_loop(
+                    path,
+                    first_connecting,
+                    coord.clone(),
+                    handle,
+                    gate,
+                );
                 if let Err(error) = &result {
                     tracing::error!(%error, "control worker error");
                     coord.request_shutdown();
@@ -8814,10 +10038,11 @@ fn control_listener_loop_actor(
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
+            let gate = gate.clone();
             let connecting = windows_pipe_connecting_server(&path, false)?;
             workers.push(std::thread::spawn(move || {
                 let result =
-                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle);
+                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle, gate);
                 if let Err(error) = &result {
                     tracing::error!(%error, "control worker error");
                     coord.request_shutdown();
@@ -8887,6 +10112,7 @@ fn windows_control_pipe_worker_loop(
     mut connecting: WindowsConnectingServer,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
+    gate: Arc<ControlConnectionGate>,
 ) -> Result<(), AutterError> {
     loop {
         let server = connecting.wait().map_err(|e| {
@@ -8904,19 +10130,46 @@ fn windows_control_pipe_worker_loop(
 
         connecting = windows_pipe_connecting_server(&control_socket_path, false)?;
 
+        let slot = match gate.admit(std::time::Instant::now()) {
+            ControlAdmission::Serve(slot) => slot,
+            ControlAdmission::Refuse { shut_down } => {
+                // Closed without a refusal message: closing a pipe instance
+                // waits (FlushFileBuffers) until the client has read what
+                // was written to it, and a client that never reads would
+                // hold this worker. The client sees the connection closed
+                // unanswered, which `autter` reports the same way.
+                drop(server);
+                if shut_down {
+                    coordinator.request_shutdown_unhealthy();
+                    break;
+                }
+                continue;
+            }
+        };
         let coord = coordinator.clone();
         let handle = runtime_handle.clone();
-        std::thread::Builder::new()
-            .spawn(move || {
-                handle_windows_control_pipe_connection(server, coord, handle);
-            })
-            .map_err(|e| {
-                AutterError::Generic(format!(
-                    "failed spawning control pipe handler for {}: {}",
-                    control_socket_path.display(),
-                    e
-                ))
-            })?;
+        match spawn_connection_handler(move || {
+            let _slot = slot;
+            handle_windows_control_pipe_connection(server, coord, handle);
+        }) {
+            Ok(()) => gate.handoff_succeeded(),
+            Err(e) => {
+                // Same policy as the Unix listener, counted across all the
+                // workers: drop this connection and keep accepting, and stop
+                // only when it keeps failing.
+                if gate.handoff_failed(
+                    "failed to spawn handler thread, so its connection was dropped",
+                    &e,
+                ) {
+                    coordinator.request_shutdown_unhealthy();
+                    return Err(AutterError::Generic(format!(
+                        "failed spawning control pipe handler for {}: {}",
+                        control_socket_path.display(),
+                        e
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -8928,6 +10181,9 @@ fn handle_windows_control_pipe_connection(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) {
+    let idle_timeout = control_connection_idle_timeout();
+    server.set_read_timeout(Some(idle_timeout));
+    server.set_write_timeout(Some(idle_timeout));
     let mut reader = BufReader::new(&mut server);
     if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
     {
@@ -8941,6 +10197,16 @@ fn handle_control_connection_actor(
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), AutterError> {
+    // Waiting for a request (or for a client to take its response) ends after
+    // the idle timeout, which ends this thread. Handling a request is not
+    // timed: that happens between the read and the write.
+    //
+    // Setting a timeout fails (EINVAL on macOS) when the client has already
+    // closed its end, as a sender that does not wait for a response does. Its
+    // request is still there to read, so that must not end the connection.
+    let idle_timeout = control_connection_idle_timeout();
+    let _ = stream.set_recv_timeout(Some(idle_timeout));
+    let _ = stream.set_send_timeout(Some(idle_timeout));
     let mut reader = BufReader::new(stream);
     handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
 }
@@ -8957,21 +10223,45 @@ fn handle_control_connection_actor_reader<R: Read + Write>(
         }
         let parsed = serde_json::from_str::<ControlRequest>(trimmed);
         let mut shutdown_after_response = false;
+        let mut receipt_requested = false;
         let response = match parsed {
             Ok(req) => {
                 shutdown_after_response = matches!(req, ControlRequest::Shutdown);
+                // The checkpoint is read in full and this thread hands it to
+                // its repository's queue next, so say so before processing
+                // it, which can wait behind other work for that repository.
+                // The sender waits for this, not for the processing. If the
+                // sender has gone, the checkpoint is still processed.
+                if matches!(req, ControlRequest::CheckpointRun { receipt: true, .. }) {
+                    receipt_requested = true;
+                    let _ = write_control_response(reader.get_mut(), &ControlResponse::receipt());
+                }
                 runtime_handle.block_on(async { coordinator.handle_control_request(req).await })
             }
             Err(e) => ControlResponse::err(format!("invalid control request: {}", e)),
         };
-        let raw = serde_json::to_string(&response)?;
-        reader.get_mut().write_all(raw.as_bytes())?;
-        reader.get_mut().write_all(b"\n")?;
-        reader.get_mut().flush()?;
+        let written = write_control_response(reader.get_mut(), &response);
         if shutdown_after_response {
             coordinator.request_stop();
         }
+        match written {
+            Ok(()) => {}
+            // A hook closes its end once it has the receipt.
+            Err(_) if receipt_requested => return Ok(()),
+            Err(error) => return Err(error),
+        }
     }
+    Ok(())
+}
+
+fn write_control_response<W: Write>(
+    writer: &mut W,
+    response: &ControlResponse,
+) -> Result<(), AutterError> {
+    let mut raw = serde_json::to_vec(response)?;
+    raw.push(b'\n');
+    writer.write_all(&raw)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -8987,27 +10277,49 @@ fn trace_listener_loop_actor(
             .create_sync()
             .map_err(|e| AutterError::Generic(format!("failed binding trace socket: {}", e)))?;
         set_socket_owner_only(&trace_socket_path)?;
+        let mut handoff_failures = ListenerFailureStreak::default();
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
                 break;
             }
-            let Ok(stream) = stream else {
-                continue;
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) if accept_error_is_transient(&error) => continue,
+                Err(error) => {
+                    if listener_handoff_failed(
+                        "trace",
+                        &mut handoff_failures,
+                        "failed to accept a connection, which stays queued",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
+                    }
+                    continue;
+                }
             };
             let coord = coordinator.clone();
-            if std::thread::Builder::new()
-                .spawn(move || {
-                    if let Err(e) = handle_trace_connection_actor(stream, coord) {
-                        tracing::debug!(%e, "trace connection error");
+            match spawn_connection_handler(move || {
+                if let Err(e) = handle_trace_connection_actor(stream, coord) {
+                    tracing::debug!(%e, "trace connection error");
+                }
+            }) {
+                Ok(()) => handoff_failures.record_success(),
+                Err(error) => {
+                    // Usually a transient resource limit on a busy machine, so
+                    // one failure must not take the whole service down. Git
+                    // never resends the dropped command's events though, so a
+                    // service that keeps failing has to stop and be restarted.
+                    if listener_handoff_failed(
+                        "trace",
+                        &mut handoff_failures,
+                        "failed to spawn handler thread, so its connection was dropped",
+                        &error,
+                    ) {
+                        coordinator.request_shutdown_unhealthy();
+                        break;
                     }
-                })
-                .is_err()
-            {
-                // Usually a transient resource limit on a busy machine. The
-                // connection is dropped and the client retries; stopping the
-                // listener would take the whole daemon down instead.
-                tracing::error!("trace listener: failed to spawn handler thread");
-                std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
         Ok(())
@@ -9122,11 +10434,20 @@ fn handle_trace_connection_actor_reader<R: Read>(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(sid) = parsed.get("sid").and_then(Value::as_str) {
-            let root_sid = trace_root_sid(sid).to_string();
-            if observed_roots.insert(root_sid.clone()) {
-                let _ = coordinator.trace_root_connection_opened(&root_sid);
-            }
+        // Only the root process's own connection says when a command is over.
+        // Its child processes (e.g. the `git maintenance run --auto` that every
+        // `git commit` spawns, or the picks of a rebase) write on connections
+        // of their own, and the handler threads race: a child's connection can
+        // be read and closed before the root's first line is read at all.
+        // Counting it would make that close look like the root process went
+        // away and synthesize an exit for a command that is still being read,
+        // finalizing it without its real post-command state (no commit, so no
+        // authorship note).
+        if let Some(sid) = parsed.get("sid").and_then(Value::as_str)
+            && trace_root_sid(sid) == sid
+            && observed_roots.insert(sid.to_string())
+        {
+            let _ = coordinator.trace_root_connection_opened(sid);
         }
         // Only enqueue payloads for mutating commands.  Read-only invocations
         // (status, diff, stash list, worktree list, …) are handled inline by
@@ -9306,9 +10627,14 @@ enum SocketHealthVerdict {
 /// Decide what one round of socket probes means. A missing socket file is
 /// final at once; a failed connect to a file that exists only counts once it
 /// has failed [`DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART`] times in a row.
+///
+/// A daemon that is out of file descriptors is final at once too: that is not
+/// a busy listener, it cannot accept connections or open files at all, and
+/// only a restart gives the descriptors back.
 fn socket_health_verdict(
     probes_ok: bool,
     socket_file_missing: bool,
+    descriptors_exhausted: bool,
     consecutive_failures: &mut u32,
 ) -> SocketHealthVerdict {
     if probes_ok {
@@ -9316,11 +10642,60 @@ fn socket_health_verdict(
         return SocketHealthVerdict::Healthy;
     }
     *consecutive_failures = consecutive_failures.saturating_add(1);
-    if socket_file_missing || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
+    if socket_file_missing
+        || descriptors_exhausted
+        || *consecutive_failures >= DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART
+    {
         SocketHealthVerdict::Unhealthy
     } else {
         SocketHealthVerdict::Retry
     }
+}
+
+/// Whether an I/O error means the process (or the machine) has no file
+/// descriptors left.
+#[cfg(unix)]
+fn io_error_is_descriptor_exhaustion(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
+/// Whether this process can no longer open a file descriptor. Asked only
+/// after a socket probe failed, to tell "the listener is busy" from "this
+/// process cannot open anything".
+fn process_descriptors_exhausted() -> bool {
+    #[cfg(unix)]
+    {
+        match File::open("/dev/null") {
+            Ok(_) => false,
+            Err(error) => io_error_is_descriptor_exhaustion(&error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Check that the control socket is served: connect, send a `ping` and read
+/// the reply. A connect alone succeeds while the listener accepts connections
+/// and then drops or refuses every one of them.
+fn control_socket_serves_requests(control_socket_path: &Path) -> Result<(), AutterError> {
+    let response = send_control_request_with_timeouts(
+        control_socket_path,
+        &ControlRequest::Ping,
+        DAEMON_SOCKET_PROBE_TIMEOUT,
+        DAEMON_CONTROL_RESPONSE_TIMEOUT,
+    )?;
+    if response.is_refusal() {
+        return Err(AutterError::Generic(format!(
+            "control socket refused the request: {}",
+            response.error.unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 fn socket_file_missing(path: &Path) -> bool {
@@ -9337,11 +10712,13 @@ fn socket_file_missing(path: &Path) -> bool {
 }
 
 /// Background loop that verifies the daemon's sockets are reachable by
-/// actually connecting to them.  A successful connect proves the socket file
-/// exists, points to this daemon's listener, and that the listener thread is
-/// alive and calling accept().  If either probe fails (deleted file, stale
-/// socket, hung listener), the daemon spawns a detached restart process and
-/// shuts down.
+/// actually using them.  A successful connect proves the socket file exists,
+/// points to this daemon's listener, and that the listener thread is alive and
+/// calling accept().  On the control socket the probe also sends a request and
+/// waits for the reply, which proves connections are served and not just
+/// accepted.  If either probe fails (deleted file, stale socket, hung
+/// listener, no file descriptors left), the daemon spawns a detached restart
+/// process and shuts down.
 ///
 /// To prevent restart loops when the underlying issue is systemic (e.g.
 /// filesystem permissions, broken paths), the daemon only self-restarts if
@@ -9381,14 +10758,21 @@ fn daemon_socket_health_check_loop(
             return;
         }
 
-        let control_ok =
-            local_socket_connects_with_timeout(&control_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
+        let control_ok = control_socket_serves_requests(&control_socket_path);
         let trace_ok =
             local_socket_connects_with_timeout(&trace_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
 
+        let probes_ok = control_ok.is_ok() && trace_ok.is_ok();
+        let descriptors_exhausted = !probes_ok && process_descriptors_exhausted();
+        if descriptors_exhausted {
+            tracing::error!(
+                "socket health check: the background service has no file descriptors left"
+            );
+        }
         let verdict = socket_health_verdict(
-            control_ok.is_ok() && trace_ok.is_ok(),
+            probes_ok,
             socket_file_missing(&control_socket_path) || socket_file_missing(&trace_socket_path),
+            descriptors_exhausted,
             &mut consecutive_probe_failures,
         );
         if verdict == SocketHealthVerdict::Retry {
@@ -9698,9 +11082,14 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
             tracing::debug!("skipping join for {} thread (deadline exceeded)", name);
             continue;
         }
-        let handle = std::thread::spawn(move || {
+        // Not `thread::spawn`: it panics when no thread can be started, and a
+        // service shutting down because it ran out of threads must still exit.
+        let Ok(handle) = std::thread::Builder::new().spawn(move || {
             let _ = thread.join();
-        });
+        }) else {
+            tracing::debug!("could not start a thread to join the {} thread", name);
+            continue;
+        };
         let poll_until =
             std::time::Instant::now() + remaining.min(std::time::Duration::from_millis(500));
         loop {
@@ -9988,9 +11377,67 @@ pub fn send_control_request(
     )
 }
 
+/// What a sender that does not wait for its response saw on the connection
+/// right after writing the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnacknowledgedSend {
+    /// A response arrived, or the service is still working on the request.
+    Taken,
+    /// The service said it would not take the request.
+    Refused(String),
+    /// The service answered that it could not take the request in (for a
+    /// checkpoint: it was never queued, so it will not be recorded).
+    Rejected(String),
+    /// The connection was closed with no response: the request went nowhere.
+    Dropped,
+}
+
+/// Classify the first read after an unacknowledged send. `read` is the result
+/// of reading one line into `line` under a short timeout.
+fn classify_unacknowledged_send(read: &std::io::Result<usize>, line: &str) -> UnacknowledgedSend {
+    match read {
+        Ok(0) => UnacknowledgedSend::Dropped,
+        Ok(_) => match serde_json::from_str::<ControlResponse>(line.trim()) {
+            Ok(response) if response.is_refusal() => UnacknowledgedSend::Refused(
+                response
+                    .error
+                    .unwrap_or_else(|| "request refused".to_string()),
+            ),
+            Ok(response) if !response.ok => UnacknowledgedSend::Rejected(
+                response
+                    .error
+                    .unwrap_or_else(|| "request failed".to_string()),
+            ),
+            _ => UnacknowledgedSend::Taken,
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            UnacknowledgedSend::Taken
+        }
+        Err(_) => UnacknowledgedSend::Dropped,
+    }
+}
+
+/// Send a request without waiting for it to be handled.
+///
+/// After writing the request the sender watches the connection for `watch`. A
+/// service that cannot take the request closes the connection (with a refusal
+/// when it can say why) as soon as it accepts it; a service that is handling
+/// the request stays silent until it is done. So an error here means the
+/// request went nowhere, and `watch` is also the most a request that takes
+/// longer costs the sender.
+///
+/// The protocol has no acknowledgement: silence past `watch` is read as
+/// "taken". A connection the service closes later than that (it was still
+/// queued behind others) is not noticed.
 pub fn send_control_request_fire_and_forget(
     socket_path: &Path,
     request: &ControlRequest,
+    watch: Duration,
 ) -> Result<(), AutterError> {
     let mut stream =
         open_local_socket_stream_with_timeout(socket_path, DAEMON_CONTROL_CONNECT_TIMEOUT)?;
@@ -9999,7 +11446,240 @@ pub fn send_control_request_fire_and_forget(
     let mut body = serde_json::to_vec(request)?;
     body.push(b'\n');
     write_all_daemon_client_stream(&mut stream, socket_path, &body)?;
-    Ok(())
+
+    // Fails when the service has already closed the connection (EINVAL on
+    // macOS); the read below then returns at once and says what happened.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, watch);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line);
+    match classify_unacknowledged_send(&read, &line) {
+        UnacknowledgedSend::Taken => Ok(()),
+        UnacknowledgedSend::Refused(reason) => Err(AutterError::Generic(format!(
+            "the background service refused the request: {}",
+            reason
+        ))),
+        UnacknowledgedSend::Rejected(reason) => Err(AutterError::Generic(format!(
+            "the background service could not take the request: {}",
+            reason
+        ))),
+        UnacknowledgedSend::Dropped => Err(AutterError::Generic(
+            "the background service closed the connection without handling the request".to_string(),
+        )),
+    }
+}
+
+/// How long `autter checkpoint` waits on the background service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointReceiptWait {
+    /// For the receipt; and, when none came, for the service's answer to a
+    /// `ping` that says whether it sends receipts at all.
+    pub receipt: Duration,
+    /// After the receipt, for the service to say how processing went. Zero:
+    /// return at the receipt.
+    pub outcome: Duration,
+}
+
+/// A checkpoint that may not have been recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointSendError {
+    /// The service did not take the checkpoint (not running, refused it,
+    /// closed the connection, or answered that it could not record it). It
+    /// is not recorded.
+    NotTaken(String),
+    /// The service took the connection but did not confirm the checkpoint in
+    /// time. It may still be recorded.
+    Unconfirmed(String),
+}
+
+impl std::fmt::Display for CheckpointSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointSendError::NotTaken(reason) | CheckpointSendError::Unconfirmed(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+/// What one read on a checkpoint's connection showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckpointReply {
+    /// The service has the checkpoint and will process it (protocol 1).
+    Receipt,
+    /// The service processed the checkpoint and answered `ok`: what an older
+    /// service sends instead of a receipt, once it is done.
+    Handled,
+    /// The service would not take the checkpoint.
+    Refused(String),
+    /// The service answered that it could not take or record the checkpoint.
+    Rejected(String),
+    /// The connection was closed with no answer.
+    Dropped,
+    /// Nothing arrived before the read timed out.
+    Silent,
+}
+
+/// Classify one read of a line (`read`, into `line`) on a checkpoint's
+/// connection.
+fn classify_checkpoint_reply(read: &std::io::Result<usize>, line: &str) -> CheckpointReply {
+    match read {
+        Ok(0) => CheckpointReply::Dropped,
+        Ok(_) => match serde_json::from_str::<ControlResponse>(line.trim()) {
+            Ok(response) if response.is_refusal() => CheckpointReply::Refused(
+                response
+                    .error
+                    .unwrap_or_else(|| "request refused".to_string()),
+            ),
+            Ok(response) if !response.ok => CheckpointReply::Rejected(
+                response
+                    .error
+                    .unwrap_or_else(|| "request failed".to_string()),
+            ),
+            Ok(response) if response.is_receipt() => CheckpointReply::Receipt,
+            Ok(_) => CheckpointReply::Handled,
+            Err(_) => CheckpointReply::Rejected(format!(
+                "unreadable answer: {}",
+                line.trim().chars().take(120).collect::<String>()
+            )),
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            CheckpointReply::Silent
+        }
+        Err(_) => CheckpointReply::Dropped,
+    }
+}
+
+/// No receipt came within `waited`. `ping_protocol` is the protocol version
+/// the service reported when asked right after (`None`: it did not answer,
+/// or refused).
+///
+/// A service older than receipts says nothing until it has processed a
+/// checkpoint, so its silence is the checkpoint being processed, as it always
+/// was: the send counts as taken, as the drop watch it replaces did. A
+/// service that sends receipts and sent none, or a service that answers
+/// nothing, cannot be assumed to have it.
+fn unconfirmed_checkpoint_verdict(
+    ping_protocol: Option<u32>,
+    waited: Duration,
+) -> Result<(), CheckpointSendError> {
+    match ping_protocol {
+        Some(version) if version < CHECKPOINT_RECEIPT_PROTOCOL => Ok(()),
+        Some(_) => Err(CheckpointSendError::Unconfirmed(format!(
+            "the background service did not confirm the checkpoint within {} ms, although it \
+             answers other requests",
+            waited.as_millis()
+        ))),
+        None => Err(CheckpointSendError::Unconfirmed(format!(
+            "the background service did not confirm the checkpoint within {} ms and did not \
+             answer a ping either",
+            waited.as_millis()
+        ))),
+    }
+}
+
+/// After a `ping`, how long to look once more for a receipt that came in
+/// while the `ping` was out.
+const LATE_RECEIPT_GRACE: Duration = Duration::from_millis(5);
+
+/// Send a checkpoint and wait for the service to confirm it has it.
+///
+/// `request` should be a `checkpoint.run` with `receipt: true`. The service
+/// (protocol 1) acknowledges it as soon as it has read it, before processing
+/// it, which takes about a millisecond on a healthy service. Without a
+/// receipt within `wait.receipt` the sender asks the service for its protocol
+/// version (`ping`): a service that predates receipts is left to process the
+/// checkpoint, as before; anything else is [`CheckpointSendError::Unconfirmed`].
+/// A refusal, a closed connection or an error answer is
+/// [`CheckpointSendError::NotTaken`].
+pub fn send_checkpoint_with_receipt(
+    socket_path: &Path,
+    request: &ControlRequest,
+    wait: CheckpointReceiptWait,
+) -> Result<(), CheckpointSendError> {
+    let not_taken = |error: AutterError| CheckpointSendError::NotTaken(error.to_string());
+    let mut stream =
+        open_local_socket_stream_with_timeout(socket_path, DAEMON_CONTROL_CONNECT_TIMEOUT)
+            .map_err(not_taken)?;
+    // Setting a timeout fails (EINVAL on macOS) when the service has already
+    // closed the connection; the write or the read below then says so.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, Duration::from_millis(500));
+    let mut body =
+        serde_json::to_vec(request).map_err(|error| not_taken(AutterError::from(error)))?;
+    body.push(b'\n');
+    if let Err(error) = write_all_daemon_client_stream(&mut stream, socket_path, &body) {
+        // A service that refuses a connection writes why and closes it, which
+        // can happen before the request is written. Report its reason.
+        let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, LATE_RECEIPT_GRACE);
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if let CheckpointReply::Refused(reason) =
+            classify_checkpoint_reply(&reader.read_line(&mut line), &line)
+        {
+            return Err(CheckpointSendError::NotTaken(format!(
+                "the background service refused the request: {}",
+                reason
+            )));
+        }
+        return Err(not_taken(error));
+    }
+
+    // Fails when the service has already closed the connection (EINVAL on
+    // macOS); the read below then returns at once and says what happened.
+    let _ = set_daemon_client_stream_timeouts(&mut stream, socket_path, wait.receipt);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut reply = classify_checkpoint_reply(&reader.read_line(&mut line), &line);
+    if reply == CheckpointReply::Silent {
+        let ping_protocol = send_control_request_with_timeouts(
+            socket_path,
+            &ControlRequest::Ping,
+            wait.receipt,
+            wait.receipt,
+        )
+        .ok()
+        .and_then(|response| response.ping_protocol());
+        let _ =
+            set_daemon_client_stream_timeouts(reader.get_mut(), socket_path, LATE_RECEIPT_GRACE);
+        reply = classify_checkpoint_reply(&reader.read_line(&mut line), &line);
+        if reply == CheckpointReply::Silent {
+            return unconfirmed_checkpoint_verdict(ping_protocol, wait.receipt);
+        }
+    }
+    match reply {
+        CheckpointReply::Receipt => {
+            if wait.outcome.is_zero() {
+                return Ok(());
+            }
+            let _ = set_daemon_client_stream_timeouts(reader.get_mut(), socket_path, wait.outcome);
+            line.clear();
+            match classify_checkpoint_reply(&reader.read_line(&mut line), &line) {
+                CheckpointReply::Rejected(reason) => Err(CheckpointSendError::NotTaken(format!(
+                    "the background service could not record the checkpoint: {}",
+                    reason
+                ))),
+                // Recorded, or still being processed: either way it is queued.
+                _ => Ok(()),
+            }
+        }
+        CheckpointReply::Handled | CheckpointReply::Silent => Ok(()),
+        CheckpointReply::Refused(reason) => Err(CheckpointSendError::NotTaken(format!(
+            "the background service refused the request: {}",
+            reason
+        ))),
+        CheckpointReply::Rejected(reason) => Err(CheckpointSendError::NotTaken(format!(
+            "the background service could not take the request: {}",
+            reason
+        ))),
+        CheckpointReply::Dropped => Err(CheckpointSendError::NotTaken(
+            "the background service closed the connection without handling the request".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -10015,27 +11695,27 @@ mod tests {
     fn socket_health_tolerates_brief_probe_failures_on_existing_sockets() {
         let mut failures = 0;
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Retry
         );
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Retry
         );
         // A good probe resets the count.
         assert_eq!(
-            socket_health_verdict(true, false, &mut failures),
+            socket_health_verdict(true, false, false, &mut failures),
             SocketHealthVerdict::Healthy
         );
         assert_eq!(failures, 0);
         for _ in 1..DAEMON_SOCKET_PROBE_FAILURES_BEFORE_RESTART {
             assert_eq!(
-                socket_health_verdict(false, false, &mut failures),
+                socket_health_verdict(false, false, false, &mut failures),
                 SocketHealthVerdict::Retry
             );
         }
         assert_eq!(
-            socket_health_verdict(false, false, &mut failures),
+            socket_health_verdict(false, false, false, &mut failures),
             SocketHealthVerdict::Unhealthy
         );
     }
@@ -10044,9 +11724,833 @@ mod tests {
     fn socket_health_fails_at_once_when_a_socket_file_is_gone() {
         let mut failures = 0;
         assert_eq!(
-            socket_health_verdict(false, true, &mut failures),
+            socket_health_verdict(false, true, false, &mut failures),
             SocketHealthVerdict::Unhealthy
         );
+    }
+
+    #[test]
+    fn socket_health_fails_at_once_when_file_descriptors_are_exhausted() {
+        // Both socket files are on disk and this is the first failed probe: a
+        // busy listener would get two more checks, a daemon that cannot open
+        // a descriptor does not.
+        let mut failures = 0;
+        assert_eq!(
+            socket_health_verdict(false, false, true, &mut failures),
+            SocketHealthVerdict::Unhealthy
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_exhaustion_is_recognised_from_the_os_error() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert!(io_error_is_descriptor_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [libc::ECONNREFUSED, libc::ENOENT, libc::EAGAIN] {
+            assert!(!io_error_is_descriptor_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!io_error_is_descriptor_exhaustion(&std::io::Error::other(
+            "no os error"
+        )));
+        // This test process can open files, so the live check says so.
+        assert!(!process_descriptors_exhausted());
+    }
+
+    #[test]
+    fn listener_keeps_serving_through_a_handful_of_failures() {
+        // What 4540ac5 was for: a brief overload must not stop the service.
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        for i in 0..10u32 {
+            let now = start + LISTENER_FAILURE_BACKOFF * i;
+            assert_eq!(
+                streak.record_failure(HANDOFF_FAILURE_LIMITS, now),
+                ListenerFailureVerdict::KeepServing,
+                "failure {} of a short burst must not stop the listener",
+                i + 1
+            );
+        }
+        // A served connection ends the run: the next burst starts from zero.
+        streak.record_success();
+        assert_eq!(streak.consecutive, 0);
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, start + Duration::from_secs(3600)),
+            ListenerFailureVerdict::KeepServing
+        );
+    }
+
+    #[test]
+    fn listener_stops_after_too_many_failures_in_a_row() {
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        let max = HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        for i in 1..max {
+            assert_eq!(
+                streak.record_failure(HANDOFF_FAILURE_LIMITS, start),
+                ListenerFailureVerdict::KeepServing,
+                "failure {i}"
+            );
+        }
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, start),
+            ListenerFailureVerdict::ShutDown
+        );
+    }
+
+    #[test]
+    fn listener_stops_when_nothing_was_served_for_too_long() {
+        // A quiet machine: two failures, far fewer than the count limit, but
+        // nothing was served in the seconds between them.
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, start),
+            ListenerFailureVerdict::KeepServing
+        );
+        let just_inside = start + HANDOFF_FAILURE_LIMITS.max_duration - Duration::from_millis(1);
+        assert_eq!(
+            streak.record_failure(HANDOFF_FAILURE_LIMITS, just_inside),
+            ListenerFailureVerdict::KeepServing
+        );
+        assert_eq!(
+            streak.record_failure(
+                HANDOFF_FAILURE_LIMITS,
+                start + HANDOFF_FAILURE_LIMITS.max_duration
+            ),
+            ListenerFailureVerdict::ShutDown
+        );
+    }
+
+    #[test]
+    fn listener_failure_limits_are_seconds_not_minutes() {
+        assert!(HANDOFF_FAILURE_LIMITS.max_duration <= Duration::from_secs(10));
+        // The count limit, at one backoff per failure, is reached well inside
+        // the time limit, so it only shortens the wait under steady load.
+        let count_floor =
+            LISTENER_FAILURE_BACKOFF * HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        assert!(count_floor < HANDOFF_FAILURE_LIMITS.max_duration);
+        assert_eq!(
+            listener_failure_verdict(HANDOFF_FAILURE_LIMITS, 1, Duration::ZERO),
+            ListenerFailureVerdict::KeepServing
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_flood_of_refusals_at_capacity_does_not_stop_the_listener_until_time_is_up() {
+        let start = std::time::Instant::now();
+        let mut streak = ListenerFailureStreak::default();
+        // Thousands of idle connections arriving at once are refused in a
+        // moment; they clear when the idle timeout closes the ones held.
+        for _ in 0..5000 {
+            assert_eq!(
+                streak.record_failure(AT_CAPACITY_LIMITS, start + Duration::from_millis(200)),
+                ListenerFailureVerdict::KeepServing
+            );
+        }
+        assert_eq!(
+            streak.record_failure(
+                AT_CAPACITY_LIMITS,
+                start + Duration::from_millis(200) + AT_CAPACITY_LIMITS.max_duration
+            ),
+            ListenerFailureVerdict::ShutDown
+        );
+        // Idle connections must have been closed before the service gives up
+        // on being at capacity.
+        assert!(AT_CAPACITY_LIMITS.max_duration > CONTROL_CONNECTION_IDLE_TIMEOUT);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn only_accept_errors_that_mean_the_listener_cannot_serve_are_counted() {
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(accept_error_is_transient(&std::io::Error::from(kind)));
+        }
+        // Out of file descriptors: every accept fails until some are freed.
+        assert!(!accept_error_is_transient(
+            &std::io::Error::from_raw_os_error(libc::EMFILE)
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_handler_limit_stays_below_the_descriptor_limit() {
+        assert_eq!(control_handler_limit_for(None), CONTROL_MAX_HANDLER_THREADS);
+        assert_eq!(
+            control_handler_limit_for(Some(u64::MAX)),
+            CONTROL_MAX_HANDLER_THREADS
+        );
+        assert_eq!(control_handler_limit_for(Some(256)), 128);
+        assert_eq!(control_handler_limit_for(Some(8)), 16);
+        assert!(control_handler_limit() >= 16);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn handler_slots_refuse_past_the_limit_and_free_on_drop() {
+        let slots = HandlerSlots::new(2);
+        let first = slots.try_acquire().expect("first slot");
+        let second = slots.try_acquire().expect("second slot");
+        assert!(slots.try_acquire().is_none(), "limit reached");
+        drop(first);
+        let third = slots.try_acquire().expect("slot freed by drop");
+        assert!(slots.try_acquire().is_none());
+        drop(second);
+        drop(third);
+        assert_eq!(slots.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unacknowledged_send_classification() {
+        // Closed with nothing sent back: the request went nowhere.
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(0), ""),
+            UnacknowledgedSend::Dropped
+        );
+        assert_eq!(
+            classify_unacknowledged_send(
+                &Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                ""
+            ),
+            UnacknowledgedSend::Dropped
+        );
+        // Still silent when the watch ends: the service is working on it.
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            assert_eq!(
+                classify_unacknowledged_send(&Err(std::io::Error::from(kind)), ""),
+                UnacknowledgedSend::Taken
+            );
+        }
+        let refusal = serde_json::to_string(&ControlResponse::refused("at its limit")).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(refusal.len()), &refusal),
+            UnacknowledgedSend::Refused("at its limit".to_string())
+        );
+        // An answer that the request could not be taken in is not a send.
+        let rejected = serde_json::to_string(&ControlResponse::err("no repository")).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(rejected.len()), &rejected),
+            UnacknowledgedSend::Rejected("no repository".to_string())
+        );
+        let handled = serde_json::to_string(&ControlResponse::ok(None, None)).unwrap();
+        assert_eq!(
+            classify_unacknowledged_send(&Ok(handled.len()), &handled),
+            UnacknowledgedSend::Taken
+        );
+    }
+
+    /// Long enough that a test only passes when the sender saw the connection
+    /// close, short enough to show it does not wait for a response.
+    #[cfg(unix)]
+    const SEND_WATCH: Duration = Duration::from_millis(500);
+
+    /// A stand-in control socket whose listener treats each connection the
+    /// way `serve` says, for testing what a client makes of it.
+    #[cfg(unix)]
+    fn fake_control_socket(
+        serve: impl Fn(LocalSocketStream) + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sock");
+        let listener = ListenerOptions::new()
+            .name(local_socket_name(&path).unwrap())
+            .create_sync()
+            .unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                serve(stream);
+            }
+        });
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_request_that_was_read_and_never_answered() {
+        // The request was written in full, then the connection was closed
+        // with no response: this used to be reported as sent.
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+        });
+        let error = send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect_err("a dropped connection must not look like a sent request");
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection without handling the request"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_connection_dropped_unread() {
+        // What a listener that cannot start a handler thread does: close the
+        // connection without reading it. Whether the sender's write still
+        // lands first is a race; either way the send must fail.
+        for delay_ms in [0, 30] {
+            let (_dir, path) = fake_control_socket(move |stream| {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                drop(stream);
+            });
+            for _ in 0..5 {
+                assert!(
+                    send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+                        .is_err(),
+                    "a connection dropped after {delay_ms} ms must not look like a sent request"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_reports_a_refusal_with_its_reason() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            refuse_control_connection(stream, "the background service is at its connection limit")
+        });
+        let error = send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect_err("a refused request must not look like a sent request");
+        assert!(
+            error
+                .to_string()
+                .contains("refused the request: the background service is at its connection limit"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_does_not_wait_for_a_request_that_is_being_handled() {
+        // The service read the request and is busy with it for a long time.
+        let (_dir, path) = fake_control_socket(|stream| {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                std::thread::sleep(Duration::from_secs(5));
+            });
+        });
+        let started = std::time::Instant::now();
+        send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect("a request the service is handling counts as sent");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sender waited {:?} for a response it does not need",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fire_and_forget_accepts_a_handled_request() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut raw = serde_json::to_vec(&ControlResponse::ok(None, None)).unwrap();
+            raw.push(b'\n');
+            let _ = reader.get_mut().write_all(&raw);
+        });
+        send_control_request_fire_and_forget(&path, &ControlRequest::Ping, SEND_WATCH)
+            .expect("a handled request is sent");
+    }
+
+    #[test]
+    fn control_gate_refuses_past_the_limit_and_shuts_down_when_stuck() {
+        let gate = ControlConnectionGate::new(2);
+        let start = std::time::Instant::now();
+        let ControlAdmission::Serve(first) = gate.admit(start) else {
+            panic!("first connection must be served");
+        };
+        let ControlAdmission::Serve(second) = gate.admit(start) else {
+            panic!("second connection must be served");
+        };
+        // At the limit: refused, and a flood of refusals is no reason to stop.
+        for millis in [0, 1_000, 14_000] {
+            assert!(matches!(
+                gate.admit(start + Duration::from_millis(millis)),
+                ControlAdmission::Refuse { shut_down: false }
+            ));
+        }
+        // Every handler still busy 15 s after the first refusal: stuck.
+        assert!(matches!(
+            gate.admit(start + Duration::from_secs(15)),
+            ControlAdmission::Refuse { shut_down: true }
+        ));
+        // A freed handler serves the next connection, and serving one ends
+        // the run of refusals.
+        drop(first);
+        let ControlAdmission::Serve(third) = gate.admit(start + Duration::from_secs(16)) else {
+            panic!("a freed slot must serve the next connection");
+        };
+        gate.handoff_succeeded();
+        let later = start + Duration::from_secs(17);
+        assert!(matches!(
+            gate.admit(later),
+            ControlAdmission::Refuse { shut_down: false }
+        ));
+        assert!(matches!(
+            gate.admit(later + Duration::from_secs(14)),
+            ControlAdmission::Refuse { shut_down: false }
+        ));
+        drop((second, third));
+        assert_eq!(gate.slots.live.load(Ordering::SeqCst), 0);
+    }
+
+    /// The Windows pipe workers share one gate. Each used to count its own
+    /// handoff failures, so with 8 workers it took 8 times as many failures
+    /// to stop a service that could not serve anyone.
+    #[test]
+    fn control_gate_counts_handoff_failures_across_workers() {
+        let gate = Arc::new(ControlConnectionGate::new(4));
+        let error = std::io::Error::other("injected");
+        let max = HANDOFF_FAILURE_LIMITS.max_consecutive.unwrap();
+        for failure in 1..=max {
+            // Alternate between two "workers".
+            let worker_gate = gate.clone();
+            let message = error.to_string();
+            let stop = std::thread::spawn(move || {
+                worker_gate.handoff_failed("failed to spawn handler thread", &message)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(stop, failure == max, "failure {failure} of {max}");
+        }
+        // One connection served resets the count for every worker.
+        gate.handoff_succeeded();
+        assert!(!gate.handoff_failed("failed to spawn handler thread", &error));
+    }
+
+    #[test]
+    fn checkpoint_reply_classification() {
+        let line = |response: ControlResponse| serde_json::to_string(&response).unwrap();
+        let read = |text: &str| -> std::io::Result<usize> { Ok(text.len()) };
+        let receipt = line(ControlResponse::receipt());
+        assert_eq!(
+            classify_checkpoint_reply(&read(&receipt), &receipt),
+            CheckpointReply::Receipt
+        );
+        // What an older service sends once it has processed the checkpoint.
+        let handled = line(ControlResponse::ok(None, None));
+        assert_eq!(
+            classify_checkpoint_reply(&read(&handled), &handled),
+            CheckpointReply::Handled
+        );
+        let refused = line(ControlResponse::refused("at its limit"));
+        assert_eq!(
+            classify_checkpoint_reply(&read(&refused), &refused),
+            CheckpointReply::Refused("at its limit".to_string())
+        );
+        let rejected = line(ControlResponse::err("no repository"));
+        assert_eq!(
+            classify_checkpoint_reply(&read(&rejected), &rejected),
+            CheckpointReply::Rejected("no repository".to_string())
+        );
+        assert!(matches!(
+            classify_checkpoint_reply(&read("garbage"), "garbage"),
+            CheckpointReply::Rejected(_)
+        ));
+        assert_eq!(
+            classify_checkpoint_reply(&Ok(0), ""),
+            CheckpointReply::Dropped
+        );
+        assert_eq!(
+            classify_checkpoint_reply(
+                &Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                ""
+            ),
+            CheckpointReply::Dropped
+        );
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            assert_eq!(
+                classify_checkpoint_reply(&Err(std::io::Error::from(kind)), ""),
+                CheckpointReply::Silent
+            );
+        }
+    }
+
+    #[test]
+    fn unconfirmed_checkpoint_verdicts() {
+        let waited = Duration::from_millis(200);
+        // An older service is processing it, as it always did: taken.
+        assert_eq!(unconfirmed_checkpoint_verdict(Some(0), waited), Ok(()));
+        // A service that sends receipts sent none.
+        assert!(matches!(
+            unconfirmed_checkpoint_verdict(Some(CHECKPOINT_RECEIPT_PROTOCOL), waited),
+            Err(CheckpointSendError::Unconfirmed(reason)) if reason.contains("answers other requests")
+        ));
+        assert!(matches!(
+            unconfirmed_checkpoint_verdict(Some(u32::MAX), waited),
+            Err(CheckpointSendError::Unconfirmed(_))
+        ));
+        // A service that answers nothing at all.
+        assert!(matches!(
+            unconfirmed_checkpoint_verdict(None, waited),
+            Err(CheckpointSendError::Unconfirmed(reason)) if reason.contains("did not answer a ping")
+        ));
+    }
+
+    /// Long enough for a loaded test machine, short enough that a test that
+    /// waits it out several times stays quick.
+    #[cfg(unix)]
+    const TEST_RECEIPT_WAIT: CheckpointReceiptWait = CheckpointReceiptWait {
+        receipt: Duration::from_millis(300),
+        outcome: Duration::ZERO,
+    };
+
+    #[cfg(unix)]
+    fn receipt_checkpoint_request() -> ControlRequest {
+        match sample_checkpoint_request() {
+            ControlRequest::CheckpointRun { request, .. } => ControlRequest::CheckpointRun {
+                request,
+                receipt: true,
+            },
+            other => other,
+        }
+    }
+
+    /// A stand-in service that reads each connection's request and answers
+    /// with `answer(method)`, one thread per connection. `None`: read it and
+    /// say nothing, holding the connection open for a while.
+    #[cfg(unix)]
+    fn scripted_control_socket(
+        answer: impl Fn(&str) -> Vec<ControlResponse> + Send + Sync + 'static,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let answer = Arc::new(answer);
+        fake_control_socket(move |stream| {
+            let answer = answer.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let method = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default();
+                let responses = answer(&method);
+                if responses.is_empty() {
+                    std::thread::sleep(Duration::from_secs(3));
+                    return;
+                }
+                for response in responses {
+                    let _ = write_control_response(reader.get_mut(), &response);
+                }
+            });
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_with_a_receipt_is_sent() {
+        let (_dir, path) = scripted_control_socket(|_| vec![ControlResponse::receipt()]);
+        let started = std::time::Instant::now();
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a receipted checkpoint is sent");
+        assert!(started.elapsed() < TEST_RECEIPT_WAIT.receipt);
+    }
+
+    /// The gap the drop watch left: a service that took the connection and
+    /// never handled it (stuck, or the connection queued behind others) was
+    /// read as "taken" once the watch ended.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_without_a_receipt_from_a_silent_service_is_unconfirmed() {
+        let (_dir, path) = scripted_control_socket(|_| Vec::new());
+        let started = std::time::Instant::now();
+        let error =
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+                .expect_err("silence is not a receipt");
+        assert!(
+            matches!(&error, CheckpointSendError::Unconfirmed(reason) if reason.contains("did not answer a ping")),
+            "{error:?}"
+        );
+        // The receipt wait, then as long again for the ping.
+        assert!(
+            started.elapsed() < TEST_RECEIPT_WAIT.receipt * 2 + Duration::from_millis(500),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_without_a_receipt_from_a_receipt_service_is_unconfirmed() {
+        // Answers a ping but never confirms the checkpoint.
+        let (_dir, path) = scripted_control_socket(|method| match method {
+            "ping" => vec![ControlResponse::pong()],
+            _ => Vec::new(),
+        });
+        let error =
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+                .expect_err("silence is not a receipt");
+        assert!(
+            matches!(&error, CheckpointSendError::Unconfirmed(reason) if reason.contains("answers other requests")),
+            "{error:?}"
+        );
+    }
+
+    /// A service from before receipts says nothing until it has processed a
+    /// checkpoint. That must not be reported as a lost checkpoint.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_to_an_older_service_falls_back_to_the_drop_watch() {
+        // This branch's first `ping`: ok, without a protocol version.
+        let (_dir, path) = scripted_control_socket(|method| match method {
+            "ping" => vec![ControlResponse::ok(None, None)],
+            _ => Vec::new(),
+        });
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("an older service working on the checkpoint has it");
+
+        // A released service that does not know `ping`.
+        let (_dir, path) = scripted_control_socket(|method| match method {
+            "ping" => vec![ControlResponse::err(
+                "invalid control request: unknown variant `ping`",
+            )],
+            _ => Vec::new(),
+        });
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("an older service working on the checkpoint has it");
+
+        // An older service that finishes within the wait answers `ok`.
+        let (_dir, path) = scripted_control_socket(|_| vec![ControlResponse::ok(None, None)]);
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a processed checkpoint is sent");
+
+        // Its drops are still drops.
+        let (_dir, path) = fake_control_socket(|stream| {
+            let mut line = String::new();
+            let _ = BufReader::new(stream).read_line(&mut line);
+        });
+        assert!(matches!(
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT),
+            Err(CheckpointSendError::NotTaken(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refused_or_dropped_is_not_taken() {
+        let (_dir, path) = fake_control_socket(|stream| {
+            refuse_control_connection(stream, "the background service is at its connection limit")
+        });
+        let error =
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+                .expect_err("a refusal is not a receipt");
+        assert!(
+            matches!(&error, CheckpointSendError::NotTaken(reason) if reason.contains("at its connection limit")),
+            "{error:?}"
+        );
+        let (_dir, path) = fake_control_socket(drop);
+        assert!(matches!(
+            send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT),
+            Err(CheckpointSendError::NotTaken(_))
+        ));
+        // Nothing listening at all.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            send_checkpoint_with_receipt(
+                &dir.path().join("none.sock"),
+                &receipt_checkpoint_request(),
+                TEST_RECEIPT_WAIT
+            ),
+            Err(CheckpointSendError::NotTaken(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_checkpoint_waits_for_the_outcome_after_the_receipt() {
+        let wait = CheckpointReceiptWait {
+            receipt: TEST_RECEIPT_WAIT.receipt,
+            outcome: Duration::from_secs(2),
+        };
+        let (_dir, path) = scripted_control_socket(|_| {
+            vec![
+                ControlResponse::receipt(),
+                ControlResponse::err("could not resolve the repository"),
+            ]
+        });
+        let error = send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), wait)
+            .expect_err("a checkpoint the service could not record is not sent");
+        assert!(
+            matches!(&error, CheckpointSendError::NotTaken(reason) if reason.contains("could not record")),
+            "{error:?}"
+        );
+        // A hook does not wait for that.
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a hook returns at the receipt");
+        // Still processing when the outcome wait ends: it is queued.
+        let (_dir, path) = scripted_control_socket(|_| vec![ControlResponse::receipt()]);
+        let quick = CheckpointReceiptWait {
+            receipt: TEST_RECEIPT_WAIT.receipt,
+            outcome: Duration::from_millis(100),
+        };
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), quick)
+            .expect("a receipted checkpoint still being processed is sent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_that_comes_while_the_ping_is_out_counts() {
+        // The receipt is late: after the receipt wait, but before the sender
+        // has given up.
+        let (_dir, path) = fake_control_socket(|stream| {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line.contains("\"ping\"") {
+                    std::thread::sleep(Duration::from_millis(150));
+                    let _ = write_control_response(reader.get_mut(), &ControlResponse::pong());
+                } else {
+                    std::thread::sleep(TEST_RECEIPT_WAIT.receipt + Duration::from_millis(50));
+                    let _ = write_control_response(reader.get_mut(), &ControlResponse::receipt());
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+        });
+        send_checkpoint_with_receipt(&path, &receipt_checkpoint_request(), TEST_RECEIPT_WAIT)
+            .expect("a late receipt is still a receipt");
+    }
+
+    #[test]
+    fn checkpoint_asking_for_a_receipt_gets_it_before_the_answer() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        // No files: handled without a repository.
+        let request = |receipt: bool| {
+            let ControlRequest::CheckpointRun { mut request, .. } = sample_checkpoint_request()
+            else {
+                unreachable!()
+            };
+            request.files.clear();
+            let mut raw =
+                serde_json::to_vec(&ControlRequest::CheckpointRun { request, receipt }).unwrap();
+            raw.push(b'\n');
+            raw
+        };
+        let answers = |input: Vec<u8>| -> Vec<ControlResponse> {
+            let mut reader = BufReader::new(ScriptedConnection {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+            });
+            handle_control_connection_actor_reader(
+                &mut reader,
+                coordinator.clone(),
+                runtime.handle().clone(),
+            )
+            .unwrap();
+            String::from_utf8(reader.get_ref().output.clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let with_receipt = answers(request(true));
+        assert_eq!(with_receipt.len(), 2, "{with_receipt:?}");
+        assert!(with_receipt[0].is_receipt());
+        assert!(with_receipt[1].ok && !with_receipt[1].is_receipt());
+        // An older client asks for none and gets exactly what it used to.
+        let without = answers(request(false));
+        assert_eq!(without.len(), 1, "{without:?}");
+        assert!(without[0].ok && !without[0].is_receipt());
+    }
+
+    #[test]
+    fn ping_reports_the_protocol_version() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        let response = runtime.block_on(coordinator.handle_control_request(ControlRequest::Ping));
+        assert_eq!(response.ping_protocol(), Some(CONTROL_PROTOCOL_VERSION));
+        const { assert!(CONTROL_PROTOCOL_VERSION >= CHECKPOINT_RECEIPT_PROTOCOL) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_probe_fails_when_connections_are_accepted_but_not_served() {
+        // The state the old connect-only probe called healthy.
+        let (_dir, path) = fake_control_socket(drop);
+        assert!(local_socket_connects_with_timeout(&path, DAEMON_SOCKET_PROBE_TIMEOUT).is_ok());
+        assert!(control_socket_serves_requests(&path).is_err());
+
+        let (_dir, path) =
+            fake_control_socket(|stream| refuse_control_connection(stream, "at its limit"));
+        let error = control_socket_serves_requests(&path).expect_err("a refusal is not service");
+        assert!(error.to_string().contains("refused"), "{error}");
+    }
+
+    /// An in-memory connection: the request bytes to read, and what the
+    /// handler wrote back.
+    struct ScriptedConnection {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for ScriptedConnection {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for ScriptedConnection {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ping_is_answered_and_proves_a_served_control_socket() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let coordinator = {
+            let _guard = runtime.enter();
+            Arc::new(ActorDaemonCoordinator::new())
+        };
+        let mut reader = BufReader::new(ScriptedConnection {
+            input: std::io::Cursor::new(b"{\"method\":\"ping\"}\n".to_vec()),
+            output: Vec::new(),
+        });
+        handle_control_connection_actor_reader(&mut reader, coordinator, runtime.handle().clone())
+            .unwrap();
+        let written = String::from_utf8(reader.get_ref().output.clone()).unwrap();
+        let response: ControlResponse = serde_json::from_str(written.trim()).unwrap();
+        assert!(response.ok, "{written}");
+        assert!(!response.is_refusal());
+    }
+
+    #[test]
+    fn a_daemon_that_only_just_started_shuts_down_without_restarting() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let coordinator = ActorDaemonCoordinator::new();
+        // Younger than the minimum uptime: restarting would likely loop.
+        coordinator.request_shutdown_unhealthy();
+        assert!(coordinator.is_shutting_down());
+        assert_eq!(coordinator.shutdown_action(), DaemonExitAction::Stop);
     }
 
     #[test]
@@ -10321,6 +12825,7 @@ mod tests {
                 stream_source: None,
                 metadata: std::collections::HashMap::new(),
             }),
+            receipt: false,
         }
     }
 
@@ -10982,6 +13487,85 @@ mod tests {
         assert!(coord.is_shutting_down());
     }
 
+    /// Feeds `lines` to the trace connection reader as one connection and
+    /// returns the root sids it synthesized a connection-close exit for.
+    fn close_fallbacks_after_trace_connection(
+        coord: &Arc<ActorDaemonCoordinator>,
+        rx: &mut mpsc::Receiver<Value>,
+        lines: &[Value],
+    ) -> Vec<String> {
+        let mut input = Vec::new();
+        for line in lines {
+            input.extend(serde_json::to_vec(line).unwrap());
+            input.push(b'\n');
+        }
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        handle_trace_connection_actor_reader(&mut reader, coord.clone()).unwrap();
+        let mut fallbacks = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            if payload
+                .get("autter_connection_close_fallback")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                fallbacks.push(payload["sid"].as_str().unwrap().to_string());
+            }
+        }
+        fallbacks
+    }
+
+    /// Every `git commit` spawns `git maintenance run --auto`, which reports on
+    /// a trace connection of its own. When that connection is read and closed
+    /// before the commit's own connection is read at all, the commit has not
+    /// ended: no exit may be made up for it, or it is finalized without its new
+    /// HEAD and never gets an authorship note.
+    #[tokio::test]
+    async fn closing_a_child_process_connection_does_not_end_its_root_command() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(crate::config::Config::get().git_cmd())
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let worktree = repo.path().to_string_lossy().to_string();
+
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        let (tx, mut rx) = mpsc::channel::<Value>(64);
+        coord.trace_ingest_tx.set(tx).unwrap();
+
+        let root = "20261112T120000.000000Z-Hcommit-P00000001";
+        let child = format!("{root}/20261112T120000.010000Z-Hcommit-P00000002");
+        let child_connection = [
+            json!({
+                "event": "start",
+                "sid": child,
+                "argv": ["git", "maintenance", "run", "--auto", "--quiet", "--detach"],
+                "worktree": worktree,
+            }),
+            json!({"event": "exit", "sid": child, "code": 0}),
+            json!({"event": "atexit", "sid": child, "code": 0}),
+        ];
+        assert_eq!(
+            close_fallbacks_after_trace_connection(&coord, &mut rx, &child_connection),
+            Vec::<String>::new(),
+            "a child's connection closing must not end the root command"
+        );
+
+        // The root's own connection still ends it when the process dies
+        // without reporting an exit.
+        let root_connection = [json!({
+            "event": "start",
+            "sid": root,
+            "argv": ["git", "commit", "-m", "msg"],
+            "worktree": worktree,
+        })];
+        assert_eq!(
+            close_fallbacks_after_trace_connection(&coord, &mut rx, &root_connection),
+            vec![root.to_string()],
+        );
+    }
+
     /// Concurrent enqueues from multiple threads must never deadlock or
     /// corrupt the accounting counter.
     #[tokio::test]
@@ -11044,38 +13628,114 @@ mod tests {
         tmp
     }
 
+    fn oids(prefixes: &[char]) -> Vec<String> {
+        prefixes
+            .iter()
+            .map(|prefix| prefix.to_string().repeat(40))
+            .collect()
+    }
+
+    fn stash_argv(args: &[&str]) -> Vec<String> {
+        ["git", "stash"]
+            .iter()
+            .chain(args)
+            .map(|arg| arg.to_string())
+            .collect()
+    }
+
     // When the last stash is popped, git deletes both refs/stash and its reflog,
-    // so the on-disk resolvers find nothing. Both payload resolvers must recover
-    // the target sha from the daemon's rewrite history instead of erroring.
+    // so the on-disk resolvers find nothing. The terminal resolver recovers the
+    // target sha from the daemon's rewrite history instead of erroring.
     #[test]
     fn stash_pop_target_oid_recovers_from_history_when_ref_and_reflog_absent() {
         let stash_sha = "1111111111111111111111111111111111111111";
         let tmp = init_repo_with_stash_create_event(stash_sha);
         let worktree = tmp.path();
-        let argv = vec!["git".to_string(), "stash".to_string(), "pop".to_string()];
-
-        let from_command = resolve_stash_target_oid_for_command(worktree, &argv).unwrap();
-        assert_eq!(from_command.as_deref(), Some(stash_sha));
+        let argv = stash_argv(&["pop"]);
 
         let from_terminal =
-            resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).unwrap();
+            resolve_stash_target_oid_for_terminal_payload(worktree, &argv, 0, &[]).unwrap();
         assert_eq!(from_terminal.as_deref(), Some(stash_sha));
     }
 
-    // A non-top-of-stack reference cannot be recovered from history, so it still
-    // surfaces as an error rather than being silently dropped.
+    // `pop`, `drop` and `branch` are not resolved while git runs: by then git
+    // may have taken the entry off the stack, and `stash@{n}` would name the
+    // stash below it.
+    #[test]
+    fn stash_entry_removing_commands_are_not_resolved_while_git_runs() {
+        let tmp = init_repo_with_stash_create_event("1111111111111111111111111111111111111111");
+        for args in [&["pop"][..], &["drop", "stash@{1}"], &["branch", "topic"]] {
+            let argv = stash_argv(args);
+            assert_eq!(
+                resolve_stash_target_oid_for_command(tmp.path(), &argv).unwrap(),
+                None,
+                "{args:?}"
+            );
+        }
+    }
+
+    // A non-top-of-stack reference that no stack from before the command
+    // explains surfaces as an error rather than a guess.
     #[test]
     fn stash_drop_non_top_reference_still_errors_without_on_disk_state() {
         let tmp = init_repo_with_stash_create_event("2222222222222222222222222222222222222222");
         let worktree = tmp.path();
-        let argv = vec![
-            "git".to_string(),
-            "stash".to_string(),
-            "drop".to_string(),
-            "stash@{2}".to_string(),
-        ];
+        let argv = stash_argv(&["drop", "stash@{2}"]);
 
-        assert!(resolve_stash_target_oid_for_command(worktree, &argv).is_err());
-        assert!(resolve_stash_target_oid_for_terminal_payload(worktree, &argv, &[]).is_err());
+        assert!(resolve_stash_target_oid_for_terminal_payload(worktree, &argv, 0, &[]).is_err());
+    }
+
+    #[test]
+    fn stash_target_spec_index_reads_stash_references() {
+        assert_eq!(stash_target_spec_index(None), Some(0));
+        assert_eq!(stash_target_spec_index(Some("stash")), Some(0));
+        assert_eq!(stash_target_spec_index(Some("refs/stash")), Some(0));
+        assert_eq!(stash_target_spec_index(Some("stash@{0}")), Some(0));
+        assert_eq!(stash_target_spec_index(Some("stash@{3}")), Some(3));
+        assert_eq!(stash_target_spec_index(Some("refs/stash@{2}")), Some(2));
+        assert_eq!(stash_target_spec_index(Some("1")), Some(1));
+        assert_eq!(stash_target_spec_index(Some("stash@{x}")), None);
+        assert_eq!(stash_target_spec_index(Some("HEAD")), None);
+    }
+
+    #[test]
+    fn stash_removed_from_stack_names_the_entry_taken_off() {
+        let before = oids(&['a', 'b', 'c']);
+        // Top entry popped.
+        assert_eq!(
+            stash_removed_from_stack(0, &oids(&['b', 'c']), std::slice::from_ref(&before)),
+            Some(before[0].clone())
+        );
+        // stash@{1} popped.
+        assert_eq!(
+            stash_removed_from_stack(1, &oids(&['a', 'c']), std::slice::from_ref(&before)),
+            Some(before[1].clone())
+        );
+        // Last entry popped.
+        assert_eq!(
+            stash_removed_from_stack(0, &[], &[oids(&['a'])]),
+            Some(before[0].clone())
+        );
+    }
+
+    #[test]
+    fn stash_removed_from_stack_skips_stacks_read_after_git_moved_it() {
+        let after = oids(&['a', 'c']);
+        // A read made after git popped stash@{1} sees the stack it left, which
+        // does not explain the pop; the stack the last stash command left does.
+        let read_late = after.clone();
+        let left_by_last_stash = oids(&['a', 'b', 'c']);
+        assert_eq!(
+            stash_removed_from_stack(1, &after, &[read_late.clone(), left_by_last_stash]),
+            Some("b".repeat(40))
+        );
+        // Without a stack that fits, the target stays unknown rather than
+        // naming the entry below it.
+        assert_eq!(stash_removed_from_stack(1, &after, &[read_late]), None);
+        // A stack that differs elsewhere does not fit either.
+        assert_eq!(
+            stash_removed_from_stack(1, &after, &[oids(&['d', 'b', 'c'])]),
+            None
+        );
     }
 }

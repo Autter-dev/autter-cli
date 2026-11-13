@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub struct UnsupportedAgent {
     pub id: &'static str,
     pub name: &'static str,
-    /// What was found, e.g. "app: /Applications/Kiro.app".
+    /// What was found, e.g. "app: /Applications/Trae.app".
     pub evidence: String,
 }
 
@@ -41,22 +41,13 @@ struct AgentSignature {
 }
 
 /// Agents with no autter preset. Kept to tools that write code on their own.
-/// Not listed: JetBrains Junie (captured by the autter JetBrains plugin) and
-/// Google Antigravity (captured through its hooks; see
-/// `crate::mdm::agents::AntigravityInstaller`). These signals are best-effort
+/// Not listed: JetBrains Junie (captured by the autter JetBrains plugin),
+/// Google Antigravity and Kiro (captured through their hooks; see
+/// `crate::mdm::agents::AntigravityInstaller` and
+/// `crate::mdm::agents::KiroInstaller`). These signals are best-effort
 /// conventional locations, not verified against each vendor's docs; a miss
 /// only means no warning. Tracking doc: docs/unsupported-agents.md.
 const SIGNATURES: &[AgentSignature] = &[
-    AgentSignature {
-        id: "kiro",
-        name: "Kiro",
-        cli_names: &["kiro"],
-        mac_apps: &["Kiro.app"],
-        windows_programs: &["Kiro"],
-        vscode_products: &["Kiro"],
-        home_paths: &[".kiro"],
-        extension_prefixes: &[],
-    },
     AgentSignature {
         id: "trae",
         name: "Trae",
@@ -309,25 +300,36 @@ mod tests {
     }
 
     #[test]
-    fn kiro_is_detected_from_each_signal() {
+    fn trae_is_detected_from_each_signal() {
         let none = |_: &str| false;
 
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join("Applications/Kiro.app")).unwrap();
+        fs::create_dir_all(home.path().join("Applications/Trae.app")).unwrap();
         let found = detect_in(&env_for(home.path(), &none));
-        assert_eq!(ids(&found), vec!["kiro"]);
+        assert_eq!(ids(&found), vec!["trae"]);
         assert!(found[0].evidence.starts_with("app: "), "{:?}", found[0]);
 
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join("config/Kiro/User")).unwrap();
-        assert_eq!(ids(&detect_in(&env_for(home.path(), &none))), vec!["kiro"]);
+        fs::create_dir_all(home.path().join("config/Trae/User")).unwrap();
+        assert_eq!(ids(&detect_in(&env_for(home.path(), &none))), vec!["trae"]);
 
         let home = tempfile::tempdir().unwrap();
-        let kiro_cli = |name: &str| name == "kiro";
+        let trae_cli = |name: &str| name == "trae";
         assert_eq!(
-            ids(&detect_in(&env_for(home.path(), &kiro_cli))),
-            vec!["kiro"]
+            ids(&detect_in(&env_for(home.path(), &trae_cli))),
+            vec!["trae"]
         );
+    }
+
+    #[test]
+    fn kiro_is_supported_and_never_reported_as_unsupported() {
+        // Kiro is captured through its hooks (`KiroInstaller`) now.
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".kiro")).unwrap();
+        fs::create_dir_all(home.path().join("Applications/Kiro.app")).unwrap();
+        fs::create_dir_all(home.path().join("config/Kiro/User")).unwrap();
+        let kiro = |name: &str| name == "kiro" || name == "kiro-cli";
+        assert!(detect_in(&env_for(home.path(), &kiro)).is_empty());
     }
 
     #[test]
@@ -363,13 +365,13 @@ mod tests {
     #[test]
     fn message_says_edits_are_attributed_to_the_user() {
         let agent = UnsupportedAgent {
-            id: "kiro",
-            name: "Kiro",
-            evidence: "app: /Applications/Kiro.app".to_string(),
+            id: "trae",
+            name: "Trae",
+            evidence: "app: /Applications/Trae.app".to_string(),
         };
         assert_eq!(
             not_captured_message(&agent),
-            "Kiro detected — its edits are not captured; they will be attributed to you"
+            "Trae detected — its edits are not captured; they will be attributed to you"
         );
     }
 }

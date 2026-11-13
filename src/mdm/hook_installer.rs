@@ -60,6 +60,13 @@ pub trait HookInstaller: Send + Sync {
         Vec::new()
     }
 
+    /// Every file autter writes to hook this agent: its hook config files,
+    /// or the plugin file for agents hooked through a plugin. Listed by
+    /// `autter doctor --agent`.
+    fn managed_files(&self) -> Vec<PathBuf> {
+        self.hook_config_paths()
+    }
+
     /// Check if the tool is installed and hook status
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError>;
 

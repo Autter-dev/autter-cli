@@ -35,6 +35,10 @@ impl HookInstaller for PiInstaller {
         "pi"
     }
 
+    fn managed_files(&self) -> Vec<PathBuf> {
+        vec![Self::extension_path()]
+    }
+
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, AutterError> {
         let has_binary = binary_exists("pi");
         let has_global_config = home_dir().join(".pi").exists();

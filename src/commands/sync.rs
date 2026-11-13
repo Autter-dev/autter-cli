@@ -3,6 +3,7 @@
 //! Subcommands:
 //! - `status`  Show whether authorship data is reaching autter cloud.
 //! - `purge`   Discard the local upload backlog without uploading it.
+//! - `retry`   Queue set-aside usage-metrics events for upload again.
 //! - `open`    Open the org dashboard.
 
 use crate::auth::notice::{CloudSyncState, clear_sync_auth_blocked, collect_cloud_sync_status};
@@ -52,12 +53,40 @@ pub fn handle_sync(args: &[String]) {
         Some("status") => print_status(&args[1..]),
         Some("purge") | Some("clear") | Some("clear-queue") => purge_cli(&args[1..]),
         Some("import") => import_cli(&args[1..]),
+        Some("retry") => retry_cli(&args[1..]),
         Some("open") => open_dashboard(),
         Some("--help") | Some("-h") | Some("help") => print_help(),
+        // `autter sync --json` is `autter sync status --json`.
+        Some(flag) if flag.starts_with('-') => print_status(args),
         Some(other) => {
-            eprintln!("Unknown sync subcommand: {other}");
+            // `autter sync bogus --json` still answers with one JSON document.
+            arg_parser::merge_json_flag_from(args);
             print_help();
-            std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+            crate::commands::output::fail(
+                crate::commands::output::ErrorKind::Usage,
+                format!("Unknown sync subcommand: {other}"),
+            );
+        }
+    }
+}
+
+/// `autter sync retry`: put the usage-metrics events that were set aside
+/// (the server failed on them every time) back in the upload queue.
+fn retry_cli(args: &[String]) {
+    arg_parser::reject_any_args("sync retry", args);
+    let released = crate::metrics::db::MetricsDatabase::global().and_then(|db| {
+        db.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release_set_aside()
+    });
+    match released {
+        Ok(0) => println!("Nothing is set aside."),
+        Ok(released) => println!(
+            "Queued {released} set-aside usage-metrics events again. The background service uploads them shortly."
+        ),
+        Err(e) => {
+            eprintln!("Failed to queue the set-aside events again: {e}");
+            std::process::exit(crate::commands::EXIT_RUNTIME_ERROR);
         }
     }
 }
@@ -173,6 +202,9 @@ pub fn purge_sync_queues() -> Result<String, AutterError> {
 
     clear_sync_auth_blocked();
     crate::auth::notice::clear_upload_failures();
+    // The metrics queue is empty now, so what it learned about batch size and
+    // its backoff no longer applies. This is the only place that resets it.
+    crate::metrics::sync_state::MetricsSyncState::reset();
 
     Ok(if parts.is_empty() {
         "nothing pending".to_string()
@@ -324,6 +356,7 @@ fn print_help() {
     eprintln!("  autter sync status [--json]");
     eprintln!("  autter sync purge --force");
     eprintln!("  autter sync import --yes");
+    eprintln!("  autter sync retry");
     eprintln!("  autter sync open");
     eprintln!();
     eprintln!("Shows whether authorship data is reaching autter cloud, how much is");
@@ -335,6 +368,9 @@ fn print_help() {
     eprintln!("`import` uploads the held backlog: records queued before you connected this");
     eprintln!("machine, or by an older autter version. Held records never upload on their own.");
     eprintln!("Without --yes it only shows what is held.");
+    eprintln!();
+    eprintln!("`retry` queues usage-metrics events again that were set aside because the");
+    eprintln!("server failed on them every time. Set-aside events are kept, not uploaded.");
     eprintln!();
     eprintln!("Status exits 0 when upload is off or no problem is detected.");
     eprintln!("It exits 1 when sign-in, upload, the service, or a queue read needs attention.");

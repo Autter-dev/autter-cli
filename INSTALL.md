@@ -15,7 +15,7 @@ Install Autter in the environment where your coding agents and your `git` run.
 | macOS or Linux | the shell installer below | needs `bash` and `curl` |
 | Windows, agents started from Windows (PowerShell, Command Prompt, VS Code, Cursor) | the PowerShell installer, or npm if you already have Node.js | run it from a normal terminal, not "Run as administrator" |
 | Windows, agents running inside WSL | the shell installer, run inside the WSL terminal | a Windows install does not cover WSL, and the reverse |
-| CI | `npm install -g @autter/cli@<version>` or `AUTTER_RELEASE_TAG=v<version>` with the shell installer | the background service never replaces the binary by itself in CI |
+| CI | `npm install -g @autter/cli@<version>` or `AUTTER_RELEASE_TAG=v<version>` with the shell installer | the background service never replaces the binary by itself in CI, or for any npm install |
 | NixOS, nix-darwin, Home Manager | the [Nix guide](README-nix.md) | |
 
 All of them install the same binary into `~/.autter/bin` (`%USERPROFILE%\.autter\bin` on Windows). Installing only downloads the binary and adds it to your `PATH`. Agent hooks, global git settings and the background service are set up by `autter onboard`, which asks first.
@@ -50,6 +50,18 @@ Use the `api.autter.dev` URL exactly as shown. Other hosts (such as `autter.dev/
 
 The installer adds `%USERPROFILE%\.autter\bin` to your user `PATH`. That reaches terminals opened afterwards, not the window you ran the command from: open a new terminal (and restart your IDE) before running `autter`. The installer prints the full path to `autter.exe` at the end so you can run it straight away. If you are already in PowerShell, `irm https://api.autter.dev/install.ps1 | iex` runs the same installer inside your current window, and `autter` works there immediately.
 
+To see what the installer would do without downloading, writing or starting anything, set `AUTTER_INSTALL_DRY_RUN` first. It is an environment variable because `irm | iex` cannot pass arguments:
+
+```powershell
+$env:AUTTER_INSTALL_DRY_RUN = '1'
+irm https://api.autter.dev/install.ps1 | iex
+Remove-Item Env:\AUTTER_INSTALL_DRY_RUN
+```
+
+It lists the download and its checksum check, where `autter.exe` goes, the `PATH` change, the Git Bash profile it would add a line to, the anonymous install ping and the onboarding step. Remove the variable afterwards, as shown: while it is set, every run in that window is a dry run. From Command Prompt, run `set AUTTER_INSTALL_DRY_RUN=1` before the `powershell ...` command above.
+
+In a terminal the binary download shows its progress on one line (megabytes received and percent). CI logs and redirected output stay quiet. The download is checked against the SHA-256 published with the release before it is installed. If a download fails (a `502`, a proxy, a blocked host), the error names the URL that failed: wait a minute and retry, or use npm below.
+
 ### npm (any platform, Node.js 18+)
 
 ```bash
@@ -57,19 +69,35 @@ npm install -g @autter/cli
 autter onboard
 ```
 
-The npm package is a thin bootstrapper that downloads the same release binary into `~/.autter/bin` and verifies its checksum against the GitHub release, then exposes `autter` through the npm global bin directory. Hooks, the background service, and `autter upgrade` work identically to the script installs. One-shot bootstrap without a global install: `npx @autter/cli onboard`.
+The npm package is a thin bootstrapper that downloads the same release binary into `~/.autter/bin` and verifies its checksum against the GitHub release, then exposes `autter` through the npm global bin directory. Hooks and the background service work identically to the script installs; upgrades go through npm (below). One-shot bootstrap without a global install: `npx @autter/cli onboard`.
 
 Three things about the npm route:
 
-- **Run `autter onboard` after installing.** npm hides the output of install scripts, so the hint to do this is not shown. Until onboarding runs, nothing is captured.
+- **Run `autter onboard` after installing.** npm hides the output of install scripts, so the hint to do this is not shown. Until onboarding runs, nothing is captured, and everyday commands (`autter stats`, `autter status`, ...) say so in one line, at most once a day.
 - **If install scripts are blocked** (`--ignore-scripts`, pnpm, npm settings that skip them), the binary is not downloaded during `npm install`. It downloads the first time you run `autter`, so no extra flag is needed.
-- **Upgrade with `autter upgrade`**, or `npm install -g @autter/cli@latest`. `npm update` alone does not upgrade the CLI, because the package only bootstraps the binary. To stay on one version, install `@autter/cli@<version>` and set `AUTTER_DISABLE_AUTO_UPDATES=1` (or `autter config set disable_auto_updates true`); in CI the background service never upgrades the binary by itself.
+- **npm picks the version.** Upgrade with `npm install -g @autter/cli@latest`, or install `@autter/cli@<version>` to stay on one release. The background service does not replace an npm-installed binary by itself; when a new release is out, autter says so once and names that npm command, and `autter upgrade` prints it instead of installing. `npm update` alone does not upgrade the CLI, because the package only bootstraps the binary. Installing with the shell or PowerShell installer afterwards hands updates back to autter.
 
 > **Git Bash is not WSL.** The bash installer only runs on macOS, Linux, and WSL; in Git Bash it exits with instructions instead of installing. Use the Windows command above (it also works from Git Bash), and install Autter in the environment where your coding agents run — agents inside WSL need the WSL install.
 
 Signed in to the Autter dashboard? [**Settings → CLI setup**](https://app.autter.dev/cli/install) generates a single-use command that runs this same installer and signs the machine in automatically.
 
 The installer downloads Autter into `~/.autter/bin` and adds it to your user `PATH`. IDE/agent hooks, global git capture settings, and the background service are applied during `autter onboard` (with consent) or with `autter install --system`. On macOS, Linux, and WSL the script starts onboarding when the shell is interactive. Automated or non-interactive installs can finish onboarding later with `autter onboard`.
+
+### Where Autter is installed
+
+The install location is fixed and is not configurable. Every install method puts the same binary in the same place:
+
+| | macOS, Linux, WSL | Windows |
+| --- | --- | --- |
+| Binary | `~/.autter/bin/autter` | `%USERPROFILE%\.autter\bin\autter.exe` |
+| `PATH` entry | `~/.autter/env` (and `env.fish`) adds `~/.autter/bin`; one line in your shell file loads it | `%USERPROFILE%\.autter\bin` on your user `PATH` (and one line in `~/.bashrc` for Git Bash) |
+| Link | `~/.local/bin/autter`, a symlink to the binary | none |
+
+With npm, the `autter` command in npm's global bin directory is a launcher for that same binary. The installers' dry run prints these paths for your machine.
+
+It is one fixed path because three things point at it: the agent hooks that `autter onboard` installs run the binary by its full path, `autter upgrade` replaces the binary at that path, and the background service runs from it and upgrades it in place. A binary somewhere else would not be upgraded, and hooks would keep running the old one.
+
+If you want `autter` somewhere else, leave the binary where it is and point at it: add a symlink (`ln -s "$HOME/.autter/bin/autter" /usr/local/bin/autter`) or add `~/.autter/bin` to the `PATH` of that environment. Do not move the binary. If you did move it, run `autter install-hooks` so the agent hooks name the path it is at now, then `autter doctor` to check that capture works.
 
 ### System requirements
 
@@ -226,6 +254,8 @@ autter upgrade
 
 Run `autter help` for the full command list.
 
+Which agents and editors are supported, how each is hooked, and what is captured: [docs/agents.md](docs/agents.md). To check one agent end to end without starting an agent session, run `autter doctor --agent <name>` (for example `autter doctor --agent claude-code`): it simulates that agent's hook calls and confirms an AI checkpoint was recorded.
+
 ## Open source, extensible, and local-first
 
 The CLI and the [Autter authorship standard](specs/autter_standard_v3.0.0.md) are open source. The platform is an optional collaboration layer, not a requirement for attribution. You can build and run your own solution on the standard, keep it local, or connect Autter to the tools your organization already uses.
@@ -273,7 +303,7 @@ The script was started with `sh`. Run the same command with `bash` at the end (`
 
 ### The download fails or returns HTML
 
-A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli && autter onboard`). If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
+A `502` or a timeout is usually temporary: wait a minute and run the installer again, or install with npm (`npm install -g @autter/cli`, then `autter onboard`). Both installers name the URL that failed. If the error mentions HTML or a parse error, check the URL: the installers are served from `api.autter.dev`, not `autter.dev`.
 
 ### Windows or WSL: which one to set up
 
@@ -302,10 +332,11 @@ This removes Autter's agent hooks and editor extensions, its settings in your gl
 
 ### An agent or editor installed after Autter is not detected
 
-Re-run integration setup:
+When an agent with hook support is installed after onboarding, the next everyday command says once that its edits are not captured. Agents you left unselected during `autter onboard` are never named. Nothing is installed until you run integration setup:
 
 ```bash
 autter install-hooks
+autter doctor --agent <name>   # e.g. claude-code: checks that agent end to end
 ```
 
 ### Browser onboarding fails

@@ -3629,9 +3629,15 @@ fn test_fast_path_feature_deletes_file_then_recreates() {
     // chain[0]=C1', chain[1]=C2', chain[2]=C3_rm', chain[3]=C3_util_c', chain[4]=C4', chain[5]=C5'
 
     // sha0 = C1': temp_module.py is deleted in C3 (before original_head), so the
-    // slow-path content-diff has no reference data for temp_module.py → only util_a.py attributed.
+    // original_head state has nothing for it; its lines keep their attribution
+    // from C1's own note, since C1' adds exactly the lines C1 added.
     assert_note_base_commit_matches(&repo, &chain[0], "sha0");
-    assert_note_files_exact(&repo, &chain[0], "sha0_files", &["util_a.py"]);
+    assert_note_files_exact(
+        &repo,
+        &chain[0],
+        "sha0_files",
+        &["temp_module.py", "util_a.py"],
+    );
     assert_note_no_forbidden_files(
         &repo,
         &chain[0],
@@ -3654,8 +3660,8 @@ fn test_fast_path_feature_deletes_file_then_recreates() {
         "temp_module.py",
         "chain1_prior_temp_module.py",
         &[
-            ("class TempProcessor:", false),
-            ("def process(self, data):", false),
+            ("class TempProcessor:", true),
+            ("def process(self, data):", true),
         ],
     );
     assert_blame_sample_at_commit(
@@ -4965,9 +4971,9 @@ fn test_slow_path_rust_lib_rs_main_prepends_feature_adds_impls() {
         "src/lib.rs",
         "sha1_blame_new",
         &[
-            ("pub struct Config {", false),
-            ("impl Default for Config", false),
-            ("impl Config {", false),
+            ("pub struct Config {", true),
+            ("impl Default for Config", true),
+            ("impl Config {", true),
         ],
     );
     // mod_a.rs (from C1) is a prior file at chain[1] — fast path, verify attribution intact
@@ -5004,7 +5010,7 @@ fn test_slow_path_rust_lib_rs_main_prepends_feature_adds_impls() {
         &chain[2],
         "src/lib.rs",
         "sha2_blame_new",
-        &[("pub struct Pool<T>", true), ("impl<T> Pool<T>", false)],
+        &[("pub struct Pool<T>", true), ("impl<T> Pool<T>", true)],
     );
     // mod_a.rs and mod_b.rs (from C1-C2) are prior files at chain[2]
     assert_blame_sample_at_commit(
@@ -5050,7 +5056,7 @@ fn test_slow_path_rust_lib_rs_main_prepends_feature_adds_impls() {
         "sha3_blame_new",
         &[
             ("pub enum Event", true),
-            ("impl std::fmt::Display for Event", false),
+            ("impl std::fmt::Display for Event", true),
         ],
     );
     // mod_a.rs, mod_b.rs, and mod_c.rs (from C1-C3) are prior files at chain[3]
@@ -5357,9 +5363,9 @@ fn test_slow_path_typescript_routes_main_prepends_feature_adds_handlers() {
             ("// Auto-generated routes", false),
             ("import express from 'express';", false),
             ("const router = express.Router();", true),
-            ("router.get('/users'", false),
-            ("try {", false),
-            ("const users = await UserService.findAll()", false),
+            ("router.get('/users'", true),
+            ("try {", true),
+            ("const users = await UserService.findAll()", true),
         ],
     );
 
@@ -5372,8 +5378,8 @@ fn test_slow_path_typescript_routes_main_prepends_feature_adds_handlers() {
         "src/routes.ts",
         "sha1_blame_new",
         &[
-            ("router.post('/users'", false),
-            ("email and name required", false),
+            ("router.post('/users'", true),
+            ("email and name required", true),
         ],
     );
 
@@ -5386,8 +5392,8 @@ fn test_slow_path_typescript_routes_main_prepends_feature_adds_handlers() {
         "src/routes.ts",
         "sha2_blame_new",
         &[
-            ("router.get('/users/:id'", false),
-            ("UserService.findById", false),
+            ("router.get('/users/:id'", true),
+            ("UserService.findById", true),
         ],
     );
 
@@ -5400,8 +5406,8 @@ fn test_slow_path_typescript_routes_main_prepends_feature_adds_handlers() {
         "src/routes.ts",
         "sha3_blame_new",
         &[
-            ("router.put('/users/:id'", false),
-            ("UserService.update", false),
+            ("router.put('/users/:id'", true),
+            ("UserService.update", true),
         ],
     );
 
@@ -5635,7 +5641,7 @@ fn test_slow_path_config_file_both_add_different_sections() {
         &[
             ("[cache]", true),
             ("backend = \"redis\"", true),
-            ("eviction_policy", false),
+            ("eviction_policy", true),
         ],
     );
 
@@ -5649,8 +5655,8 @@ fn test_slow_path_config_file_both_add_different_sections() {
         "sha2_blame_new",
         &[
             ("[metrics]", true),
-            ("exporter = \"prometheus\"", false),
-            ("histogram_buckets", false),
+            ("exporter = \"prometheus\"", true),
+            ("histogram_buckets", true),
         ],
     );
 
@@ -5665,7 +5671,7 @@ fn test_slow_path_config_file_both_add_different_sections() {
         &[
             ("[auth]", true),
             ("provider = \"jwt\"", true),
-            ("allow_anonymous = false", false),
+            ("allow_anonymous = false", true),
         ],
     );
 
@@ -5996,7 +6002,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         &chain[1],
         "src/engine.rs",
         "sha1_blame_new",
-        &[("pub struct Task {", true), ("impl Task {", false)],
+        &[("pub struct Task {", true), ("impl Task {", true)],
     );
 
     assert_note_base_commit_matches(&repo, &chain[2], "sha2");
@@ -6006,7 +6012,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         &chain[2],
         "src/engine.rs",
         "sha2_blame_new",
-        &[("pub struct Queue {", true), ("impl Queue {", false)],
+        &[("pub struct Queue {", true), ("impl Queue {", true)],
     );
 
     assert_note_base_commit_matches(&repo, &chain[3], "sha3");
@@ -6016,7 +6022,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         &chain[3],
         "src/engine.rs",
         "sha3_blame_new",
-        &[("pub struct Worker {", false), ("impl Worker {", false)],
+        &[("pub struct Worker {", true), ("impl Worker {", true)],
     );
 
     assert_note_base_commit_matches(&repo, &chain[4], "sha4");
@@ -6026,10 +6032,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         &chain[4],
         "src/engine.rs",
         "sha4_blame_new",
-        &[
-            ("pub struct Scheduler {", true),
-            ("impl Scheduler {", false),
-        ],
+        &[("pub struct Scheduler {", true), ("impl Scheduler {", true)],
     );
 
     assert_note_base_commit_matches(&repo, &chain[5], "sha5");
@@ -6039,7 +6042,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         &chain[5],
         "src/engine.rs",
         "sha5_blame_new",
-        &[("pub struct Metrics {", false), ("impl Metrics {", false)],
+        &[("pub struct Metrics {", true), ("impl Metrics {", true)],
     );
 
     assert_note_base_commit_matches(&repo, &chain[6], "sha6");
@@ -6049,10 +6052,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         &chain[6],
         "src/engine.rs",
         "sha6_blame_new",
-        &[
-            ("pub struct RateLimit {", false),
-            ("impl RateLimit {", false),
-        ],
+        &[("pub struct RateLimit {", true), ("impl RateLimit {", true)],
     );
 
     assert_note_base_commit_matches(&repo, &chain[7], "sha7");
@@ -6063,7 +6063,7 @@ fn test_slow_path_growing_shared_file_10_commits() {
         "src/engine.rs",
         "sha7_blame_new",
         &[
-            ("pub struct CircuitBreaker {", false),
+            ("pub struct CircuitBreaker {", true),
             ("pub enum BreakState {", true),
         ],
     );
@@ -6076,8 +6076,8 @@ fn test_slow_path_growing_shared_file_10_commits() {
         "src/engine.rs",
         "sha8_blame_new",
         &[
-            ("pub struct HealthCheck {", false),
-            ("impl HealthCheck {", false),
+            ("pub struct HealthCheck {", true),
+            ("impl HealthCheck {", true),
         ],
     );
 
@@ -6360,17 +6360,14 @@ fn test_slow_path_multiple_shared_files_both_modified() {
         &chain[1],
         "models.py",
         "sha1_models_product",
-        &[("class Product:", false), ("price: float", false)],
+        &[("class Product:", true), ("price: float", true)],
     );
     assert_blame_sample_at_commit(
         &repo,
         &chain[1],
         "services.py",
         "sha1_services_product",
-        &[
-            ("class ProductService:", false),
-            ("def list_in_stock", false),
-        ],
+        &[("class ProductService:", true), ("def list_in_stock", true)],
     );
 
     // sha2 = C3': {models.py, services.py} ~12 accepted lines (only C3's delta)
@@ -6387,14 +6384,14 @@ fn test_slow_path_multiple_shared_files_both_modified() {
         &chain[2],
         "models.py",
         "sha2_models_order",
-        &[("class Order:", false), ("status: str = 'pending'", false)],
+        &[("class Order:", true), ("status: str = 'pending'", true)],
     );
     assert_blame_sample_at_commit(
         &repo,
         &chain[2],
         "services.py",
         "sha2_services_order",
-        &[("class OrderService:", false), ("def cancel", false)],
+        &[("class OrderService:", true), ("def cancel", true)],
     );
 
     // sha3 = C4': ~12 accepted lines (only C4's delta)
@@ -6411,14 +6408,14 @@ fn test_slow_path_multiple_shared_files_both_modified() {
         &chain[3],
         "models.py",
         "sha3_models_address",
-        &[("class Address:", false), ("country: str = 'US'", false)],
+        &[("class Address:", true), ("country: str = 'US'", true)],
     );
     assert_blame_sample_at_commit(
         &repo,
         &chain[3],
         "services.py",
         "sha3_services_address",
-        &[("class AddressService:", false), ("def get_by_user", false)],
+        &[("class AddressService:", true), ("def get_by_user", true)],
     );
 
     // sha4 = C5': ~12 accepted lines (only C5's delta)
@@ -6641,7 +6638,7 @@ fn test_slow_path_mixed_unique_and_shared_files() {
         &chain[1],
         "core.rs",
         "sha1_core_registry",
-        &[("pub struct Registry", true), ("pub fn register", false)],
+        &[("pub struct Registry", true), ("pub fn register", true)],
     );
 
     // sha2 = C3': {core.rs} — C3 only changes core.rs
@@ -6654,7 +6651,7 @@ fn test_slow_path_mixed_unique_and_shared_files() {
         &chain[2],
         "core.rs",
         "sha2_core_eventbus",
-        &[("pub struct EventBus", true), ("pub fn emit", false)],
+        &[("pub struct EventBus", true), ("pub fn emit", true)],
     );
     // module_b.rs (from C2) is a prior file at chain[2] — fast path, verify attribution intact
     assert_blame_sample_at_commit(
@@ -6677,7 +6674,7 @@ fn test_slow_path_mixed_unique_and_shared_files() {
         &chain[3],
         "core.rs",
         "sha3_core_pipeline",
-        &[("pub struct Pipeline", true), ("pub fn run", false)],
+        &[("pub struct Pipeline", true), ("pub fn run", true)],
     );
     // module_b.rs (from C2) is a prior file at chain[3]
     assert_blame_sample_at_commit(
@@ -6906,7 +6903,7 @@ fn test_slow_path_feature_has_human_commits_intermixed() {
     // sha1 = C2' (first AI commit): api.py with ~10 accepted lines
     assert_note_base_commit_matches(&repo, &chain[1], "sha1");
     assert_note_files_exact(&repo, &chain[1], "sha1_files", &["api.py"]);
-    assert_accepted_lines_exact(&repo, &chain[1], "sha1_lines", 12);
+    assert_accepted_lines_exact(&repo, &chain[1], "sha1_lines", 13);
     // C2 introduced Flask app + /health endpoint — verify they are AI at sha1.
     assert_blame_sample_at_commit(
         &repo,
@@ -6916,22 +6913,22 @@ fn test_slow_path_feature_has_human_commits_intermixed() {
         &[
             ("app = Flask(__name__)", true),
             ("def require_auth", true),
-            ("def health", false),
+            ("def health", true),
         ],
     );
 
     // sha2 = C3' (second AI commit): api.py cumulative AI lines
     assert_note_base_commit_matches(&repo, &chain[2], "sha2");
     assert_note_files_exact(&repo, &chain[2], "sha2_files", &["api.py"]);
-    assert_accepted_lines_exact(&repo, &chain[2], "sha2_lines", 18);
-    // C3 introduced /users GET and POST routes. Some lines show as human because
-    // C5 later modified them (content mismatch prevents attribution transfer).
+    assert_accepted_lines_exact(&repo, &chain[2], "sha2_lines", 25);
+    // C3 introduced /users GET and POST routes. C5 later rewrote some of these
+    // lines; they are still AI at sha2, where C3's note attests them.
     assert_blame_sample_at_commit(
         &repo,
         &chain[2],
         "api.py",
         "sha2_blame",
-        &[("def list_users", false), ("def create_user", false)],
+        &[("def list_users", true), ("def create_user", true)],
     );
 
     // sha3 = C4' (human-only commit: requirements.txt via write_raw_commit, no note expected).
@@ -6945,7 +6942,7 @@ fn test_slow_path_feature_has_human_commits_intermixed() {
     // sha4 = C5' (third AI commit): api.py cumulative AI lines
     assert_note_base_commit_matches(&repo, &chain[4], "sha4");
     assert_note_files_exact(&repo, &chain[4], "sha4_files", &["api.py"]);
-    assert_accepted_lines_exact(&repo, &chain[4], "sha4_lines", 30);
+    assert_accepted_lines_exact(&repo, &chain[4], "sha4_lines", 32);
     // C5 introduced /users/:id GET and DELETE — verify they are AI at sha4.
     assert_blame_sample_at_commit(
         &repo,
@@ -6960,7 +6957,7 @@ fn test_slow_path_feature_has_human_commits_intermixed() {
     );
 
     // Session format: cumulative AI lines in attestation ranges.
-    // Values grow monotonically: [12, 18, 30].
+    // Values grow monotonically: [13, 25, 32].
 }
 
 /// Test 9: Large function blocks with 20-line license header prepended.
@@ -7234,10 +7231,8 @@ fn test_slow_path_large_function_blocks_line_offset() {
     assert_note_base_commit_matches(&repo, &chain[1], "sha1");
     assert_note_files_exact(&repo, &chain[1], "sha1_files", &["processor.rs"]);
     // The 20-line license header shifts ALL feature lines by +20. We check that
-    // known-AI lines in the intermediate commit C2′ are correctly attributed.
-    // Only lines whose content also exists in the final feature tip (C5) are
-    // attributable via the hunk-based content-map lookup; lines that C3/C4/C5
-    // later rewrote are no longer in the content map and show as human.
+    // known-AI lines in the intermediate commit C2′ are correctly attributed,
+    // including lines that C3/C4/C5 later rewrote: C2's own note attests them.
     assert_blame_sample_at_commit(
         &repo,
         &chain[1],
@@ -7260,9 +7255,9 @@ fn test_slow_path_large_function_blocks_line_offset() {
         "processor.rs",
         "sha2_chunk_data",
         &[
-            ("pub fn chunk_data", false),
-            ("chunk_size == 0", false),
-            ("chunks.push", false),
+            ("pub fn chunk_data", true),
+            ("chunk_size == 0", true),
+            ("chunks.push", true),
         ],
     );
 
@@ -7273,7 +7268,7 @@ fn test_slow_path_large_function_blocks_line_offset() {
         &chain[3],
         "processor.rs",
         "sha3_rle",
-        &[("pub fn run_length_encode", true), ("result.push", false)],
+        &[("pub fn run_length_encode", true), ("result.push", true)],
     );
 
     // sha4 = C5': C5 added transform_pipeline and helpers
@@ -7552,9 +7547,9 @@ fn test_slow_path_file_grows_then_unique_files_each_commit() {
         "shared_util.js",
         "sha1_shared_curry",
         &[
-            ("export function curry", false),
-            ("export function partial", false),
-            ("export const negate", false),
+            ("export function curry", true),
+            ("export function partial", true),
+            ("export const negate", true),
         ],
     );
     // helpers/date.js (from C1) is a prior file at chain[1] — fast path, verify attribution intact
@@ -7593,9 +7588,9 @@ fn test_slow_path_file_grows_then_unique_files_each_commit() {
         "shared_util.js",
         "sha2_shared_debounce",
         &[
-            ("export function debounce", false),
-            ("export function throttle", false),
-            ("export function trampoline", false),
+            ("export function debounce", true),
+            ("export function throttle", true),
+            ("export function trampoline", true),
         ],
     );
     // helpers/date.js (from C1) and helpers/string.js (from C2) are prior files at chain[2]
@@ -7645,7 +7640,7 @@ fn test_slow_path_file_grows_then_unique_files_each_commit() {
         "shared_util.js",
         "sha3_shared_eventemitter",
         &[
-            ("export class EventEmitter", false),
+            ("export class EventEmitter", true),
             ("export const sleep", true),
             ("export async function retry", true),
         ],

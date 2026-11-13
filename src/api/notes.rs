@@ -2,7 +2,8 @@
 
 use crate::api::client::ApiClient;
 use crate::api::types::{
-    ApiErrorResponse, NotesReadResponse, NotesUploadRequest, NotesUploadResponse,
+    ApiErrorResponse, NoteRecordsResponse, NotesReadResponse, NotesUploadRequest,
+    NotesUploadResponse,
 };
 use crate::error::AutterError;
 
@@ -56,15 +57,7 @@ impl ApiClient {
     /// * `Ok(NotesReadResponse)` - Response mapping commit_sha → note content
     /// * `Err(AutterError)` - On invalid input, auth, or DB errors
     pub fn read_notes(&self, commit_shas: &[&str]) -> Result<NotesReadResponse, AutterError> {
-        // Validate that all SHAs are hex strings before querying.
-        for sha in commit_shas {
-            if !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(AutterError::Generic(format!(
-                    "Commit SHA contains non-hex characters: {}",
-                    sha
-                )));
-            }
-        }
+        validate_commit_shas(commit_shas)?;
 
         let endpoint = format!("/worker/notes/?commits={}", commit_shas.join(","));
         let response = self.context().get(&endpoint)?;
@@ -84,6 +77,65 @@ impl ApiClient {
             ))),
         }
     }
+
+    /// Read the server's record of every version of these commits' notes
+    /// (`GET /worker/notes/record`, at most [`MAX_RECORD_COMMITS`] per call).
+    ///
+    /// Returns `Ok(None)` when the server has no such endpoint (404: a server
+    /// older than the record), so callers can say the record was not checked
+    /// rather than fail. Commits the server has no record for are absent from
+    /// the response.
+    pub fn read_note_records(
+        &self,
+        commit_shas: &[&str],
+    ) -> Result<Option<NoteRecordsResponse>, AutterError> {
+        validate_commit_shas(commit_shas)?;
+        if commit_shas.len() > MAX_RECORD_COMMITS {
+            return Err(AutterError::Generic(format!(
+                "At most {MAX_RECORD_COMMITS} commits per note record request, got {}",
+                commit_shas.len()
+            )));
+        }
+        if commit_shas.is_empty() {
+            return Ok(Some(NoteRecordsResponse::default()));
+        }
+
+        let endpoint = format!("/worker/notes/record?commits={}", commit_shas.join(","));
+        let response = self.context().get(&endpoint)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| AutterError::Generic(format!("Failed to read response body: {}", e)))?;
+
+        match status_code {
+            200 => serde_json::from_str(body)
+                .map(Some)
+                .map_err(AutterError::JsonError),
+            404 => Ok(None),
+            401 | 403 => Err(AutterError::Generic(format!(
+                "the server refused the request (status {status_code}); run `autter login`"
+            ))),
+            _ => Err(AutterError::Generic(format!(
+                "note record read failed with status {status_code}"
+            ))),
+        }
+    }
+}
+
+/// The most commits one `GET /worker/notes/record` request may name.
+pub const MAX_RECORD_COMMITS: usize = 100;
+
+/// Commit SHAs go into a query string: only hex digits are allowed.
+fn validate_commit_shas(commit_shas: &[&str]) -> Result<(), AutterError> {
+    for sha in commit_shas {
+        if !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(AutterError::Generic(format!(
+                "Commit SHA contains non-hex characters: {}",
+                sha
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -187,6 +239,76 @@ mod tests {
         let response: NotesReadResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.notes.get("abc123"), Some(&"content1".to_string()));
         assert_eq!(response.notes.get("def456"), Some(&"content2".to_string()));
+    }
+
+    #[test]
+    fn test_read_note_records_rejects_non_hex_sha() {
+        let ctx = ApiContext::without_auth(Some("https://example.com".to_string()));
+        let client = ApiClient::new(ctx);
+        let err = client
+            .read_note_records(&["abc123", "abc&commits=x"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-hex"), "{err}");
+    }
+
+    #[test]
+    fn test_read_note_records_rejects_more_than_a_chunk() {
+        let ctx = ApiContext::without_auth(Some("https://example.com".to_string()));
+        let client = ApiClient::new(ctx);
+        let shas: Vec<String> = (0..=MAX_RECORD_COMMITS)
+            .map(|i| format!("{i:040x}"))
+            .collect();
+        let refs: Vec<&str> = shas.iter().map(String::as_str).collect();
+        let err = client.read_note_records(&refs).unwrap_err().to_string();
+        assert!(err.contains("At most 100"), "{err}");
+    }
+
+    #[test]
+    fn test_read_note_records_empty_input_makes_no_request() {
+        // An unreachable server: an empty request must not contact it.
+        let ctx = ApiContext::without_auth(Some("http://127.0.0.1:1".to_string()));
+        let client = ApiClient::new(ctx);
+        let response = client.read_note_records(&[]).unwrap().unwrap();
+        assert!(response.records.is_empty());
+    }
+
+    #[test]
+    fn test_note_records_response_deserialization() {
+        let json = r#"{"records": {
+            "abc123": {"versions": [
+                {"content_sha256": "aa", "integrity_digest": "dd", "uploaded_by": "user_1",
+                 "recorded_at": "2026-11-01T10:00:00Z", "seeded": true},
+                {"content_sha256": "bb", "integrity_digest": null, "uploaded_by": null,
+                 "recorded_at": "2026-11-02T10:00:00Z", "seeded": false}
+            ]},
+            "def456": {"versions": []}
+        }}"#;
+        let response: NoteRecordsResponse = serde_json::from_str(json).unwrap();
+        let versions = &response.records["abc123"].versions;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].content_sha256, "aa");
+        assert_eq!(versions[0].integrity_digest.as_deref(), Some("dd"));
+        assert_eq!(versions[0].uploaded_by.as_deref(), Some("user_1"));
+        assert!(versions[0].seeded);
+        assert_eq!(versions[1].integrity_digest, None);
+        assert_eq!(versions[1].uploaded_by, None);
+        assert_eq!(versions[1].recorded_at, "2026-11-02T10:00:00Z");
+        assert!(!versions[1].seeded);
+        assert!(response.records["def456"].versions.is_empty());
+    }
+
+    #[test]
+    fn test_note_records_response_tolerates_missing_optional_fields() {
+        // Fields a server may leave out (older or trimmed responses).
+        let json = r#"{"records": {"abc": {"versions": [{"content_sha256": "aa"}]}}}"#;
+        let response: NoteRecordsResponse = serde_json::from_str(json).unwrap();
+        let v = &response.records["abc"].versions[0];
+        assert_eq!(v.integrity_digest, None);
+        assert_eq!(v.uploaded_by, None);
+        assert!(!v.seeded);
+        let empty: NoteRecordsResponse = serde_json::from_str("{}").unwrap();
+        assert!(empty.records.is_empty());
     }
 
     #[test]

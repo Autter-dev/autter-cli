@@ -11,9 +11,11 @@
 // the npm global bin directory (already on PATH) provides the `autter`
 // command via bin/autter.js.
 //
-// The package version is stamped to the CLI release tag at publish time, so
-// `npm i -g @autter/cli@1.7.0` fetches the v1.7.0 binaries. The in-repo placeholder
-// version (0.0.0-dev) resolves to the latest release instead.
+// The package version is stamped to the CLI release tag at publish time
+// (release.yml runs `npm version <tag>`), so `npm i -g @autter/cli@1.7.0`
+// fetches the v1.7.0 binaries. The checked-in version is the placeholder
+// 0.0.0-dev, which is never published: an install from a checkout resolves
+// the latest release instead.
 //
 // Escape hatches:
 //   AUTTER_NPM_SKIP_DOWNLOAD=1  skip the postinstall download entirely
@@ -57,17 +59,80 @@ function binaryDest() {
   return path.join(installDir(), process.platform === 'win32' ? 'autter.exe' : 'autter');
 }
 
+// ~/.autter/npm-install.json says the binary in ~/.autter/bin was installed
+// by this package, so npm picks its version: the autter background service
+// then never replaces it, and `autter upgrade` names the npm command instead
+// (src/commands/upgrade.rs reads it). The shell and PowerShell installers
+// remove it when they install over an npm install.
+function installMarkerPath(home = os.homedir()) {
+  return path.join(home, '.autter', 'npm-install.json');
+}
+
+function readInstallMarker(home = os.homedir()) {
+  try {
+    return JSON.parse(fs.readFileSync(installMarkerPath(home), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeInstallMarker({ home = os.homedir(), packageVersion = pkg.version } = {}) {
+  const file = installMarkerPath(home);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        { installer: 'npm', package: pkg.name, package_version: packageVersion },
+        null,
+        2,
+      ) + '\n',
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Whether the launcher has to (re)install before it runs the binary: the
+// binary is missing, or this published package version has not installed its
+// binary yet. The second happens when npm skipped the postinstall script
+// (npm 10+ with scripts off, --ignore-scripts, pnpm): `npm install -g
+// @autter/cli@<version>` then changed nothing but the launcher.
+function launcherNeedsInstall({ binaryExists, marker, packageVersion = pkg.version }) {
+  if (!binaryExists) return true;
+  if (packageVersion === DEV_VERSION) return false;
+  return !marker || marker.package_version !== packageVersion;
+}
+
+// The version checked in to the repository. release.yml replaces it with the
+// release version before `npm publish`.
+const DEV_VERSION = '0.0.0-dev';
+
 function releaseTag() {
   const override = process.env.AUTTER_RELEASE_TAG;
   if (override && override !== 'latest') return override;
-  if (pkg.version === '0.0.0-dev') return 'latest';
+  if (pkg.version === DEV_VERSION) return 'latest';
   return `v${pkg.version}`;
 }
 
+// "latest" is resolved to the tag it names before anything is downloaded, the
+// way install.sh and install.ps1 do: the binary and checksums.txt then come
+// from one release, and the checksum policy (which needs a version) applies.
+// GitHub answers /releases/latest with a redirect to /releases/tag/<tag>.
+async function resolveLatestTag(fetchImpl = fetch) {
+  const url = `https://github.com/${REPO}/releases/latest`;
+  const res = await fetchImpl(url, { method: 'HEAD', redirect: 'manual' });
+  const target = (res.headers && res.headers.get('location')) || res.url || '';
+  const match = /\/releases\/tag\/([^/?#]+)/.exec(target);
+  if (!match) {
+    throw new Error(`could not resolve the latest release (HTTP ${res.status}) from ${url}`);
+  }
+  return decodeURIComponent(match[1]);
+}
+
 function downloadUrl(tag, file) {
-  return tag === 'latest'
-    ? `https://github.com/${REPO}/releases/latest/download/${file}`
-    : `https://github.com/${REPO}/releases/download/${tag}/${file}`;
+  return `https://github.com/${REPO}/releases/download/${tag}/${file}`;
 }
 
 async function fetchBuffer(url) {
@@ -266,7 +331,7 @@ function reportInstallPing(tag) {
 async function ensureBinary() {
   const asset = assetName(); // throws early on unsupported platforms
   const dest = binaryDest();
-  const tag = releaseTag();
+  let tag = releaseTag();
 
   if (fs.existsSync(dest)) {
     if (tag === 'latest') {
@@ -278,6 +343,10 @@ async function ensureBinary() {
       return { bin: dest, downloaded: false };
     }
     console.log(`autter: replacing version ${current ?? 'unknown'} at ${dest} with ${tag}`);
+  }
+
+  if (tag === 'latest') {
+    tag = await resolveLatestTag();
   }
 
   console.log(`autter: downloading ${asset} (release: ${tag})...`);
@@ -344,6 +413,7 @@ async function main() {
     console.warn('autter: it will be downloaded on first run instead');
     return;
   }
+  writeInstallMarker();
 
   if (!result.downloaded) {
     return;
@@ -354,16 +424,23 @@ async function main() {
   console.log('');
   console.log(`autter installed at ${result.bin}`);
   console.log("Run 'autter onboard' to finish setup (consent for hooks, git config, and daemon).");
-  console.log("Upgrade later with 'autter upgrade' (or npm install -g @autter/cli@latest); 'npm update' alone does not upgrade the CLI.");
+  console.log("Upgrade later with 'npm install -g @autter/cli@latest'; 'npm update' alone does not upgrade the CLI.");
 }
 
 module.exports = {
+  DEV_VERSION,
   assetName,
   binaryDest,
+  downloadUrl,
   ensureBinary,
+  installMarkerPath,
+  launcherNeedsInstall,
+  readInstallMarker,
   releaseTag,
+  resolveLatestTag,
   spawnFailureHelp,
   verifyChecksum,
+  writeInstallMarker,
 };
 
 if (require.main === module) {

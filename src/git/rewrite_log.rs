@@ -191,6 +191,16 @@ pub struct MergeSquashEvent {
     /// does not, so uncommitted attribution may still be live and must be kept.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preserve_working_log: bool,
+    /// Every commit one `git cherry-pick -n` picked, in pick order, when
+    /// `source_head` alone does not cover them. `source_head` is the last one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub picked_commits: Vec<String>,
+    /// Every commit one `git cherry-pick -n` applied, in the order it applied
+    /// them, including commits `picked_commits` leaves out because a later pick
+    /// descends from them. What the pick put in the tree is worked out from
+    /// these commits alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_commits: Vec<String>,
 }
 
 impl MergeSquashEvent {
@@ -208,6 +218,8 @@ impl MergeSquashEvent {
             base_head,
             staged_file_blobs,
             preserve_working_log: false,
+            picked_commits: Vec::new(),
+            applied_commits: Vec::new(),
         }
     }
 
@@ -216,6 +228,37 @@ impl MergeSquashEvent {
     pub fn with_preserved_working_log(mut self) -> Self {
         self.preserve_working_log = true;
         self
+    }
+
+    /// The commits a `git cherry-pick -n` picked, oldest pick first.
+    pub fn with_picked_commits(mut self, picked_commits: Vec<String>) -> Self {
+        self.picked_commits = picked_commits;
+        self
+    }
+
+    /// Every commit a `git cherry-pick -n` applied, in order.
+    pub fn with_applied_commits(mut self, applied_commits: Vec<String>) -> Self {
+        self.applied_commits = applied_commits;
+        self
+    }
+
+    /// The commits whose changes this pick applied, in order. Older events
+    /// only list the picked commits.
+    pub fn applied_commits(&self) -> Vec<String> {
+        if self.applied_commits.is_empty() {
+            self.source_commits()
+        } else {
+            self.applied_commits.clone()
+        }
+    }
+
+    /// The commits this event brings in, in the order they were applied.
+    pub fn source_commits(&self) -> Vec<String> {
+        if self.picked_commits.is_empty() {
+            vec![self.source_head.clone()]
+        } else {
+            self.picked_commits.clone()
+        }
     }
 }
 
@@ -330,11 +373,25 @@ impl CherryPickCompleteEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CherryPickAbortEvent {
     pub original_head: String,
+    /// Set when a `git stash` took away everything a pending `git cherry-pick
+    /// -n` had applied: the stash it went into. Applying that stash again on
+    /// the same commit brings the pick back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stashed_as: Option<String>,
 }
 
 impl CherryPickAbortEvent {
     pub fn new(original_head: String) -> Self {
-        Self { original_head }
+        Self {
+            original_head,
+            stashed_as: None,
+        }
+    }
+
+    /// The pick was not thrown away but stashed, as `stash_sha`.
+    pub fn stashed_as(mut self, stash_sha: String) -> Self {
+        self.stashed_as = Some(stash_sha);
+        self
     }
 }
 

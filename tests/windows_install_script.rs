@@ -522,3 +522,18 @@ fn windows_install_script_gates_daemon_restart_to_self_update() {
         "install.ps1 should funnel daemon restart attempts through the gated helper"
     );
 }
+
+#[test]
+fn windows_install_script_removes_the_npm_marker_after_installing() {
+    let script = fs::read_to_string(install_script_path()).expect("failed to read install.ps1");
+    let moved = script
+        .find("Move-Item -Force -Path $tmpFile -Destination $finalExe")
+        .expect("install.ps1 moves the new binary into place");
+    let removed = script
+        .find(r"Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $HOME '.autter\npm-install.json')")
+        .expect("install.ps1 must remove the npm package's marker");
+    assert!(
+        removed > moved,
+        "the marker goes once this installer owns the binary"
+    );
+}

@@ -265,6 +265,29 @@ pub fn stash_requires_target_resolution(command_args: &[String]) -> bool {
     )
 }
 
+/// True when the arguments of `git cherry-pick` ask it not to commit: `-n`,
+/// `--no-commit`, or `-n` bundled with other short flags, as in `-nx`.
+pub fn cherry_pick_requests_no_commit(command_args: &[String]) -> bool {
+    for arg in command_args {
+        if arg == "--no-commit" {
+            return true;
+        }
+        let Some(short_flags) = arg.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+            continue;
+        };
+        for flag in short_flags.chars() {
+            match flag {
+                'n' => return true,
+                // `-m<parent>`, `-S<keyid>` and `-X<option>` take the rest of
+                // the argument as their value.
+                'm' | 'S' | 'X' => break,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 pub fn stash_target_spec(command_args: &[String]) -> Option<&str> {
     if !stash_requires_target_resolution(command_args) {
         return None;
@@ -733,6 +756,31 @@ fn derive_directory_from_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cherry_pick_no_commit_is_recognised_alone_and_bundled() {
+        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(cherry_pick_requests_no_commit(&args(&["-n", "abc"])));
+        assert!(cherry_pick_requests_no_commit(&args(&[
+            "--no-commit",
+            "abc"
+        ])));
+        assert!(cherry_pick_requests_no_commit(&args(&["-nx", "abc"])));
+        assert!(cherry_pick_requests_no_commit(&args(&["-xn", "abc"])));
+
+        assert!(!cherry_pick_requests_no_commit(&args(&["-x", "abc"])));
+        assert!(!cherry_pick_requests_no_commit(&args(&["main"])));
+        // The value of a flag is not a flag.
+        assert!(!cherry_pick_requests_no_commit(&args(&[
+            "-Xpatience",
+            "abc"
+        ])));
+        assert!(!cherry_pick_requests_no_commit(&args(&["-Sjohn", "abc"])));
+        assert!(!cherry_pick_requests_no_commit(&args(&[
+            "--no-edit",
+            "abc"
+        ])));
+    }
 
     #[test]
     fn test_pos_command_basic() {

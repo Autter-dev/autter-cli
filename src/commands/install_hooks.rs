@@ -67,6 +67,38 @@ pub fn detect_tools() -> Vec<DetectedTool> {
         .collect()
 }
 
+/// The next step after an agent's hooks or extension could not be changed.
+pub(crate) fn hook_error_fix(name: &str, id: &str, error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("access is denied") {
+        format!(
+            "  Fix: make sure your user can write {name}'s settings (they may be owned by root after `sudo`), then run `autter install-hooks` again."
+        )
+    } else if lower.contains("parse") || lower.contains("invalid") || lower.contains("expected") {
+        format!(
+            "  Fix: {name}'s settings file could not be read; correct it (or move it aside), then run `autter install-hooks` again."
+        )
+    } else {
+        format!(
+            "  Fix: run `autter install-hooks` again, then `autter doctor --agent {id}` to check {name}."
+        )
+    }
+}
+
+/// The next step after removing an agent's hooks or extension failed.
+pub(crate) fn uninstall_error_fix(name: &str, error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("access is denied") {
+        format!(
+            "  Fix: make sure your user can write {name}'s settings, then run the same command again."
+        )
+    } else {
+        format!(
+            "  Fix: run the same command again; if it fails again, remove autter's entry from {name}'s settings by hand (`autter uninstall --dry-run` lists them)."
+        )
+    }
+}
+
 /// Install hooks for `tool_ids` (from [`detect_tools`]; `None` for every
 /// detected tool), plus the global git trace2 config and background service
 /// when `system` is set. Output hangs off onboarding's step rail.
@@ -475,12 +507,14 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, AutterError> {
     // Internal: rewrite only out-of-date hooks of agents already set up. Started
     // in the background on the first command after an upgrade, and by
     // `autter upgrade` with the newly installed binary.
+    // A failure goes back to the caller like every other path here (it is
+    // printed and the command exits 1); this used to exit from inside `run`.
     if args.len() == 1 && args[0] == crate::mdm::hook_refresh::REFRESH_STALE_FLAG {
-        let ok = crate::mdm::hook_refresh::run_refresh_command();
-        std::process::exit(if ok {
-            crate::commands::EXIT_SUCCESS
-        } else {
-            crate::commands::EXIT_RUNTIME_ERROR
+        return crate::mdm::hook_refresh::run_refresh_command().map(|refreshed| {
+            refreshed
+                .into_iter()
+                .map(|name| (name, "refreshed".to_string()))
+                .collect()
         });
     }
     let mut options = parse_install_options(args).map_err(AutterError::Usage)?;
@@ -1137,6 +1171,7 @@ async fn async_run_install(
                             let error_msg = e.to_string();
                             spinner.error(&format!("{}: Failed to update hooks", name));
                             eprintln!("  Error: {}", error_msg);
+                            eprintln!("{}", hook_error_fix(name, id, &error_msg));
                             statuses.insert(id.to_string(), InstallStatus::Failed);
                             detailed_results
                                 .push((id.to_string(), InstallResult::failed(error_msg)));
@@ -1208,6 +1243,7 @@ async fn async_run_install(
                     }
                     Err(e) => {
                         eprintln!("  Error installing extras for {}: {}", name, e);
+                        eprintln!("{}", hook_error_fix(name, id, &e.to_string()));
                         // Capture extras error as a warning on the tool's result
                         if let Some((_, detail)) = detailed_results
                             .iter_mut()
@@ -1543,6 +1579,7 @@ async fn async_run_uninstall(
                         Err(e) => {
                             spinner.error(&format!("{}: Failed to remove hooks", name));
                             eprintln!("  Error: {}", e);
+                            eprintln!("{}", uninstall_error_fix(name, &e.to_string()));
                             statuses.insert(id.to_string(), InstallStatus::NotFound);
                         }
                     }
@@ -1580,11 +1617,13 @@ async fn async_run_uninstall(
                     }
                     Err(e) => {
                         eprintln!("  Error uninstalling extras for {}: {}", name, e);
+                        eprintln!("{}", uninstall_error_fix(name, &e.to_string()));
                     }
                 }
             }
             Err(e) => {
                 eprintln!("  Error checking {}: {}", name, e);
+                eprintln!("{}", uninstall_error_fix(name, &e.to_string()));
                 statuses.insert(id.to_string(), InstallStatus::NotFound);
             }
         }
@@ -1628,6 +1667,28 @@ fn cleanup_legacy_envelope_logs() {
 
     // Remove the debounce marker file
     let _ = fs::remove_file(internal.join("last_flush_trigger_ts"));
+}
+
+#[cfg(test)]
+mod error_fix_tests {
+    use super::*;
+
+    #[test]
+    fn hook_errors_name_the_next_step() {
+        let fix = hook_error_fix("Cursor", "cursor", "Permission denied (os error 13)");
+        assert!(fix.contains("autter install-hooks"), "{fix}");
+        assert!(fix.contains("root"), "{fix}");
+        let fix = hook_error_fix("Codex", "codex", "TOML parse error at line 3");
+        assert!(fix.contains("settings file could not be read"), "{fix}");
+        let fix = hook_error_fix("Gemini", "gemini", "something else");
+        assert!(fix.contains("autter doctor --agent gemini"), "{fix}");
+        for fix in [
+            uninstall_error_fix("Cursor", "Permission denied"),
+            uninstall_error_fix("Cursor", "boom"),
+        ] {
+            assert!(fix.trim_start().starts_with("Fix:"), "{fix}");
+        }
+    }
 }
 
 #[cfg(test)]

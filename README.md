@@ -197,21 +197,22 @@ It computes % AI code, AI lines generated vs committed, acceptance rates, and hu
 
 ### Scripting and CI
 
-Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `whoami`, `doctor`, `sync status`) takes `--json` and prints exactly one JSON document on stdout, with a `schema_version` and, on failure, an `error` object. Fields are only ever added. With `--strict` (or `AUTTER_STRICT=1`), `stats` and `status` fail when nothing was captured and `doctor` fails when capture is broken:
+Every reporting command (`stats`, `status`, `log`, `show`, `blame`, `diff`, `whoami`, `doctor`, `sync status`) takes `--json` and prints exactly one JSON document on stdout, with a `schema_version` and, on failure, an `error` object. Fields are only ever added. With `--strict` (or `AUTTER_STRICT=1`), `stats` and `status` fail when autter has no record of the lines that were added (capture missed them; a recorded commit typed by hand passes) and `doctor` fails when capture is broken:
 
 | Exit code | Meaning |
 |---|---|
 | 0 | Success |
 | 1 | Runtime error |
 | 2 | Usage error (bad flags, outside a repository) |
-| 3 | Nothing captured (`stats`, `status`; only with `--strict`) |
+| 3 | Nothing captured: autter has no record of the added lines (`stats`, `status`; only with `--strict`) |
 | 4 | Capture is broken (`doctor`; only with `--strict`) |
+| 5 | A note failed the integrity check (`verify`), or was carried by a rewrite from one that did |
 
 ```bash
 autter stats "$BASE..$HEAD" --json --strict | jq '.percent.ai'
 ```
 
-In CI (`CI=true`) or when output is not a terminal, autter prints no color, prompts or spinners. See [Scripting and CI](docs/scripting.md) for the JSON Schema, error codes and a GitHub Actions workflow that fails a pull request when nothing was captured or the AI share is too high.
+In CI (`CI=true`) or when output is not a terminal, autter prints no color, prompts or spinners. `autter verify origin/main..HEAD --strict` checks that each commit's authorship note was written for that commit and has not been changed since (an integrity check); stats and blame count the lines of a note that fails as unknown. See [Scripting and CI](docs/scripting.md) for the JSON Schema, error codes and a GitHub Actions workflow that fails a pull request when nothing was captured or the AI share is too high.
 
 For a year at a glance, `autter wrapped` draws a screenshot-ready card of your AI-assisted coding in the repository: AI share by month, top agent and model, most-prompted file, longest prompt, streak and busiest weekday. `--json` prints the same numbers, and `--share` publishes the card as a page with a share image. Prompt text never leaves the machine unless you pass `--include-prompt-text`.
 
@@ -348,6 +349,8 @@ Autter provides line-level attribution for AI-generated code whether it was writ
 | Remote dev (SSH / WSL / devcontainers / Codespaces)              | Same as above, but everything runs on the remote host | Install autter **on the remote host** and run `autter install-hooks` there; a local-only install looks healthy while capturing nothing. |
 
 Run `autter debug` and read the **AI Agent Capture** section to see, per agent, whether the capture chain on this machine is complete.
+
+Every supported agent and editor, its integration type, what is and is not captured, and the command that checks it end to end (`autter doctor --agent <name>`, which simulates the agent's hook calls) are listed in [docs/agents.md](docs/agents.md).
 
 Here is the full breakdown of what is supported today:
 

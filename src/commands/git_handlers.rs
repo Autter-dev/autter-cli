@@ -534,8 +534,7 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
         return;
     }
 
-    let is_interactive =
-        std::io::stdout().is_terminal() || std::env::var_os("AUTTER_TEST_FORCE_TTY").is_some();
+    let is_interactive = std::io::stdout().is_terminal() || crate::utils::test_forces_tty();
     if !is_interactive {
         return;
     }

@@ -618,6 +618,9 @@ fi
 verify_checksum "$TMP_FILE" "$BINARY_NAME"
 
 mv -f "$TMP_FILE" "${INSTALL_DIR}/autter"
+# This installer now owns the binary: drop the npm package's marker, so the
+# background service updates it again and `autter upgrade` stops pointing at npm.
+rm -f "$HOME/.autter/npm-install.json" 2>/dev/null || true
 
 # Make executable
 chmod +x "${INSTALL_DIR}/autter"
@@ -641,7 +644,10 @@ success "Successfully installed autter into ${INSTALL_DIR}"
 success "You can now run 'autter' from your terminal"
 echo "Installed autter ${INSTALLED_VERSION}"
 
-# Login user with install token if provided
+# Sign the user in with the install token, when the install command carried
+# one (the command copied from the Autter app does). A failed exchange (an
+# expired or already-used token, no network) is handled before onboarding
+# below, where NEED_LOGIN is read.
 NEED_LOGIN=false
 if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
     if ! ${INSTALL_DIR}/autter exchange-nonce; then
@@ -754,6 +760,23 @@ fi
 # opening it fails (no controlling terminal, e.g. CI or `bash < /dev/null`),
 # which used to print a bare "/dev/tty: Device not configured" error. Actually
 # try to open it instead.
+# The install token did not sign the user in: sign in now, as install.ps1
+# does, so the account the install command came from is connected before
+# onboarding asks about it. NEED_LOGIN used to be set and never read, so the
+# install went on signed out without saying so. Login needs a person (it
+# opens the browser or prints a code), so without a terminal say what to run.
+if [ "$NEED_LOGIN" = "true" ]; then
+    echo ""
+    if ( : </dev/tty ) 2>/dev/null; then
+        echo "The install command could not sign you in automatically. Launching login..."
+        if ! ${INSTALL_DIR}/autter login </dev/tty; then
+            warn "Sign-in did not finish. autter is installed; sign in later with: autter login"
+        fi
+    else
+        warn "The install command could not sign you in automatically, and there is no terminal to sign in from. autter is installed; sign in with: autter login"
+    fi
+fi
+
 echo ""
 ONBOARD_STATUS=0
 if ( : </dev/tty ) 2>/dev/null; then

@@ -5,9 +5,9 @@ Autter runs one small background process per user, called the background service
 ## What it does
 
 - **Writes authorship notes.** When you commit, git reports the command to the service, which matches it with the checkpoints your agents sent and writes the authorship note for the commit to `refs/notes/ai`. It does the same bookkeeping for rebase, cherry-pick, merge, stash and reset, so attribution follows the code.
-- **Receives checkpoints.** Agent hooks call `autter checkpoint`, which hands the edit to the service and returns at once, so the agent is not slowed down.
+- **Receives checkpoints.** Agent hooks call `autter checkpoint`, which hands the edit to the service and returns as soon as the service confirms it has it (about a millisecond), before the service processes it, so the agent is not slowed down. If the service does not confirm it within 200 ms, the hook tries once more and then prints `Checkpoint may not have been recorded` on stderr; it still exits 0 so the agent carries on. Run by hand, `autter checkpoint` exits 1 instead.
 - **Uploads, in connected mode only.** If this machine is connected to the Autter platform, the service uploads queued authorship and usage data. In local mode it uploads nothing.
-- **Checks for updates.** Release builds check for a newer version about once an hour and install it in the background. It does not do this in CI, when `AUTTER_RELEASE_TAG` pins a release, or when updates are turned off (`AUTTER_DISABLE_AUTO_UPDATES=1`, or `autter config set disable_auto_updates true`). `autter upgrade` upgrades on request.
+- **Checks for updates.** Release builds check for a newer version about once an hour and install it in the background. It does not do this in CI, when `AUTTER_RELEASE_TAG` pins a release, for an npm install (npm picks the version; autter names `npm install -g @autter/cli@latest` once per release instead), or when updates are turned off (`AUTTER_DISABLE_AUTO_UPDATES=1`, or `autter config set disable_auto_updates true`). `autter upgrade` upgrades on request.
 
 It does not open a network port, does not read files outside the repositories you commit in and the agent transcripts named in checkpoints, and is not started until you agree to it during `autter onboard` (or run `autter install --system`).
 
@@ -42,5 +42,7 @@ Start with `autter doctor`. It checks that the service is running, that a git co
 | "Access is denied" or "lock held" | the service was started as root or Administrator, so your own account cannot reach it | stop the elevated one (from the elevated terminal, `autter bg shutdown`), then `autter bg restart` from a normal terminal |
 | The service and the CLI report different versions | an upgrade replaced the binary while the old service was still running | `autter bg restart` |
 | Doctor times out on a slow machine | time limits too short for this machine | `AUTTER_DOCTOR_TIMEOUT_SCALE=5 autter doctor` |
+
+If it still fails, run `autter doctor --report autter-report.txt` and send that file with your report. It holds doctor's results, the service's start timings and lock-file state, the end of its log, and your git and OS versions, but no source code, file contents or tokens.
 
 To remove it along with the rest of Autter's setup, run `autter uninstall`.

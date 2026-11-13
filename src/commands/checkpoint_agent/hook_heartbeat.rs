@@ -106,9 +106,18 @@ pub fn next_heartbeat(
     }
 }
 
-/// Record one hook run for `preset`. A no-op for presets that aren't tracked.
+/// Set by `autter doctor --agent` on the hook calls it simulates, so they
+/// are never mistaken for the agent's own hook runs.
+pub const SIMULATED_HOOK_ENV: &str = "AUTTER_SIMULATED_HOOK";
+
+fn should_record(preset: &str, simulated: bool) -> bool {
+    !simulated && TRACKED_PRESETS.contains(&preset)
+}
+
+/// Record one hook run for `preset`. A no-op for presets that aren't tracked,
+/// and for the hook calls `autter doctor --agent` simulates.
 pub fn record(preset: &str, outcome: HookOutcome, detail: Option<&str>) {
-    if !TRACKED_PRESETS.contains(&preset) {
+    if !should_record(preset, std::env::var_os(SIMULATED_HOOK_ENV).is_some()) {
         return;
     }
     let Some(path) = heartbeat_path(preset) else {
@@ -202,5 +211,10 @@ mod tests {
     fn untracked_presets_are_ignored() {
         assert!(!TRACKED_PRESETS.contains(&"claude"));
         assert!(TRACKED_PRESETS.contains(&"github-copilot"));
+        // A hook call simulated by `autter doctor --agent` must not read as
+        // Copilot capture working.
+        assert!(should_record("github-copilot", false));
+        assert!(!should_record("github-copilot", true));
+        assert!(!should_record("claude", false));
     }
 }

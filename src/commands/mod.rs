@@ -34,6 +34,7 @@ pub mod notes_migrate;
 pub mod onboard;
 pub mod output;
 pub mod personal_dashboard;
+pub mod setup_notices;
 pub mod show;
 pub mod show_prompt;
 pub mod squash_authorship;
@@ -42,6 +43,7 @@ pub mod sync;
 pub mod telemetry;
 pub mod upgrade;
 pub mod usage_hints;
+pub mod verify;
 pub mod whoami;
 pub mod wrapped;
 
@@ -57,7 +59,8 @@ pub mod wrapped;
 ///   unknown subcommand, missing required argument, unparseable flag value,
 ///   or a reporting command run outside a git repository).
 /// * [`EXIT_NOTHING_CAPTURED`] (`3`) — only with `--strict`: `stats`/`status`
-///   found nothing captured.
+///   found lines Autter has no record of (capture missed them). Lines typed
+///   by hand in a recorded commit are not that.
 /// * [`EXIT_CAPTURE_BROKEN`] (`4`) — only with `--strict`: `doctor` found
 ///   capture broken.
 ///
@@ -74,6 +77,8 @@ pub const EXIT_RUNTIME_ERROR: i32 = 1;
 pub const EXIT_USAGE_ERROR: i32 = 2;
 /// `--strict`: capture is broken (`doctor`). See [`output`].
 pub use output::EXIT_CAPTURE_BROKEN;
+#[allow(unused_imports)]
+pub use output::EXIT_INTEGRITY_FAILED;
 /// `--strict`: nothing was captured. See [`output`] for the full contract.
 pub use output::EXIT_NOTHING_CAPTURED;
 
@@ -111,8 +116,18 @@ pub fn repository_has_no_commits(repo: &crate::git::repository::Repository) -> b
         full.extend(args.iter().map(|a| a.to_string()));
         exec_git(&full).is_ok()
     };
-    git(&["symbolic-ref", "--quiet", "HEAD"])
-        && !git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+    // The usual case, a repository with commits, costs one git process.
+    !git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        && git(&["symbolic-ref", "--quiet", "HEAD"])
+}
+
+/// In a repository with no commits yet, stop with the same message and exit
+/// code `autter status` and `autter stats` use, instead of git's own error for
+/// a branch that does not exist. Returns when the repository has commits.
+pub fn exit_if_no_commits(repo: &crate::git::repository::Repository, command: &str) {
+    if repository_has_no_commits(repo) {
+        output::fail(output::ErrorKind::Runtime, no_commits_message(command));
+    }
 }
 
 /// What a reporting command says in a repository with no commits yet. It used

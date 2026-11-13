@@ -8,6 +8,7 @@ use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
 use crate::authorship::stats::{
     CommitStats, StatsSummary, stats_for_commit_stats, stats_from_authorship_log,
+    unsupported_agent_notice_for,
 };
 use crate::error::AutterError;
 use crate::git::notes_api::{
@@ -31,6 +32,11 @@ pub fn should_ignore_file(path: &str, ignore_patterns: &[String]) -> bool {
 pub struct RangeAuthorshipStats {
     pub authorship_stats: RangeAuthorshipStatsData,
     pub range_stats: CommitStats,
+    /// How many of `range_stats.unknown_additions` were added by a commit
+    /// with no authorship record. Those lines are Unknown; the rest of the
+    /// lines without attestation are Untracked. Reported as `lines.unknown`.
+    #[serde(default, skip_serializing)]
+    pub lines_without_record: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeAuthorshipStatsData {
@@ -46,8 +52,9 @@ pub struct RangeAuthorshipStatsData {
 /// [`RangeAuthorshipStats`] fields (kept for existing readers) and the
 /// [`StatsSummary`] of the range's added lines.
 ///
-/// Unattributed lines count as Untracked when any commit in the range has an
-/// authorship note and as Unknown when none has.
+/// A line without attestation is Untracked when the commit that added it has
+/// an authorship note and Unknown when that commit has none, the same as
+/// `autter stats <commit>` and `autter blame` label it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RangeStatsReport {
     pub range: RangeEnds,
@@ -66,7 +73,11 @@ pub struct RangeEnds {
 impl RangeStatsReport {
     pub fn new(start: String, end: String, stats: RangeAuthorshipStats) -> Self {
         let note_present = stats.authorship_stats.commits_with_authorship > 0;
-        let summary = StatsSummary::from_stats(&stats.range_stats, note_present);
+        let summary = StatsSummary::with_unknown_lines(
+            &stats.range_stats,
+            stats.lines_without_record,
+            note_present,
+        );
         Self {
             range: RangeEnds { start, end },
             stats,
@@ -153,7 +164,7 @@ pub fn range_authorship(
     let commit_authorship = get_commits_with_notes_from_list(repository, &commit_shas)?;
 
     // Calculate range stats - pass commit_shas directly to avoid re-fetching
-    let range_stats = calculate_range_stats_direct(
+    let (range_stats, lines_without_record) = calculate_range_stats_direct(
         repository,
         commit_range_clone,
         &commit_shas,
@@ -199,6 +210,7 @@ pub fn range_authorship(
                 .collect(),
         },
         range_stats,
+        lines_without_record,
     })
 }
 
@@ -431,17 +443,25 @@ fn get_git_diff_stats_for_range(
 
 /// Calculate AI vs human line contributions for a commit range
 /// Uses VirtualAttributions approach to create an in-memory squash
+///
+/// Returns the stats and how many of their `unknown_additions` were added by
+/// a commit that has no authorship record.
 fn calculate_range_stats_direct(
     repo: &Repository,
     commit_range: CommitRange,
     commit_shas: &[String],
     ignore_patterns: &[String],
-) -> Result<CommitStats, AutterError> {
+) -> Result<(CommitStats, u32), AutterError> {
     let start_sha = commit_range.start_oid.clone();
     let end_sha = commit_range.end_oid.clone();
     // Special case: single commit range (start == end)
     if start_sha == end_sha {
-        return stats_for_commit_stats(repo, &end_sha, ignore_patterns);
+        let stats = stats_for_commit_stats(repo, &end_sha, ignore_patterns)?;
+        // A note that fails the integrity check is no record (note_integrity.rs).
+        let recorded = crate::git::notes_api::read_note(repo, &end_sha).is_some()
+            && crate::authorship::note_integrity::failed_note(repo, &end_sha).is_none();
+        let lines_without_record = if recorded { 0 } else { stats.unknown_additions };
+        return Ok((stats, lines_without_record));
     }
 
     // Step 1: Get git diff stats between start and end
@@ -463,8 +483,9 @@ fn calculate_range_stats_direct(
         diff_ai_stats.total_known_human,
         &diff_ai_stats.per_tool_model,
     );
+    let lines_without_record = diff_ai_stats.total_unknown.min(stats.unknown_additions);
 
-    Ok(stats)
+    Ok((stats, lines_without_record))
 }
 
 pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
@@ -474,38 +495,73 @@ pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
 /// Text for `autter stats <a>..<b>`. Printed whether or not stdout is a
 /// terminal, so piped output matches what a person sees.
 pub fn render_range_authorship_stats(stats: &RangeAuthorshipStats) -> String {
-    use crate::authorship::labels::{AI_SHARE_MEANING, LineCategory};
-    use crate::authorship::stats::write_stats_to_terminal_with;
+    use crate::authorship::labels::AI_SHARE_MEANING;
+    use crate::authorship::stats::write_stats_to_terminal_split;
 
     let data = &stats.authorship_stats;
     let none_recorded = data.commits_with_authorship == 0;
-    let unattributed = if none_recorded {
-        LineCategory::Unknown
-    } else {
-        LineCategory::Untracked
-    };
-    let mut out = write_stats_to_terminal_with(&stats.range_stats, false, unattributed);
+    let range_stats = &stats.range_stats;
+    let unknown_lines = stats
+        .lines_without_record
+        .min(range_stats.unknown_additions);
+    let untracked_lines = range_stats.unknown_additions - unknown_lines;
+    let mut out = write_stats_to_terminal_split(range_stats, false, unknown_lines);
 
     if none_recorded {
         out.push_str("No commit in this range has an Autter record.\n");
     } else if data.commits_with_authorship < data.total_commits {
-        let commits_without = data.total_commits - data.commits_with_authorship;
-        let commit_word = if commits_without == 1 {
-            "commit has"
-        } else {
-            "commits have"
-        };
-        out.push_str(&format!(
-            "{commits_without} of {} {commit_word} no Autter record (their lines count as untracked):\n",
-            data.total_commits
+        out.push_str(&commits_without_record_line(
+            data.total_commits - data.commits_with_authorship,
+            data.total_commits,
         ));
         for (sha, author) in &data.commits_without_authorship_with_authors {
             out.push_str(&format!("  {} {}\n", &sha[..sha.len().min(7)], author));
         }
     }
-    if stats.range_stats.ai_additions > 0 {
+    if range_stats.ai_additions > 0 {
         out.push_str(AI_SHARE_MEANING);
         out.push('\n');
     }
+    // The same note `autter stats <commit>` prints: an AI tool Autter cannot
+    // capture is installed, and much of the range is untracked.
+    if let Some(notice) = unsupported_agent_notice_for(range_stats, untracked_lines) {
+        out.push_str(&notice);
+    }
     out
+}
+
+/// `1 of 3 commits has no Autter record (its lines count as unknown):`
+fn commits_without_record_line(commits_without: usize, total_commits: usize) -> String {
+    // "commits" follows the total ("1 of 3 commits", "1 of 1 commit"); the
+    // verb follows how many lack a record.
+    let commits = if total_commits == 1 {
+        "commit"
+    } else {
+        "commits"
+    };
+    let (verb, lines) = if commits_without == 1 {
+        ("has", "its lines count")
+    } else {
+        ("have", "their lines count")
+    };
+    format!(
+        "{commits_without} of {total_commits} {commits} {verb} no Autter record ({lines} as unknown):\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commits_without_record_line_agrees_in_number() {
+        assert_eq!(
+            commits_without_record_line(1, 3),
+            "1 of 3 commits has no Autter record (its lines count as unknown):\n"
+        );
+        assert_eq!(
+            commits_without_record_line(2, 3),
+            "2 of 3 commits have no Autter record (their lines count as unknown):\n"
+        );
+    }
 }
