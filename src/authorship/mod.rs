@@ -16,6 +16,7 @@ pub mod move_detection;
 pub mod no_commit_pick;
 pub mod note_integrity;
 pub mod note_server_record;
+pub mod note_stamp_floor;
 pub mod post_commit;
 
 pub mod prompt_utils;

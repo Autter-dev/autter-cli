@@ -5,9 +5,11 @@
 //!
 //! Exit codes: 0 when no note fails; [`EXIT_INTEGRITY_FAILED`] (5) when a note
 //! belongs to another commit, was changed (locally detected, or against the
-//! server's record: `changed_after_recorded`), or was carried by a rewrite
-//! from a note that failed. With `--strict`, a note rebound by an older
-//! autter (whose digest cannot be checked) also exits 5. Missing and legacy
+//! server's record: `changed_after_recorded`), was carried by a rewrite
+//! from a note that failed, or had its stamp removed (`stamp_removed`). With
+//! `--strict`, a note rebound by an older autter (whose digest cannot be
+//! checked) and an unstamped note an older autter says it wrote on a commit
+//! after stamping began (`unstamped_by_older_autter`) also exit 5. Missing and legacy
 //! notes are warnings, also with `--strict` for now (a later release will
 //! fail them under `--strict`). `not_recorded` is a warning, also with
 //! `--strict`; with `--require-record` it exits 5, and so does a run whose
@@ -247,11 +249,16 @@ pub fn handle_verify(args: &[String]) {
 
 /// Whether `status` fails `autter verify`: every failure; under `--strict`
 /// a note rebound by an older autter, whose digest cannot be checked (anyone
-/// can make a note look rebound); under `--require-record` a note the
-/// server has no record of.
+/// can make a note look rebound), and an unstamped note on a commit after
+/// stamping began that says an older autter wrote it (anyone can edit that
+/// version); under `--require-record` a note the server has no record of.
 fn fails(status: IntegrityStatus, policy: Policy) -> bool {
     status.is_failure()
-        || (policy.strict && status == IntegrityStatus::ReboundByOlderAutter)
+        || (policy.strict
+            && matches!(
+                status,
+                IntegrityStatus::ReboundByOlderAutter | IntegrityStatus::UnstampedByOlderAutter
+            ))
         || (policy.require_record && status == IntegrityStatus::NotRecorded)
 }
 
@@ -357,6 +364,16 @@ fn print_human(target: &str, results: &[VerifyResult], policy: Policy, record_ch
         if policy.strict && count(IntegrityStatus::ReboundByOlderAutter) > 0 {
             eprintln!(
                 "--strict: a note rebound by an older autter cannot be checked against its digest, so it fails; run a newer autter over the range (rebase or `autter ci`) to stamp it again."
+            );
+        }
+        if count(IntegrityStatus::StampRemoved) > 0 {
+            eprintln!(
+                "stamp_removed: autter 3.8.0 and later stamp every note they write, so a note without a stamp that one of them wrote, or one on a commit after stamping began with no autter version, had its stamp removed."
+            );
+        }
+        if policy.strict && count(IntegrityStatus::UnstampedByOlderAutter) > 0 {
+            eprintln!(
+                "--strict: an unstamped note on a commit after stamping began says an older autter wrote it, which cannot be checked, so it fails; upgrade autter everywhere and rewrite the range (rebase or `autter ci`) to stamp it."
             );
         }
         if policy.require_record && count(IntegrityStatus::NotRecorded) > 0 {
