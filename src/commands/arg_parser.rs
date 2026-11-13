@@ -787,8 +787,8 @@ autter verify [<rev|range>] [--json] [--strict] [--no-record] [--require-record]
   of each note it receives, and verify compares each note with that record,
   so a later edit is visible even when the note's digest was recomputed. In
   local-only mode this is only an integrity check: someone who can rewrite
-  the note can also rewrite its integrity record. When the record cannot be
-  checked (local mode, not logged in, server unreachable), verify says so on
+  the note can also rewrite its integrity record. When connected mode cannot
+  read the record (not logged in, server unreachable), verify says so on
   stderr and does not fail.
 
   --json            One JSON document with counts and a result per commit

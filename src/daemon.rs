@@ -7997,6 +7997,10 @@ impl ActorDaemonCoordinator {
                     if let Some(cherry_pick) =
                         self.cherry_pick_concluded_by_plain_commit(cmd, new_head)?
                     {
+                        // The commit's post-commit note is provisional: the
+                        // cherry-pick rewrite replaces it right after. Hold its
+                        // upload so the server records only the final note.
+                        crate::git::notes_api::hold_next_upload(new_head);
                         out.push(RewriteLogEvent::cherry_pick_complete(cherry_pick));
                     }
                 }

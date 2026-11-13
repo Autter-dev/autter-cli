@@ -168,12 +168,21 @@ impl AuthorshipLog {
             .unwrap()
     }
 
-    /// Serialize to the new text format
+    /// Serialize to the new text format.
+    ///
+    /// The attestation section is written in a canonical order (files by
+    /// path, each file's entries by their first line, then hash), whatever
+    /// order they were built in: the builders collect them from hash maps,
+    /// and the same note computed twice for one commit (a CI re-run) must be
+    /// byte for byte the same, since the server keeps every distinct version.
     pub fn serialize_to_string(&self) -> Result<String, fmt::Error> {
         let mut output = String::new();
 
+        let mut files: Vec<&FileAttestation> = self.attestations.iter().collect();
+        files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+
         // Write attestation section
-        for file_attestation in &self.attestations {
+        for file_attestation in files {
             // Quote file names that contain spaces or whitespace
             let file_path = if needs_quoting(&file_attestation.file_path) {
                 format!("\"{}\"", &file_attestation.file_path)
@@ -183,7 +192,13 @@ impl AuthorshipLog {
             output.push_str(&file_path);
             output.push('\n');
 
-            for entry in &file_attestation.entries {
+            let mut entries: Vec<&AttestationEntry> = file_attestation.entries.iter().collect();
+            entries.sort_by(|a, b| {
+                first_line(&a.line_ranges)
+                    .cmp(&first_line(&b.line_ranges))
+                    .then_with(|| a.hash.cmp(&b.hash))
+            });
+            for entry in entries {
                 output.push_str("  ");
                 output.push_str(&entry.hash);
                 output.push(' ');
@@ -568,6 +583,18 @@ impl Default for AuthorshipLog {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The first line an entry's ranges cover (`u32::MAX` for none).
+fn first_line(ranges: &[LineRange]) -> u32 {
+    ranges
+        .iter()
+        .map(|r| match r {
+            LineRange::Single(line) => *line,
+            LineRange::Range(start, _) => *start,
+        })
+        .min()
+        .unwrap_or(u32::MAX)
 }
 
 /// Format line ranges as comma-separated values with ranges as "start-end"
@@ -1442,5 +1469,82 @@ mod tests {
         let prompt = generate_short_hash("session_123", "cursor");
         // The hex portion of session (after "s_") should be a prefix of the prompt hash
         assert_eq!(&session[2..], &prompt[..14]);
+    }
+
+    /// The same attribution built in any order serializes to the same text
+    /// (the builders collect files and entries from hash maps), and a note
+    /// written by 3.8.x with its files and entries in another order still
+    /// parses to the same attribution.
+    #[test]
+    fn test_serialization_order_is_canonical_and_old_orders_parse() {
+        let build = |files: &[(&str, &[(&str, LineRange)])]| {
+            let mut log = AuthorshipLog::new();
+            log.metadata.base_commit_sha = "abc123".to_string();
+            for (path, entries) in files {
+                let mut file = FileAttestation::new(path.to_string());
+                for (hash, range) in entries.iter() {
+                    file.add_entry(AttestationEntry::new(hash.to_string(), vec![range.clone()]));
+                }
+                log.attestations.push(file);
+            }
+            log
+        };
+        let a: &[(&str, LineRange)] = &[
+            ("1111111111111111", LineRange::Range(1, 3)),
+            ("h_22222222222222", LineRange::Single(5)),
+        ];
+        let a_reversed: &[(&str, LineRange)] = &[
+            ("h_22222222222222", LineRange::Single(5)),
+            ("1111111111111111", LineRange::Range(1, 3)),
+        ];
+        let b: &[(&str, LineRange)] = &[("1111111111111111", LineRange::Single(2))];
+
+        let one = build(&[("src/a.rs", a), ("docs/b.md", b)])
+            .serialize_to_string()
+            .unwrap();
+        let other = build(&[("docs/b.md", b), ("src/a.rs", a_reversed)])
+            .serialize_to_string()
+            .unwrap();
+        assert_eq!(one, other);
+        assert!(one.starts_with(
+            "docs/b.md\n  1111111111111111 2\nsrc/a.rs\n  1111111111111111 1-3\n  h_22222222222222 5\n---\n"
+        ));
+
+        // As 3.8.x could have written it: files and entries in another order.
+        let old = one.replacen(
+            "docs/b.md\n  1111111111111111 2\nsrc/a.rs\n  1111111111111111 1-3\n  h_22222222222222 5\n",
+            "src/a.rs\n  h_22222222222222 5\n  1111111111111111 1-3\ndocs/b.md\n  1111111111111111 2\n",
+            1,
+        );
+        assert_ne!(old, one);
+        let parsed = AuthorshipLog::deserialize_from_string(&old).unwrap();
+        assert_eq!(parsed.attestations[0].file_path, "src/a.rs");
+        assert_eq!(parsed.attestations[0].entries[0].hash, "h_22222222222222");
+        let canonical = AuthorshipLog::deserialize_from_string(&one).unwrap();
+        /// One file's attributions, sorted, for comparing two logs.
+        type SortedEntries = Vec<(String, Vec<LineRange>)>;
+        let by_file = |log: &AuthorshipLog| {
+            let mut files: Vec<(String, SortedEntries)> = log
+                .attestations
+                .iter()
+                .map(|f| {
+                    let mut entries: SortedEntries = f
+                        .entries
+                        .iter()
+                        .map(|e| (e.hash.clone(), e.line_ranges.clone()))
+                        .collect();
+                    entries.sort_by(|x, y| x.0.cmp(&y.0));
+                    (f.file_path.clone(), entries)
+                })
+                .collect();
+            files.sort_by(|x, y| x.0.cmp(&y.0));
+            files
+        };
+        assert_eq!(by_file(&parsed), by_file(&canonical));
+        assert_eq!(
+            parsed.metadata.base_commit_sha,
+            canonical.metadata.base_commit_sha
+        );
+        assert_eq!(parsed.serialize_to_string().unwrap(), one);
     }
 }

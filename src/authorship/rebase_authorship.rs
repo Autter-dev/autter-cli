@@ -864,6 +864,11 @@ pub fn rewrite_authorship_after_squash_or_rebase(
         VirtualAttributions, merge_attributions_favoring_first,
     };
 
+    // A merge that is the source head itself (a fast-forward) keeps its note.
+    let _keep = crate::git::notes_api::keep_existing_notes_for(
+        (merge_commit_sha == source_head_sha).then(|| merge_commit_sha.to_string()),
+    );
+
     // Step 1: Get target branch head (first parent on merge_ref)
     // This is more correct than just parent(0) in cases with complex back-and-forth merge history
     let merge_commit = repo.find_commit(merge_commit_sha.to_string())?;
@@ -1810,6 +1815,10 @@ pub fn rewrite_authorship_after_rebase_v2(
     _human_author: &str,
 ) -> Result<(), AutterError> {
     let rewrite_start = std::time::Instant::now();
+    // Commits the rebase left at the same SHA keep their notes.
+    let _keep = crate::git::notes_api::keep_existing_notes_for(
+        crate::git::notes_api::commits_kept_by_rewrite(original_commits, new_commits),
+    );
     let mut timing_phases: Vec<(String, u128)> = Vec::new();
     // Handle edge case: no commits to process
     if new_commits.is_empty() {
@@ -3358,6 +3367,10 @@ pub fn rewrite_authorship_after_cherry_pick(
     new_commits: &[String],
     _human_author: &str,
 ) -> Result<(), AutterError> {
+    // A pick that fast-forwards leaves the commit at its SHA: it keeps its note.
+    let _keep = crate::git::notes_api::keep_existing_notes_for(
+        crate::git::notes_api::commits_kept_by_rewrite(source_commits, new_commits),
+    );
     if new_commits.is_empty() {
         return Err(AutterError::Generic(
             "cherry-pick rewrite missing new commits".to_string(),
@@ -4333,6 +4346,13 @@ pub fn rewrite_authorship_after_commit_amend_with_snapshot(
     agent_env: &crate::authorship::background_agent::AgentEnv,
 ) -> Result<AuthorshipLog, AutterError> {
     use crate::authorship::virtual_attribution::VirtualAttributions;
+
+    // An amend creates a commit; nothing writes its note before this (no
+    // post-commit pass runs for an amend). So an amended commit that already
+    // has its own note existed before the amend: an amend that changed
+    // nothing, whose "original" the reflog may name as an earlier commit. It
+    // keeps that note.
+    let _keep = crate::git::notes_api::keep_existing_notes_for([amended_commit.to_string()]);
 
     // Check the original note before carrying it (note_integrity.rs): an
     // amended commit whose original note fails gets a note that fails too.

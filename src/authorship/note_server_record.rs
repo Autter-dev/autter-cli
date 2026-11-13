@@ -281,24 +281,52 @@ pub fn apply_record(
     })
 }
 
-/// The server's record for a set of commits, or why it could not be read.
+/// The server's record for a set of commits.
 #[derive(Debug)]
 pub struct FetchedRecords {
     pub records: HashMap<String, NoteRecord>,
     pub mode: CompareMode,
 }
 
+/// Why the server's record could not be checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordUnavailable {
+    /// A short reason (local mode, not logged in, server unreachable ...).
+    pub reason: String,
+    /// The machine is in connected mode (notes are synced), so the record
+    /// was expected and its absence is worth telling the user about.
+    pub connected: bool,
+}
+
+impl RecordUnavailable {
+    fn local(reason: &str) -> Self {
+        RecordUnavailable {
+            reason: reason.to_string(),
+            connected: false,
+        }
+    }
+
+    fn connected(reason: String) -> Self {
+        RecordUnavailable {
+            reason,
+            connected: true,
+        }
+    }
+}
+
 /// Read the server's record of `commits`' notes, in chunks of
-/// [`MAX_RECORD_COMMITS`]. `Err` carries a short reason the record could not
-/// be checked (local mode, not logged in, server unreachable or too old);
-/// none of these is a failure by itself.
-pub fn fetch_records(commits: &[String]) -> Result<FetchedRecords, String> {
+/// [`MAX_RECORD_COMMITS`]. `Err` says why the record could not be checked
+/// (local mode, not logged in, server unreachable or too old); none of these
+/// is a failure by itself.
+pub fn fetch_records(commits: &[String]) -> Result<FetchedRecords, RecordUnavailable> {
     let cfg = Config::fresh();
     if !cfg.platform_sync_enabled() {
-        return Err("local mode: notes are not uploaded to the server".to_string());
+        return Err(RecordUnavailable::local(
+            "local mode: notes are not uploaded to the server",
+        ));
     }
     let Some(url) = cfg.notes_backend_url() else {
-        return Err("no notes server is configured".to_string());
+        return Err(RecordUnavailable::local("no notes server is configured"));
     };
     let mode = if cfg.notes_backend_kind() == NotesBackendKind::Http {
         CompareMode::VersionsOnly
@@ -307,7 +335,9 @@ pub fn fetch_records(commits: &[String]) -> Result<FetchedRecords, String> {
     };
     let client = ApiClient::new(ApiContext::new(Some(url.to_string())).with_timeout(15));
     if !client.is_logged_in() && !client.has_api_key() {
-        return Err("not logged in (run `autter login`)".to_string());
+        return Err(RecordUnavailable::connected(
+            "not logged in (run `autter login`)".to_string(),
+        ));
     }
     let mut records = HashMap::new();
     for chunk in commits.chunks(MAX_RECORD_COMMITS) {
@@ -315,9 +345,15 @@ pub fn fetch_records(commits: &[String]) -> Result<FetchedRecords, String> {
         match client.read_note_records(&refs) {
             Ok(Some(response)) => records.extend(response.records),
             Ok(None) => {
-                return Err("the server does not keep a record of note versions".to_string());
+                return Err(RecordUnavailable::connected(
+                    "the server does not keep a record of note versions".to_string(),
+                ));
             }
-            Err(e) => return Err(format!("the server could not be read: {e}")),
+            Err(e) => {
+                return Err(RecordUnavailable::connected(format!(
+                    "the server could not be read: {e}"
+                )));
+            }
         }
     }
     Ok(FetchedRecords { records, mode })

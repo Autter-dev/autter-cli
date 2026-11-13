@@ -15,7 +15,9 @@
 //! server unreachable or too old).
 
 use crate::authorship::note_integrity::{self, CommitIntegrity, IntegrityStatus};
-use crate::authorship::note_server_record::{self, CompareMode, RecordComparison};
+use crate::authorship::note_server_record::{
+    self, CompareMode, RecordComparison, RecordUnavailable,
+};
 use crate::commands::arg_parser::{self, ScanMode};
 use crate::commands::output::{self, ErrorKind};
 use crate::error::AutterError;
@@ -133,15 +135,21 @@ pub fn handle_verify(args: &[String]) {
 
     // Compare with the server's record, when there is one to compare with.
     let fetched = if no_record {
-        Err("--no-record".to_string())
+        Err(RecordUnavailable {
+            reason: "--no-record".to_string(),
+            connected: false,
+        })
     } else if commits.is_empty() {
-        Err("no commits to check".to_string())
+        Err(RecordUnavailable {
+            reason: "no commits to check".to_string(),
+            connected: false,
+        })
     } else {
         note_server_record::fetch_records(&commits)
     };
     let record_check = RecordCheck {
         checked: fetched.is_ok(),
-        reason: fetched.as_ref().err().cloned(),
+        reason: fetched.as_ref().err().map(|e| e.reason.clone()),
         mode: fetched.as_ref().ok().map(|f| f.mode),
         required: require_record,
     };
@@ -193,11 +201,15 @@ pub fn handle_verify(args: &[String]) {
             if unproven == 1 { "commit" } else { "commits" }
         );
     }
-    if let Some(reason) = &record_check.reason
+    // Say the record was not checked when it was asked for, or expected
+    // (connected mode) and could not be read; a local-only machine has no
+    // record, and saying so on every run is noise.
+    if let Err(unavailable) = &fetched
         && !no_record
         && !results.is_empty()
+        && (require_record || unavailable.connected)
     {
-        eprintln!("Server record not checked: {reason}.");
+        eprintln!("Server record not checked: {}.", unavailable.reason);
     }
 
     let summary = if failed > 0 {

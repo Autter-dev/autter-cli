@@ -293,6 +293,21 @@ pub fn read_integrity(content: &str) -> Option<NoteIntegrity> {
     split_note(content).integrity.and_then(Result::ok)
 }
 
+/// Whether `note` is a note autter wrote for `commit`: its integrity member
+/// names `commit`, or, for a note without one (written before the integrity
+/// check), its `base_commit_sha` does. A note git copied here from another
+/// commit during a rebase or amend names that other commit, so it is not.
+pub fn note_written_for(note: &str, commit: &str) -> bool {
+    let split = split_note(note);
+    match split.integrity {
+        Some(Ok(integrity)) => integrity.commit == commit,
+        Some(Err(_)) => false,
+        None => AuthorshipLog::deserialize_from_string(&split.body)
+            .map(|log| log.metadata.base_commit_sha == commit)
+            .unwrap_or(false),
+    }
+}
+
 /// `content` with `integrity` written into it and a digest computed for it,
 /// replacing any member it had. Anyone who can write to the repository can do
 /// this, which is why the digest alone is an integrity check and not tamper
@@ -1531,6 +1546,29 @@ mod tests {
             split_note(&twice).integrity.unwrap().unwrap().commit,
             "beef"
         );
+    }
+
+    #[test]
+    fn note_written_for_reads_the_stamp_then_the_base_commit() {
+        // Legacy note: base_commit_sha decides.
+        assert!(note_written_for(NOTE, "c0ffee"));
+        assert!(!note_written_for(NOTE, "beef"));
+        // Stamped note: the stamp decides, also when base_commit_sha differs.
+        let stamped = insert_integrity(
+            NOTE,
+            &NoteIntegrity {
+                v: INTEGRITY_FORMAT_VERSION,
+                commit: "beef".to_string(),
+                tree: "7ree".to_string(),
+                files: BTreeMap::new(),
+                carried_failure: None,
+                digest: None,
+            },
+        )
+        .unwrap();
+        assert!(note_written_for(&stamped, "beef"));
+        assert!(!note_written_for(&stamped, "c0ffee"));
+        assert!(!note_written_for("not a note", "c0ffee"));
     }
 
     #[test]

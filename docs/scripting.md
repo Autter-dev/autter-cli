@@ -312,11 +312,33 @@ has more than one version.
 
 The record is not checked in local-only mode, when not logged in, when the
 server cannot be reached or is older than the record (a 404), or with
-`--no-record`. `autter verify` then prints one line on stderr, `Server record
-not checked: <reason>.` (`record_check.checked: false` and
-`record_check.reason` in `--json`), and the run passes or fails on the
-local check alone. `--require-record` makes both gaps fail with exit 5: a
-`not_recorded` note, and a run whose record could not be checked at all.
+`--no-record`. The run then passes or fails on the local check alone, and
+`--json` has `record_check.checked: false` with `record_check.reason`. In
+connected mode, when the record could not be read (not logged in, server
+unreachable, a 404 or an auth error), and whenever `--require-record` is
+given, `autter verify` also prints one line on stderr, `Server record not
+checked: <reason>.`; a local-only machine, which has no record, gets no such
+line. `--require-record` makes both gaps fail with exit 5: a `not_recorded`
+note, and a run whose record could not be checked at all.
+
+autter does not write a second, different note for a commit whose note may
+already be on the server, so its own rewrites do not read as
+`changed_after_recorded`. A commit that keeps its SHA (a no-op rebase, a pick
+that fast-forwards, an amend that changes nothing, a second post-commit pass
+over the same commit) keeps the note it has, and an `autter ci` re-run that
+computes a different note for a merge commit that already has one keeps the
+first. A note written before the integrity check is kept as it is rather
+than stamped again. The same note is never written or uploaded twice, and
+notes are written with their entries in a fixed order, so the same note
+computed twice (a CI re-run in a fresh clone) is the same text. A note that
+is still queued on this machine and has never been sent can be replaced: a
+cherry-pick that stops on a conflict and is finished with a plain `git
+commit` gets a provisional note, held back from upload, and then the
+cherry-pick's; only the final one is uploaded.
+
+`autter squash-authorship` run on a commit whose note the server already has
+replaces that note on purpose, and the record then shows two versions
+(`changed_after_recorded`): that is a real change to the attribution.
 
 What the record does not catch:
 

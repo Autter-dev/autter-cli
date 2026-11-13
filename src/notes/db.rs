@@ -326,6 +326,23 @@ impl NotesDatabase {
         entries: &[(String, String)],
         repo_url: Option<&str>,
     ) -> Result<(), AutterError> {
+        self.upsert_notes_batch_holding(entries, repo_url, &HashSet::new(), 0)
+    }
+
+    /// [`Self::upsert_notes_batch_with_repo`], holding the upload of the notes
+    /// of `held` commits for `hold_secs` (when their content is new). A
+    /// provisional note that autter is about to replace (a cherry-pick
+    /// finished with a plain `git commit`: the commit's note is rewritten
+    /// right after) is held, so only the final note is uploaded: the server
+    /// keeps every version it receives. A later write with other content
+    /// releases the hold; if none comes, the note uploads when it ends.
+    pub fn upsert_notes_batch_holding(
+        &mut self,
+        entries: &[(String, String)],
+        repo_url: Option<&str>,
+        held: &HashSet<String>,
+        hold_secs: i64,
+    ) -> Result<(), AutterError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -335,7 +352,7 @@ impl NotesDatabase {
             let mut stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO notes (commit_sha, content, repo_url, synced, created_at, updated_at, next_retry_at)
-                VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4)
+                VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5)
                 ON CONFLICT(commit_sha) DO UPDATE SET
                     content        = excluded.content,
                     repo_url       = excluded.repo_url,
@@ -346,7 +363,12 @@ impl NotesDatabase {
                 "#,
             )?;
             for (sha, content) in entries {
-                stmt.execute(params![sha, content, repo_url, now])?;
+                let next_retry_at = if held.contains(sha) {
+                    now + hold_secs
+                } else {
+                    now
+                };
+                stmt.execute(params![sha, content, repo_url, now, next_retry_at])?;
             }
         }
         tx.commit()?;
@@ -824,6 +846,40 @@ impl NotesDatabase {
         Ok(result)
     }
 
+    /// The subset of `commit_shas` whose note is queued and has never been
+    /// sent: `synced = 0`, not being uploaded now, and no upload attempted
+    /// (`attempts = 0`; a failed attempt may still have reached the server).
+    /// A note parked because its repository is not connected counts as unsent:
+    /// the server refused it. A row cached from the server (`synced = 1`) or
+    /// no row at all does not.
+    pub fn unsent_shas(&self, commit_shas: &[&str]) -> Result<HashSet<String>, AutterError> {
+        if commit_shas.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let placeholders: String = commit_shas
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT commit_sha FROM notes WHERE synced = 0 AND processing_started_at IS NULL \
+             AND attempts = 0 AND commit_sha IN ({})",
+            placeholders
+        );
+        let params_vec: Vec<&dyn rusqlite::ToSql> = commit_shas
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_vec.as_slice(), |row| row.get::<_, String>(0))?;
+        let mut result = HashSet::new();
+        for row in rows {
+            result.insert(row?);
+        }
+        Ok(result)
+    }
+
     /// Every commit SHA that has a note row, pending upload or synced cache.
     ///
     /// Used by the local-notes backfill, which copies these rows into
@@ -1056,6 +1112,29 @@ mod tests {
     fn test_upsert_missing_sha_returns_none() {
         let (db, _tmp) = create_test_db();
         assert_eq!(db.get_note("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_held_note_is_not_dequeued_until_replaced() {
+        let (mut db, _tmp) = create_test_db();
+        let held: HashSet<String> = ["sha1".to_string()].into_iter().collect();
+
+        // A provisional note is held: nothing to upload yet.
+        db.upsert_notes_batch_holding(
+            &[("sha1".to_string(), "provisional".to_string())],
+            None,
+            &held,
+            120,
+        )
+        .unwrap();
+        assert!(db.dequeue_pending(10).unwrap().is_empty());
+
+        // The final note replaces it and releases the hold: one upload, of
+        // the final note.
+        db.upsert_note("sha1", "final").unwrap();
+        let pending = db.dequeue_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "final");
     }
 
     #[test]

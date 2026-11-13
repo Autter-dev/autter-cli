@@ -252,6 +252,10 @@ pub fn post_commit_with_final_state(
         .serialize_to_string()
         .map_err(|_| AutterError::Generic("Failed to serialize authorship log".to_string()))?;
 
+    // Post-commit running again for a commit that already has its note (the
+    // git proxy's fallback write, then a late event in the background
+    // service) keeps that note: the commit did not change.
+    let _keep = crate::git::notes_api::keep_existing_notes_for([commit_sha.clone()]);
     notes_add(repo, &commit_sha, &authorship_note_str)?;
 
     // Compute stats once (needed for both metrics and terminal output), unless preflight
