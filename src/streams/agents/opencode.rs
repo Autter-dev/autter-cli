@@ -690,4 +690,40 @@ mod tests {
         assert_eq!(pid, Some("msg_c5d3ff791001Egl5tW62x4Vgzo".to_string()));
         assert_eq!(tid, None);
     }
+
+    /// An OpenCode assistant message: disjoint `tokens.input` /
+    /// `tokens.cache.read` / `tokens.cache.write`, plus OpenCode's own `cost`.
+    #[test]
+    fn test_assistant_tokens_cache_and_cost_are_forwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        create_test_db(&db_path, 0);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "msg-assistant",
+                "test-session",
+                5000,
+                6000,
+                r#"{"role":"assistant","modelID":"claude-sonnet-4-6","providerID":"anthropic","cost":0.0187,"tokens":{"input":3,"output":245,"reasoning":0,"cache":{"read":13248,"write":2959}}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (events, _) = drain_all(&OpenCodeAgent::new(), &db_path);
+        let event = crate::daemon::transcript_redaction::redact_json_secrets(
+            events
+                .iter()
+                .find(|e| e["message"]["id"] == "msg-assistant")
+                .cloned()
+                .unwrap(),
+        );
+        let data = &event["message"]["data"];
+        assert_eq!(data["tokens"]["input"], 3);
+        assert_eq!(data["tokens"]["cache"]["read"], 13248);
+        assert_eq!(data["tokens"]["cache"]["write"], 2959);
+        assert_eq!(data["cost"], 0.0187);
+    }
 }

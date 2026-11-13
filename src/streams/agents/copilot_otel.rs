@@ -273,11 +273,28 @@ fn read_events_for_spans(
     Ok(result)
 }
 
+/// Span attribute VS Code Copilot Chat sets to the prompt-cache write count.
+/// Its traces DB keeps it only in `span_attributes`; `cached_tokens` is its
+/// cache-read sibling, `gen_ai.usage.cache_read.input_tokens`.
+const CACHE_CREATION_ATTR: &str = "gen_ai.usage.cache_creation.input_tokens";
+
+/// Integer value of a span attribute (stored as text), if it parses.
+fn attribute_count(attributes: &HashMap<String, String>, key: &str) -> Option<i64> {
+    let raw = attributes.get(key)?.trim();
+    raw.parse::<i64>()
+        .ok()
+        .or_else(|| raw.parse::<f64>().ok().map(|f| f as i64))
+}
+
 fn build_span_event_json(
     span: SpanRow,
     attributes: HashMap<String, String>,
     events: Vec<serde_json::Value>,
 ) -> serde_json::Value {
+    // Token convention (OpenAI style, as Copilot reports it): `input_tokens`
+    // includes both `cached_tokens` (cache reads) and `cache_creation_tokens`
+    // (cache writes); `output_tokens` includes `reasoning_tokens`.
+    let cache_creation_tokens = attribute_count(&attributes, CACHE_CREATION_ATTR);
     json!({
         "span": {
             "span_id": span.span_id,
@@ -297,6 +314,7 @@ fn build_span_event_json(
             "input_tokens": span.input_tokens,
             "output_tokens": span.output_tokens,
             "cached_tokens": span.cached_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
             "reasoning_tokens": span.reasoning_tokens,
             "tool_name": span.tool_name,
             "tool_call_id": span.tool_call_id,
@@ -864,6 +882,7 @@ mod tests {
         assert_eq!(span["input_tokens"], 500);
         assert_eq!(span["output_tokens"], 200);
         assert_eq!(span["cached_tokens"], 100);
+        assert!(span["cache_creation_tokens"].is_null());
         assert_eq!(span["reasoning_tokens"], 50);
         assert_eq!(span["tool_name"], "read_file");
         assert_eq!(span["tool_call_id"], "call-xyz");
@@ -871,6 +890,60 @@ mod tests {
         assert_eq!(span["chat_session_id"], "session-abc");
         assert_eq!(span["turn_index"], 3);
         assert_eq!(span["ttft_ms"], 125.5);
+    }
+
+    /// A Claude request through Copilot, as VS Code Copilot Chat records it:
+    /// `prompt_tokens` = Anthropic input + cache writes + cache reads, the read
+    /// count denormalized into `cached_tokens`, the write count only in
+    /// `span_attributes`.
+    #[test]
+    fn test_cache_creation_tokens_are_lifted_from_span_attributes() {
+        let (_dir, db_path) = create_test_otel_db();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO spans (span_id, trace_id, name, start_time_ms, end_time_ms, \
+             operation_name, provider_name, request_model, response_model, \
+             input_tokens, output_tokens, cached_tokens, reasoning_tokens, chat_session_id) \
+             VALUES ('claude-span', 'trace-1', 'chat claude-sonnet-4.6', 1000, 2000, \
+             'chat', 'anthropic', 'claude-sonnet-4.6', 'claude-sonnet-4-6', \
+             15040, 412, 12800, 96, 'session-1')",
+            [],
+        )
+        .unwrap();
+        for (key, value) in [
+            ("gen_ai.usage.input_tokens", "15040"),
+            ("gen_ai.usage.output_tokens", "412"),
+            ("gen_ai.usage.cache_read.input_tokens", "12800"),
+            ("gen_ai.usage.cache_creation.input_tokens", "2210"),
+        ] {
+            conn.execute(
+                "INSERT INTO span_attributes (span_id, key, value) VALUES ('claude-span', ?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let watermark: Box<dyn WatermarkStrategy> = Box::new(TimestampCursorWatermark::initial());
+        let batch = read_otel_spans_incremental(&db_path, watermark, 100).unwrap();
+        let event = &batch.events[0];
+        assert_eq!(event["span"]["input_tokens"], 15040);
+        assert_eq!(event["span"]["cached_tokens"], 12800);
+        assert_eq!(event["span"]["cache_creation_tokens"], 2210);
+        // The raw attribute still travels with the span.
+        assert_eq!(
+            event["attributes"]["gen_ai.usage.cache_creation.input_tokens"],
+            "2210"
+        );
+    }
+
+    #[test]
+    fn test_unparseable_cache_creation_attribute_is_null() {
+        let mut attrs = HashMap::new();
+        attrs.insert(CACHE_CREATION_ATTR.to_string(), "n/a".to_string());
+        assert_eq!(attribute_count(&attrs, CACHE_CREATION_ATTR), None);
+        attrs.insert(CACHE_CREATION_ATTR.to_string(), " 7.0 ".to_string());
+        assert_eq!(attribute_count(&attrs, CACHE_CREATION_ATTR), Some(7));
     }
 
     #[test]

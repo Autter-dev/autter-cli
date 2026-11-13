@@ -65,6 +65,23 @@ impl DroidAgent {
             }
         }
     }
+
+    /// The settings file Droid writes next to a session transcript.
+    pub fn settings_path(transcript: &Path) -> Option<PathBuf> {
+        let name = transcript.file_name()?.to_str()?;
+        let stem = name.strip_suffix(".jsonl")?;
+        Some(transcript.with_file_name(format!("{stem}.settings.json")))
+    }
+
+    /// A usage snapshot event from the session's settings file, if it has usage.
+    fn usage_snapshot_event(transcript: &Path) -> Option<serde_json::Value> {
+        let settings_path = Self::settings_path(transcript)?;
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).ok()?).ok()?;
+        crate::streams::usage_snapshot::from_droid_settings(&settings)?.to_event(
+            crate::streams::usage_snapshot::file_mtime_rfc3339(&settings_path),
+        )
+    }
 }
 
 impl Default for DroidAgent {
@@ -172,6 +189,7 @@ impl Agent for DroidAgent {
 
         // Read lines from watermark position
         let mut line = String::new();
+        let mut reached_end = false;
         loop {
             match crate::streams::types::read_jsonl_line(&mut reader, &mut line).map_err(|e| {
                 StreamError::Transient {
@@ -179,8 +197,11 @@ impl Agent for DroidAgent {
                     retry_after: std::time::Duration::from_secs(5),
                 }
             })? {
-                crate::streams::types::JsonlLineState::Eof => break,
-                crate::streams::types::JsonlLineState::Partial => break,
+                crate::streams::types::JsonlLineState::Eof
+                | crate::streams::types::JsonlLineState::Partial => {
+                    reached_end = true;
+                    break;
+                }
                 crate::streams::types::JsonlLineState::Complete(bytes_read) => {
                     line_number += 1;
                     current_offset += bytes_read as u64;
@@ -229,6 +250,16 @@ impl Agent for DroidAgent {
             if events.len() >= batch_limit {
                 break;
             }
+        }
+
+        // Droid keeps token usage (with prompt-cache reads and writes) only as a
+        // running total in the sibling settings file. Append a snapshot of it to
+        // the last batch that read new messages; the watermark is unaffected.
+        if reached_end
+            && !events.is_empty()
+            && let Some(snapshot) = Self::usage_snapshot_event(path)
+        {
+            events.push(snapshot);
         }
 
         // Create new hybrid watermark with updated offset, record count, and timestamp
@@ -429,5 +460,53 @@ mod tests {
         assert!(new_watermark.offset > 0); // Byte offset advanced
         assert_eq!(new_watermark.record, 2); // Two message records processed
         assert!(new_watermark.timestamp.is_some()); // Timestamp captured
+    }
+
+    #[test]
+    fn test_settings_token_usage_with_cache_tokens_is_forwarded() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("052cb8d0.jsonl");
+        std::fs::copy(fixtures.join("droid-session.jsonl"), &transcript).unwrap();
+        std::fs::copy(
+            fixtures.join("droid-session.settings.json"),
+            dir.path().join("052cb8d0.settings.json"),
+        )
+        .unwrap();
+
+        let agent = DroidAgent::new();
+        let (events, wm) = drain_all(&agent, &transcript);
+        let snapshot_type = crate::streams::usage_snapshot::USAGE_SNAPSHOT_EVENT_TYPE;
+        let snaps: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == snapshot_type)
+            .collect();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(events.last().unwrap()["type"], snapshot_type);
+        assert!(snaps[0]["timestamp"].is_string());
+
+        let usage = &snaps[0]["autter_usage_snapshot"];
+        assert_eq!(usage["source"], "droid_settings");
+        assert_eq!(usage["model"], "custom:BYOK-GPT-5-MINI-0");
+        assert_eq!(usage["input_tokens"], 6743);
+        assert_eq!(usage["output_tokens"], 1450);
+        assert_eq!(usage["cache_read_tokens"], 42496);
+        assert_eq!(usage["cache_write_tokens"], 0);
+        assert_eq!(usage["reasoning_tokens"], 1088);
+        assert_eq!(usage["input_includes_cache"], false);
+
+        // Only message records count toward the watermark.
+        let messages = events.iter().filter(|e| e["type"] == "message").count();
+        let wm = wm.as_any().downcast_ref::<HybridWatermark>().unwrap();
+        assert_eq!(wm.record, messages as u64);
+    }
+
+    #[test]
+    fn test_settings_path_is_sibling_of_transcript() {
+        assert_eq!(
+            DroidAgent::settings_path(Path::new("/s/abc.jsonl")),
+            Some(PathBuf::from("/s/abc.settings.json"))
+        );
+        assert_eq!(DroidAgent::settings_path(Path::new("/s/abc.json")), None);
     }
 }
