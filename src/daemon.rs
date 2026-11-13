@@ -1,3 +1,4 @@
+use crate::ci::ci_context::stable_patch_id_for_commit;
 use crate::config;
 use crate::daemon::domain::RepoContext;
 use crate::daemon::git_backend::GitBackend;
@@ -9,12 +10,12 @@ use crate::git::cli_parser::{
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
     HeadState, common_dir_for_git_dir, common_dir_for_worktree, git_dir_for_worktree,
-    head_reflog_entry_written_by, is_valid_git_oid, latest_worktree_head_reflog_move,
-    read_head_state_for_worktree, read_ref_oid_for_worktree, read_stash_stack_for_worktree,
-    resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
-    resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
-    resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
-    worktree_root_for_path,
+    head_reflog_entry_written_by, head_reflog_path_messages_for_worktree, is_valid_git_oid,
+    latest_worktree_head_reflog_move, read_head_state_for_worktree, read_ref_oid_for_worktree,
+    read_stash_stack_for_worktree, resolve_linear_head_commit_chain_for_worktree,
+    resolve_rebase_segment_for_worktree, resolve_reflog_old_oid_for_ref_new_oid_in_worktree,
+    resolve_squash_source_head_for_worktree, resolve_stash_target_oid_for_worktree,
+    resolve_worktree_head_reflog_old_oid_for_new_head, worktree_root_for_path,
 };
 use crate::git::repository::{
     Repository, discover_repository_in_path_no_git_exec, exec_git,
@@ -3706,6 +3707,12 @@ fn strict_cherry_pick_mappings_from_command(
             Err(err) => last_err = err.to_string(),
         }
     }
+    if let [source_commit] = source_commits.as_slice()
+        && let Some(original_head) =
+            recover_single_cherry_pick_by_content(worktree, source_commit, new_head, context)
+    {
+        return Ok((original_head, source_commits, vec![new_head.to_string()]));
+    }
     Err(AutterError::Generic(format!(
         "{} failed to reconstruct cherry-pick commits new={} expected_count={}: {}",
         context,
@@ -3713,6 +3720,67 @@ fn strict_cherry_pick_mappings_from_command(
         source_commits.len(),
         last_err
     )))
+}
+
+/// Whether the HEAD reflog entry that landed on the new head can come from the
+/// pick itself: an entry `git cherry-pick` writes (including a renamed one from
+/// an inherited `GIT_REFLOG_ACTION`), or a hook amending the picked commit.
+/// Anything else (`commit:`, `reset:`, `checkout:` …) means `new_head` is a
+/// commit that existed before the pick, which must not be mapped by content.
+fn cherry_pick_content_fallback_allowed(landing_message: &str) -> bool {
+    head_reflog_entry_written_by("cherry-pick", landing_message)
+        || landing_message.starts_with("commit (amend)")
+}
+
+/// Recover a single-commit pick whose HEAD reflog entry does not say
+/// "cherry-pick", for example when a hook amends the picked commit or an
+/// inherited `GIT_REFLOG_ACTION` renames the entry. Accept it when the reflog
+/// moved HEAD from the parent of `new_head` to `new_head`, the entry landing on
+/// `new_head` passes [`cherry_pick_content_fallback_allowed`], and the new
+/// commit applies the same patch as the source commit. Returns the original head.
+fn recover_single_cherry_pick_by_content(
+    worktree: &Path,
+    source_commit: &str,
+    new_head: &str,
+    context: &str,
+) -> Option<String> {
+    let repo = find_repository_in_path(&worktree.to_string_lossy()).ok()?;
+    let original_head = commit_parent_head_for_capture(&repo, new_head)?;
+    let messages =
+        head_reflog_path_messages_for_worktree(worktree, &original_head, new_head).ok()??;
+    // The walk starts at the entry that landed on `new_head`.
+    let landing_allowed = messages
+        .first()
+        .is_some_and(|message| cherry_pick_content_fallback_allowed(message));
+    let content_matches = landing_allowed
+        && matches!(
+            (
+                stable_patch_id_for_commit(&repo, source_commit),
+                stable_patch_id_for_commit(&repo, new_head),
+            ),
+            (Ok(source), Ok(new)) if source == new
+        );
+    // Only the action part of each reflog message: the rest is the commit subject.
+    let reflog_actions = messages
+        .iter()
+        .map(|message| {
+            message
+                .split_once(": ")
+                .map_or(message.as_str(), |(action, _)| action)
+        })
+        .collect::<Vec<_>>();
+    crate::observability::log_message(
+        "cherry-pick HEAD reflog entry without cherry-pick action",
+        "warn",
+        Some(serde_json::json!({
+            "component": "daemon",
+            "phase": context,
+            "reflog_actions": reflog_actions,
+            "landing_allowed": landing_allowed,
+            "content_matches": content_matches,
+        })),
+    );
+    content_matches.then_some(original_head)
 }
 
 /// Match source commits to new commits by commit subject (first line of message).
@@ -13555,6 +13623,80 @@ mod tests {
             tokio::task::yield_now().await;
         }
         coord.request_shutdown();
+    }
+
+    /// A base commit on `main`, then a `feature` branch with one commit that
+    /// adds a line. Returns (repo, base, feature commit), back on `main`.
+    fn repo_with_feature_commit() -> (crate::git::test_utils::TmpRepo, String, String) {
+        let tmp = crate::git::test_utils::TmpRepo::new().unwrap();
+        tmp.write_file("file.txt", "base\n", true).unwrap();
+        let base = tmp.commit_all("base").unwrap();
+        tmp.git_command(&["switch", "-c", "feature"]).unwrap();
+        tmp.write_file("file.txt", "base\nfeature line\n", true)
+            .unwrap();
+        let feature = tmp.commit_all("add feature line").unwrap();
+        tmp.switch_branch("main").unwrap();
+        (tmp, base, feature)
+    }
+
+    #[test]
+    fn cherry_pick_content_fallback_accepts_pick_then_amend() {
+        let (tmp, base, feature) = repo_with_feature_commit();
+        tmp.git_command(&["cherry-pick", &feature]).unwrap();
+        tmp.git_command(&["commit", "--amend", "--no-edit"])
+            .unwrap();
+        let new_head = tmp
+            .git_command(&["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert_eq!(
+            recover_single_cherry_pick_by_content(tmp.path(), &feature, &new_head, "test"),
+            Some(base)
+        );
+    }
+
+    // A stale ref state can name a commit that was on the branch before the
+    // pick and happens to have the source's patch id. Its reflog entry is a
+    // plain `commit:`, so the fallback must not map it to the source.
+    #[test]
+    fn cherry_pick_content_fallback_rejects_existing_commit_with_same_patch() {
+        let (tmp, _base, feature) = repo_with_feature_commit();
+        tmp.write_file("file.txt", "base\nfeature line\n", true)
+            .unwrap();
+        let manual = tmp.commit_all("add feature line by hand").unwrap();
+
+        assert_eq!(
+            recover_single_cherry_pick_by_content(tmp.path(), &feature, &manual, "test"),
+            None
+        );
+    }
+
+    #[test]
+    fn cherry_pick_content_fallback_landing_actions() {
+        for accepted in [
+            "cherry-pick: add feature line",
+            "commit (cherry-pick): add feature line",
+            "commit (amend): add feature line",
+            "custom-tool: add feature line",
+        ] {
+            assert!(cherry_pick_content_fallback_allowed(accepted), "{accepted}");
+        }
+        for rejected in [
+            "commit: add feature line",
+            "commit (initial): add feature line",
+            "commit (merge): add feature line",
+            "reset: moving to HEAD~1",
+            "checkout: moving from feature to main",
+            "rebase (pick): add feature line",
+            "merge feature: Fast-forward",
+        ] {
+            assert!(
+                !cherry_pick_content_fallback_allowed(rejected),
+                "{rejected}"
+            );
+        }
     }
 
     fn init_repo_with_stash_create_event(stash_sha: &str) -> crate::git::test_utils::TmpRepo {

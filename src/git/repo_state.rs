@@ -619,6 +619,36 @@ pub fn resolve_linear_head_commit_chain_for_worktree(
     }
 }
 
+/// Walk the HEAD reflog back from the newest entry that moved HEAD to
+/// `new_head` until an entry that moved HEAD away from `original_head`.
+/// Returns the messages on that path, newest first, or `None` when the
+/// reflog has no such path.
+pub fn head_reflog_path_messages_for_worktree(
+    worktree: &Path,
+    original_head: &str,
+    new_head: &str,
+) -> Result<Option<Vec<String>>, AutterError> {
+    let transitions = read_head_reflog_transitions_for_worktree(worktree)?;
+    let Some(mut cursor) = transitions.iter().rposition(|t| t.new == new_head) else {
+        return Ok(None);
+    };
+    let mut messages = Vec::new();
+    loop {
+        let current = &transitions[cursor];
+        messages.push(current.message.clone());
+        if current.old == original_head {
+            return Ok(Some(messages));
+        }
+        let Some(previous) = transitions[..cursor]
+            .iter()
+            .rposition(|t| t.new == current.old)
+        else {
+            return Ok(None);
+        };
+        cursor = previous;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,5 +926,43 @@ mod tests {
                 .unwrap();
         assert_eq!(resolved_original, original);
         assert_eq!(commits, vec![commit.to_string()]);
+    }
+
+    #[test]
+    fn head_reflog_path_messages_for_worktree_follows_amend_after_pick() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path();
+        let git_dir = worktree.join(".git");
+        let original = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let picked = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let amended = "cccccccccccccccccccccccccccccccccccccccc";
+        write_file(&git_dir.join("HEAD"), "ref: refs/heads/main\n");
+        write_file(
+            &git_dir.join("logs/HEAD"),
+            &format!(
+                concat!(
+                    "{original} {picked} Test <t@example.com> 0 -0000\tcherry-pick: feature\n",
+                    "{picked} {amended} Test <t@example.com> 0 -0000\tcommit (amend): feature\n",
+                ),
+                original = original,
+                picked = picked,
+                amended = amended
+            ),
+        );
+
+        let messages = head_reflog_path_messages_for_worktree(worktree, original, amended)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            messages,
+            vec![
+                "commit (amend): feature".to_string(),
+                "cherry-pick: feature".to_string()
+            ]
+        );
+        assert_eq!(
+            head_reflog_path_messages_for_worktree(worktree, picked, original).unwrap(),
+            None
+        );
     }
 }
