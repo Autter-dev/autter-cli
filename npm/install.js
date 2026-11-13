@@ -575,7 +575,7 @@ function finishInstall(dest, swap, deps = {}) {
   if (swap.serviceWasRunning) {
     const failure = start(dest);
     if (failure) {
-      warn(`autter: could not start the background service again (${failure}); run 'autter bg start'`);
+      warn(`autter: could not start the background service again (${failure}); run 'autter bg restart'`);
     }
   }
 }

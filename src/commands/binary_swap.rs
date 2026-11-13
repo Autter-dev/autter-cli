@@ -134,7 +134,7 @@ pub(crate) fn run_installer_with_binary_aside(
             && let Err(err) = host.start_service(exe)
         {
             eprintln!(
-                "Could not start the autter background service again ({err}). Run `autter bg start`."
+                "Could not start the autter background service again ({err}). Run `autter bg restart`."
             );
         }
     };
@@ -159,9 +159,9 @@ pub(crate) fn run_installer_with_binary_aside(
         } else {
             match host.rename(&aside, exe) {
                 Ok(()) => {
-                    let reason = result
-                        .err()
-                        .unwrap_or_else(|| "The installer left no autter binary behind.".to_string());
+                    let reason = result.err().unwrap_or_else(|| {
+                        "The installer left no autter binary behind.".to_string()
+                    });
                     result = Err(format!(
                         "{reason}\nThe previous autter is still installed ({}).",
                         exe.display()
@@ -226,10 +226,9 @@ impl SwapHost for SystemHost {
 
     fn stop_service(&self) -> Result<(), String> {
         match &self.daemon {
-            Some(config) => crate::commands::daemon::stop_daemon(
-                config,
-                std::time::Duration::from_secs(10),
-            ),
+            Some(config) => {
+                crate::commands::daemon::stop_daemon(config, std::time::Duration::from_secs(10))
+            }
             None => Ok(()),
         }
     }
@@ -247,7 +246,7 @@ impl SwapHost for SystemHost {
         if status.success() {
             Ok(())
         } else {
-            Err(format!("`autter bg start` exited with {status}"))
+            Err(format!("starting it exited with {status}"))
         }
     }
 }
@@ -489,8 +488,14 @@ mod tests {
             Err("Installation script failed with exit code: Some(1)".to_string())
         });
         let message = result.unwrap_err();
-        assert!(message.starts_with("Installation script failed"), "{message}");
-        assert!(message.contains("previous autter is still installed"), "{message}");
+        assert!(
+            message.starts_with("Installation script failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("previous autter is still installed"),
+            "{message}"
+        );
         assert_eq!(host.listing(), vec![("autter.exe".to_string(), "old")]);
         assert_eq!(
             host.events().last().map(String::as_str),
@@ -580,5 +585,57 @@ mod tests {
         let other = swap_failure_message(&exe(), &io::Error::from(io::ErrorKind::NotFound));
         assert!(!other.contains("in use"), "{other}");
         assert!(other.contains("still installed"), "{other}");
+    }
+
+    /// The real Windows file system: a running .exe can be renamed aside and
+    /// replaced, and one held open without delete sharing fails with the
+    /// in-use message and stays in place.
+    #[cfg(windows)]
+    #[test]
+    fn system_host_swaps_a_running_exe_and_reports_a_held_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("autter.exe");
+        let windir = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let ping = PathBuf::from(windir).join("System32").join("PING.EXE");
+        std::fs::copy(&ping, &exe).unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let host = SystemHost { daemon: None };
+
+        // Renaming the running file aside works, and the new one goes in.
+        let new = dir.path().join("new.bin");
+        std::fs::write(&new, b"new").unwrap();
+        let result = run_installer_with_binary_aside(&host, &exe, 7, || {
+            std::fs::rename(&new, &exe).map_err(|e| e.to_string())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        let aside = dir.path().join("autter.exe.old");
+        assert!(aside.exists(), "still running, so kept for later");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        remove_leftover_binaries(&host, dir.path(), INSTALLED_BINARY_NAMES);
+        assert!(!aside.exists());
+
+        // Held open without FILE_SHARE_DELETE: cannot even be renamed.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .open(&exe)
+            .unwrap();
+        let result = run_installer_with_binary_aside(&host, &exe, 7, || {
+            panic!("the installer must not run when the binary cannot be moved")
+        });
+        drop(held);
+        let message = result.unwrap_err();
+        assert!(message.contains("the file is in use"), "{message}");
+        assert!(message.contains("autter bg shutdown"), "{message}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
     }
 }

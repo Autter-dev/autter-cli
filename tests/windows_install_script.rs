@@ -510,7 +510,9 @@ fn windows_install_script_does_not_shadow_reserved_pid_variable() {
 fn windows_install_script_restarts_the_service_it_stopped_or_on_self_update() {
     let script = fs::read_to_string(install_script_path()).expect("failed to read install.ps1");
     assert!(
-        script.contains("$env:AUTTER_RESTART_DAEMON_AFTER_INSTALL -ne '1' -and -not $serviceWasRunning"),
+        script.contains(
+            "$env:AUTTER_RESTART_DAEMON_AFTER_INSTALL -ne '1' -and -not $serviceWasRunning"
+        ),
         "install.ps1 should restart the service only for a self-update or when it stopped a running one"
     );
     assert!(
@@ -527,7 +529,9 @@ fn windows_install_script_restarts_the_service_it_stopped_or_on_self_update() {
 fn windows_install_script_renames_a_running_binary_aside_and_fails_loudly() {
     let script = fs::read_to_string(install_script_path()).expect("failed to read install.ps1");
     assert!(script.contains("[IO.File]::Move($Destination, $aside)"));
-    assert!(script.contains("$swap = Install-ExecutableFile -Source $tmpFile -Destination $finalExe"));
+    assert!(
+        script.contains("$swap = Install-ExecutableFile -Source $tmpFile -Destination $finalExe")
+    );
     assert!(script.contains("Fix: run 'autter bg shutdown', then run the installer again."));
     assert!(
         !script.contains("Move-Item -Force -Path $tmpFile -Destination $finalExe"),
