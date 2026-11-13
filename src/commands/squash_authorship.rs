@@ -80,6 +80,11 @@ pub fn handle_squash_authorship(args: &[String]) {
         }
     };
 
+    // This command exists to rewrite the new commit's attribution, so it
+    // replaces a note that may already be on the server (the record then
+    // shows a second version). Automatic rewrites keep such a note.
+    crate::git::notes_api::allow_replacing_recorded_notes();
+
     // Use the same function as CI handlers to create authorship log for the new commit
     if let Err(e) = rewrite_authorship_after_squash_or_rebase(
         &repo,

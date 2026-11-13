@@ -1185,9 +1185,15 @@ fn test_ai_deletion_with_human_checkpoint_in_same_commit() {
     ]);
 
     // Verify the stats are correct for the last commit
+    // `stats --json` prints one JSON document (stdout; any stderr follows it).
+    // The old `split("}}}")` cut assumed the pre-3.4 document shape, which
+    // ended at the first `}}}`; the document now has more nested objects.
     let stats_output = repo.autter(&["stats", "HEAD", "--json"]).unwrap();
-    let stats_output = stats_output.split("}}}").next().unwrap().to_string() + "}}}";
-    let stats: serde_json::Value = serde_json::from_str(&stats_output).unwrap();
+    let stats: serde_json::Value = serde_json::Deserializer::from_str(&stats_output)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .expect("stats --json printed a document")
+        .unwrap();
 
     // Expected: 2 human additions, 2 AI additions
     // Bug #193 causes: 0 human additions, 4 AI additions

@@ -92,11 +92,13 @@ fn sync_blocked_stamp_path() -> PathBuf {
         .join("sync-auth-blocked-at")
 }
 
+/// Legacy stamp: a bare timestamp written for any failed queue.
+const SYNC_UPLOAD_STALLED_STAMP: &str = "sync-upload-stalled-at";
+/// Legacy stamp: a bare timestamp written when the metrics queue failed.
+const METRICS_UPLOAD_STALLED_STAMP: &str = "metrics-upload-stalled-at";
+
 fn sync_upload_stalled_stamp_path() -> PathBuf {
-    crate::mdm::utils::home_dir()
-        .join(".autter")
-        .join("internal")
-        .join("sync-upload-stalled-at")
+    internal_dir().join(SYNC_UPLOAD_STALLED_STAMP)
 }
 
 /// Record that a sync attempt found pending work but no working auth.
@@ -127,8 +129,15 @@ pub struct UploadFailure {
     pub detail: String,
 }
 
-fn upload_failure_path() -> PathBuf {
-    sync_upload_stalled_stamp_path().with_file_name("sync-upload-failure.json")
+/// `~/.autter/internal`, where the daemon and the CLI share their stamps.
+fn internal_dir() -> PathBuf {
+    crate::mdm::utils::home_dir()
+        .join(".autter")
+        .join("internal")
+}
+
+fn upload_failure_path_in(internal_dir: &std::path::Path) -> PathBuf {
+    internal_dir.join("sync-upload-failure.json")
 }
 
 /// Record that a durable-queue upload failed for a reason other than missing
@@ -138,6 +147,10 @@ fn upload_failure_path() -> PathBuf {
 /// [`crate::metrics::sync_state`] and are reported as "usage metrics", since a
 /// metrics problem says nothing about whether attribution reaches autter.
 pub fn record_upload_failure(queue: &str, detail: &str) {
+    record_upload_failure_in(&internal_dir(), queue, detail);
+}
+
+fn record_upload_failure_in(internal_dir: &std::path::Path, queue: &str, detail: &str) {
     if queue == "metrics" {
         return;
     }
@@ -151,39 +164,57 @@ pub fn record_upload_failure(queue: &str, detail: &str) {
             detail
         },
     };
-    let path = upload_failure_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let _ = std::fs::create_dir_all(internal_dir);
     if let Ok(content) = serde_json::to_vec(&failure) {
-        let _ = std::fs::write(&path, content);
+        let _ = std::fs::write(upload_failure_path_in(internal_dir), content);
     }
-    record_sync_upload_stalled();
+    let _ = std::fs::write(
+        internal_dir.join(SYNC_UPLOAD_STALLED_STAMP),
+        unix_now().to_string(),
+    );
 }
 
 /// Drop the recorded failure when that same queue uploads successfully.
+///
+/// This clears the attribution failure record only. It must never reset the
+/// usage-metrics state ([`crate::metrics::sync_state::MetricsSyncState`]):
+/// the metrics queue's reduced batch size and backoff are what it learned
+/// about its own endpoint, and notes or transcripts uploading again says
+/// nothing about that.
 pub fn clear_upload_failure_for(queue: &str) {
-    let Some(current) = read_upload_failure() else {
+    clear_upload_failure_for_in(&internal_dir(), queue);
+}
+
+fn clear_upload_failure_for_in(internal_dir: &std::path::Path, queue: &str) {
+    let Some(current) = read_upload_failure_in(internal_dir) else {
         return;
     };
     if current.queue != queue {
         return;
     }
-    clear_upload_failures();
+    clear_upload_failures_in(internal_dir);
 }
 
-/// Drop every upload-failure stamp, including the legacy timestamp files and
-/// the usage-metrics failure state.
+/// Drop every attribution upload-failure stamp, including the legacy
+/// timestamp files. The usage-metrics state is not touched; `autter sync
+/// purge` resets that itself.
 pub fn clear_upload_failures() {
-    let _ = std::fs::remove_file(upload_failure_path());
-    clear_sync_upload_stalled();
-    clear_metrics_upload_stalled();
-    crate::metrics::sync_state::MetricsSyncState::reset();
+    clear_upload_failures_in(&internal_dir());
+}
+
+fn clear_upload_failures_in(internal_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(upload_failure_path_in(internal_dir));
+    let _ = std::fs::remove_file(internal_dir.join(SYNC_UPLOAD_STALLED_STAMP));
+    let _ = std::fs::remove_file(internal_dir.join(METRICS_UPLOAD_STALLED_STAMP));
+}
+
+fn read_upload_failure_in(internal_dir: &std::path::Path) -> Option<UploadFailure> {
+    let content = std::fs::read(upload_failure_path_in(internal_dir)).ok()?;
+    serde_json::from_slice(&content).ok()
 }
 
 fn read_upload_failure() -> Option<UploadFailure> {
-    let content = std::fs::read(upload_failure_path()).ok()?;
-    serde_json::from_slice(&content).ok()
+    read_upload_failure_in(&internal_dir())
 }
 
 /// The fresh attribution-sync upload failure (notes, commit summaries,
@@ -220,27 +251,8 @@ fn stamp_time(path: &std::path::Path) -> Option<i64> {
         .and_then(|raw| raw.trim().parse::<i64>().ok())
 }
 
-/// Record that a durable-queue upload failed for a reason other than missing
-/// auth (network error, org database unreachable, etc.).
-fn record_sync_upload_stalled() {
-    let path = sync_upload_stalled_stamp_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, unix_now().to_string());
-}
-
-/// Clear the upload-stalled stamp after a successful cloud upload.
-pub fn clear_sync_upload_stalled() {
-    let _ = std::fs::remove_file(sync_upload_stalled_stamp_path());
-}
-
 fn metrics_upload_stalled_stamp_path() -> PathBuf {
-    sync_upload_stalled_stamp_path().with_file_name("metrics-upload-stalled-at")
-}
-
-fn clear_metrics_upload_stalled() {
-    let _ = std::fs::remove_file(metrics_upload_stalled_stamp_path());
+    internal_dir().join(METRICS_UPLOAD_STALLED_STAMP)
 }
 
 /// True when the daemon recently reported auth-blocked sync attempts.
@@ -778,7 +790,10 @@ pub fn format_sync_report(report: &CloudSyncStatusReport) -> String {
         ));
     }
     if report.enabled {
-        if report.usage_metrics.queued > 0 || report.usage_metrics.failing {
+        if report.usage_metrics.queued > 0
+            || report.usage_metrics.failing
+            || report.usage_metrics.set_aside > 0
+        {
             summary.push('\n');
             summary.push_str(&report.usage_metrics.summary_line());
             if report.usage_metrics.failing {
@@ -898,6 +913,49 @@ mod tests {
         assert!(summary.contains("next: 321 events"), "{summary}");
         assert!(!summary.contains("bg restart"), "{summary}");
         assert!(summary.contains("separate from attribution"), "{summary}");
+    }
+
+    /// The metrics queue learned to send 125 events at a time and is waiting
+    /// out a backoff. The notes queue failing and then recovering must leave
+    /// that alone: before, any queue's recovery deleted the metrics state, so
+    /// the next metrics replay sent the full 1,000 events that were timing
+    /// out.
+    #[test]
+    fn another_queue_recovering_leaves_the_metrics_state_alone() {
+        use crate::metrics::sync_state::MetricsSyncState;
+        let dir = tempfile::tempdir().unwrap();
+        let internal = dir.path();
+        let state_path = MetricsSyncState::path_in(internal);
+
+        let mut state = MetricsSyncState::default();
+        let timeout = crate::api::metrics::MetricsUploadFailure::Timeout {
+            after_secs: Some(30),
+        };
+        for size in [1000, 500, 250] {
+            state.record_failure(1_762_588_800, &timeout, size);
+        }
+        assert_eq!(state.batch_limit(), 125);
+        state.save_to(&state_path);
+
+        record_upload_failure_in(internal, "notes", "HTTP 503");
+        assert_eq!(
+            read_upload_failure_in(internal).map(|failure| failure.queue),
+            Some("notes".to_string())
+        );
+
+        // A different queue recovering clears nothing.
+        clear_upload_failure_for_in(internal, "transcripts");
+        assert!(read_upload_failure_in(internal).is_some());
+        assert_eq!(MetricsSyncState::load_from(&state_path), state);
+
+        // The failed queue recovering clears its own record, and only that.
+        clear_upload_failure_for_in(internal, "notes");
+        assert!(read_upload_failure_in(internal).is_none());
+        assert!(!internal.join(SYNC_UPLOAD_STALLED_STAMP).exists());
+        let after = MetricsSyncState::load_from(&state_path);
+        assert_eq!(after, state, "metrics batch size and backoff survive");
+        assert_eq!(after.batch_limit(), 125);
+        assert!(after.backoff_active(1_762_588_800));
     }
 
     #[test]

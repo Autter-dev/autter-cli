@@ -95,6 +95,21 @@ impl FileBackend {
         Self { path }
     }
 
+    /// An error for a failed read, write or remove that names the file. The
+    /// message used to be "Failed to read credentials file: Access is denied",
+    /// which left the user searching for which file. A permission error also
+    /// says what to do about it.
+    fn io_error(&self, action: &str, error: &std::io::Error) -> String {
+        let path = self.path.display();
+        let mut message = format!("Failed to {action} credentials file {path}: {error}");
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            message.push_str(&format!(
+                ". Your user account has no permission to {action} that file: fix its permissions (it should be readable and writable by you only), or delete it and run `autter login` again"
+            ));
+        }
+        message
+    }
+
     #[cfg(windows)]
     fn set_file_protection(path: &std::path::Path) -> Result<(), String> {
         use std::process::Command;
@@ -148,15 +163,14 @@ impl CredentialBackend for FileBackend {
                 .truncate(true)
                 .mode(0o600)
                 .open(&self.path)
-                .map_err(|e| format!("Failed to write credentials file: {}", e))?;
+                .map_err(|e| self.io_error("write", &e))?;
             file.write_all(value.as_bytes())
-                .map_err(|e| format!("Failed to write credentials file: {}", e))?;
+                .map_err(|e| self.io_error("write", &e))?;
         }
 
         #[cfg(not(unix))]
         {
-            fs::write(&self.path, value)
-                .map_err(|e| format!("Failed to write credentials file: {}", e))?;
+            fs::write(&self.path, value).map_err(|e| self.io_error("write", &e))?;
         }
 
         #[cfg(windows)]
@@ -171,7 +185,7 @@ impl CredentialBackend for FileBackend {
         match fs::read_to_string(&self.path) {
             Ok(content) => Ok(Some(content)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("Failed to read credentials file: {}", e)),
+            Err(e) => Err(self.io_error("read", &e)),
         }
     }
 
@@ -179,7 +193,7 @@ impl CredentialBackend for FileBackend {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("Failed to remove credentials file: {}", e)),
+            Err(e) => Err(self.io_error("remove", &e)),
         }
     }
 
@@ -290,6 +304,36 @@ mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_errors_name_the_credentials_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: reading it fails for every
+        // user, root included.
+        let path = dir.path().join("credentials");
+        std::fs::create_dir(&path).unwrap();
+        let backend = FileBackend::new(path.clone());
+
+        let error = backend.load().unwrap_err();
+        assert!(
+            error.contains(&path.display().to_string()),
+            "the error must name the file: {error}"
+        );
+        assert!(
+            error.starts_with("Failed to read credentials file "),
+            "{error}"
+        );
+
+        let denied = backend.io_error(
+            "read",
+            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access is denied."),
+        );
+        assert!(denied.contains(&path.display().to_string()), "{denied}");
+        assert!(
+            denied.contains("no permission to read that file") && denied.contains("autter login"),
+            "a permission error must say what to do: {denied}"
+        );
+    }
 
     #[test]
     fn test_mock_backend_store_load_clear() {

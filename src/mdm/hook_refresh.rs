@@ -106,11 +106,26 @@ fn tracing_debug(message: &str) {
     }
 }
 
+/// Whether these arguments must not start a refresh. The subcommand is read
+/// past any leading global flags, the way `handle_autter` reads it, so
+/// `autter --json uninstall-hooks` is skipped like `autter uninstall-hooks`
+/// (a refresh running beside it would rewrite the files it is removing hooks
+/// from). Arguments that ask for help or do not parse start none either.
+fn args_skip_refresh(args: &[String]) -> bool {
+    use crate::commands::arg_parser::{ScanMode, pre_parse};
+    match pre_parse(args, ScanMode::LeadingOnly, true) {
+        Ok(parsed) => {
+            parsed.flags.help || command_skips_refresh(parsed.rest.first().map(String::as_str))
+        }
+        Err(_) => true,
+    }
+}
+
 /// Commands that must not start a refresh: they install or remove hooks
 /// themselves, replace the binary, or are read by scripts right after install.
-fn command_skips_refresh(first_arg: Option<&str>) -> bool {
+fn command_skips_refresh(subcommand: Option<&str>) -> bool {
     matches!(
-        first_arg,
+        subcommand,
         None | Some(
             "install-hooks"
                 | "install"
@@ -138,9 +153,7 @@ struct RefreshClaim {
 /// agents the user already set up, in a background `autter install-hooks
 /// --refresh-stale`. Costs one small file read when hooks are current.
 pub fn maybe_refresh_after_upgrade(args: &[String]) {
-    if std::env::var(WORKER_GUARD_ENV).as_deref() == Ok("1")
-        || command_skips_refresh(args.first().map(String::as_str))
-    {
+    if std::env::var(WORKER_GUARD_ENV).as_deref() == Ok("1") || args_skip_refresh(args) {
         return;
     }
     // Integration tests run hundreds of commands against throwaway homes; they
@@ -155,29 +168,58 @@ pub fn maybe_refresh_after_upgrade(args: &[String]) {
         return;
     }
     let Some(claim) = claim_path() else { return };
-    let now = now_secs();
-    if read_json::<RefreshClaim>(&claim)
-        .is_some_and(|c| c.version == current && now.saturating_sub(c.at) < CLAIM_TTL_SECS)
-    {
+    // Held until the worker is started, so a second command arriving in the
+    // same moment cannot also see no claim and start a second worker.
+    let Some(_claimed) = claim_refresh(&claim, current, now_secs()) else {
         return;
-    }
-    if write_json(
-        &claim,
-        &RefreshClaim {
-            version: current.to_string(),
-            at: now,
-        },
-    )
-    .is_err()
-    {
-        return;
-    }
+    };
     crate::utils::spawn_internal_autter_subcommand(
         "install-hooks",
         &[REFRESH_STALE_FLAG],
         WORKER_GUARD_ENV,
         &[],
     );
+}
+
+/// Claim the after-upgrade refresh for `version`, or `None` when another
+/// command already has (a fresh claim on disk, or one being written right
+/// now). The check and the write happen under an exclusive lock on a file
+/// next to the claim: two commands started at the same moment after an
+/// upgrade used to both read "no claim" and both start a worker, which then
+/// rewrote the same agent config files at the same time. The returned lock
+/// is held until the caller drops it.
+fn claim_refresh(claim: &Path, version: &str, now: u64) -> Option<crate::utils::LockFile> {
+    if let Some(dir) = claim.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    // Not blocking: whoever holds the lock is claiming it right now.
+    let lock = crate::utils::LockFile::try_acquire(&claim.with_extension("lock"))?;
+    if read_json::<RefreshClaim>(claim)
+        .is_some_and(|c| c.version == version && now.saturating_sub(c.at) < CLAIM_TTL_SECS)
+    {
+        return None;
+    }
+    write_json(
+        claim,
+        &RefreshClaim {
+            version: version.to_string(),
+            at: now,
+        },
+    )
+    .ok()?;
+    Some(lock)
+}
+
+/// Whether the agent's hook config is exactly what `install_hooks` would write
+/// for this binary: a dry run that reports no change. Agents whose own check
+/// only looks for an autter checkpoint command, whatever binary it names, use
+/// this so a hook that still names a binary that moved (a nix store path, a
+/// dev build, a renamed home) counts as out of date and gets rewritten.
+pub fn install_would_change_nothing(
+    installer: &dyn HookInstaller,
+    params: &HookInstallerParams,
+) -> bool {
+    matches!(installer.install_hooks(params, true), Ok(None))
 }
 
 /// Installers whose hooks autter rewrites in place. Editor extensions (VS
@@ -215,15 +257,14 @@ pub fn refresh_stale_hooks(
 }
 
 /// `autter install-hooks --refresh-stale`: refresh, record the result for
-/// `autter doctor`, and report on stderr. Returns false when an agent failed.
-pub fn run_refresh_command() -> bool {
-    let binary_path = match crate::mdm::utils::resolve_hook_binary_path() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("autter: could not locate the autter binary to refresh hooks: {e}");
-            return false;
-        }
-    };
+/// `autter doctor`, and report on stderr. Returns the agents refreshed, or an
+/// error naming the agents that could not be.
+pub fn run_refresh_command() -> Result<Vec<String>, AutterError> {
+    let binary_path = crate::mdm::utils::resolve_hook_binary_path().map_err(|e| {
+        AutterError::Generic(format!(
+            "could not locate the autter binary to refresh hooks: {e}"
+        ))
+    })?;
     let params = HookInstallerParams { binary_path };
     let outcome = refresh_stale_hooks(&crate::mdm::agents::get_all_installers(), &params);
     for name in &outcome.refreshed {
@@ -235,9 +276,16 @@ pub fn run_refresh_command() -> bool {
             failure.name, failure.error
         );
     }
-    let ok = outcome.failed.is_empty();
+    let failed: Vec<String> = outcome.failed.iter().map(|f| f.name.clone()).collect();
     record_refresh(outcome.failed);
-    ok
+    if failed.is_empty() {
+        Ok(outcome.refreshed)
+    } else {
+        Err(AutterError::Generic(format!(
+            "could not refresh autter hooks for {}",
+            failed.join(", ")
+        )))
+    }
 }
 
 /// After `autter upgrade` replaced the binary: run the refresh with the newly
@@ -521,11 +569,93 @@ mod tests {
     }
 
     #[test]
+    fn commands_started_together_claim_the_refresh_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = dir.path().join("internal").join("hooks_refresh_claim.json");
+        let racers = 8;
+        let start = Arc::new(std::sync::Barrier::new(racers));
+        let done = Arc::new(std::sync::Barrier::new(racers));
+        let handles: Vec<_> = (0..racers)
+            .map(|_| {
+                let (claim, start, done) = (claim.clone(), start.clone(), done.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let won = claim_refresh(&claim, "9.9.9", 1_000);
+                    // Hold any claim until every racer has tried, the way
+                    // the winner holds it while starting the worker.
+                    done.wait();
+                    won.is_some()
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one command may start the worker");
+
+        // Later commands see the claim on disk.
+        assert!(claim_refresh(&claim, "9.9.9", 1_000 + 60).is_none());
+        // A claim for another version, or one past its time, is replaced.
+        assert!(claim_refresh(&claim, "9.9.10", 1_000 + 60).is_some());
+        assert!(claim_refresh(&claim, "9.9.10", 1_000 + 60 + CLAIM_TTL_SECS).is_some());
+    }
+
+    #[test]
+    fn a_claim_being_written_blocks_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = dir.path().join("hooks_refresh_claim.json");
+        let held = claim_refresh(&claim, "1.0.0", 5).unwrap();
+        // Even a claim for another version waits for the one in progress.
+        assert!(claim_refresh(&claim, "2.0.0", 5).is_none());
+        drop(held);
+        assert!(claim_refresh(&claim, "2.0.0", 5).is_some());
+    }
+
+    #[test]
     fn refresh_skip_list() {
         assert!(command_skips_refresh(Some("install-hooks")));
         assert!(command_skips_refresh(Some("--version")));
         assert!(command_skips_refresh(None));
         assert!(!command_skips_refresh(Some("checkpoint")));
         assert!(!command_skips_refresh(Some("status")));
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn refresh_skip_list_reads_past_leading_global_flags() {
+        for args in [
+            &["uninstall-hooks"][..],
+            &["--json", "uninstall-hooks"],
+            &["--quiet", "--json", "install-hooks"],
+            &["-C", "/tmp", "uninstall"],
+            &["--no-color", "upgrade"],
+            &["--strict", "--json", "onboard"],
+            &["--json", "--version"],
+            &["--json"],
+            &["--help", "status"],
+            &["-h"],
+            // `-C` with no path: nothing to run.
+            &["-C"],
+            &[],
+        ] {
+            assert!(args_skip_refresh(&argv(args)), "{args:?} must not refresh");
+        }
+        for args in [
+            &["status"][..],
+            &["--json", "status"],
+            &["-C", "/tmp", "--json", "stats"],
+            &["checkpoint", "claude", "--hook-input", "stdin"],
+            // A flag after the subcommand belongs to the subcommand.
+            &["status", "--json"],
+            // A path that happens to be named like a skipped command.
+            &["-C", "uninstall-hooks", "status"],
+        ] {
+            assert!(!args_skip_refresh(&argv(args)), "{args:?} must refresh");
+        }
     }
 }

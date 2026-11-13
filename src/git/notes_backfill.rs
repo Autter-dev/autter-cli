@@ -10,14 +10,25 @@
 //! The backfill copies those notes into `refs/notes/ai`:
 //! - only for commits reachable in the current repository;
 //! - never over a note that already exists locally (local notes win);
-//! - idempotently, so a second run writes nothing.
+//! - idempotently, so a second run writes nothing;
+//! - as stored, without a new integrity stamp (see below).
+//!
+//! **Integrity.** Every other note write stamps the note for its commit
+//! (`note_integrity`). The backfill copies notes autter did not just write, so
+//! it writes each one exactly as the database has it: a note stamped for its
+//! commit still verifies, a note changed in the database fails `autter verify`
+//! (and stats and blame count its lines as unknown), and a note written before
+//! the integrity check stays `legacy`. Stamping them would turn the last two
+//! into `verified`. Each note is checked against its commit before it is
+//! written, and the ones that fail are reported.
 //!
 //! It runs once per repository automatically on the first note write under a
 //! backend that writes git notes (guarded by a marker file in `.git/ai/`), and
 //! on demand through `autter notes backfill`.
 
+use crate::authorship::note_integrity::{self, CommitIntegrity};
 use crate::error::AutterError;
-use crate::git::refs::{notes_add_batch, notes_for_commits};
+use crate::git::refs::{notes_add_batch_unstamped, notes_for_commits};
 use crate::git::repository::{Repository, exec_git};
 use crate::notes::db::NotesDatabase;
 use std::collections::{HashMap, HashSet};
@@ -30,9 +41,19 @@ pub const AUTO_BACKFILL_MARKER: &str = "notes_backfill_v1";
 /// How many commits to look up or write per git invocation.
 const CHUNK: usize = 500;
 
+/// What a backfill wrote.
+#[derive(Debug, Default)]
+pub struct BackfillOutcome {
+    /// Notes written into `refs/notes/ai`.
+    pub written: usize,
+    /// The written notes that fail the integrity check for their commit.
+    /// They were written unchanged, so `autter verify` reports them.
+    pub failed: Vec<CommitIntegrity>,
+}
+
 /// Copy notes that exist only in the global notes database into
-/// `refs/notes/ai` for this repository. Returns how many notes were written.
-pub fn backfill_local_notes(repo: &Repository) -> Result<usize, AutterError> {
+/// `refs/notes/ai` for this repository.
+pub fn backfill_local_notes(repo: &Repository) -> Result<BackfillOutcome, AutterError> {
     let db = NotesDatabase::global()?;
     backfill_with(
         repo,
@@ -55,7 +76,7 @@ pub fn backfill_local_notes(repo: &Repository) -> Result<usize, AutterError> {
 pub fn backfill_local_notes_from_db(
     repo: &Repository,
     db: &NotesDatabase,
-) -> Result<usize, AutterError> {
+) -> Result<BackfillOutcome, AutterError> {
     backfill_with(repo, || db.all_note_shas(), |shas| db.get_notes(shas))
 }
 
@@ -81,11 +102,18 @@ pub fn maybe_auto_backfill(repo: &Repository) {
     }
 
     match backfill_local_notes(repo) {
-        Ok(written) => {
+        Ok(outcome) => {
+            let written = outcome.written;
             if written > 0 {
                 tracing::info!(
                     written,
                     "backfilled authorship notes from notes-db into refs/notes/ai"
+                );
+            }
+            if !outcome.failed.is_empty() {
+                tracing::warn!(
+                    failed = outcome.failed.len(),
+                    "backfilled notes that fail the integrity check were written unchanged; `autter verify` reports them"
                 );
             }
             if let Some(parent) = marker.parent() {
@@ -110,17 +138,18 @@ fn backfill_with<L, G>(
     repo: &Repository,
     list_shas: L,
     mut get_notes: G,
-) -> Result<usize, AutterError>
+) -> Result<BackfillOutcome, AutterError>
 where
     L: FnOnce() -> Result<Vec<String>, AutterError>,
     G: FnMut(&[&str]) -> Result<HashMap<String, String>, AutterError>,
 {
+    let mut outcome = BackfillOutcome::default();
     let db_shas: Vec<String> = list_shas()?
         .into_iter()
         .filter(|sha| is_full_hex_oid(sha))
         .collect();
     if db_shas.is_empty() {
-        return Ok(0);
+        return Ok(outcome);
     }
 
     // Only commits that belong to this repository. The notes database is
@@ -131,10 +160,9 @@ where
         .filter(|sha| reachable.contains(sha))
         .collect();
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(outcome);
     }
 
-    let mut written = 0usize;
     for chunk in candidates.chunks(CHUNK) {
         // Local notes win: skip any commit that already has one.
         let existing = notes_for_commits(repo, chunk)?;
@@ -161,11 +189,22 @@ where
             continue;
         }
         entries.sort();
-        notes_add_batch(repo, &entries)?;
-        written += entries.len();
+        // Check each note against the commit it is written for, then write
+        // it unchanged: no new stamp, so a failing or legacy note is not
+        // turned into a verified one.
+        let commits: Vec<String> = entries.iter().map(|(sha, _)| sha.clone()).collect();
+        let notes: HashMap<String, String> = entries.iter().cloned().collect();
+        match note_integrity::verify_notes(repo, &commits, &notes) {
+            Ok(results) => outcome
+                .failed
+                .extend(results.into_iter().filter(|r| r.status.is_failure())),
+            Err(e) => tracing::debug!("notes backfill: integrity check skipped: {e}"),
+        }
+        notes_add_batch_unstamped(repo, &entries)?;
+        outcome.written += entries.len();
     }
 
-    Ok(written)
+    Ok(outcome)
 }
 
 fn reachable_commits(repo: &Repository) -> Result<HashSet<String>, AutterError> {
@@ -250,7 +289,7 @@ mod tests {
         db.upsert_note_with_repo(&"f".repeat(40), &note_json("other"), None)
             .unwrap();
 
-        let written = backfill_local_notes_from_db(&repo, &db).unwrap();
+        let written = backfill_local_notes_from_db(&repo, &db).unwrap().written;
         assert_eq!(written, 2, "only a and b lack local notes");
 
         let notes = notes_for_commits(&repo, &[a.clone(), b.clone(), c.clone()]).unwrap();
@@ -265,7 +304,7 @@ mod tests {
         assert_eq!(notes.get(&c).map(|s| s.trim()), Some("local-wins"));
 
         // Idempotent: a second run writes nothing.
-        assert_eq!(backfill_local_notes_from_db(&repo, &db).unwrap(), 0);
+        assert_eq!(backfill_local_notes_from_db(&repo, &db).unwrap().written, 0);
     }
 
     #[test]
@@ -278,7 +317,7 @@ mod tests {
 
         let repo = find_repository_in_path(dir.to_str().unwrap()).unwrap();
         let db = NotesDatabase::open_at_path(&tmp.path().join("notes-db")).unwrap();
-        assert_eq!(backfill_local_notes_from_db(&repo, &db).unwrap(), 0);
+        assert_eq!(backfill_local_notes_from_db(&repo, &db).unwrap().written, 0);
         let list = git(&dir, &["notes", "--ref=ai", "list"]);
         assert!(list.is_empty(), "no notes expected, got {list:?}");
     }

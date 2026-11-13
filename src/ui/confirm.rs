@@ -4,7 +4,7 @@
 //! deadline so a prompt can never wedge a `git` invocation, and cliclack
 //! prompts have no timeout. It is drawn in the same theme.
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -52,7 +52,7 @@ pub fn confirm(question: &str, default: bool) -> bool {
 }
 
 fn confirm_with_timeout(question: &str, default: bool, timeout: Duration) -> bool {
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if !super::is_interactive() {
         return default;
     }
     let Some(guard) = RawModeGuard::enable() else {

@@ -17,6 +17,7 @@ const AI_AUTHOR_NAMES: &[&str] = &[
     "amp",
     "windsurf",
     "antigravity",
+    "kiro",
     "devin",
     "cloud-agent",
     "codex-cloud",
@@ -562,7 +563,7 @@ impl<'a> TestFile<'a> {
 
     /// Check if an author string indicates AI authorship
     /// AI authors typically contain keywords like "mock_ai", agent names, etc.
-    fn is_ai_author(&self, author: &str) -> bool {
+    pub fn is_ai_author(&self, author: &str) -> bool {
         Self::is_ai_author_helper(author)
     }
 

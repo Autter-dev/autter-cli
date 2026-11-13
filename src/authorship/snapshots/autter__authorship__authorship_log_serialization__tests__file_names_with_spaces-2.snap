@@ -5,6 +5,19 @@ expression: log
 AuthorshipLogV3 {
     attestations: [
         FileAttestation {
+            file_path: "docs/README (copy).md",
+            entries: [
+                AttestationEntry {
+                    hash: "c9883b05a2487d6d",
+                    line_ranges: [
+                        Single(
+                            5,
+                        ),
+                    ],
+                },
+            ],
+        },
+        FileAttestation {
             file_path: "src/my file.rs",
             entries: [
                 AttestationEntry {
@@ -13,19 +26,6 @@ AuthorshipLogV3 {
                         Range(
                             1,
                             10,
-                        ),
-                    ],
-                },
-            ],
-        },
-        FileAttestation {
-            file_path: "docs/README (copy).md",
-            entries: [
-                AttestationEntry {
-                    hash: "c9883b05a2487d6d",
-                    line_ranges: [
-                        Single(
-                            5,
                         ),
                     ],
                 },

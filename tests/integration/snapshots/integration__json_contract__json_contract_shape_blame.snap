@@ -1,0 +1,41 @@
+---
+source: tests/integration/json_contract.rs
+expression: shape_text(&document)
+---
+{
+  "category_counts": {
+    "ai": "integer",
+    "human": "integer",
+    "unknown": "integer",
+    "untracked": "integer"
+  },
+  "line_categories": {
+    "<key>": "string"
+  },
+  "lines": {
+    "<key>": "string"
+  },
+  "metadata": {
+    "current_user": "string",
+    "is_logged_in": "boolean"
+  },
+  "prompts": {
+    "<key>": {
+      "accepted_lines": "integer",
+      "agent_id": {
+        "id": "string",
+        "model": "string",
+        "tool": "string"
+      },
+      "commits": [
+        "string"
+      ],
+      "human_author": "string",
+      "other_files": [],
+      "overriden_lines": "integer",
+      "total_additions": "integer",
+      "total_deletions": "integer"
+    }
+  },
+  "schema_version": "integer"
+}

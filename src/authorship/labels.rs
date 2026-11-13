@@ -38,6 +38,18 @@ impl LineCategory {
         }
     }
 
+    /// The name in `--json` output: the key of this category in `lines` and
+    /// `percent` (`stats`, `status`, `log`) and the value `blame --json` gives
+    /// each line.
+    pub fn json_name(self) -> &'static str {
+        match self {
+            LineCategory::Ai => "ai",
+            LineCategory::Human => "human",
+            LineCategory::Untracked => "untracked",
+            LineCategory::Unknown => "unknown",
+        }
+    }
+
     /// One-clause meaning, for legends.
     pub fn meaning(self) -> &'static str {
         match self {
@@ -86,6 +98,12 @@ mod tests {
         let labels: Vec<&str> = LineCategory::ALL.iter().map(|c| c.label()).collect();
         assert_eq!(labels, vec!["AI", "human", "untracked", "unknown"]);
         assert_eq!(LineCategory::max_label_width(), "untracked".len());
+    }
+
+    #[test]
+    fn json_names_are_the_stats_line_keys() {
+        let names: Vec<&str> = LineCategory::ALL.iter().map(|c| c.json_name()).collect();
+        assert_eq!(names, vec!["ai", "human", "untracked", "unknown"]);
     }
 
     #[test]

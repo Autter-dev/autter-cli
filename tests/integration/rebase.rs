@@ -2482,18 +2482,17 @@ sed -i.bak '3s/pick/fixup/' "$1"
         );
     }
 
-    // Verify line-level attribution: human line must still show as human
-    // Note: the closing `}` may lose AI attribution during squash-rebase
-    // content-diff reconstruction (it's a common line that gets re-attributed
-    // to the commit author). The critical assertion is that the human-authored
-    // line retains its known-human attribution.
+    // Verify line-level attribution: human line must still show as human.
+    // The closing `}` keeps its AI attribution too: the squashed-away commits
+    // moved it from line 4 to line 6, and their hunks are replayed along with
+    // the first commit's.
     handler.assert_lines_and_blame(crate::lines![
         "func handleOrder() {".ai(),
         "    validate()".ai(),
         "    log(\"order received\")".human(),
         "    process()".ai(),
         "    sendMetrics()".ai(),
-        "}".unattributed_human(),
+        "}".ai(),
     ]);
 }
 
@@ -2655,13 +2654,14 @@ sed -i.bak '3s/pick/fixup/' "$1"
         "Post-squash: squashed note should have all 3 sessions merged"
     );
 
-    // Verify line-level AI attribution survived the squash
+    // Verify line-level AI attribution survived the squash, including the
+    // closing `}` that the squashed-away commits moved down.
     service.assert_lines_and_blame(crate::lines![
         "func serve() {".ai(),
         "    listen()".ai(),
         "    handle()".ai(),
         "    logMetrics()".ai(),
         "    shutdown()".ai(),
-        "}".unattributed_human(),
+        "}".ai(),
     ]);
 }

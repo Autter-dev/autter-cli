@@ -86,12 +86,10 @@ fn main() {
         if !is_superuser_exempt_command(&cli.args) {
             match check_superuser_guard() {
                 SuperuserCheckResult::WarnFutureBlock => print_superuser_warning(),
-                SuperuserCheckResult::AllowedWithWarning => {
-                    eprintln!(
-                        "[autter] warning: running as superuser (AUTTER_ALLOW_SUPERUSER is set)"
-                    );
-                }
-                SuperuserCheckResult::Allowed => {}
+                // Opted in with AUTTER_ALLOW_SUPERUSER=1 or `allow_superuser`:
+                // the user said they know, so stay quiet. This used to print a
+                // warning line on every command anyway.
+                SuperuserCheckResult::AllowedWithWarning | SuperuserCheckResult::Allowed => {}
             }
         }
         // Warn if the CLI is below the platform's minimum required version.
@@ -111,6 +109,10 @@ fn main() {
         {
             auth::notice::maybe_warn_logged_out();
         }
+        // Setup not finished, an agent installed since onboarding, or (npm
+        // installs) a newer release: one line each, only for a person at a
+        // terminal on an everyday command.
+        commands::setup_notices::maybe_print(&cli.args);
         // First command after an upgrade: refresh the hooks of agents the user
         // already set up, in the background, so no hook keeps calling a binary
         // or preset from the previous version.

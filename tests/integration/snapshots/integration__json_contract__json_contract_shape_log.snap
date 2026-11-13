@@ -1,0 +1,59 @@
+---
+source: tests/integration/json_contract.rs
+expression: shape_text(&document)
+---
+{
+  "commits": [
+    {
+      "author": {
+        "email": "string",
+        "name": "string"
+      },
+      "body": "string",
+      "commit": "string",
+      "date": "string",
+      "note_present": "boolean",
+      "parents": [
+        "string"
+      ],
+      "refs": [
+        "string"
+      ],
+      "stats": {
+        "ai_accepted": "integer",
+        "ai_additions": "integer",
+        "capture": {
+          "note_present": "boolean",
+          "status": "string"
+        },
+        "commit": "string",
+        "git_diff_added_lines": "integer",
+        "git_diff_deleted_lines": "integer",
+        "human_additions": "integer",
+        "lines": {
+          "added": "integer",
+          "ai": "integer",
+          "deleted": "integer",
+          "human": "integer",
+          "unknown": "integer",
+          "untracked": "integer"
+        },
+        "percent": {
+          "ai": "number",
+          "human": "number",
+          "unknown": "number",
+          "untracked": "number"
+        },
+        "tool_model_breakdown": {
+          "<key>": {
+            "ai_accepted": "integer",
+            "ai_additions": "integer"
+          }
+        },
+        "unknown_additions": "integer"
+      },
+      "subject": "string"
+    }
+  ],
+  "schema_version": "integer"
+}

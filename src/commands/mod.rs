@@ -32,7 +32,9 @@ pub mod memory_skills;
 pub mod notes_backfill;
 pub mod notes_migrate;
 pub mod onboard;
+pub mod output;
 pub mod personal_dashboard;
+pub mod setup_notices;
 pub mod show;
 pub mod show_prompt;
 pub mod squash_authorship;
@@ -41,6 +43,7 @@ pub mod sync;
 pub mod telemetry;
 pub mod upgrade;
 pub mod usage_hints;
+pub mod verify;
 pub mod whoami;
 pub mod wrapped;
 
@@ -53,7 +56,13 @@ pub mod wrapped;
 /// * [`EXIT_RUNTIME_ERROR`] (`1`) — a runtime/IO/lookup error (e.g. repository
 ///   not found, a git invocation failed, serialization failed).
 /// * [`EXIT_USAGE_ERROR`] (`2`) — the caller misused the command (missing or
-///   unknown subcommand, missing required argument, unparseable flag value).
+///   unknown subcommand, missing required argument, unparseable flag value,
+///   or a reporting command run outside a git repository).
+/// * [`EXIT_NOTHING_CAPTURED`] (`3`) — only with `--strict`: `stats`/`status`
+///   found lines Autter has no record of (capture missed them). Lines typed
+///   by hand in a recorded commit are not that.
+/// * [`EXIT_CAPTURE_BROKEN`] (`4`) — only with `--strict`: `doctor` found
+///   capture broken.
 ///
 /// This policy intentionally does NOT apply to the git proxy/hook path or to
 /// the `checkpoint` command. Those run *inside* the user's `git` invocation or
@@ -63,8 +72,15 @@ pub mod wrapped;
 pub const EXIT_SUCCESS: i32 = 0;
 /// Runtime/IO error in a user-invoked subcommand. See [`EXIT_SUCCESS`].
 pub const EXIT_RUNTIME_ERROR: i32 = 1;
-/// Usage/argument error in a user-invoked subcommand. See [`EXIT_SUCCESS`].
+/// Usage/argument error in a user-invoked subcommand (bad flags, or a
+/// reporting command run outside a repository). See [`EXIT_SUCCESS`].
 pub const EXIT_USAGE_ERROR: i32 = 2;
+/// `--strict`: capture is broken (`doctor`). See [`output`].
+pub use output::EXIT_CAPTURE_BROKEN;
+#[allow(unused_imports)]
+pub use output::EXIT_INTEGRITY_FAILED;
+/// `--strict`: nothing was captured. See [`output`] for the full contract.
+pub use output::EXIT_NOTHING_CAPTURED;
 
 /// The error a repository-scoped command prints when it can't open the
 /// repository. Outside a repository that is one plain sentence instead of
@@ -80,10 +96,47 @@ pub fn repository_error_message(command: &str, error: &crate::error::AutterError
     }
 }
 
-/// Print [`repository_error_message`] and exit with [`EXIT_RUNTIME_ERROR`].
+/// Print [`repository_error_message`] and exit: [`EXIT_USAGE_ERROR`]
+/// (`not_a_repository`) outside a git repository, [`EXIT_RUNTIME_ERROR`]
+/// otherwise. Under `--json` the error is also printed as a JSON document.
 pub fn exit_repository_error(command: &str, error: &crate::error::AutterError) -> ! {
-    eprintln!("{}", repository_error_message(command, error));
-    std::process::exit(EXIT_RUNTIME_ERROR);
+    output::fail(
+        output::repository_error_kind(error),
+        repository_error_message(command, error),
+    )
+}
+
+/// Whether the repository has no commits yet: `HEAD` points at a branch that
+/// does not exist (a fresh `git init`). Any other reason `HEAD` cannot be read
+/// is not this.
+pub fn repository_has_no_commits(repo: &crate::git::repository::Repository) -> bool {
+    use crate::git::repository::exec_git;
+    let git = |args: &[&str]| {
+        let mut full = repo.global_args_for_exec();
+        full.extend(args.iter().map(|a| a.to_string()));
+        exec_git(&full).is_ok()
+    };
+    // The usual case, a repository with commits, costs one git process.
+    !git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        && git(&["symbolic-ref", "--quiet", "HEAD"])
+}
+
+/// In a repository with no commits yet, stop with the same message and exit
+/// code `autter status` and `autter stats` use, instead of git's own error for
+/// a branch that does not exist. Returns when the repository has commits.
+pub fn exit_if_no_commits(repo: &crate::git::repository::Repository, command: &str) {
+    if repository_has_no_commits(repo) {
+        output::fail(output::ErrorKind::Runtime, no_commits_message(command));
+    }
+}
+
+/// What a reporting command says in a repository with no commits yet. It used
+/// to print git's own "ambiguous argument 'refs/heads/main'" error, which is
+/// the first thing someone trying autter in a fresh `git init` saw.
+pub fn no_commits_message(command: &str) -> String {
+    format!(
+        "This repository has no commits yet, so there is nothing for `autter {command}` to report. Make a first commit (`git add -A && git commit -m \"first commit\"`), then run it again."
+    )
 }
 
 /// Print a one-line stderr pointer to `autter doctor`.

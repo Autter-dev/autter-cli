@@ -200,12 +200,16 @@ pub struct DiffBuildArtifacts {
 // ============================================================================
 
 pub fn handle_diff(repo: &Repository, args: &[String]) -> Result<(), AutterError> {
+    use crate::commands::output::{self, ErrorKind};
     if crate::commands::usage_hints::diff_args_missing_commit(args) {
         crate::commands::usage_hints::eprint_missing_diff_args(repo);
-        std::process::exit(crate::commands::EXIT_USAGE_ERROR);
+        output::fail(ErrorKind::Usage, "diff requires a commit or range");
     }
 
-    let parsed = parse_diff_args(args)?;
+    let parsed = match parse_diff_args(args) {
+        Ok(parsed) => parsed,
+        Err(e) => output::fail(ErrorKind::Usage, format!("Diff failed: {}", e)),
+    };
     let output = execute_diff(repo, parsed)?;
     print!("{}", output);
 
@@ -397,7 +401,7 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
                 &output_sessions,
                 commit_stats,
             )?;
-            serde_json::to_string(&diff_json)
+            crate::commands::output::document(Some(&diff_json), None)
                 .map_err(|e| AutterError::Generic(format!("Failed to serialize JSON: {}", e)))?
         }
         DiffFormat::GitCompatibleTerminal => {

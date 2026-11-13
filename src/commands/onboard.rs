@@ -253,6 +253,13 @@ pub fn handle_onboard(args: &[String]) {
     // to local if the device login fails.
     let connected = file_config.prompt_storage.as_deref() != Some("local");
     eprint!("{}", render_finished(connected, &report, &ui::caps()));
+    let config_path = config::config_file_path_public()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.autter/config.json".to_string());
+    eprint!(
+        "{}",
+        render_changes(connected, capture, &config_path, &ui::caps())
+    );
 
     // Fire a one-off install/onboard event so we can count installs by version
     // and platform. Only when the user just opted in.
@@ -499,7 +506,10 @@ fn setup_local(cfg: &mut config::FileConfig, announce: bool) {
     });
 
     if announce {
-        rail::print_step("Local mode \u{00B7} your code and prompts stay on this machine", None);
+        rail::print_step(
+            "Local mode \u{00B7} your code and prompts stay on this machine",
+            None,
+        );
     }
     rail::print_note(
         "Attribution, blame and stats run on this machine, in git notes (refs/notes/ai).\n\
@@ -705,6 +715,31 @@ fn render_finished(connected: bool, report: &SetupReport, caps: &TermCaps) -> St
     out
 }
 
+/// What onboarding changed on this machine and the one command that undoes
+/// it. Setup touches the settings of other tools and the global git config;
+/// it used to end without saying so or how to take it back.
+fn render_changes(connected: bool, capture: bool, config_path: &str, caps: &TermCaps) -> String {
+    let dim = |text: &str| caps.paint("2", text);
+    let mut out = String::from("\n   What setup changed on this machine:\n");
+    let mut line = |text: &str| out.push_str(&format!("     \u{2022} {}\n", dim(text)));
+    line(&format!(
+        "your choice ({} mode) saved in {config_path}",
+        if connected { "connected" } else { "local" }
+    ));
+    if capture {
+        line(
+            "hooks added to the settings of the coding tools you picked (`autter doctor` lists them)",
+        );
+        line("trace2 settings in your global git config, so git tells autter about commits");
+        line("a background service that writes the authorship notes (`autter bg status`)");
+    }
+    out.push_str(&format!(
+        "   {}\n",
+        dim("Undo it with `autter uninstall`: it asks first, and `autter uninstall --dry-run` lists what it would remove.")
+    ));
+    out
+}
+
 fn print_status_summary() {
     let status = collect_auth_status();
     if !config::Config::fresh().platform_sync_enabled() {
@@ -767,6 +802,30 @@ enum SystemCapture {
 
 fn in_test_harness() -> bool {
     std::env::var_os("AUTTER_TEST_DB_PATH").is_some()
+}
+
+/// The detected tools picked in onboarding's multiselect and the ones left
+/// unselected, as installer ids. Indexes past the tools are the "Git capture"
+/// item and are ignored.
+fn split_tool_choice(
+    tools: &[crate::commands::install_hooks::DetectedTool],
+    chosen: &[usize],
+) -> (Vec<String>, Vec<String>) {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, tool)| (chosen.contains(&i), tool.id.clone()))
+        .fold(
+            (Vec::new(), Vec::new()),
+            |(mut yes, mut no), (picked, id)| {
+                if picked {
+                    yes.push(id)
+                } else {
+                    no.push(id)
+                }
+                (yes, no)
+            },
+        )
 }
 
 /// Install IDE hooks + global git trace2 + start the daemon after consent.
@@ -832,6 +891,10 @@ fn apply_system_integrations_with_consent(
                 ui::caps().paint("2", "space toggles \u{00B7} enter confirms")
             );
             let chosen = ui::multiselect(&question, &items, &all);
+            let (accepted, declined) = split_tool_choice(&tools, &chosen);
+            // Agents left unselected are never named in the "installed but
+            // not captured" notice (`setup_notices`).
+            crate::commands::setup_notices::record_onboarding_choice(&declined, &accepted);
             if chosen.is_empty() {
                 rail::print_note("Skipped. Run `autter install --system` when you're ready.");
                 return Ok(SystemCapture::NotSetUp);
@@ -930,7 +993,7 @@ fn offer_historical_sync_consent(assume_yes: bool, steps: &mut Steps) -> Result<
             ),
             SelectItem::new(
                 "Discard — delete it from this machine",
-                "Runs `autter sync purge`. Nothing pre-dating this connect is uploaded.",
+                "Runs `autter sync purge`. Permanent: the queued records are deleted and can't be uploaded later. Your git history and local authorship notes are not touched.",
             ),
         ];
         let counter = steps.next();
@@ -997,6 +1060,24 @@ mod tests {
 
     fn args(flags: &[&str]) -> Vec<String> {
         flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tools_left_unselected_in_onboarding_are_declined() {
+        use crate::commands::install_hooks::DetectedTool;
+        let tool = |id: &str| DetectedTool {
+            id: id.to_string(),
+            name: id.to_string(),
+        };
+        let tools = vec![tool("claude-code"), tool("cursor"), tool("codex")];
+        // Index 3 is the "Git capture and background service" item.
+        let (accepted, declined) = split_tool_choice(&tools, &[0, 2, 3]);
+        assert_eq!(accepted, args(&["claude-code", "codex"]));
+        assert_eq!(declined, args(&["cursor"]));
+        // Nothing picked: every tool was turned down.
+        let (accepted, declined) = split_tool_choice(&tools, &[]);
+        assert!(accepted.is_empty());
+        assert_eq!(declined, args(&["claude-code", "cursor", "codex"]));
     }
 
     fn plain() -> TermCaps {
@@ -1096,6 +1177,32 @@ mod tests {
         assert!(!text.contains("Capture verified"), "{text}");
         assert!(text.contains("Your choice (local mode) is saved"), "{text}");
         assert!(text.contains("Fix: autter install --system"), "{text}");
+    }
+
+    #[test]
+    fn closing_summary_says_what_changed_and_how_to_undo_it() {
+        let text = render_changes(false, true, "/home/me/.autter/config.json", &plain());
+        assert!(
+            text.contains("What setup changed on this machine"),
+            "{text}"
+        );
+        assert!(
+            text.contains("your choice (local mode) saved in /home/me/.autter/config.json"),
+            "{text}"
+        );
+        for changed in ["hooks added", "global git config", "background service"] {
+            assert!(text.contains(changed), "missing `{changed}`: {text}");
+        }
+        assert!(text.contains("autter uninstall --dry-run"), "{text}");
+
+        // Integrations declined: only the saved choice changed, and the
+        // summary must not claim hooks, git settings or a service.
+        let declined = render_changes(true, false, "/home/me/.autter/config.json", &plain());
+        assert!(declined.contains("connected mode"), "{declined}");
+        for absent in ["hooks added", "global git config", "background service"] {
+            assert!(!declined.contains(absent), "`{absent}` claimed: {declined}");
+        }
+        assert!(declined.contains("autter uninstall"), "{declined}");
     }
 
     #[test]

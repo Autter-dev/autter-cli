@@ -98,6 +98,12 @@ impl MetricsDatabase {
             "CREATE TABLE IF NOT EXISTS metrics_held (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS metrics_set_aside (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                set_aside_at INTEGER NOT NULL
             );",
         )?;
         Ok(())
@@ -308,11 +314,66 @@ impl MetricsDatabase {
         Ok(count as usize)
     }
 
-    /// Drop every queued metrics event (pre-upload backlog), held or not.
+    /// Drop every queued metrics event (pre-upload backlog), held, set aside
+    /// or not.
     pub fn delete_all(&mut self) -> Result<usize, AutterError> {
         let n = self.conn.execute("DELETE FROM metrics", [])?;
         let held = self.conn.execute("DELETE FROM metrics_held", [])?;
-        Ok(n + held)
+        let set_aside = self.conn.execute("DELETE FROM metrics_set_aside", [])?;
+        Ok(n + held + set_aside)
+    }
+
+    /// Move events the server fails on every time out of the upload queue,
+    /// with the reason and the time. Like held events they live in a side
+    /// table no flush reads, so they are kept without blocking the queue.
+    pub fn set_aside(&mut self, ids: &[i64], reason: &str, now: i64) -> Result<usize, AutterError> {
+        let tx = self.conn.transaction()?;
+        let mut moved = 0;
+        for id in ids {
+            moved += tx.execute(
+                "INSERT INTO metrics_set_aside (event_json, reason, set_aside_at)
+                 SELECT event_json, ?2, ?3 FROM metrics WHERE id = ?1",
+                params![id, reason, now],
+            )?;
+            tx.execute("DELETE FROM metrics WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// Number of events set aside.
+    pub fn count_set_aside(&self) -> Result<usize, AutterError> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM metrics_set_aside", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count as usize)
+    }
+
+    /// Why the most recent event was set aside.
+    pub fn last_set_aside_reason(&self) -> Result<Option<String>, AutterError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT reason FROM metrics_set_aside ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Move set-aside events back to the end of the upload queue
+    /// (`autter sync retry`).
+    pub fn release_set_aside(&mut self) -> Result<usize, AutterError> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "INSERT INTO metrics (event_json) SELECT event_json FROM metrics_set_aside ORDER BY id",
+            [],
+        )?;
+        tx.execute("DELETE FROM metrics_set_aside", [])?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Move every queued event to the held table, where no flush reads it.

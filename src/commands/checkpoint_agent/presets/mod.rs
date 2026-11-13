@@ -13,6 +13,7 @@ mod firebender;
 pub(crate) mod gemini;
 pub(crate) mod github_copilot;
 mod human;
+mod kiro;
 mod known_human;
 mod mock_ai;
 mod mock_known_human;
@@ -213,6 +214,7 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, AutterError> {
         "droid" => Ok(Box::new(droid::DroidPreset)),
         "opencode" => Ok(Box::new(opencode::OpenCodePreset)),
         "pi" => Ok(Box::new(pi::PiPreset)),
+        "kiro" => Ok(Box::new(kiro::KiroPreset)),
         "antigravity-pre" => Ok(Box::new(antigravity::AntigravityPreset {
             phase: antigravity::AntigravityPhase::PreToolUse,
         })),

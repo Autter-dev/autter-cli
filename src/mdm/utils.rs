@@ -70,6 +70,12 @@ pub fn get_binary_version(binary: &str) -> Result<String, AutterError> {
 
 /// Get version from an editor CLI command's --version output
 pub fn get_editor_version(cli: &EditorCliCommand) -> Result<String, AutterError> {
+    // A program that already answered `--version` with nothing is the
+    // editor's window: running it again opens another window. The VS Code
+    // and GitHub Copilot checks of one `install-hooks` each asked it.
+    if editor_cli_known_answer(&cli.program) == Some(false) {
+        return Err(editor_cli_silent_error(cli));
+    }
     let output = cli.command(&["--version"]).output().map_err(|e| {
         AutterError::Generic(format!("Failed to run {} --version: {}", cli.program, e))
     })?;
@@ -82,7 +88,61 @@ pub fn get_editor_version(cli: &EditorCliCommand) -> Result<String, AutterError>
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.trim().to_string())
+    let version = stdout.trim().to_string();
+    record_editor_cli_answer(&cli.program, !version.is_empty());
+    if version.is_empty() {
+        return Err(editor_cli_silent_error(cli));
+    }
+    Ok(version)
+}
+
+/// Editor CLIs this process has asked for `--version`, and whether each
+/// answered. A program that exits 0 and prints nothing is the editor's window
+/// executable, not its command line (on Windows, `Code.exe` ahead of
+/// `bin\code.cmd` on PATH): every further call opens another window, so once
+/// one is seen no later call in this process runs it.
+fn editor_cli_answers() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static ANSWERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    ANSWERS.get_or_init(Default::default)
+}
+
+/// Whether `program` answered `--version` in this process, if it was asked.
+fn editor_cli_known_answer(program: &str) -> Option<bool> {
+    editor_cli_answers()
+        .lock()
+        .ok()
+        .and_then(|answers| answers.get(program).copied())
+}
+
+fn record_editor_cli_answer(program: &str, answered: bool) {
+    if let Ok(mut answers) = editor_cli_answers().lock() {
+        answers.insert(program.to_string(), answered);
+    }
+}
+
+fn editor_cli_silent_error(cli: &EditorCliCommand) -> AutterError {
+    AutterError::Generic(format!(
+        "`{} --version` printed nothing, so it is not the editor's command line (it may have opened the editor instead); autter will not call it again. Install the autter extension manually: download the .vsix from https://open-vsx.org/extension/autter/autter-vscode and choose \"Extensions: Install from VSIX...\" in the editor's command palette",
+        cli.program
+    ))
+}
+
+/// Make sure `cli` is a command line that answers before asking it anything
+/// that would open a window if it is not. Asks `--version` until the program
+/// has answered once in this process.
+pub fn ensure_editor_cli_answers(cli: &EditorCliCommand) -> Result<(), AutterError> {
+    let known = || editor_cli_known_answer(&cli.program);
+    if known().is_none() {
+        // Only a silent answer rules the program out. A `--version` that
+        // fails outright (the editor CLI is flaky) is left to the caller's
+        // own retries, as before.
+        let _ = get_editor_version(cli);
+    }
+    match known() {
+        Some(false) => Err(editor_cli_silent_error(cli)),
+        _ => Ok(()),
+    }
 }
 
 /// Parse version string to extract major.minor version
@@ -173,6 +233,7 @@ pub struct EditorCliCommand {
 
 impl EditorCliCommand {
     /// Create a command from a CLI binary found in PATH
+    #[cfg_attr(windows, allow(dead_code))]
     fn from_path(program: &str) -> Self {
         Self {
             program: program.to_string(),
@@ -180,6 +241,32 @@ impl EditorCliCommand {
             env_vars: vec![],
             #[cfg(windows)]
             use_cmd_wrapper: true,
+        }
+    }
+
+    /// Create a command that runs the file at `program` directly. A `.cmd`
+    /// or `.bat` path is run through `cmd.exe` by the standard library, which
+    /// quotes its arguments safely; `cmd /C <name>` is not used, so PATH is
+    /// not searched a second time.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn from_program(program: &Path) -> Self {
+        Self {
+            program: program.to_string_lossy().to_string(),
+            args_prefix: vec![],
+            env_vars: vec![],
+            #[cfg(windows)]
+            use_cmd_wrapper: false,
+        }
+    }
+
+    /// The command for what [`plan_windows_editor_cli`] found.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn from_windows_plan(plan: &WindowsEditorCli) -> Self {
+        match plan {
+            WindowsEditorCli::Wrapper(path) | WindowsEditorCli::Executable(path) => {
+                Self::from_program(path)
+            }
+            WindowsEditorCli::CliJs { electron, cli_js } => Self::from_cli_js(electron, cli_js),
         }
     }
 
@@ -224,11 +311,130 @@ impl EditorCliCommand {
 /// Try to resolve the editor CLI command, first checking PATH, then falling back
 /// to finding the Electron binary and `cli.js` directly in known install locations.
 pub fn resolve_editor_cli(cli_name: &str) -> Option<EditorCliCommand> {
-    if binary_exists(cli_name) {
-        return Some(EditorCliCommand::from_path(cli_name));
+    // Windows: `cmd /C code` runs the first `code.*` on PATH, and when the
+    // editor's install folder comes before its `bin` folder that is
+    // `Code.exe`, the window, which opens a new window per call and prints
+    // nothing. Work out which file PATH gives and use the command line that
+    // belongs to it.
+    #[cfg(windows)]
+    {
+        let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        let pathext = windows_pathext(std::env::var("PATHEXT").ok().as_deref());
+        if let Some(plan) =
+            plan_windows_editor_cli(cli_name, &dirs, &pathext, &|path: &Path| path.is_file())
+        {
+            return Some(EditorCliCommand::from_windows_plan(&plan));
+        }
+        find_editor_cli_js(cli_name)
     }
 
-    find_editor_cli_js(cli_name)
+    #[cfg(not(windows))]
+    {
+        if binary_exists(cli_name) {
+            return Some(EditorCliCommand::from_path(cli_name));
+        }
+
+        find_editor_cli_js(cli_name)
+    }
+}
+
+/// What an editor's CLI name (`code`, `cursor`, `windsurf`) resolves to on a
+/// Windows PATH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum WindowsEditorCli {
+    /// The editor's `.cmd`/`.bat` command line.
+    Wrapper(PathBuf),
+    /// The editor's window executable and its `cli.js`, run as Node
+    /// (`ELECTRON_RUN_AS_NODE`), which is what the `.cmd` wrapper does.
+    CliJs { electron: PathBuf, cli_js: PathBuf },
+    /// An executable with the CLI's name and nothing beside it that marks it
+    /// as an editor install. Used only when PATH has no wrapper at all.
+    Executable(PathBuf),
+}
+
+/// The extensions `cmd.exe` tries for a bare command name, in order, lower
+/// case with their dot. `raw` is `%PATHEXT%`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_pathext(raw: Option<&str>) -> Vec<String> {
+    let parsed: Vec<String> = raw
+        .unwrap_or("")
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| {
+            let ext = ext.to_ascii_lowercase();
+            if ext.starts_with('.') {
+                ext
+            } else {
+                format!(".{ext}")
+            }
+        })
+        .collect();
+    if parsed.is_empty() {
+        [".com", ".exe", ".bat", ".cmd"]
+            .iter()
+            .map(|ext| ext.to_string())
+            .collect()
+    } else {
+        parsed
+    }
+}
+
+/// Decide how to run an editor's command line on Windows from what PATH
+/// holds. Directories are searched in PATH order and, inside each, the
+/// extensions in `pathext` order, as `cmd.exe` does. A `.cmd`/`.bat` hit is
+/// the command line. An `.exe` hit is the editor's window when its folder
+/// holds `bin\<name>.cmd`, `resources\app\bin\<name>.cmd` or
+/// `resources\app\out\cli.js`; the command line beside it is used and the
+/// window executable is never run on its own. Any other `.exe` is kept as a
+/// last resort while the rest of PATH is searched for a wrapper.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn plan_windows_editor_cli(
+    cli_name: &str,
+    path_dirs: &[PathBuf],
+    pathext: &[String],
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<WindowsEditorCli> {
+    let mut last_resort: Option<WindowsEditorCli> = None;
+    for dir in path_dirs {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let Some((hit, ext)) = pathext.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{cli_name}{ext}"));
+            is_file(&candidate).then_some((candidate, ext.as_str()))
+        }) else {
+            continue;
+        };
+        if matches!(ext, ".cmd" | ".bat") {
+            return Some(WindowsEditorCli::Wrapper(hit));
+        }
+        let wrapper_name = format!("{cli_name}.cmd");
+        let wrappers = [
+            dir.join("bin").join(&wrapper_name),
+            dir.join("resources")
+                .join("app")
+                .join("bin")
+                .join(&wrapper_name),
+        ];
+        if let Some(wrapper) = wrappers.into_iter().find(|path| is_file(path)) {
+            return Some(WindowsEditorCli::Wrapper(wrapper));
+        }
+        let cli_js = dir.join("resources").join("app").join("out").join("cli.js");
+        if is_file(&cli_js) {
+            return Some(WindowsEditorCli::CliJs {
+                electron: hit,
+                cli_js,
+            });
+        }
+        if last_resort.is_none() {
+            last_resort = Some(WindowsEditorCli::Executable(hit));
+        }
+    }
+    last_resort
 }
 
 /// Search known installation directories for the Electron binary and cli.js
@@ -685,6 +891,7 @@ pub fn is_vsc_editor_extension_installed(
     cli: &EditorCliCommand,
     extension_id: &str,
 ) -> Result<bool, AutterError> {
+    ensure_editor_cli_answers(cli)?;
     // NOTE: We try up to 3 times, because the editor CLI can be flaky (throws intermittent JS errors)
     let mut last_error_message: Option<String> = None;
     for attempt in 1..=3 {
@@ -720,6 +927,7 @@ pub fn uninstall_vsc_editor_extension(
     cli: &EditorCliCommand,
     extension_id: &str,
 ) -> Result<(), AutterError> {
+    ensure_editor_cli_answers(cli)?;
     let output = cli
         .command(&["--uninstall-extension", extension_id])
         .output()
@@ -808,6 +1016,7 @@ pub fn install_vsc_editor_extension(
     cli: &EditorCliCommand,
     id_or_vsix: &str,
 ) -> Result<(), AutterError> {
+    ensure_editor_cli_answers(cli)?;
     // NOTE: We try up to 3 times, because the editor CLI can be flaky (throws intermittent JS errors)
     let mut last_error_message: Option<String> = None;
     for attempt in 1..=3 {
@@ -2300,12 +2509,289 @@ mod tests {
         assert!(confirm_extension_listed(&cli, "autter.autter-vscode").is_ok());
     }
 
+    /// A stand-in editor CLI: a shell script that appends each call's
+    /// arguments to `calls.log` beside it, then runs `body`.
+    #[cfg(unix)]
+    fn fake_editor_cli(dir: &Path, body: &str) -> EditorCliCommand {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-editor");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> \"{}\"\n{body}\n",
+                dir.join("calls.log").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        EditorCliCommand::from_program(&script)
+    }
+
+    #[cfg(unix)]
+    fn fake_editor_calls(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_confirm_extension_listed_rejects_missing_extension() {
-        // `true` exits 0 with empty output: a definitive "not listed".
-        let cli = EditorCliCommand::from_path("true");
+        // Answers `--version`, lists no extensions: a definitive "not listed".
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_editor_cli(
+            dir.path(),
+            "if [ \"$1\" = \"--version\" ]; then echo 1.144.1; fi",
+        );
         let err = confirm_extension_listed(&cli, "autter.autter-vscode").unwrap_err();
         assert!(err.to_string().contains("missing from its extension list"));
+    }
+
+    /// The row's report: `code` resolved to the editor window, every call
+    /// opened another window and `--version` printed nothing. One silent
+    /// `--version` is the last call this process makes to that program.
+    #[cfg(unix)]
+    #[test]
+    fn silent_editor_cli_is_called_once_and_never_again() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exits 0 and prints nothing, whatever it is asked.
+        let cli = fake_editor_cli(dir.path(), "exit 0");
+
+        let err = get_editor_version(&cli).unwrap_err().to_string();
+        assert!(err.contains("printed nothing"), "{err}");
+        assert!(err.contains("Install from VSIX"), "{err}");
+
+        assert!(is_vsc_editor_extension_installed(&cli, "autter.autter-vscode").is_err());
+        assert!(install_vsc_editor_extension(&cli, "autter.autter-vscode").is_err());
+        assert!(
+            install_vsc_editor_extension_with_vsix_fallback(&cli, "autter.autter-vscode").is_err()
+        );
+        assert!(uninstall_vsc_editor_extension(&cli, "autter.autter-vscode").is_err());
+        assert!(get_editor_version(&cli).is_err());
+        let result = uninstall_autter_editor_extension(
+            "VS Code",
+            Some(fake_editor_cli(dir.path(), "exit 0")),
+            "autter.autter-vscode",
+            false,
+        );
+        assert!(!result.changed);
+
+        // The first `--version` was the only call: a later version check
+        // (doctor and install-hooks ask from both the VS Code and the GitHub
+        // Copilot checks, which opened two windows per run on Windows) does
+        // not run it again.
+        let again = get_editor_version(&cli).unwrap_err().to_string();
+        assert!(again.contains("printed nothing"), "{again}");
+        assert_eq!(fake_editor_calls(dir.path()), vec!["--version".to_string()]);
+    }
+
+    /// Without a version check first (the install path), the extension calls
+    /// ask `--version` once and stop there.
+    #[cfg(unix)]
+    #[test]
+    fn extension_calls_check_the_cli_answers_before_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_editor_cli(dir.path(), "exit 0");
+        assert!(is_vsc_editor_extension_installed(&cli, "autter.autter-vscode").is_err());
+        assert!(install_vsc_editor_extension(&cli, "autter.autter-vscode").is_err());
+        assert_eq!(fake_editor_calls(dir.path()), vec!["--version".to_string()]);
+
+        // A CLI that answers is asked `--version` once, then used normally.
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_editor_cli(
+            dir.path(),
+            "case \"$1\" in --version) echo 1.144.1;; --list-extensions) echo autter.autter-vscode;; esac",
+        );
+        assert!(is_vsc_editor_extension_installed(&cli, "autter.autter-vscode").unwrap());
+        assert!(is_vsc_editor_extension_installed(&cli, "autter.autter-vscode").unwrap());
+        assert_eq!(
+            fake_editor_calls(dir.path()),
+            vec!["--version", "--list-extensions", "--list-extensions"]
+        );
+    }
+
+    /// A Windows machine's files, matched without regard to case as NTFS does.
+    fn windows_files(files: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
+        move |path: &Path| {
+            let wanted = path.to_string_lossy().to_ascii_lowercase();
+            files
+                .iter()
+                .any(|file| file.to_string_lossy().to_ascii_lowercase() == wanted)
+        }
+    }
+
+    fn default_pathext() -> Vec<String> {
+        windows_pathext(Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS"))
+    }
+
+    #[test]
+    fn windows_pathext_is_lowercased_and_defaults_when_unset() {
+        assert_eq!(
+            windows_pathext(Some(".COM;.EXE; .BAT ;CMD;;")),
+            vec![".com", ".exe", ".bat", ".cmd"]
+        );
+        assert_eq!(windows_pathext(None), vec![".com", ".exe", ".bat", ".cmd"]);
+        assert_eq!(
+            windows_pathext(Some("")),
+            vec![".com", ".exe", ".bat", ".cmd"]
+        );
+    }
+
+    /// Regression: `Code.exe`'s folder before `bin\code.cmd` on PATH. `cmd /C
+    /// code` ran the window; onboarding, doctor and uninstall each opened
+    /// about ten. The command line beside the window is used instead.
+    #[test]
+    fn windows_code_exe_before_bin_on_path_uses_the_cmd_wrapper() {
+        let install = PathBuf::from("C:/Users/dev/AppData/Local/Programs/Microsoft VS Code");
+        let files = vec![
+            install.join("Code.exe"),
+            install.join("bin").join("code.cmd"),
+            install.join("bin").join("code"),
+            install
+                .join("resources")
+                .join("app")
+                .join("out")
+                .join("cli.js"),
+        ];
+        let is_file = windows_files(&files);
+        let wrapper = WindowsEditorCli::Wrapper(install.join("bin").join("code.cmd"));
+
+        // The reported order: install folder first, then bin.
+        let path = vec![
+            PathBuf::from("C:/Windows/System32"),
+            install.clone(),
+            install.join("bin"),
+        ];
+        assert_eq!(
+            plan_windows_editor_cli("code", &path, &default_pathext(), &is_file),
+            Some(wrapper.clone())
+        );
+        // Only the install folder on PATH.
+        assert_eq!(
+            plan_windows_editor_cli(
+                "code",
+                std::slice::from_ref(&install),
+                &default_pathext(),
+                &is_file
+            ),
+            Some(wrapper.clone())
+        );
+        // The normal order.
+        assert_eq!(
+            plan_windows_editor_cli(
+                "code",
+                &[install.join("bin"), install.clone()],
+                &default_pathext(),
+                &is_file
+            ),
+            Some(wrapper.clone())
+        );
+
+        // What runs is the wrapper's full path, never the bare name through
+        // `cmd /C`, and never the window executable.
+        let command = EditorCliCommand::from_windows_plan(&wrapper);
+        assert_eq!(
+            PathBuf::from(&command.program),
+            install.join("bin").join("code.cmd")
+        );
+        assert!(command.args_prefix.is_empty());
+        assert!(command.env_vars.is_empty());
+    }
+
+    #[test]
+    fn windows_editor_window_without_a_wrapper_runs_cli_js_as_node() {
+        let install = PathBuf::from("C:/Portable/VSCode");
+        let cli_js = install
+            .join("resources")
+            .join("app")
+            .join("out")
+            .join("cli.js");
+        let files = vec![install.join("Code.exe"), cli_js.clone()];
+        let plan = plan_windows_editor_cli(
+            "code",
+            std::slice::from_ref(&install),
+            &default_pathext(),
+            &windows_files(&files),
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            WindowsEditorCli::CliJs {
+                electron: install.join("code.exe"),
+                cli_js: cli_js.clone(),
+            }
+        );
+        let command = EditorCliCommand::from_windows_plan(&plan);
+        assert_eq!(
+            command.args_prefix,
+            vec![cli_js.to_string_lossy().to_string()]
+        );
+        assert_eq!(
+            command.env_vars,
+            vec![("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn windows_cursor_window_uses_the_wrapper_under_resources() {
+        let install = PathBuf::from("C:/Users/dev/AppData/Local/Programs/cursor");
+        let wrapper = install
+            .join("resources")
+            .join("app")
+            .join("bin")
+            .join("cursor.cmd");
+        let files = vec![install.join("Cursor.exe"), wrapper.clone()];
+        assert_eq!(
+            plan_windows_editor_cli(
+                "cursor",
+                std::slice::from_ref(&install),
+                &default_pathext(),
+                &windows_files(&files)
+            ),
+            Some(WindowsEditorCli::Wrapper(wrapper))
+        );
+    }
+
+    #[test]
+    fn windows_unknown_executable_is_a_last_resort_behind_any_wrapper() {
+        let tools = PathBuf::from("C:/tools");
+        let bin = PathBuf::from("C:/vscode/bin");
+        let files = vec![tools.join("code.exe"), bin.join("code.cmd")];
+        let is_file = windows_files(&files);
+        // A wrapper later on PATH wins over an executable nothing identifies.
+        assert_eq!(
+            plan_windows_editor_cli(
+                "code",
+                &[tools.clone(), bin.clone()],
+                &default_pathext(),
+                &is_file
+            ),
+            Some(WindowsEditorCli::Wrapper(bin.join("code.cmd")))
+        );
+        // With no wrapper anywhere it is still returned (and the empty
+        // `--version` check stops it if it turns out to be a window).
+        assert_eq!(
+            plan_windows_editor_cli(
+                "code",
+                std::slice::from_ref(&tools),
+                &default_pathext(),
+                &is_file
+            ),
+            Some(WindowsEditorCli::Executable(tools.join("code.exe")))
+        );
+        // Nothing on PATH; an extensionless `code` (the Git Bash script) is
+        // not something `cmd.exe` can run.
+        let files = vec![bin.join("code")];
+        assert_eq!(
+            plan_windows_editor_cli(
+                "code",
+                &[PathBuf::new(), bin],
+                &default_pathext(),
+                &windows_files(&files)
+            ),
+            None
+        );
     }
 }

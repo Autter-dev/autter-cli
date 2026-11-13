@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
+use crate::authorship::labels::LineCategory;
 use crate::commands::blame::AutterBlameOptions;
 use crate::error::AutterError;
 use crate::git::repository::Repository;
@@ -10,6 +11,9 @@ pub struct DiffAiAcceptedStats {
     pub total_ai_accepted: u32,
     /// Added lines attested as typed by a person (known human).
     pub total_known_human: u32,
+    /// Added lines whose commit has no authorship record at all, so nothing
+    /// is known about them (as opposed to recorded lines no agent wrote).
+    pub total_unknown: u32,
     pub per_tool_model: BTreeMap<String, u32>,
     pub per_prompt: BTreeMap<String, u32>,
 }
@@ -53,11 +57,15 @@ pub fn diff_ai_accepted_stats(
             options.use_prompt_hashes_as_names = true;
         }
 
-        let blame_result = repo.blame(&file_path, &options);
-        let (line_authors, prompt_records) = match blame_result {
-            Ok(result) => result,
-            Err(_) => continue,
-        };
+        let (line_authors, prompt_records, line_categories) =
+            match repo.blame_analysis(&file_path, &options) {
+                Ok(analysis) => (
+                    analysis.line_authors,
+                    analysis.prompt_records,
+                    analysis.line_categories,
+                ),
+                Err(_) => continue,
+            };
 
         let mut author_tool_map: HashMap<String, String> = HashMap::new();
         for (hash, record) in &prompt_records {
@@ -78,6 +86,8 @@ pub fn diff_ai_accepted_stats(
                 if let Some(tool_model) = author_tool_map.get(author_hash) {
                     *stats.per_tool_model.entry(tool_model.clone()).or_insert(0) += 1;
                 }
+            } else if line_categories.get(line) == Some(&LineCategory::Unknown) {
+                stats.total_unknown += 1;
             }
         }
     }
@@ -188,6 +198,7 @@ mod tests {
         let stats = DiffAiAcceptedStats {
             total_ai_accepted: 10,
             total_known_human: 0,
+            total_unknown: 0,
             per_tool_model: BTreeMap::new(),
             per_prompt: BTreeMap::new(),
         };

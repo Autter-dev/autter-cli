@@ -2794,6 +2794,9 @@ pub fn exec_git_allow_nonzero_with_profile(
 ///
 /// This is used by streaming consumers that cannot call `exec_git*` without
 /// buffering all stdout in memory.
+///
+/// stderr is piped as well, so the caller can tell a bad option from a
+/// revision that does not resolve; it must drain stderr while it reads stdout.
 pub fn spawn_git_stdout(args: &[String]) -> Result<Child, AutterError> {
     let effective_args = args_with_internal_git_profile(
         &args_with_disabled_hooks_if_needed(args),
@@ -2803,7 +2806,7 @@ pub fn spawn_git_stdout(args: &[String]) -> Result<Child, AutterError> {
     cmd.args(&effective_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::piped());
     cmd.env_remove("GIT_EXTERNAL_DIFF");
     cmd.env_remove("GIT_DIFF_OPTS");
 
