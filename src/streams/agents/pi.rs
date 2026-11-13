@@ -372,4 +372,27 @@ mod tests {
         assert_eq!(result.events[0]["type"].as_str(), Some("session"));
         assert_eq!(result.events[1]["type"].as_str(), Some("message"));
     }
+
+    /// A Pi assistant message (pi-mono `AssistantMessage.usage`): disjoint
+    /// `input` / `cacheRead` / `cacheWrite`, `cacheWrite1h` a subset of
+    /// `cacheWrite`, and Pi's own cost breakdown.
+    #[test]
+    fn test_assistant_usage_cache_fields_and_cost_are_forwarded() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let line = r#"{"type":"message","id":"33333333","parentId":"22222222","timestamp":"2026-11-10T10:00:05.000Z","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-6","content":[{"type":"text","text":"Done."}],"usage":{"input":3,"output":245,"cacheRead":13248,"cacheWrite":2959,"cacheWrite1h":0,"totalTokens":16455,"cost":{"input":0.000009,"output":0.003675,"cacheRead":0.0039744,"cacheWrite":0.01109625,"total":0.01875465}},"stopReason":"stop","timestamp":1794304805000}}"#;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{}", line).unwrap();
+        file.flush().unwrap();
+
+        let (events, _) = drain_all(&PiAgent::new(), file.path());
+        let event = crate::daemon::transcript_redaction::redact_json_secrets(events[0].clone());
+        let usage = &event["message"]["usage"];
+        assert_eq!(usage["input"], 3);
+        assert_eq!(usage["cacheRead"], 13248);
+        assert_eq!(usage["cacheWrite"], 2959);
+        assert_eq!(usage["cacheWrite1h"], 0);
+        assert_eq!(usage["cost"]["total"], 0.01875465);
+    }
 }

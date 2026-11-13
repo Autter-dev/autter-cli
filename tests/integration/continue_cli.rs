@@ -25,7 +25,18 @@ fn test_continue_cli_raw_event_fidelity() {
         serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
     let expected: Vec<serde_json::Value> = parsed["history"].as_array().unwrap().clone();
 
-    assert_eq!(result.events, expected);
+    // History items verbatim, then one snapshot of the session-level usage
+    // (prompt-cache reads and writes and Continue's own cost).
+    let (snapshot, history) = result.events.split_last().unwrap();
+    assert_eq!(history, expected.as_slice());
+    assert_eq!(
+        snapshot["type"],
+        autter::streams::usage_snapshot::USAGE_SNAPSHOT_EVENT_TYPE
+    );
+    assert_eq!(
+        snapshot["autter_usage_snapshot"]["cache_write_tokens"],
+        2183
+    );
 }
 
 #[test]

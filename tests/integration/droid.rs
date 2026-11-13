@@ -32,8 +32,19 @@ fn test_droid_raw_event_fidelity() {
         .filter(|v| v["type"].as_str() == Some("message"))
         .collect();
 
-    assert_eq!(result.events.len(), expected.len());
-    assert_eq!(result.events, expected);
+    // The sibling settings file's running token totals (with prompt-cache
+    // reads and writes) ride along as one trailing usage snapshot event.
+    let (snapshot, messages) = result.events.split_last().unwrap();
+    assert_eq!(messages.len(), expected.len());
+    assert_eq!(messages, expected.as_slice());
+    assert_eq!(
+        snapshot["type"],
+        autter::streams::usage_snapshot::USAGE_SNAPSHOT_EVENT_TYPE
+    );
+    assert_eq!(
+        snapshot["autter_usage_snapshot"]["cache_read_tokens"],
+        42496
+    );
 }
 
 #[test]

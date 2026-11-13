@@ -310,4 +310,26 @@ mod tests {
         assert_eq!(id, Some("evt-001".to_string()));
         assert_eq!(parent_id, None);
     }
+
+    /// Copilot CLI's persisted `session.shutdown` event (copilot-sdk
+    /// `ShutdownModelMetricUsage`): per-model totals where `inputTokens`
+    /// includes `cacheReadTokens` and `cacheWriteTokens`.
+    #[test]
+    fn test_shutdown_model_metrics_cache_fields_are_forwarded() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let line = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","totalPremiumRequests":3,"totalApiDurationMs":41250,"sessionStartTime":1794304800000,"currentModel":"claude-sonnet-4.6","modelMetrics":{"claude-sonnet-4.6":{"requests":{"count":7,"cost":3},"usage":{"inputTokens":148200,"outputTokens":3120,"cacheReadTokens":121600,"cacheWriteTokens":18400,"reasoningTokens":640}}}},"id":"e5f6a7b8-5555-6666-7777-888899990000","timestamp":"2026-11-10T10:05:00.000Z","parentId":"d4e5f6a7-4444-5555-6666-777788889999"}"#;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{}", line).unwrap();
+        file.flush().unwrap();
+
+        let (events, _) = drain_all(&CopilotCliAgent::new(), file.path());
+        let event = crate::daemon::transcript_redaction::redact_json_secrets(events[0].clone());
+        let usage = &event["data"]["modelMetrics"]["claude-sonnet-4.6"]["usage"];
+        assert_eq!(usage["inputTokens"], 148200);
+        assert_eq!(usage["cacheReadTokens"], 121600);
+        assert_eq!(usage["cacheWriteTokens"], 18400);
+        assert_eq!(usage["reasoningTokens"], 640);
+    }
 }

@@ -447,4 +447,29 @@ mod tests {
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[2]["type"], "tool_use");
     }
+
+    /// Amp assistant messages carry Anthropic-style disjoint usage in camelCase
+    /// (`inputTokens` excludes `cacheCreationInputTokens` / `cacheReadInputTokens`;
+    /// `totalInputTokens` is their sum). Real thread fixture, forwarded verbatim.
+    #[test]
+    fn test_assistant_usage_cache_fields_are_forwarded() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/amp-threads/T-019ca1ce-3ae2-7686-a41e-ccc078837f8a.json");
+        let (events, _) = drain_all(&AmpAgent::new(), &fixture);
+        let first = events
+            .iter()
+            .find(|e| e["role"] == "assistant")
+            .map(|e| crate::daemon::transcript_redaction::redact_json_secrets(e.clone()))
+            .unwrap();
+        let usage = &first["usage"];
+        assert_eq!(usage["model"], "claude-opus-4-6");
+        assert_eq!(usage["inputTokens"], 3);
+        assert_eq!(usage["cacheCreationInputTokens"], 1619);
+        assert_eq!(usage["cacheReadInputTokens"], 13248);
+        assert_eq!(
+            usage["totalInputTokens"].as_u64().unwrap(),
+            3 + 1619 + 13248,
+            "inputTokens is disjoint from the cache counts"
+        );
+    }
 }

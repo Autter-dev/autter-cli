@@ -592,4 +592,27 @@ mod tests {
             CodexAgent::detect_subagent_parent(Path::new("/nonexistent/path/rollout.jsonl"));
         assert_eq!(result, None);
     }
+
+    /// A Codex `token_count` rollout event (codex-rs/protocol `TokenUsage`):
+    /// OpenAI convention, `input_tokens` includes `cached_input_tokens` and
+    /// `cache_write_input_tokens`. Forwarded verbatim, cache fields intact.
+    #[test]
+    fn test_token_count_cache_fields_are_forwarded() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let line = r#"{"timestamp":"2026-11-10T10:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24210,"cached_input_tokens":18944,"cache_write_input_tokens":4096,"output_tokens":812,"reasoning_output_tokens":448,"total_tokens":25022},"last_token_usage":{"input_tokens":12105,"cached_input_tokens":9472,"cache_write_input_tokens":2048,"output_tokens":406,"reasoning_output_tokens":224,"total_tokens":12511},"model_context_window":272000},"rate_limits":null}}"#;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{}", line).unwrap();
+        file.flush().unwrap();
+
+        let (events, _) = drain_all(&CodexAgent::new(), file.path());
+        let event = crate::daemon::transcript_redaction::redact_json_secrets(events[0].clone());
+        let total = &event["payload"]["info"]["total_token_usage"];
+        assert_eq!(total["input_tokens"], 24210);
+        assert_eq!(total["cached_input_tokens"], 18944);
+        assert_eq!(total["cache_write_input_tokens"], 4096);
+        assert_eq!(total["output_tokens"], 812);
+        assert_eq!(total["reasoning_output_tokens"], 448);
+    }
 }

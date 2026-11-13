@@ -424,4 +424,26 @@ mod tests {
             .unwrap();
         assert_eq!(result2.events.len(), 0);
     }
+
+    /// A Gemini CLI `gemini` record with its `tokens` summary
+    /// (chatRecordingService `TokensSummary`): `input` is `promptTokenCount`,
+    /// which includes `cached` (`cachedContentTokenCount`).
+    #[test]
+    fn test_message_token_summary_with_cached_is_forwarded() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let line = r#"{"id":"0c5f2a9e-6b1d-4a54-9e1a-2f6f5c1d7a10","timestamp":"2026-11-10T10:00:05.000Z","type":"gemini","content":"Updated index.ts.","model":"gemini-3.1-pro-preview","thoughts":[],"tokens":{"input":20480,"output":310,"cached":16384,"thoughts":220,"tool":12,"total":21022}}"#;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{}", line).unwrap();
+        file.flush().unwrap();
+
+        let (events, _) = drain_all(&GeminiAgent::new(), file.path());
+        let event = crate::daemon::transcript_redaction::redact_json_secrets(events[0].clone());
+        assert_eq!(event["model"], "gemini-3.1-pro-preview");
+        assert_eq!(event["tokens"]["input"], 20480);
+        assert_eq!(event["tokens"]["cached"], 16384);
+        assert_eq!(event["tokens"]["thoughts"], 220);
+        assert_eq!(event["tokens"]["tool"], 12);
+    }
 }

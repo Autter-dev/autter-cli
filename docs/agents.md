@@ -37,6 +37,9 @@ Every failed step prints a `fix:` line.
 | JetBrains IDEs | IDE plugin (build 252 or newer) | Edits by GitHub Copilot for JetBrains and Junie | The model and prompts; other JetBrains AI plugins | `autter doctor --agent jetbrains` |
 | Visual Studio (Windows) | IDE extension (VSIX, Visual Studio 2022) | Copilot edits | The model and prompts | `autter doctor --agent visual-studio` |
 
+Token usage, including prompt-cache reads and writes, is described per agent in
+[agent-usage.md](agent-usage.md).
+
 Shell commands an agent runs (Bash, `run_in_terminal`, ...) are captured by
 comparing the files before and after the command. Gitignored files and deletions
 are not attributed; see [shell-edit-capture.md](shell-edit-capture.md).

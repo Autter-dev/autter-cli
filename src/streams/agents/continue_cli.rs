@@ -149,6 +149,12 @@ impl Agent for ContinueAgent {
                 message: format!("Invalid JSON in {}: {}", path.display(), e),
             })?;
 
+        // Continue keeps a running session total (with prompt-cache reads and
+        // writes and its own cost) at the top level, outside `history`.
+        let session_usage = parsed
+            .get("usage")
+            .and_then(crate::streams::usage_snapshot::from_continue_session_usage);
+
         let history = match parsed.as_object_mut().and_then(|obj| obj.remove("history")) {
             Some(serde_json::Value::Array(arr)) => arr,
             _ => {
@@ -162,16 +168,25 @@ impl Agent for ContinueAgent {
         };
 
         let batch_limit = self.batch_size_hint();
+        let history_len = history.len() as u64;
 
-        let events: Vec<serde_json::Value> = history
+        let mut events: Vec<serde_json::Value> = history
             .into_iter()
             .skip(already_processed as usize)
             .take(batch_limit)
             .collect();
 
-        let new_watermark = Box::new(RecordIndexWatermark::new(
-            already_processed + events.len() as u64,
-        ));
+        let next_index = already_processed + events.len() as u64;
+        let new_watermark = Box::new(RecordIndexWatermark::new(next_index));
+
+        // Append the session total to the last batch that read new history
+        // items. It is not a history record, so the watermark ignores it.
+        if !events.is_empty()
+            && next_index >= history_len
+            && let Some(snapshot) = session_usage.and_then(|usage| usage.to_event(None))
+        {
+            events.push(snapshot);
+        }
 
         Ok(StreamBatch {
             events,
@@ -400,5 +415,67 @@ mod tests {
         assert_eq!(result.events.len(), 1);
         assert_eq!(result.events[0]["message"]["content"], "Let me check");
         assert!(result.events[0]["contextItems"].is_array());
+    }
+
+    fn snapshots(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| e["type"] == crate::streams::usage_snapshot::USAGE_SNAPSHOT_EVENT_TYPE)
+            .collect()
+    }
+
+    #[test]
+    fn test_session_usage_with_cache_tokens_is_forwarded_once() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/continue-cli-session-simple.json");
+        let history_len = {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+            parsed["history"].as_array().unwrap().len()
+        };
+
+        // A small batch size: the snapshot rides only on the batch that reaches
+        // the end of the history, so it is sent once per read-through.
+        let agent = ContinueAgent::with_batch_size(2);
+        let (events, wm) = drain_all(&agent, &fixture);
+        assert_eq!(events.len(), history_len + 1);
+        let snaps = snapshots(&events);
+        assert_eq!(snaps.len(), 1);
+        assert!(std::ptr::eq(snaps[0], events.last().unwrap()));
+
+        let usage = &snaps[0]["autter_usage_snapshot"];
+        assert_eq!(usage["source"], "continue_session");
+        assert_eq!(usage["scope"], "session_total");
+        assert_eq!(usage["input_includes_cache"], false);
+        assert_eq!(usage["input_tokens"], 1813);
+        assert_eq!(usage["output_tokens"], 305);
+        assert_eq!(usage["cache_read_tokens"], 4366);
+        assert_eq!(usage["cache_write_tokens"], 2183);
+        assert_eq!(usage["cost_usd"], 0.002423);
+
+        // The snapshot is not a history record: the watermark counts history only.
+        let wm = wm.as_any().downcast_ref::<RecordIndexWatermark>().unwrap();
+        assert_eq!(wm.0, history_len as u64);
+
+        // Nothing new: no events and no repeated snapshot.
+        let again = agent
+            .read_incremental(&fixture, Box::new(RecordIndexWatermark::new(wm.0)), "test")
+            .unwrap();
+        assert!(again.events.is_empty());
+    }
+
+    #[test]
+    fn test_session_without_usage_adds_no_snapshot() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", make_continue_json(2)).unwrap();
+        file.flush().unwrap();
+
+        let agent = ContinueAgent::new();
+        let (events, _) = drain_all(&agent, file.path());
+        assert_eq!(events.len(), 2);
+        assert!(snapshots(&events).is_empty());
     }
 }

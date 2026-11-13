@@ -47,6 +47,7 @@ pub mod db;
 pub mod model_extraction;
 pub mod sweep;
 pub mod types;
+pub mod usage_snapshot;
 pub mod watermark;
 
 // Re-export main types for convenient access
