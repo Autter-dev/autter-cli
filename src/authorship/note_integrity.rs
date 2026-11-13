@@ -22,10 +22,14 @@
 //! unknown member and keep reading new notes, and notes written before this
 //! existed read as [`IntegrityStatus::Legacy`].
 //!
-//! **What it does not do.** This is an integrity check, not tamper evidence:
-//! the repository's owner can rewrite a note and recompute every field. Making
-//! later edits visible to someone else needs a record outside the repository
-//! (the server-side record planned as the next stage).
+//! **What it does not do.** On its own this is an integrity check, not tamper
+//! evidence: anyone who can write the repository can rewrite a note and
+//! recompute every field. In connected mode the server keeps every version of
+//! each note it receives, and `autter verify` compares notes with that record
+//! (`note_server_record`, statuses [`IntegrityStatus::ChangedAfterRecorded`]
+//! and [`IntegrityStatus::NotRecorded`]), so a later edit is visible to the
+//! organisation. A note that was never uploaded (local-only mode, or not
+//! uploaded yet) can only get the integrity check.
 //!
 //! **Rewrites.** Git copies notes during `rebase` and `commit --amend` when
 //! `notes.rewriteRef` is set, before autter rewrites them. A copied note still
@@ -144,6 +148,15 @@ pub enum IntegrityStatus {
     /// autter rebound it from a note that fails the check. The result names
     /// the source commit; its lines are no more trusted than the source's.
     CarriedFailure,
+    /// Set only by `autter verify` in connected mode: the server's record of
+    /// this note has more than one version, or the note here matches none of
+    /// them or only a later one. The note was changed after it was uploaded
+    /// (see `note_server_record`).
+    ChangedAfterRecorded,
+    /// Set only by `autter verify` in connected mode: the note passed the
+    /// local check but the server has no record of it yet (notes upload in
+    /// the background). A warning; a failure with `--require-record`.
+    NotRecorded,
 }
 
 impl IntegrityStatus {
@@ -160,6 +173,8 @@ impl IntegrityStatus {
             IntegrityStatus::RangeOutOfBounds => "range_out_of_bounds",
             IntegrityStatus::DigestMismatch => "digest_mismatch",
             IntegrityStatus::CarriedFailure => "carried_failure",
+            IntegrityStatus::ChangedAfterRecorded => "changed_after_recorded",
+            IntegrityStatus::NotRecorded => "not_recorded",
         }
     }
 
@@ -174,6 +189,7 @@ impl IntegrityStatus {
                 | IntegrityStatus::RangeOutOfBounds
                 | IntegrityStatus::DigestMismatch
                 | IntegrityStatus::CarriedFailure
+                | IntegrityStatus::ChangedAfterRecorded
         )
     }
 
@@ -186,6 +202,7 @@ impl IntegrityStatus {
                 | IntegrityStatus::PendingRewrite
                 | IntegrityStatus::ReboundByOlderAutter
                 | IntegrityStatus::Unavailable
+                | IntegrityStatus::NotRecorded
         )
     }
 }
@@ -278,8 +295,8 @@ pub fn read_integrity(content: &str) -> Option<NoteIntegrity> {
 
 /// `content` with `integrity` written into it and a digest computed for it,
 /// replacing any member it had. Anyone who can write to the repository can do
-/// this, which is why this stage is an integrity check and not tamper
-/// evidence (see the module docs).
+/// this, which is why the digest alone is an integrity check and not tamper
+/// evidence; the server's record covers that (see the module docs).
 pub fn seal_note(content: &str, integrity: &NoteIntegrity) -> Option<String> {
     insert_integrity(&split_note(content).body, integrity)
 }
@@ -1122,6 +1139,7 @@ pub fn failure_notice(result: &CommitIntegrity) -> String {
             IntegrityStatus::RangeOutOfBounds => "does not match this commit's files",
             IntegrityStatus::ContentMismatch => "does not match this commit's files",
             IntegrityStatus::CarriedFailure => "was carried from a note that failed the check",
+            IntegrityStatus::ChangedAfterRecorded => "was changed after the server recorded it",
             _ => "was changed after autter wrote it",
         },
         short(&result.commit)
