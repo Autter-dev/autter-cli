@@ -17,6 +17,11 @@
 #   doctor    doctor --json and doctor --report
 #   lifecycle bg shutdown, start, restart; then the service process killed
 #             with Stop-Process -Force and started again over its stale lock
+#   upgrade   the npm bootstrapper replaces autter.exe while the service runs
+#             it (stopped, swapped, started again on the new binary); a
+#             running exe is renamed aside; a file held open fails non-zero
+#             with the fix and is left in place; install.ps1 over the
+#             running service
 #   vscode    Code.exe ahead of bin\code.cmd on PATH: doctor and
 #             install-hooks --dry-run run code.cmd and never Code.exe; a
 #             Code.exe with no wrapper is asked --version once and no more
@@ -442,6 +447,121 @@ try {
         Check $noted 'a commit after the takeover gets an authorship note'
     }
 } catch { Fail ("section error: " + $_.Exception.Message) }
+
+# --- upgrade ----------------------------------------------------------------
+
+Begin-Section 'upgrade'
+try {
+    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $node) { Fail 'node is not on PATH' } else {
+        $installJs = Join-Path $RepoRoot 'npm\install.js'
+        $swapJs = Join-Path $script:Root 'npm-swap.js'
+        $swapSource = @'
+const [mode, installJs, a, b] = process.argv.slice(2);
+const npm = require(installJs);
+try {
+  if (mode === 'swap') {
+    console.log(JSON.stringify(npm.installDownloadedBinary(a, b)));
+  } else {
+    npm.removeLeftoverBinaries(a);
+  }
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
+'@
+        [IO.File]::WriteAllText($swapJs, $swapSource, (New-Object Text.UTF8Encoding($false)))
+
+        # 1. What `npm install -g @autter/cli@<new>` does when the service
+        #    runs the installed binary.
+        $r = Invoke-Autter -Arguments @('bg', 'start') -TimeoutSec 90
+        $pidBefore = Get-ServicePid
+        Check ($null -ne $pidBefore) 'the service runs before the npm swap'
+        $tmp = Join-Path $BinDir 'autter.tmp.e2e'
+        Copy-Item -LiteralPath $Autter -Destination $tmp -Force
+        $r = Invoke-Exe -File $node.Source -Arguments @($swapJs, 'swap', $installJs, $tmp, $script:AutterExe) -TimeoutSec 240 -Label 'npm swap over the running service'
+        Check ($r.ExitCode -eq 0) 'the npm swap over the running service exits 0' (Show-Output $r)
+        $swap = $null
+        try { $swap = ConvertFrom-Json $r.Stdout.Trim().Split("`n")[-1] } catch { }
+        Check ($null -ne $swap -and $swap.serviceWasRunning) 'the npm swap stopped the running service first' (Show-Output $r)
+        if ($null -ne $swap) { Write-Host ("  aside file used: {0}" -f $swap.aside) }
+        Check (-not (Test-Path -LiteralPath $tmp)) 'the downloaded file was moved into place'
+        $restarted = Wait-Until -TimeoutSec 60 -Condition {
+            $p = Get-ServicePid
+            return ($null -ne $p -and $p -ne $pidBefore)
+        }
+        Check $restarted 'the service runs again, as a new process, after the npm swap'
+        $r = Invoke-Autter -Arguments @('--version')
+        Check ($r.ExitCode -eq 0) 'autter.exe runs after the npm swap' (Show-Output $r)
+
+        # 2. A running exe is renamed aside and replaced. A copy of PING.EXE
+        #    stands in for a process nobody can stop.
+        $swapDir = Join-Path $script:Root 'swap'
+        New-Item -ItemType Directory -Force -Path $swapDir | Out-Null
+        $runningExe = Join-Path $swapDir 'autter.exe'
+        Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\PING.EXE') -Destination $runningExe -Force
+        $pinger = Start-Process -FilePath $runningExe -ArgumentList @('-n', '120', '127.0.0.1') -PassThru -WindowStyle Hidden
+        try {
+            $tmp = Join-Path $swapDir 'autter.tmp.e2e'
+            Copy-Item -LiteralPath $Autter -Destination $tmp -Force
+            $r = Invoke-Exe -File $node.Source -Arguments @($swapJs, 'swap', $installJs, $tmp, $runningExe) -TimeoutSec 120 -Label 'npm swap over a running exe'
+            Check ($r.ExitCode -eq 0) 'the npm swap over a running exe exits 0' (Show-Output $r)
+            $swap = $null
+            try { $swap = ConvertFrom-Json $r.Stdout.Trim().Split("`n")[-1] } catch { }
+            Check ($null -ne $swap -and $swap.aside) 'the running exe was renamed aside' (Show-Output $r)
+            $v = Invoke-Exe -File $runningExe -Arguments @('--version') -Label 'swapped autter.exe --version'
+            Check ($v.ExitCode -eq 0 -and $v.Stdout -match '\d+\.\d+\.\d+') 'the new autter.exe is in place and runs' (Show-Output $v)
+            Check (-not $pinger.HasExited) 'the process running the old file was not stopped'
+        } finally {
+            try { Stop-Process -Id $pinger.Id -Force -ErrorAction Stop } catch { }
+            try { $pinger.WaitForExit(10000) | Out-Null } catch { }
+        }
+        $r = Invoke-Exe -File $node.Source -Arguments @($swapJs, 'cleanup', $installJs, $runningExe) -Label 'npm leftover cleanup'
+        $left = @(Get-ChildItem -LiteralPath $swapDir -Filter 'autter.exe*.old' -File -ErrorAction SilentlyContinue)
+        Check ($left.Count -eq 0) 'the aside file is deleted once nothing runs it' (($left | ForEach-Object { $_.Name }) -join ', ')
+
+        # 3. A file held open without delete sharing cannot even be renamed:
+        #    the swap fails non-zero, says why and what to do, and leaves the
+        #    old file in place.
+        $before = (Get-FileHash -LiteralPath $runningExe -Algorithm SHA256).Hash
+        $tmp = Join-Path $swapDir 'autter.tmp.e2e'
+        [IO.File]::WriteAllBytes($tmp, [byte[]](1, 2, 3))
+        $held = [IO.File]::Open($runningExe, 'Open', 'Read', 'Read')
+        try {
+            $r = Invoke-Exe -File $node.Source -Arguments @($swapJs, 'swap', $installJs, $tmp, $runningExe) -TimeoutSec 120 -Label 'npm swap over a held file'
+        } finally { $held.Close() }
+        Check ($r.ExitCode -ne 0) 'the npm swap over a held file exits non-zero' (Show-Output $r)
+        Check ($r.Stderr -match 'in use' -and $r.Stderr -match 'autter bg shutdown') 'it names the file in use and the fix' $r.Stderr
+        Check ((Get-FileHash -LiteralPath $runningExe -Algorithm SHA256).Hash -eq $before) 'the previous file is left in place'
+        Check (-not (Test-Path -LiteralPath $tmp)) 'the download is removed'
+
+        # 4. install.ps1 over the running service, from the local build.
+        $r = Invoke-Autter -Arguments @('bg', 'start') -TimeoutSec 90
+        $pidBefore = Get-ServicePid
+        Check ($null -ne $pidBefore) 'the service runs before install.ps1'
+        $env:AUTTER_LOCAL_BINARY = $Autter
+        $env:AUTTER_SKIP_PATH_UPDATE = '1'
+        try {
+            $psExe = Join-Path $PSHOME 'powershell.exe'
+            $r = Invoke-Exe -File $psExe -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'install.ps1')) -TimeoutSec 300 -Label 'install.ps1 over the running service'
+        } finally {
+            Remove-Item Env:\AUTTER_LOCAL_BINARY -ErrorAction SilentlyContinue
+            Remove-Item Env:\AUTTER_SKIP_PATH_UPDATE -ErrorAction SilentlyContinue
+        }
+        Check ($r.ExitCode -eq 0) 'install.ps1 over the running service exits 0' (Show-Output $r)
+        Check ($r.Stdout.Contains($script:AutterExe)) 'install.ps1 installed into the test profile' (Show-Output $r)
+        Check ($r.Stdout -match 'Stopped the autter background service') 'install.ps1 stopped the service first' (Show-Output $r)
+        $restarted = Wait-Until -TimeoutSec 60 -Condition {
+            $p = Get-ServicePid
+            return ($null -ne $p -and $p -ne $pidBefore)
+        }
+        Check $restarted 'install.ps1 started the service again as a new process'
+        $r = Invoke-Autter -Arguments @('--version')
+        Check ($r.ExitCode -eq 0) 'autter.exe runs after install.ps1' (Show-Output $r)
+    }
+} catch { Fail ("section error: " + $_.Exception.Message) }
+
+$env:Path = $script:BasePath
 
 # --- vscode -----------------------------------------------------------------
 
