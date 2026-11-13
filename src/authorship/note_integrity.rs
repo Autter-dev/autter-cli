@@ -22,6 +22,34 @@
 //! unknown member and keep reading new notes, and notes written before this
 //! existed read as [`IntegrityStatus::Legacy`].
 //!
+//! **A removed stamp.** Anyone can delete the `integrity` member, edit the
+//! note, and have it read as legacy. So an unstamped note passes as legacy
+//! only when it can be one:
+//!
+//! * its metadata's `autter_version` names autter 3.8.0 or later: every such
+//!   release stamps every note it writes, so the stamp was removed
+//!   ([`IntegrityStatus::StampRemoved`], a failure);
+//! * its commit comes after stamping began, meaning it descends from a commit
+//!   whose note is stamped (commit topology, not dates; see
+//!   `note_stamp_floor`), and it has no readable `autter_version`: also
+//!   [`IntegrityStatus::StampRemoved`];
+//! * its commit comes after stamping began and its `autter_version` names a
+//!   release older than 3.8.0: [`IntegrityStatus::UnstampedByOlderAutter`],
+//!   a warning (a failure under `autter verify --strict`), because a teammate
+//!   who has not upgraded writes exactly this, and the version cannot be
+//!   checked: whoever removes a stamp can edit it too. This mirrors
+//!   [`IntegrityStatus::ReboundByOlderAutter`];
+//! * otherwise (older release, or no version, on a commit before stamping
+//!   began or with no stamped notes in the repository): legacy.
+//!
+//! The paths that legitimately write unstamped notes after stamping began
+//! all stay out of the failure: `autter notes backfill` copies notes as
+//! stored, so a pre-3.8.0 note keeps its old version and an old commit; a
+//! note rebound by an older autter keeps a stamp and is not unstamped; a
+//! teammate on an older autter writes its own older version; and every
+//! rewrite this autter performs (rebase, amend, cherry-pick, `autter ci`)
+//! stamps the note it writes.
+//!
 //! **What it does not do.** On its own this is an integrity check, not tamper
 //! evidence: anyone who can write the repository can rewrite a note and
 //! recompute every field. In connected mode the server keeps every version of
@@ -61,7 +89,12 @@
 //! **Stash notes.** `git stash` saves the working log as a note in
 //! `refs/notes/ai-stash`, stamped for the stash commit
 //! ([`seal_stash_note`]); `stash pop`/`apply` checks it
-//! ([`check_stash_note`]) and does not restore one that fails.
+//! ([`check_stash_note`]) and does not restore one that fails. An unstamped
+//! stash note is not restored when it says autter 3.8.2 or later wrote it
+//! (the first release that stamps stash notes), or has no version and the
+//! stash was made on a commit at or after the first stamped commit. One that
+//! says 3.8.1 or earlier is restored, since 3.8.0 and 3.8.1 stamped commit
+//! notes but not stash notes.
 //!
 //! **Notes copied from the notes database** (`autter notes backfill`) are
 //! written as stored, without a new stamp, so a failing or legacy note is not
@@ -1868,13 +1901,9 @@ mod tests {
         assert_eq!(claim(Some("3.x")), VersionClaim::Unknown);
         assert_eq!(claim(None), VersionClaim::Unknown);
         // Stash notes were stamped from 3.8.2.
-        let stash = |v: &str| {
-            version_claim(&log_with_version(Some(v)), FIRST_STASH_STAMPING_RELEASE)
-        };
+        let stash =
+            |v: &str| version_claim(&log_with_version(Some(v)), FIRST_STASH_STAMPING_RELEASE);
         assert_eq!(stash("3.8.1"), VersionClaim::Older("3.8.1".to_string()));
-        assert_eq!(
-            stash("3.8.2"),
-            VersionClaim::Stamping("3.8.2".to_string())
-        );
+        assert_eq!(stash("3.8.2"), VersionClaim::Stamping("3.8.2".to_string()));
     }
 }

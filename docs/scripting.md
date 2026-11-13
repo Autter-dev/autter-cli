@@ -213,15 +213,17 @@ autter verify origin/main..HEAD --json --strict
 | Status | Exit | Meaning |
 |---|---|---|
 | `verified` | 0 | Written for this commit and unchanged since |
-| `legacy` | 0 (warning) | Written before the integrity check (autter 3.7.1 and earlier). Its commit and line ranges are still checked |
+| `legacy` | 0 (warning) | Written before the integrity check (autter 3.7.1 and earlier). Its commit and line ranges are still checked. See "Notes without a stamp" below for when an unstamped note is not `legacy` |
 | `missing` | 0 (warning) | The commit has no note |
 | `pending_rewrite` | 0 (warning) | Git copied another commit's note here during a rebase or amend and autter has not rewritten it yet (the background service was not running). The two commits carry the same patch |
+| `unstamped_by_older_autter` | 0 (warning); 5 with `--strict` | No stamp, and the note says an autter older than 3.8.0 wrote it, but its commit comes after a commit whose note is stamped. A teammate still on an older autter writes such notes; so does anyone who removes a stamp and edits the version. Its lines still count |
 | `rebound_by_older_autter` | 0 (warning); 5 with `--strict` | An autter release older than the integrity check moved the note here and kept the old stamp, so the digest cannot be checked. The stamp's tree and blobs are checked against the commit it names (`recorded_commit`) when that commit is in this clone |
 | `unavailable` | 0 (warning) | The commit or its files are not in this clone (a shallow or partial clone), so the note could not be checked. This is not tampering |
 | `wrong_commit` | 5 | The note was written for another commit with a different change: it was copied or moved |
 | `content_mismatch` | 5 | The note's record of the commit's files does not match the commit; for a note that looks rebound, its stamp does not describe the commit it names (`recorded_commit`) |
 | `range_out_of_bounds` | 5 | The note attributes lines past the end of a file, or lines of a file the commit does not have |
 | `digest_mismatch` | 5 | The note was changed after autter wrote it |
+| `stamp_removed` | 5 | No stamp, but the note cannot predate stamping: it says autter 3.8.0 or later wrote it (those releases stamp every note), or it has no autter version and its commit comes after a commit whose note is stamped |
 | `carried_failure` | 5 | Autter derived the note, during a rebase, amend, cherry-pick or `autter ci` merge, from a note that failed the check, or an older autter rebound it from a note that fails the check. `recorded_commit` names that source commit |
 | `not_recorded` | 0 (warning); 5 with `--require-record` | Connected mode only: the note passed the local check, but the server has no record of it yet. Notes upload in the background, so a commit made a moment ago is usually not recorded yet |
 | `changed_after_recorded` | 5 | Connected mode only: the server's record of this note has more than one version, or the note here matches none of them, or only a later one. The note was changed after it was uploaded |
@@ -232,15 +234,54 @@ record?, local_status?, record_summary?}`; on exit 5 the same report comes
 with `error.code` = `integrity_failed`, and `failed` counts the commits that
 made it fail.
 
-`--strict` fails `rebound_by_older_autter` (exit 5; the status stays
-`rebound_by_older_autter` and the human report marks it `FAIL`): its digest
-cannot be checked, so anyone who can write notes could otherwise turn a
-failure into a warning by making a note look rebound. To
-clear it, rewrite the commits with this autter (a rebase or `autter ci`
-merge), which stamps them again. `--strict` still passes `legacy` and
+`--strict` fails `rebound_by_older_autter` and `unstamped_by_older_autter`
+(exit 5; the status stays the same and the human report marks it `FAIL`):
+neither can be checked against a digest, so anyone who can write notes
+could otherwise turn a failure into a warning by making a note look rebound,
+or by removing its stamp and writing an older version into it. To clear
+them, upgrade autter everywhere and rewrite the commits with this autter (a
+rebase or `autter ci` merge), which stamps them again. `--strict` still passes `legacy` and
 `missing` notes, with a warning on stderr. **A later release will fail them
 under `--strict`**, once notes written before the integrity check have aged
 out of the ranges you check.
+
+### Notes without a stamp
+
+A note without an `integrity` member reads as `legacy`, so notes written
+before 3.8.0 keep working. Removing the member from a note is easy, so an
+unstamped note is `legacy` only when it can have been written before
+stamping:
+
+| The note says it was written by | Its commit comes after stamping began | Otherwise |
+|---|---|---|
+| autter 3.8.0 or later | `stamp_removed` (5) | `stamp_removed` (5) |
+| no readable autter version | `stamp_removed` (5) | `legacy` |
+| an autter older than 3.8.0 | `unstamped_by_older_autter` (warning; 5 with `--strict`) | `legacy` |
+
+"The note says" is the `autter_version` field of the note's metadata (debug
+builds write `development:<version>`). A commit "comes after stamping began"
+when it descends from a commit whose note is stamped. This uses commit
+ancestry, not dates: committer dates can be set to anything and change on a
+rebase, so a 3.7 note committed yesterday on a branch that forked before
+your first stamped commit is still `legacy`, and a commit dated in the past
+on top of a stamped one is still after it. autter finds the earliest stamped
+commits once and keeps them in `.git/ai/stamp_floor.json`, keyed by the
+notes ref; when the notes change it reads only the notes that changed, so
+`stats` and `blame` do not walk the history each time. The check runs only
+for notes that have no stamp.
+
+A team where some people have not upgraded keeps passing without
+`--strict`: their notes say an older version and read as
+`unstamped_by_older_autter`, a warning whose lines still count. That
+version cannot be checked, so `--strict` fails it, as it fails
+`rebound_by_older_autter`. Notes that are legitimately unstamped are not
+flagged: `autter notes backfill` copies notes as stored, so a pre-3.8.0 note
+keeps its old version (and an old commit), a note rebound by an older autter
+keeps its stamp, and every rewrite this autter performs (rebase, amend,
+cherry-pick, `autter ci` merges) stamps the note it writes.
+
+With the `http` notes backend there is no local `refs/notes/ai`, so only the
+version column applies; the server's record covers those notes.
 
 `autter stats`, `autter blame` and the range stats do not trust a note that
 fails: its lines count as `unknown`, and they print one line naming the commit
@@ -266,8 +307,10 @@ The same holds for the other ways attribution comes back:
   autter prints one warning line naming the stash (in the background service's
   log when the service handles the stash). A stash note without a stamp,
   written by autter 3.8.1 or earlier, is restored as before, so stashes made
-  before an upgrade keep their AI lines; a stamped note with its stamp removed
-  looks the same and is restored too.
+  before an upgrade keep their AI lines. A stash note with its stamp removed
+  is not restored when it says autter 3.8.2 or later wrote it (those releases
+  stamp every stash note), or has no autter version and the stash was made on
+  a commit at or after the first stamped commit.
 - **`autter notes backfill`** (and the automatic backfill when a machine moves
   off the `http` notes backend) copies notes from the local notes database
   into `refs/notes/ai` as stored, without a new stamp. A note changed in the
@@ -360,6 +403,12 @@ commit, moved, or edited by hand. Not caught:
   whose commit is not in the clone, or whose claims hold: it is a warning
   without `--strict`, and a rewrite by this autter carries it like any other
   warning;
+- a note whose stamp was removed and whose `autter_version` was edited to a
+  release older than 3.8.0: on a commit after stamping began it is
+  `unstamped_by_older_autter`, a warning without `--strict`; on a commit
+  before stamping began, or in a repository with no stamped notes, it is
+  `legacy`. A stash note edited the same way (to 3.8.1 or earlier) is
+  restored;
 - edits to the working log in `.git/ai/`, which the next commit records as
   they are.
 

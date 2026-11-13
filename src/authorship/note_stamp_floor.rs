@@ -111,8 +111,11 @@ pub fn at_or_after_stamping(repo: &Repository, commit: &str) -> bool {
     }
 }
 
-fn memo() -> &'static Mutex<HashMap<(PathBuf, String), Vec<String>>> {
-    static MEMO: OnceLock<Mutex<HashMap<(PathBuf, String), Vec<String>>>> = OnceLock::new();
+/// (cache file, notes tree) -> floor, for this process.
+type FloorMemo = Mutex<HashMap<(PathBuf, String), Vec<String>>>;
+
+fn memo() -> &'static FloorMemo {
+    static MEMO: OnceLock<FloorMemo> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -437,7 +440,8 @@ mod tests {
 
     #[test]
     fn the_pattern_matches_the_stamp_line_only() {
-        let stamped = "x\n---\n{\n  \"schema_version\": \"authorship/3.0.0\",\n  \"integrity\": {\"v\":1}\n}";
+        let stamped =
+            "x\n---\n{\n  \"schema_version\": \"authorship/3.0.0\",\n  \"integrity\": {\"v\":1}\n}";
         assert!(stamped.contains(STAMP_PATTERN));
         // An escaped mention inside a prompt does not match.
         let mention = "x\n---\n{\n  \"prompts\": {\"m\": \"\\\"integrity\\\": {\"}\n}";
