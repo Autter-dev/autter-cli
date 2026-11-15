@@ -159,7 +159,7 @@ You can also disable it by setting `"telemetry_oss": "off"` in `~/.autter/config
 ![Junie](https://img.shields.io/badge/Junie-555?style=for-the-badge)
 ![Rovo Dev](https://img.shields.io/badge/Rovo_Dev-555?style=for-the-badge)
 ![Firebender](https://img.shields.io/badge/Firebender-555?style=for-the-badge)
-[![+ Add an Agent](https://img.shields.io/badge/+_Add_an_Agent-1f6feb?style=for-the-badge)](https://autter.dev/docs/cli/add-your-agent)
+[![+ Add an Agent](https://img.shields.io/badge/+_Add_an_Agent-1f6feb?style=for-the-badge)](https://autter.dev/docs/guides/add-your-agent)
 
 ## Why Autter
 
@@ -175,14 +175,14 @@ Want a closer look?
 
 ### Documentation
 
-- [CI Actions](https://autter.dev/docs/guides/ci-workflows) — preserve attribution through Rebase and Merge and Squash and Merge.
+- [CI Actions](https://autter.dev/docs/cli/command-reference#ci) — preserve attribution through Rebase and Merge and Squash and Merge.
 - [How Autter Works](https://autter.dev/docs/cli/how-autter-works)
 - [Stats command](https://autter.dev/docs/cli/commit-stats) — aggregate % AI stats across commits.
 - [Scripting and CI](docs/scripting.md) — `--json` output, exit codes, `--strict`, and a GitHub Actions example.
 - [AI Blame](https://autter.dev/docs/cli/ai-blame)
 - [Config](https://autter.dev/docs/cli/configuration)
 - [Add support for an agent in Autter](https://autter.dev/docs/guides/add-your-agent)
-- Install Autter in background agents: [Claude Web](https://autter.dev/docs/cli/claude-web), [Codex Cloud](https://autter.dev/docs/cli/codex-cloud), [Cursor Agent](https://autter.dev/docs/cli/cursor-agent), and [Devin](https://autter.dev/docs/cli/devin).
+- Install Autter in background agents (Claude Code on the web, Codex Cloud, Cursor background agents, Devin): run the [install script](https://autter.dev/docs/cli/install) in the agent environment's setup step. There are no agent-specific guides yet.
 
 ## Attribution Stats
 
@@ -193,7 +193,7 @@ autter stats --json
 autter stats <start_sha>..<end_sha> --json
 ```
 
-It computes % AI code, AI lines generated vs committed, acceptance rates, and human overrides, broken down by tool and model. More in the [stats command reference](https://autter.dev/docs/cli/reference#stats).
+It computes % AI code, AI lines generated vs committed, acceptance rates, and human overrides, broken down by tool and model. More in the [stats command reference](https://autter.dev/docs/cli/commit-stats).
 
 ### Scripting and CI
 
@@ -361,7 +361,7 @@ Here is the full breakdown of what is supported today:
 | Edit / Write / Patch tools                                      | ✅      | Line-level attribution recorded automatically.                               |
 | Files created via Bash                                          | ✅      | May not work if the agent is not operating from the repository root.         |
 | Git worktrees                                                   | ✅      | Attribution maintained across linked worktrees.                              |
-| Background Agents                                               | ✅      | See docs for [Claude Web](https://autter.dev/docs/cli/claude-web), [Codex Cloud](https://autter.dev/docs/cli/codex-cloud), [Cursor Agent](https://autter.dev/docs/cli/cursor-agent), and [Devin](https://autter.dev/docs/cli/devin). |
+| Background Agents                                               | ✅      | Run the [install script](https://autter.dev/docs/cli/install) in the agent environment's setup step. |
 | Attribute lines from multiple Agent Sessions in the same commit | ✅      |                                                                              |
 | Record which lines a human overrode                             | ✅      |                                                                              |
 | Attribute sessions that produced no code                        | ✅      | Records token usage and session activity even when no code is accepted.      |
@@ -396,8 +396,8 @@ GitHub, GitLab, Bitbucket, Azure DevOps:
 
 | Capability                                                      | Status | Notes                                                                        |
 | --------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- |
-| Squash and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
-| Rebase and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/guides/ci-workflows) to preserve attribution. |
+| Squash and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/cli/command-reference#ci) to preserve attribution. |
+| Rebase and Merge                                                | ✅      | Requires [Autter for Teams](https://cal.com/sagnik-autter/15min) or [Open Source CI Actions](https://autter.dev/docs/cli/command-reference#ci) to preserve attribution. |
 
 ## Acknowledgments
 

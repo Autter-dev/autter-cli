@@ -202,7 +202,12 @@ pub struct HumanRecord {
 }
 
 /// Prompt session details stored in the top-level prompts map keyed by short hash (agent_id + tool)
+///
+/// The overwritten-line counter is written as `overriden_lines` (the schema's
+/// original spelling, see erratum E-001 in the spec) and read under either
+/// spelling: see [`PromptRecordWire`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "PromptRecordWire")]
 pub struct PromptRecord {
     pub agent_id: AgentId,
     pub human_author: Option<String>,
@@ -229,8 +234,10 @@ pub struct PromptRecord {
 /// `accepted_lines` is how many of the session's lines survived to the committed
 /// state; `overriden_lines` is how many of this session's lines were later overwritten
 /// (by a human or another session). Field name `overriden_lines` keeps the existing
-/// (intentionally misspelled) schema convention used by [`PromptRecord`].
+/// (intentionally misspelled) schema convention used by [`PromptRecord`]; the
+/// corrected `overridden_lines` is accepted when reading (see [`FileStatsWire`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(from = "FileStatsWire")]
 pub struct FileStats {
     #[serde(default)]
     pub total_additions: u32,
@@ -243,7 +250,9 @@ pub struct FileStats {
 }
 
 /// Aggregate line statistics for a session, plus a per-file breakdown.
+/// Reads `overridden_lines` as well as `overriden_lines` (see [`SessionStatsWire`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(from = "SessionStatsWire")]
 pub struct SessionStats {
     #[serde(default)]
     pub total_additions: u32,
@@ -256,6 +265,115 @@ pub struct SessionStats {
     /// Per-file breakdown keyed by repo-relative POSIX path. Omitted when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, FileStats>,
+}
+
+// ---------------------------------------------------------------------------
+// Reading the overwritten-line counter under either spelling
+// ---------------------------------------------------------------------------
+//
+// Schema 3.x shipped the counter as `overriden_lines` (erratum E-001). Readers
+// accept the corrected `overridden_lines` too, so a later release can write
+// both keys and schema 4 can drop the old one without breaking this release.
+// Writers keep emitting only `overriden_lines` for now: an older autter that
+// rewrites a note (rebase, amend) re-serializes it from its own structs and
+// would drop a key it does not know, silently zeroing the count.
+//
+// `#[serde(alias)]` is not enough: with an alias, a note that carries both
+// keys fails with "duplicate field". These wire structs hold both spellings
+// as separate optional fields instead. The corrected spelling wins when both
+// are present. Reading changes no bytes of the note, so integrity stamps are
+// unaffected.
+
+fn either_spelling(corrected: Option<u32>, original: Option<u32>) -> u32 {
+    corrected.or(original).unwrap_or(0)
+}
+
+#[derive(Deserialize)]
+struct PromptRecordWire {
+    agent_id: AgentId,
+    human_author: Option<String>,
+    #[serde(default)]
+    messages_url: Option<String>,
+    #[serde(default)]
+    total_additions: u32,
+    #[serde(default)]
+    total_deletions: u32,
+    #[serde(default)]
+    accepted_lines: u32,
+    #[serde(default)]
+    overriden_lines: Option<u32>,
+    #[serde(default)]
+    overridden_lines: Option<u32>,
+    #[serde(default)]
+    custom_attributes: Option<HashMap<String, String>>,
+}
+
+impl From<PromptRecordWire> for PromptRecord {
+    fn from(w: PromptRecordWire) -> Self {
+        Self {
+            agent_id: w.agent_id,
+            human_author: w.human_author,
+            messages_url: w.messages_url,
+            total_additions: w.total_additions,
+            total_deletions: w.total_deletions,
+            accepted_lines: w.accepted_lines,
+            overriden_lines: either_spelling(w.overridden_lines, w.overriden_lines),
+            custom_attributes: w.custom_attributes,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FileStatsWire {
+    #[serde(default)]
+    total_additions: u32,
+    #[serde(default)]
+    total_deletions: u32,
+    #[serde(default)]
+    accepted_lines: u32,
+    #[serde(default)]
+    overriden_lines: Option<u32>,
+    #[serde(default)]
+    overridden_lines: Option<u32>,
+}
+
+impl From<FileStatsWire> for FileStats {
+    fn from(w: FileStatsWire) -> Self {
+        Self {
+            total_additions: w.total_additions,
+            total_deletions: w.total_deletions,
+            accepted_lines: w.accepted_lines,
+            overriden_lines: either_spelling(w.overridden_lines, w.overriden_lines),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionStatsWire {
+    #[serde(default)]
+    total_additions: u32,
+    #[serde(default)]
+    total_deletions: u32,
+    #[serde(default)]
+    accepted_lines: u32,
+    #[serde(default)]
+    overriden_lines: Option<u32>,
+    #[serde(default)]
+    overridden_lines: Option<u32>,
+    #[serde(default)]
+    files: BTreeMap<String, FileStats>,
+}
+
+impl From<SessionStatsWire> for SessionStats {
+    fn from(w: SessionStatsWire) -> Self {
+        Self {
+            total_additions: w.total_additions,
+            total_deletions: w.total_deletions,
+            accepted_lines: w.accepted_lines,
+            overriden_lines: either_spelling(w.overridden_lines, w.overriden_lines),
+            files: w.files,
+        }
+    }
 }
 
 /// Session record for session tracking. `stats` carries the per-session (and

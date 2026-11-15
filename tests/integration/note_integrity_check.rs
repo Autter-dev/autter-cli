@@ -420,6 +420,86 @@ fn test_edit_with_recomputed_digest_still_verifies() {
     assert_status(&repo, &commit, "verified");
 }
 
+/// The overwritten-line counter of every prompt and session in `note`.
+fn overwritten_counts(note: &str) -> Vec<u32> {
+    use autter::authorship::authorship_log_serialization::AuthorshipLog;
+    let log = AuthorshipLog::deserialize_from_string(&strip_integrity(note))
+        .unwrap_or_else(|e| panic!("note should parse ({e}):\n{note}"));
+    let mut counts: Vec<u32> = log
+        .metadata
+        .prompts
+        .values()
+        .map(|p| p.overriden_lines)
+        .collect();
+    for session in log.metadata.sessions.values() {
+        if let Some(stats) = &session.stats {
+            counts.push(stats.overriden_lines);
+            counts.extend(stats.files.values().map(|f| f.overriden_lines));
+        }
+    }
+    counts
+}
+
+/// Schema 3.x writes the overwritten-line counter as `overriden_lines`
+/// (erratum E-001). A note that spells it `overridden_lines`, or carries both
+/// spellings, as later releases will write, is read with the right count and
+/// verifies once stamped; and a rewrite (amend) keeps the count, written back
+/// under the original key.
+#[test]
+fn test_note_with_either_overwritten_lines_spelling_verifies() {
+    let shapes = [
+        ("original key", "\"overriden_lines\": 2"),
+        ("corrected key", "\"overridden_lines\": 2"),
+        (
+            "both keys",
+            "\"overriden_lines\": 2,\n  \"overridden_lines\": 2",
+        ),
+    ];
+    for (shape, replacement) in shapes {
+        let repo = TestRepo::new();
+        let mut file = repo.filename("app.txt");
+        file.set_contents(crate::lines!["human one", "ai one".ai()]);
+        let commit = repo.stage_all_and_commit("ai commit").unwrap().commit_sha;
+
+        let note = raw_note(&repo, &commit);
+        let integrity = read_integrity(&note).unwrap();
+        let body = strip_integrity(&note);
+        assert!(
+            body.contains("\"overriden_lines\": 0") && !body.contains("overridden_lines"),
+            "autter writes the original key only:\n{body}"
+        );
+        let edited = body.replace("\"overriden_lines\": 0", replacement);
+        let stamped = seal_note(&edited, &integrity).unwrap();
+        write_raw_note(&repo, &commit, &stamped);
+
+        let counts = overwritten_counts(&raw_note(&repo, &commit));
+        assert!(!counts.is_empty(), "{shape}: note has no counters");
+        assert!(
+            counts.iter().all(|&c| c == 2),
+            "{shape}: counts read as {counts:?}"
+        );
+        assert_status(&repo, &commit, "verified");
+        file.assert_committed_lines(crate::lines!["human one".human(), "ai one".ai()]);
+
+        // A rewrite re-serializes the note: the counts survive,
+        // under the original key, and the new note verifies.
+        repo.git(&["commit", "--amend", "-m", "reworded"]).unwrap();
+        let amended = rev(&repo, "HEAD");
+        assert_ne!(commit, amended);
+        let rewritten = raw_note(&repo, &amended);
+        assert!(
+            !rewritten.contains("overridden_lines"),
+            "{shape}: autter writes the original key only:\n{rewritten}"
+        );
+        let rewritten_counts = overwritten_counts(&rewritten);
+        assert!(
+            !rewritten_counts.is_empty() && rewritten_counts.iter().all(|&c| c == 2),
+            "{shape}: counts after the rewrite read as {rewritten_counts:?}:\n{rewritten}"
+        );
+        assert_status(&repo, &amended, "verified");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Warnings
 // ---------------------------------------------------------------------------

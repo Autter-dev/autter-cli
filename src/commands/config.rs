@@ -101,7 +101,7 @@ fn print_config_help() {
     println!("  exclude_prompts_in_repositories  Repos to exclude prompts from (array)");
     println!("  allow_repositories           Allowed repos (array)");
     println!("  exclude_repositories         Excluded repos (array)");
-    println!("  telemetry_oss                OSS telemetry setting (on/off)");
+    println!("  telemetry_oss                Anonymous telemetry (on/off, off until you opt in)");
     println!("  telemetry_enterprise_dsn     Enterprise telemetry DSN");
     println!("  disable_version_checks       Disable version checks (bool)");
     println!("  disable_auto_updates         Disable auto updates (bool)");
@@ -280,6 +280,11 @@ fn show_all_config() -> Result<(), String> {
         effective_config.insert("exclude_repositories".to_string(), Value::Array(vec![]));
     }
 
+    effective_config.insert(
+        "telemetry_oss".to_string(),
+        Value::String(telemetry_oss_value(runtime_config).to_string()),
+    );
+
     // Booleans with runtime values
     effective_config.insert(
         "telemetry_oss_disabled".to_string(),
@@ -379,6 +384,16 @@ fn show_all_config() -> Result<(), String> {
     Ok(())
 }
 
+/// `telemetry_oss` as `autter config set telemetry_oss` takes it: "on" only
+/// after the user opted in, "off" otherwise (unset counts as off).
+fn telemetry_oss_value(runtime_config: &crate::config::Config) -> &'static str {
+    if runtime_config.is_telemetry_oss_disabled() {
+        "off"
+    } else {
+        "on"
+    }
+}
+
 fn get_config_value(key: &str) -> Result<(), String> {
     let file_config = crate::config::load_file_config_public()?;
     let runtime_config = crate::config::Config::get();
@@ -410,6 +425,9 @@ fn get_config_value(key: &str) -> Result<(), String> {
                     Value::Array(vec![])
                 }
             }
+            // The key `autter config set telemetry_oss on|off` writes. Reads
+            // back the effective setting: "off" until the user opts in.
+            "telemetry_oss" => Value::String(telemetry_oss_value(runtime_config).to_string()),
             "telemetry_oss_disabled" => Value::Bool(runtime_config.is_telemetry_oss_disabled()),
             "telemetry_enterprise_dsn" => {
                 if let Some(ref dsn) = file_config.telemetry_enterprise_dsn {

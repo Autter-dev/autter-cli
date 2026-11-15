@@ -8,7 +8,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 The [Autter project](https://github.com/autter-dev/autter-cli) is a full, production-ready implementation of this standard built as a Git extension. Another project would be considered compliant with this standard if it also attached AI Authorship Logs with Git Notes, even if it was implemented in another way. 
 
-If you are trying to add support for your Coding Agent to Autter format, that is best done by [integrating with published implementation](https://autter.dev/docs/cli/add-your-agent), not implementing this spec. 
+If you are trying to add support for your Coding Agent to Autter format, that is best done by [integrating with published implementation](https://autter.dev/docs/guides/add-your-agent), not implementing this spec. 
 
 ## 1. Authorship Logs
 
@@ -265,7 +265,7 @@ Each entry in the `prompts` object represents an AI session in the legacy format
 | `total_additions` | integer | REQUIRED | Total lines added by this session |
 | `total_deletions` | integer | REQUIRED | Total lines deleted by this session |
 | `accepted_lines` | integer | REQUIRED | Lines accepted in the final commit |
-| `overriden_lines` | integer | REQUIRED | Lines that were later modified by human (see E-001) |
+| `overriden_lines` | integer | REQUIRED | Lines that were later modified by human (see E-001; readers also accept `overridden_lines`) |
 | `custom_attributes` | object | OPTIONAL | User-defined key-value string pairs from configuration |
 
 **Deprecated:** The `messages` array field was removed as of v1.3.4 and MUST NOT appear in new notes.
@@ -908,7 +908,12 @@ The length of IDs (currently 14 hex chars for each component, 16 total with pref
 
 ### Errata
 
-E-001: The field name `overriden_lines` was introduced as a typographical error in v3.0.0 and shipped in the reference autter implementation, where it became canonical. In v4.x, this field WILL be renamed to `overridden_lines`.
+E-001: The field name `overriden_lines` was introduced as a typographical error in v3.0.0 and shipped in the reference autter implementation, where it became canonical. In v4.x, this field WILL be renamed to `overridden_lines`. Until then, in every object that carries the counter (`prompts` entries, session `stats` and their per-file `files` entries):
+
+- Readers MUST accept both `overriden_lines` and `overridden_lines`. When both are present, readers MUST use `overridden_lines`. When neither is present, the count is 0.
+- Readers MUST ignore members they do not recognise, so a note carrying both spellings stays readable.
+- Writers of v3.x notes MUST emit `overriden_lines`. They MAY also emit `overridden_lines` with the same value; the reference implementation does not yet (it reads both from autter 3.12.0). Writers MUST NOT emit only `overridden_lines` in a v3.x note, because an older reader that rewrites the note would drop the count.
+- Adding the second key does not change the schema version.
 
 E-002: The `messages` array field in prompt records was deprecated in v1.3.4 and removed. It MUST NOT appear in new notes. The optional `messages_url` field remains available in `prompts` for linking to externally-stored transcripts. Session records do not carry `messages_url` as session IDs map directly to agent conversation data.
 

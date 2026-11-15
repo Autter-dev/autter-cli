@@ -25,7 +25,6 @@ use crate::git::repository::{Repository, exec_git};
 /// old is more likely to be wrong than useful.
 pub const STRANDED_LOOKBACK_COMMITS: usize = 100;
 
-
 /// A commit with no authorship note whose parent still has unprocessed
 /// checkpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,7 +243,9 @@ pub fn recover_stranded_commits(
                     .get(index + 1)
                     .is_some_and(|next| next.parent == item.commit);
                 if !had_own_log && item.commit != head_sha && !next_is_stranded {
-                    let _ = repo.storage.delete_working_log_for_base_commit(&item.commit);
+                    let _ = repo
+                        .storage
+                        .delete_working_log_for_base_commit(&item.commit);
                 }
             }
             Err(err) => {

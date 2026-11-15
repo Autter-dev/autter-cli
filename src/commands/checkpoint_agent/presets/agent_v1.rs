@@ -31,7 +31,7 @@ impl AgentPreset for AgentV1Preset {
     fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, AutterError> {
         let payload: AgentV1Payload = serde_json::from_str(hook_input).map_err(|e| {
             AutterError::PresetError(format!(
-                "Invalid AgentV1Input JSON. Format is documented here: https://autter.dev/docs/cli/add-your-agent: \n\n Error: {}",
+                "Invalid AgentV1Input JSON. Format is documented here: https://autter.dev/docs/guides/add-your-agent: \n\n Error: {}",
                 e
             ))
         })?;

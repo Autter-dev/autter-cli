@@ -1547,4 +1547,137 @@ mod tests {
         );
         assert_eq!(parsed.serialize_to_string().unwrap(), one);
     }
+
+    /// A note whose prompt, session and per-file counters are all 3, written
+    /// the way autter writes it today (`overriden_lines` everywhere).
+    fn note_with_overwritten_lines() -> String {
+        use crate::authorship::authorship_log::{
+            FileStats, PromptRecord, SessionRecord, SessionStats,
+        };
+        let agent_id = crate::authorship::working_log::AgentId {
+            tool: "cursor".to_string(),
+            id: "session_123".to_string(),
+            model: "claude-3-sonnet".to_string(),
+        };
+        let mut log = AuthorshipLog::new();
+        let hash = generate_short_hash(&agent_id.id, &agent_id.tool);
+        log.metadata.prompts.insert(
+            hash.clone(),
+            PromptRecord {
+                agent_id: agent_id.clone(),
+                human_author: None,
+                messages_url: None,
+                total_additions: 5,
+                total_deletions: 0,
+                accepted_lines: 2,
+                overriden_lines: 3,
+                custom_attributes: None,
+            },
+        );
+        log.metadata.sessions.insert(
+            "s_0123456789abcd".to_string(),
+            SessionRecord {
+                agent_id,
+                human_author: None,
+                messages_url: None,
+                stats: Some(SessionStats {
+                    total_additions: 5,
+                    total_deletions: 0,
+                    accepted_lines: 2,
+                    overriden_lines: 3,
+                    files: BTreeMap::from([(
+                        "src/main.rs".to_string(),
+                        FileStats {
+                            total_additions: 5,
+                            total_deletions: 0,
+                            accepted_lines: 2,
+                            overriden_lines: 3,
+                        },
+                    )]),
+                }),
+                custom_attributes: None,
+            },
+        );
+        let mut file = FileAttestation::new("src/main.rs".to_string());
+        file.add_entry(AttestationEntry::new(hash, vec![LineRange::Range(1, 5)]));
+        log.attestations.push(file);
+        log.serialize_to_string().unwrap()
+    }
+
+    /// The prompt, session and per-file counters of a parsed note.
+    fn overwritten_counts(note: &str) -> Vec<u32> {
+        let log = AuthorshipLog::deserialize_from_string(note).unwrap();
+        let prompt = log.metadata.prompts.values().next().unwrap();
+        let stats = log
+            .metadata
+            .sessions
+            .values()
+            .next()
+            .unwrap()
+            .stats
+            .as_ref()
+            .unwrap();
+        vec![
+            prompt.overriden_lines,
+            stats.overriden_lines,
+            stats.files["src/main.rs"].overriden_lines,
+        ]
+    }
+
+    #[test]
+    fn overwritten_lines_are_written_under_the_original_key_only() {
+        let note = note_with_overwritten_lines();
+        assert_eq!(note.matches("\"overriden_lines\": 3").count(), 3);
+        assert!(!note.contains("overridden_lines"));
+    }
+
+    #[test]
+    fn overwritten_lines_read_under_the_original_key() {
+        let note = note_with_overwritten_lines();
+        assert_eq!(overwritten_counts(&note), vec![3, 3, 3]);
+    }
+
+    #[test]
+    fn overwritten_lines_read_under_the_corrected_key() {
+        let note =
+            note_with_overwritten_lines().replace("\"overriden_lines\"", "\"overridden_lines\"");
+        assert!(!note.contains("overriden_lines"));
+        assert_eq!(overwritten_counts(&note), vec![3, 3, 3]);
+        // Written back under the original key, so an older autter that
+        // rewrites the note still finds the count.
+        let rewritten = AuthorshipLog::deserialize_from_string(&note)
+            .unwrap()
+            .serialize_to_string()
+            .unwrap();
+        assert_eq!(rewritten, note_with_overwritten_lines());
+    }
+
+    #[test]
+    fn overwritten_lines_read_when_a_note_carries_both_keys() {
+        // Both keys with the same value (what a later dual-writing release
+        // will write). With `#[serde(alias)]` this would fail with
+        // "duplicate field".
+        let both = note_with_overwritten_lines().replace(
+            "\"overriden_lines\": 3",
+            "\"overriden_lines\": 3,\n  \"overridden_lines\": 3",
+        );
+        assert_eq!(both.matches("overridden_lines").count(), 3);
+        assert_eq!(overwritten_counts(&both), vec![3, 3, 3]);
+
+        // Different values: the corrected key wins.
+        let differ = note_with_overwritten_lines().replace(
+            "\"overriden_lines\": 3",
+            "\"overriden_lines\": 1,\n  \"overridden_lines\": 4",
+        );
+        assert_eq!(overwritten_counts(&differ), vec![4, 4, 4]);
+    }
+
+    #[test]
+    fn overwritten_lines_default_to_zero_when_absent() {
+        // Neither spelling (an unknown member in its place is ignored).
+        let none =
+            note_with_overwritten_lines().replace("\"overriden_lines\"", "\"unrelated_counter\"");
+        assert!(!none.contains("overriden_lines"));
+        assert_eq!(overwritten_counts(&none), vec![0, 0, 0]);
+    }
 }

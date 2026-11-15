@@ -982,15 +982,26 @@ fn git_dir_fast(repo_root: &Path) -> Option<PathBuf> {
     }
     if dot_git.is_file()
         && let Ok(contents) = fs::read_to_string(&dot_git)
-        && let Some(rest) = contents.lines().next().and_then(|l| l.strip_prefix("gitdir:"))
+        && let Some(rest) = contents
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("gitdir:"))
     {
         let p = PathBuf::from(rest.trim());
-        return Some(if p.is_absolute() { p } else { repo_root.join(p) });
+        return Some(if p.is_absolute() {
+            p
+        } else {
+            repo_root.join(p)
+        });
     }
     get_git_dir(repo_root).ok()
 }
 
-fn persisted_snapshot_path(repo_root: &Path, session_id: &str, tool_use_id: &str) -> Option<PathBuf> {
+fn persisted_snapshot_path(
+    repo_root: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
     let git_dir = git_dir_fast(repo_root)?;
     let mut hasher = Sha256::new();
@@ -1097,7 +1108,13 @@ pub fn handle_bash_pre_tool_use_with_context(
     // post-snapshot (which keeps everything modified since this moment) does
     // not report them as created when bash left them untouched.
     let now_ns = system_time_to_nanos(SystemTime::now());
-    let snap = snapshot_with_recent(repo_root, session_id, tool_use_id, wm.as_ref(), Some(now_ns))?;
+    let snap = snapshot_with_recent(
+        repo_root,
+        session_id,
+        tool_use_id,
+        wm.as_ref(),
+        Some(now_ns),
+    )?;
 
     // When watermarks are unavailable (no daemon + no .git/index), the snapshot
     // contains every non-ignored file in the repo. Using that as dirty_paths

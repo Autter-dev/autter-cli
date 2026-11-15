@@ -2,7 +2,7 @@
 
 **[Autter](https://autter.dev) is an open source git extension that records which lines of your code were written by AI** — tied to the agent, model, and prompt that produced them.
 
-This package is a thin bootstrapper: it downloads the official native `autter` binary for your platform (macOS, Linux, or Windows; x64 or arm64) into `~/.autter/bin`, verifies its checksum against the GitHub release, and exposes the `autter` command through your npm global bin. The binary location is shared with the [shell installers](https://docs.autter.dev/cli/install), so hooks and the background service's self-updates keep working no matter how autter was installed.
+This package is a thin bootstrapper: it downloads the official native `autter` binary for your platform (macOS, Linux, or Windows; x64 or arm64) into `~/.autter/bin`, verifies its checksum against the GitHub release, and exposes the `autter` command through your npm global bin. The binary location is shared with the [shell installers](https://autter.dev/docs/cli/install), so hooks and the background service's self-updates keep working no matter how autter was installed.
 
 ## Install
 
@@ -38,6 +38,6 @@ If your package manager skips install scripts (`--ignore-scripts`, pnpm, or an n
 
 ## Links
 
-- [Documentation](https://docs.autter.dev)
+- [Documentation](https://autter.dev/docs)
 - [GitHub repository](https://github.com/Autter-dev/autter-cli)
-- [Other install methods](https://docs.autter.dev/cli/install) (`curl`, PowerShell, Nix)
+- [Other install methods](https://autter.dev/docs/cli/install) (`curl`, PowerShell, Nix)

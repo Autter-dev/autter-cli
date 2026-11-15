@@ -6,7 +6,7 @@ Unless you choose connected mode (`autter onboard --connect`, or "Connected" in 
 
 Before you finish `autter onboard`, Autter does not read your AI agents' session history, and plain commands such as `autter status` or `autter doctor` do not start the background service.
 
-The only other data Autter can send is anonymous error and usage telemetry. It is off until you opt in during `autter onboard` or with `autter telemetry on`, and you can turn it off at any time by setting `telemetry_oss` to `off`. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options) for details.
+The only other data Autter can send is anonymous error and usage telemetry. It is off until you opt in during `autter onboard` or with `autter telemetry on`, and you can turn it off at any time by setting `telemetry_oss` to `off`. See [configuration options](https://autter.dev/docs/cli/configuration#storage-and-privacy-options) for details.
 
 ## Data
 
@@ -24,7 +24,7 @@ AI attribution data is written to git notes and is readable by anyone with repo 
 
 ### Telemetry
 
-- **Error & exception telemetry** — off until you opt in during `autter onboard` (or with `autter telemetry on`), in local and connected mode alike. It never includes code or prompts. You can turn it off or redirect it to your own endpoint. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options).
+- **Error & exception telemetry** — off until you opt in during `autter onboard` (or with `autter telemetry on`), in local and connected mode alike. It never includes code or prompts. You can turn it off or redirect it to your own endpoint. See [configuration options](https://autter.dev/docs/cli/configuration#storage-and-privacy-options).
 
 ---
 
@@ -54,7 +54,7 @@ Teams and Enterprise deployments store additional data in the team instance:
 - **SCM PR data** from GitHub, Bitbucket, and GitLab
   - PR metadata: description, opener, reviewer, status
   - PR diffs — processed for computing % AI code, but not stored
-- **Error & exception telemetry** — off until you opt in; you can turn it off or redirect it to your own endpoint at any time. See [configuration options](https://autter.dev/docs/cli/configuration#configuration-options).
+- **Error & exception telemetry** — off until you opt in; you can turn it off or redirect it to your own endpoint at any time. See [configuration options](https://autter.dev/docs/cli/configuration#storage-and-privacy-options).
 
 For more information, see our [Trust Center](https://trust.autter.dev).
 

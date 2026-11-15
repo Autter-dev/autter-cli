@@ -190,7 +190,7 @@ class AutterService {
 
                     To fix: Install autter using one of these methods:
                     - cargo install autter
-                    - curl -fsSL https://install.autter.dev | sh
+                    - curl -fsSL https://api.autter.dev/install.sh | bash
                     - Or ensure autter is in your PATH
                 """.trimIndent())
                 TelemetryService.getInstanceOrNull()?.reportAutterNotFound(

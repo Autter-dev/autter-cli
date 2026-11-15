@@ -136,4 +136,4 @@ vendor's documentation. A miss only means no warning.
 | Aider | A hook around its edit step; today its commits arrive as ordinary git commits |
 
 To ask for an integration, or to contribute one, see
-https://autter.dev/docs/cli/add-your-agent.
+https://autter.dev/docs/guides/add-your-agent.

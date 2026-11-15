@@ -31,7 +31,10 @@ export interface PromptRecord {
   total_additions?: number;
   total_deletions?: number;
   accepted_lines?: number;
+  /** Schema 3.x spelling (erratum E-001); autter still writes this key. */
   overriden_lines?: number;
+  /** Corrected spelling; later notes may carry it. Read it first: `overridden_lines ?? overriden_lines`. */
+  overridden_lines?: number;
   other_files?: string[];
   commits?: string[];
   messages_url?: string;
