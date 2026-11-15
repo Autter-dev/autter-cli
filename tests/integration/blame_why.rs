@@ -92,3 +92,43 @@ fn why_rejects_malformed_argument() {
         "argument with a non-numeric line should fail"
     );
 }
+
+/// `autter lineage <file>:<line>` is `autter blame --why <file>:<line>`: one
+/// code path, the same output.
+#[test]
+fn lineage_with_a_file_and_line_explains_the_line_like_blame_why() {
+    let repo = repo_with_human_and_ai_line();
+    for target in ["f.txt:1", "f.txt:2"] {
+        let blame = repo.autter(&["blame", "--why", target]).unwrap();
+        let lineage = repo.autter(&["lineage", target]).unwrap();
+        assert_eq!(lineage, blame, "lineage {target} should print blame --why");
+    }
+    assert!(
+        repo.autter(&["lineage", "f.txt:99"]).is_err(),
+        "an out-of-range line fails as it does for blame --why"
+    );
+}
+
+/// An issue id is read from Autter, so it needs a login (the tests have none);
+/// bad usage fails before that.
+#[test]
+fn lineage_with_an_issue_id_needs_a_login_and_rejects_bad_usage() {
+    let repo = TestRepo::new();
+    let output = repo
+        .autter(&["lineage", "ri_0123456789abcdef0123456789"])
+        .expect_err("not logged in");
+    assert!(output.contains("autter login"), "{output}");
+    let output = repo
+        .autter(&[
+            "lineage",
+            "https://app.autter.dev/acme/runtime/errors/ri_abc",
+        ])
+        .expect_err("a URL is not an issue id");
+    assert!(output.contains("issue id"), "{output}");
+    let output = repo
+        .autter(&["lineage", "ri_abc", "--since", "1h"])
+        .expect_err("unknown option");
+    assert!(output.contains("unknown option for lineage"), "{output}");
+    let output = repo.autter(&["lineage"]).expect_err("no target");
+    assert!(output.contains("autter lineage <issue-id>"), "{output}");
+}

@@ -23,6 +23,7 @@ pub mod home;
 pub mod hooks;
 pub mod install_hooks;
 pub mod interactive;
+pub mod lineage;
 pub mod log;
 pub mod login;
 pub mod logout;

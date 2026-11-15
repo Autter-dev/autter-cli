@@ -153,7 +153,8 @@ pub fn handle_autter(args: &[String]) {
             | "memory"
             | "context"
             | "mcp"
-    );
+    ) || (args[0] == "lineage"
+        && commands::lineage::blame_why_args(&args[1..]).is_none());
     // A help request never needs the background service: `stats --help` used
     // to fail when it was unreachable while `--help stats` worked.
     let needs_daemon = !help_requested && !works_without_daemon;
@@ -206,6 +207,17 @@ pub fn handle_autter(args: &[String]) {
 
     match args[0].as_str() {
         "ask" | "logs" | "threads" => commands::ask::handle(&args[0], &args[1..]),
+        // `lineage <issue-id>` reads the issue's lineage from Autter;
+        // `lineage <file>:<line>` is `blame --why <file>:<line>`.
+        "lineage" => match commands::lineage::blame_why_args(&args[1..]) {
+            Some(blame_args) => {
+                handle_ai_blame(&blame_args);
+                if is_interactive_terminal() {
+                    log_message("blame", "info", None)
+                }
+            }
+            None => commands::lineage::handle(&args[1..]),
+        },
         "memory" => commands::memory::handle(&args[1..]),
         "context" => commands::context::handle(&args[1..]),
         "mcp" => commands::mcp::handle(&args[1..]),
@@ -487,6 +499,7 @@ const AUTTER_COMMANDS: &[&str] = &[
     "help",
     "install",
     "install-hooks",
+    "lineage",
     "log",
     "login",
     "logout",

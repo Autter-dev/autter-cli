@@ -880,7 +880,7 @@ autter login [--token <token>]
         name: "ask",
         aliases: &[],
         summary: "Investigate your system with Runtime evidence",
-        body: "autter ask <question> [--repo <name>] [--org <slug>] [--thread <id>] [--mode system|codebase|reviews] [--json]\n\n  Get root causes, impact, and recommended fixes. Questions and answers are\n  saved in the same private thread history as Dashboard Ask. Use --thread to resume.\n  Sign in with autter login. Default mode: system.",
+        body: "autter ask <question> [--repo <name>] [--org <slug>] [--thread <id>] [--mode system|codebase|reviews] [--json]\n\n  Get root causes, impact, and recommended fixes. Ask it \"why did this happen\"\n  and \"what is the impact\" questions: it answers them from Runtime evidence.\n  Questions and answers are saved in the same private thread history as Dashboard Ask. Use --thread to resume.\n  Sign in with autter login. Default mode: system.",
     },
     HelpEntry {
         name: "logs",
@@ -893,6 +893,34 @@ autter login [--token <token>]
         aliases: &[],
         summary: "Search and read saved debugging investigations",
         body: "autter threads [search <keywords>] [--repo <name>] [--org <slug>] [--offset <n>] [--json]\nautter threads show <id> [--org <slug>] [--json]\n\n  Search your questions and answers across Dashboard and CLI. Lists 50 threads\n  at a time. Continue an investigation with autter ask <question> --thread <id>.",
+    },
+    HelpEntry {
+        name: "lineage",
+        aliases: &[],
+        summary: "From a Runtime issue to its release, commit, PR, owner and AI authorship",
+        body: "\
+autter lineage <issue-id> [--repo <name>] [--org <slug>] [--json]
+autter lineage <file>:<line>
+
+  <issue-id>     Print the chain behind a Runtime issue (its id, ri_...), top to
+                 bottom: the issue; the release it first appeared in and the
+                 commit it runs (and the release before it); the suspect PR;
+                 the owner (assigned, else suggested); the suspect commits,
+                 marking those an AI agent wrote with no human author; who wrote
+                 each failing frame (an agent and model, a person, or not known
+                 when the commit has no authorship notes), with the function's
+                 AI share; and why the error was grouped into this issue. When
+                 an agent's transcript is stored, prints the `autter show-prompt`
+                 command for it; prompt text is never printed here.
+  <file>:<line>  Explain one line of code: the same as
+                 `autter blame --why <file>:<line>`.
+
+  --repo <name>  Only an issue in this repository (as Autter names it)
+  --org <slug>   Another organization you belong to
+  --json         The response as JSON, for scripts
+
+  Uses your autter login. A part Autter could not read prints one line saying
+  so; the command still exits 0. No one is shown by email address.",
     },
     HelpEntry {
         name: "memory",
