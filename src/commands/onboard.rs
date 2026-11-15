@@ -702,7 +702,7 @@ fn render_finished(connected: bool, report: &SetupReport, caps: &TermCaps) -> St
     ));
     out.push_str(&command("autter log", "git log with AI authorship stats"));
     if connected {
-        out.push_str(&command("autter dash", "open your personal dashboard"));
+        out.push_str(&command("autter dash", "open this repository in Autter"));
     }
     out.push('\n');
     out.push_str(&format!(
