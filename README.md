@@ -270,6 +270,8 @@ Details: autter show-prompt s_3f9a2c1d  |  autter blame --why src/log_fmt/author
 3. **`autter show-prompt <ref>`** prints the full prompt record as JSON: agent, model, session, line counts, the commit whose note holds it, and the transcript. It takes the short reference, a full session ID (`s_` + 14 hex), an older 16-hex prompt hash, any unique prefix of 4+ hex characters, or the agent's own session ID. `autter show-prompt --help` lists where each ID appears.
 4. **`git show <commit>`** is the change itself.
 
+`autter lineage <file>:<line>` is the same as `autter blame --why <file>:<line>`. From a production error instead of a line, `autter lineage <issue-id>` walks a Runtime issue back to its release, commit, PR and owner, and says which failing frames an AI agent wrote (see [System investigations](docs/system-investigations.md)).
+
 Transcripts are read from this machine first, then from the Autter platform when you are connected and signed in. When one can't be shown, `--why` and `show-prompt` (in `transcript.reason`) say why: none was recorded, it stayed on the machine that made the commit (local mode), or you need to sign in. Notes made on other machines arrive with `autter fetch-notes`. The web app has no page per prompt or session yet, so there is no link to one.
 
 <img align="right" width="350" alt="Autter VS Code extension showing color-coded AI blame in the gutter" src="https://github.com/user-attachments/assets/94e332e7-5d96-4e5c-8757-63ac0e2f88e0" />
@@ -408,7 +410,7 @@ Apache 2.0
 
 ### System investigations
 
-Use `autter ask` for evidence-backed system questions, `autter logs` for structured Runtime log queries, and `autter threads` to search and resume the same private debugging history as Dashboard Ask. See [usage and examples](docs/system-investigations.md).
+Use `autter ask` for evidence-backed system questions ("why did this happen and what is the impact"), `autter lineage <issue-id>` to go from a Runtime issue to the release, commit, PR, owner and AI authorship behind it, `autter logs` for structured Runtime log queries, and `autter threads` to search and resume the same private debugging history as Dashboard Ask. See [usage and examples](docs/system-investigations.md).
 
 ### Repository memory
 

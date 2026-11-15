@@ -37,6 +37,7 @@ const NOTICE_COMMANDS: &[&str] = &[
     "dashboard",
     "personal-dashboard",
     "ask",
+    "lineage",
     "logs",
     "threads",
     "memory",
