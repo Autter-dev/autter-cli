@@ -666,12 +666,24 @@ autter sync open
     HelpEntry {
         name: "dashboard",
         aliases: &["dash", "personal-dashboard", "personal_dashboard"],
-        summary: "Open your personal dashboard in the browser",
+        summary: "Open the Autter page for this repository in the browser",
         body: "\
-autter dashboard
+autter dash [--org <slug>] [--repo <owner/name|name>] [--no-open] [--json]
 
-  Open your personal dashboard in the browser
-  (https://app.autter.dev/me, or your configured web app URL).",
+  Open the Autter page for where you are (https://app.autter.dev, or your
+  configured web app URL):
+    - inside a git repository connected to your organization: its page
+    - otherwise: the organization dashboard
+    - when signed out: the app's dashboard
+
+  --org <slug>     Look in this organization instead of the active one
+  --repo <repo>    Open this repository (owner/name or name) instead of the
+                   current one
+  --no-open        Print the URL instead of opening a browser
+  --json           Print {url, target, organization, repository,
+                   repository_full_name, opened, fallback_reason}; target is
+                   repo, org or home, fallback_reason one of not_in_git_repo,
+                   no_remote, not_signed_in, repo_not_connected, lookup_failed",
     },
     HelpEntry {
         name: "bg",
@@ -880,7 +892,7 @@ autter login [--token <token>]
         name: "ask",
         aliases: &[],
         summary: "Investigate your system with Runtime evidence",
-        body: "autter ask <question> [--repo <name>] [--org <slug>] [--thread <id>] [--mode system|codebase|reviews] [--json]\n\n  Get root causes, impact, and recommended fixes. Ask it \"why did this happen\"\n  and \"what is the impact\" questions: it answers them from Runtime evidence.\n  Questions and answers are saved in the same private thread history as Dashboard Ask. Use --thread to resume.\n  Sign in with autter login. Default mode: system.",
+        body: "autter ask <question> [--repo <name>] [--org <slug>] [--thread <id>] [--mode system|codebase|reviews] [--json]\n\n  Get root causes, impact, and recommended fixes. Ask it \"why did this happen\"\n  and \"what is the impact\" questions: it answers them from Runtime evidence.\n  Questions and answers are saved in the same private thread history as Dashboard Ask. Use --thread to resume.\n  Without --repo, a new question asked inside a connected repository is scoped to it.\n  Sign in with autter login. Default mode: system.",
     },
     HelpEntry {
         name: "logs",

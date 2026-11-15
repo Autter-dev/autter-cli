@@ -249,6 +249,26 @@ pub(crate) fn org_api_context(
     Ok((context, slug.to_owned()))
 }
 
+/// The current git repository's `owner/name` when it is connected to the
+/// organization, so a new question is scoped to the repo you are in. `None`
+/// outside a repo, without a remote, for an unconnected repo, or when the
+/// lookup fails (the question then goes out unscoped, as before).
+fn current_connected_repository(context: &ApiContext, slug: &str) -> Option<String> {
+    use crate::commands::personal_dashboard::{
+        current_repository_candidate, fetch_connected_repositories, match_repository,
+    };
+    let wanted = current_repository_candidate().ok()?;
+    let repos = fetch_connected_repositories(&context.clone().with_timeout(5), slug)?;
+    match_repository(&wanted, &repos).map(|repo| repo.full_name)
+}
+
+/// Strip terminal control sequences, keeping newlines and tabs.
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
 pub(crate) fn component(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
@@ -267,6 +287,8 @@ fn run(command: &str, mut options: Options) -> Result<(), AutterError> {
                 if options.mode.is_none() {
                     options.mode = thread["mode"].as_str().map(str::to_owned);
                 }
+            } else if options.repository.is_none() {
+                options.repository = current_connected_repository(&context, &slug);
             }
             response_json(context.post_json(&format!("{base}/chat"), &json!({ "question": options.words.join(" "), "repository": options.repository, "mode": options.mode.unwrap_or_else(|| "system".into()), "threadId": options.thread, "format": "json" }))?)?
         }
@@ -310,15 +332,32 @@ fn run(command: &str, mut options: Options) -> Result<(), AutterError> {
     match command {
         "ask" => {
             // Preserve newlines in prose while stripping terminal control sequences.
-            println!(
-                "{}",
-                result["answer"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-                    .collect::<String>()
-            );
+            println!("{}", printable(result["answer"].as_str().unwrap_or("")));
+            // Pages the answer points at, as absolute URLs (newer APIs only).
+            let links: Vec<(String, String)> = result["links"]
+                .as_array()
+                .map(|links| {
+                    links
+                        .iter()
+                        .filter_map(|link| {
+                            let url = link["url"].as_str()?;
+                            url.starts_with("https://").then(|| {
+                                (
+                                    printable(link["label"].as_str().unwrap_or(url))
+                                        .replace('\n', " "),
+                                    printable(url),
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !links.is_empty() {
+                println!("\nOpen in Autter:");
+                for (label, url) in links {
+                    println!("  {label}: {url}");
+                }
+            }
             if !arg_parser::quiet() {
                 println!("\nThread: {}", result["threadId"].as_str().unwrap_or(""));
             }

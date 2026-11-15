@@ -17,6 +17,10 @@ Questions use captured Runtime evidence and source code to explain root causes, 
 
 Use `--org <slug>` for another organization you belong to and `--json` for complete structured output. `--mode codebase` and `--mode reviews` select the existing assistants. Resuming with `--thread` restores that thread's mode and repository unless you explicitly specify them; changing its scope requires a new thread.
 
+Without `--repo`, a new question run inside a git repository is scoped to that repository when its default remote (`owner/name`) is connected to the organization; otherwise it goes out unscoped. Answers that point at Autter pages (a pull request, a file at a line, a scan finding, a Runtime issue) end with an **Open in Autter** list of absolute links, and links inside the answer are absolute too.
+
+`autter dash` opens the page for where you are: the current repository's page when it is connected to the organization (`--org`, else your active one), else the organization dashboard, else (signed out) the app's dashboard. `--repo <owner/name|name>` picks the repository, `--no-open` prints the URL instead of opening it, and `--json` prints `{ url, target, organization, repository, repository_full_name, opened, fallback_reason }`, where `target` is `repo`, `org` or `home` and `fallback_reason` is null or one of `not_in_git_repo`, `no_remote`, `not_signed_in`, `repo_not_connected`, `lookup_failed`. The lookup waits at most 5 seconds and reads the repository list without starting an index refresh.
+
 ## From a Runtime issue to the code behind it
 
 `autter lineage <issue-id>` prints the chain behind one Runtime issue (its id starts with `ri_`), top to bottom:
