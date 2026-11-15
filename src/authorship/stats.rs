@@ -540,7 +540,7 @@ fn counts_line(stats: &CommitStats, unknown_lines: u32, colorize: bool) -> Strin
         let label = if category == LineCategory::Untracked && colorize && use_hyperlinks() {
             // OSC 8 link on terminals that render it; color alone isn't enough
             // (Windows ConHost with VT enabled prints OSC 8 literally).
-            "\x1b]8;;https://autter.dev/docs/cli/untracked\x1b\\\x1b[4muntracked\x1b[24m\x1b]8;;\x1b\\"
+            "\x1b]8;;https://autter.dev/docs/cli/commit-stats#untracked-and-unknown-lines\x1b\\\x1b[4muntracked\x1b[24m\x1b]8;;\x1b\\"
                 .to_string()
         } else {
             category.label().to_string()

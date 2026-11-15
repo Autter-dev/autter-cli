@@ -1959,6 +1959,34 @@ fn test_author_config_cli_set_get_unset() {
     assert_eq!(value.as_object().unwrap().len(), 0);
 }
 
+/// What `autter config set telemetry_oss` writes, `autter config telemetry_oss`
+/// reads back (it used to fail with "Unknown config key"). Unset reads as
+/// "off": anonymous telemetry is off until the user opts in.
+#[test]
+fn test_telemetry_oss_config_reads_back() {
+    let repo = TestRepo::new();
+    let read = |repo: &TestRepo| -> String {
+        repo.autter(&["config", "telemetry_oss"])
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+
+    repo.autter(&["config", "unset", "telemetry_oss"]).unwrap();
+    assert_eq!(read(&repo), "\"off\"");
+
+    repo.autter(&["config", "set", "telemetry_oss", "on"])
+        .unwrap();
+    assert_eq!(read(&repo), "\"on\"");
+    let all: serde_json::Value =
+        serde_json::from_str(repo.autter(&["config"]).unwrap().trim()).unwrap();
+    assert_eq!(all["telemetry_oss"], "on");
+
+    repo.autter(&["config", "set", "telemetry_oss", "off"])
+        .unwrap();
+    assert_eq!(read(&repo), "\"off\"");
+}
+
 #[test]
 fn test_author_config_overrides_session_and_known_human_records() {
     let mut repo = TestRepo::new();
