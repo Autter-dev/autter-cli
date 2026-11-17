@@ -755,7 +755,18 @@ pub(crate) fn attach_local_review(result: &mut Value, local: &Local) {
     if saved["branch"].as_str() != local.branch.as_deref() {
         return;
     }
-    let findings = place_local_findings(local, &saved);
+    // Findings dismissed with `autter review --dismiss` (or from the editor)
+    // are left out; the PR page still shows them, marked dismissed.
+    let dismissed = &saved["dismissed"];
+    let all = place_local_findings(local, &saved);
+    let dismissed_count = all
+        .iter()
+        .filter(|f| f["id"].as_str().is_some_and(|id| !dismissed[id].is_null()))
+        .count();
+    let findings: Vec<Value> = all
+        .into_iter()
+        .filter(|f| f["id"].as_str().is_none_or(|id| dismissed[id].is_null()))
+        .collect();
     result["localReview"] = json!({
         "reviewId": saved["result"]["review"]["reviewId"],
         "reviewedAt": saved["reviewedAt"],
@@ -763,6 +774,7 @@ pub(crate) fn attach_local_review(result: &mut Value, local: &Local) {
         "baseRef": saved["baseRef"],
         "files": saved["files"].as_object().map(|f| f.len()).unwrap_or(0),
         "bundles": saved["result"]["review"]["bundles"],
+        "dismissed": dismissed_count,
         "findings": findings,
     });
 }
@@ -1517,5 +1529,21 @@ diff --git \"a/sp\\303\\251cial \\\"q\\\".ts\" \"b/sp\\303\\251cial \\\"q\\\".ts
         let mut result = json!({});
         attach_local_review(&mut result, &other);
         assert!(result["localReview"].is_null());
+
+        // A dismissed finding leaves the list and is counted.
+        let mut dismissed = saved.clone();
+        dismissed["dismissed"] = json!({ "f": { "at": "2026-11-17T10:00:00Z" } });
+        std::fs::write(local_review_path(&other), dismissed.to_string()).unwrap();
+        let mine = Local {
+            branch: Some("feat".into()),
+            ..other
+        };
+        let mut result = json!({});
+        attach_local_review(&mut result, &mine);
+        assert_eq!(
+            result["localReview"]["findings"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(result["localReview"]["dismissed"], 4);
     }
 }

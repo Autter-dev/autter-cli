@@ -10,6 +10,7 @@ import {
   diagnosticMessage,
   type FindingsOutcome,
   inlineText,
+  isLocalFindingId,
   parseFindingsOutput,
   type PlacedFinding,
   placeFindings,
@@ -19,6 +20,8 @@ import {
 
 const SOURCE = "autter";
 const DISMISSED_KEY = "autter.findings.dismissed";
+/** Local-review finding id → the work tree it came from, to undo its dismissal there. */
+const DISMISSED_LOCAL_KEY = "autter.findings.dismissedLocal";
 const SAVE_DEBOUNCE_MS = 3_000;
 const POLL_MS = 5 * 60_000;
 const FOCUS_REFRESH_MIN_MS = 60_000;
@@ -479,10 +482,63 @@ export class FindingsManager implements vscode.CodeActionProvider {
     }
   }
 
+  /** Run a short CLI command in `cwd` and parse its JSON line; null when it failed to run. */
+  private async runCliJson(cwd: string, args: string[]): Promise<Record<string, unknown> | null> {
+    if (!(await resolveAutterBinary())) {
+      return null;
+    }
+    return new Promise((resolve) => {
+      let stdout = "";
+      const proc = spawn(getAutterBinary(), args, { cwd, timeout: 60_000 });
+      proc.stdout.on("data", (d) => {
+        stdout += d.toString();
+      });
+      proc.stderr.on("data", () => {});
+      proc.on("error", () => resolve(null));
+      proc.on("close", () => {
+        try {
+          resolve(JSON.parse(stdout.trim() || "null"));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+  }
+
+  /**
+   * A local review's finding: tell Autter (`autter review --dismiss`), so the
+   * pull request page shows it as dismissed. Best effort; the editor hides it
+   * either way.
+   */
+  private async sendLocalDismissal(workdir: string, findingId: string, dismissed: boolean): Promise<void> {
+    const args = ["review", "--dismiss", findingId, "--json"];
+    if (!dismissed) {
+      args.push("--undo");
+    }
+    const out = await this.runCliJson(workdir, args);
+    if (dismissed && (!out || out.synced !== true)) {
+      const why = typeof out?.error === "string" ? ` (${out.error})` : "";
+      void vscode.window.showWarningMessage(
+        `autter: Dismissed here, but Autter did not record it${why}. The pull request page won't show it as dismissed.`,
+      );
+    }
+  }
+
   private async dismiss(finding: CliFinding): Promise<void> {
     const dismissed = new Set(this.context.workspaceState.get<string[]>(DISMISSED_KEY, []));
     dismissed.add(finding.id);
     await this.context.workspaceState.update(DISMISSED_KEY, [...dismissed]);
+    if (isLocalFindingId(finding.id)) {
+      const root = [...this.roots.values()].find((r) =>
+        [...r.placed.values()].some((list) => list.some((p) => p.finding.id === finding.id)),
+      );
+      if (root) {
+        const local = { ...this.context.workspaceState.get<Record<string, string>>(DISMISSED_LOCAL_KEY, {}) };
+        local[finding.id] = root.workdir;
+        await this.context.workspaceState.update(DISMISSED_LOCAL_KEY, local);
+        void this.sendLocalDismissal(root.workdir, finding.id, true);
+      }
+    }
     for (const root of this.roots.values()) {
       for (const [rel, list] of root.placed) {
         const kept = list.filter((p) => p.finding.id !== finding.id);
@@ -498,6 +554,13 @@ export class FindingsManager implements vscode.CodeActionProvider {
 
   private async restoreDismissed(): Promise<void> {
     await this.context.workspaceState.update(DISMISSED_KEY, []);
+    // Local-review findings were also dismissed in Autter (and left out of
+    // `autter findings`): restore them there before refreshing.
+    const local = this.context.workspaceState.get<Record<string, string>>(DISMISSED_LOCAL_KEY, {});
+    await Promise.all(
+      Object.entries(local).map(([findingId, workdir]) => this.sendLocalDismissal(workdir, findingId, false)),
+    );
+    await this.context.workspaceState.update(DISMISSED_LOCAL_KEY, {});
     this.refreshAll(true);
   }
 

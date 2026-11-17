@@ -3,9 +3,10 @@
 //! Sends what a pull request from this branch would contain — the diff from
 //! the merge base with the default branch to your working tree, untracked
 //! files included — to `POST /api/cli/orgs/<org>/review`, which runs the
-//! deterministic checks of the PR review (secrets, static security, auth,
-//! race conditions) with no AI model calls, and streams back JSON lines. The
-//! full review, AI checks included, runs on the pull request.
+//! deterministic layer of the PR review's check bundles with no AI model
+//! calls, and streams back JSON lines. The full review, AI checks included,
+//! runs on the pull request, whose page also lists this review's findings.
+//! `--dismiss <finding-id>` records a dismissal there (and hides it here).
 //!
 //! Before sending, every reviewed file is saved as a git blob. The result and
 //! those blob ids go to `.autter/local-review.json`; `autter findings` (and so
@@ -43,6 +44,10 @@ struct Options {
     repository: Option<String>,
     organization: Option<String>,
     write: bool,
+    /// `--dismiss <finding-id>`: record a dismissal instead of reviewing.
+    dismiss: Option<String>,
+    /// With `--dismiss`: clear the dismissal instead.
+    undo: bool,
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -59,7 +64,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         match arg {
             "--write" => options.write = true,
             "--uncommitted" => options.uncommitted = true,
-            "--base" | "--repo" | "--org" => {
+            "--undo" => options.undo = true,
+            "--base" | "--repo" | "--org" | "--dismiss" => {
                 let value = args
                     .get(index + 1)
                     .map(|v| v.trim())
@@ -67,6 +73,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                     .ok_or_else(|| format!("{arg} requires a value"))?;
                 match arg {
                     "--base" => options.base = Some(value.to_owned()),
+                    "--dismiss" => options.dismiss = Some(value.to_owned()),
                     "--repo" => options.repository = Some(value.to_owned()),
                     _ => options.organization = Some(value.to_owned()),
                 }
@@ -80,6 +87,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     }
     if options.uncommitted && options.base.is_some() {
         return Err("--uncommitted and --base can't be used together".into());
+    }
+    if options.undo && options.dismiss.is_none() {
+        return Err("--undo goes with --dismiss <finding-id>".into());
     }
     options.paths.retain(|p| !p.is_empty());
     Ok(options)
@@ -444,7 +454,108 @@ fn stream_result(code: u16, body: &str) -> Result<Value, AutterError> {
     })))
 }
 
+/// The saved local review with `finding_id` marked dismissed (or not).
+/// `Err` when the review has no such finding.
+fn with_dismissal(
+    mut saved: Value,
+    finding_id: &str,
+    dismissed: bool,
+    at: &str,
+) -> Result<Value, String> {
+    let known = saved["result"]["findings"]
+        .as_array()
+        .is_some_and(|list| list.iter().any(|f| f["id"].as_str() == Some(finding_id)));
+    if !known {
+        return Err(format!(
+            "No finding {finding_id} in the last local review on this branch. Run `autter findings --json` to see the ids."
+        ));
+    }
+    if !saved["dismissed"].is_object() {
+        saved["dismissed"] = json!({});
+    }
+    let map = saved["dismissed"].as_object_mut().expect("set above");
+    if dismissed {
+        map.insert(finding_id.to_owned(), json!({ "at": at }));
+    } else {
+        map.remove(finding_id);
+    }
+    Ok(saved)
+}
+
+/// `autter review --dismiss <finding-id> [--undo]`: tell Autter the developer
+/// dismissed (or restored) one finding of their last local review, so the PR
+/// page shows it as dismissed, and leave it out of `autter findings` here.
+fn dismiss(options: &Options, finding_id: &str) -> Result<(), AutterError> {
+    let local = local_context_for(options.repository.clone(), None)?;
+    let path = local_review_path(&local);
+    let saved: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .ok_or_else(|| {
+            AutterError::Generic(
+                "No local review on this machine yet. Run `autter review` first.".into(),
+            )
+        })?;
+    let review_id = saved["result"]["review"]["reviewId"]
+        .as_str()
+        .ok_or_else(|| {
+            AutterError::Generic(
+                "The saved local review has no id. Run `autter review` again.".into(),
+            )
+        })?
+        .to_owned();
+    let dismissed = !options.undo;
+    let updated = with_dismissal(
+        saved,
+        finding_id,
+        dismissed,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .map_err(AutterError::Generic)?;
+
+    let (context, slug) = org_api_context(options.organization.as_deref(), 30)?;
+    let response = context.post_json(
+        &format!(
+            "/api/cli/orgs/{}/local-reviews/{}/dismissals",
+            component(&slug),
+            component(&review_id)
+        ),
+        &json!({ "findingId": finding_id, "dismissed": dismissed }),
+    )?;
+    let synced = response.status_code == 200;
+    if !synced && response.status_code == 401 {
+        return Err(AutterError::Generic(NOT_SIGNED_IN.into()));
+    }
+    // Kept locally either way: the editor stops showing it even if Autter is
+    // unreachable (a review run before reviews were kept is unknown there: 404).
+    write_if_changed(&path, &serde_json::to_string_pretty(&updated)?)?;
+    let output = json!({
+        "findingId": finding_id,
+        "dismissed": dismissed,
+        "synced": synced,
+    });
+    if arg_parser::json() {
+        println!("{output}");
+    } else if synced {
+        println!(
+            "{} {finding_id}. The pull request page shows it{}.",
+            if dismissed { "Dismissed" } else { "Restored" },
+            if dismissed { " as dismissed" } else { " again" }
+        );
+    } else {
+        println!(
+            "{} {finding_id} on this machine; Autter did not record it (HTTP {}).",
+            if dismissed { "Dismissed" } else { "Restored" },
+            response.status_code
+        );
+    }
+    Ok(())
+}
+
 fn run(options: Options) -> Result<(), AutterError> {
+    if let Some(finding_id) = options.dismiss.clone() {
+        return dismiss(&options, &finding_id);
+    }
     let local = local_context_for(options.repository.clone(), None)?;
     let (base, base_label) = resolve_base(&local, &options)?;
     let filters = repo_relative_filters(&local, &options.paths);
@@ -740,5 +851,28 @@ Binary files a/img.png and b/img.png differ
                 .to_string()
                 .contains("autter login")
         );
+    }
+
+    #[test]
+    fn parses_dismiss_options() {
+        let o = parse_options(&s(&["--dismiss", "local-abc-1", "--undo"])).unwrap();
+        assert_eq!(o.dismiss.as_deref(), Some("local-abc-1"));
+        assert!(o.undo);
+        assert!(parse_options(&s(&["--undo"])).is_err());
+        assert!(parse_options(&s(&["--dismiss"])).is_err());
+    }
+
+    #[test]
+    fn records_and_clears_a_dismissal_in_the_saved_review() {
+        let saved =
+            json!({ "result": { "findings": [{ "id": "local-abc-1" }, { "id": "local-abc-2" }] } });
+        let once = with_dismissal(saved, "local-abc-1", true, "2026-11-17T10:00:00Z").unwrap();
+        assert_eq!(
+            once["dismissed"]["local-abc-1"]["at"],
+            "2026-11-17T10:00:00Z"
+        );
+        let cleared = with_dismissal(once, "local-abc-1", false, "x").unwrap();
+        assert!(cleared["dismissed"]["local-abc-1"].is_null());
+        assert!(with_dismissal(cleared, "local-zzz-9", true, "x").is_err());
     }
 }
