@@ -6,6 +6,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-17
+
+- **Autter: Review My Changes** runs only the deterministic, rule-based checks (no AI calls), so it usually finishes in a few seconds. The full review runs on the pull request.
+
 ## [0.2.0] - 2026-11-17
 
 - Review findings in the editor: the findings of your branch's pull request appear as squiggles, Problems entries and (by default) the title after the line, on the lines of your working tree. Lines follow your edits; a finding whose line you have edited since the review is not shown in the code. Setting: `autter.findings.display` (`inline`, `problems`, `off`).

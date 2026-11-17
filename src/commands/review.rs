@@ -2,9 +2,10 @@
 //!
 //! Sends what a pull request from this branch would contain — the diff from
 //! the merge base with the default branch to your working tree, untracked
-//! files included — to `POST /api/cli/orgs/<org>/review`, which runs the core
-//! of the PR review (secrets, static security, auth, race conditions and, when
-//! the org has it on, deep correctness) and streams back JSON lines.
+//! files included — to `POST /api/cli/orgs/<org>/review`, which runs the
+//! deterministic checks of the PR review (secrets, static security, auth,
+//! race conditions) with no AI model calls, and streams back JSON lines. The
+//! full review, AI checks included, runs on the pull request.
 //!
 //! Before sending, every reviewed file is saved as a git blob. The result and
 //! those blob ids go to `.autter/local-review.json`; `autter findings` (and so
@@ -24,7 +25,7 @@ use crate::git::repository::{exec_git, exec_git_allow_nonzero};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
-/// A review takes a minute or two; the server streams while it runs.
+/// A large change can take a while; the server streams while it runs.
 const TIMEOUT_SECS: u64 = 600;
 /// What the server takes (`LOCAL_REVIEW_MAX_FILES` / `_MAX_BYTES` in the backend).
 const MAX_FILES: usize = 60;
@@ -473,7 +474,7 @@ fn run(options: Options) -> Result<(), AutterError> {
     let (context, slug) = org_api_context(options.organization.as_deref(), TIMEOUT_SECS)?;
     if !arg_parser::json() && !arg_parser::quiet() {
         eprintln!(
-            "Reviewing {} file{} compared with {} ({}). This takes a minute or two…",
+            "Checking {} file{} compared with {} ({})…",
             prepared.files.len(),
             if prepared.files.len() == 1 { "" } else { "s" },
             base_label,
