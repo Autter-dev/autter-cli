@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const TIMEOUT_SECS: u64 = 30;
+pub(crate) const TIMEOUT_SECS: u64 = 30;
 /// A missing reviewed commit is fetched from the PR's ref at most this long.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const FINDINGS_DIR: &str = ".autter";
@@ -33,7 +33,7 @@ pub(crate) const FINDINGS_FILE: &str = "findings.md";
 const NOT_SIGNED_IN: &str = "Autter did not accept your sign-in for this organization (HTTP 401). Sign in with `autter login` first, or choose an organization with --org <slug>.";
 
 #[derive(Debug, Default, PartialEq)]
-struct Options {
+pub(crate) struct Options {
     branch: Option<String>,
     pr: Option<u64>,
     repository: Option<String>,
@@ -96,7 +96,7 @@ struct Hunk {
 }
 
 #[derive(Debug, Default, PartialEq)]
-struct FileDiff {
+pub(crate) struct FileDiff {
     deleted: bool,
     /// A binary file that differs: no line can be trusted.
     binary: bool,
@@ -221,7 +221,7 @@ fn unquote_c(s: &str) -> String {
 /// Parse `git diff -U0 --no-renames <commit>` output into hunks per old path.
 /// `---`/`+++` are read only in a file's header, so a removed line that
 /// starts with `--` is never mistaken for one.
-fn parse_diff(diff: &str) -> HashMap<String, FileDiff> {
+pub(crate) fn parse_diff(diff: &str) -> HashMap<String, FileDiff> {
     let mut files: HashMap<String, FileDiff> = HashMap::new();
     let mut current: Option<String> = None;
     let mut in_header = false;
@@ -279,7 +279,7 @@ fn binary_path(line: &str) -> Option<String> {
 }
 
 /// Where line `line` of the reviewed file is now, given that file's diff.
-fn map_line(diff: Option<&FileDiff>, line: u32) -> Placement {
+pub(crate) fn map_line(diff: Option<&FileDiff>, line: u32) -> Placement {
     let Some(diff) = diff else {
         return Placement::Unchanged(line);
     };
@@ -319,7 +319,7 @@ fn map_line(diff: Option<&FileDiff>, line: u32) -> Placement {
     }
 }
 
-fn finding_has_line(finding: &Value) -> bool {
+pub(crate) fn finding_has_line(finding: &Value) -> bool {
     finding["line"].as_u64().unwrap_or(0) > 0
         && finding["side"].as_str() != Some("LEFT")
         && !finding["prScoped"].as_bool().unwrap_or(false)
@@ -346,7 +346,7 @@ fn place_findings(findings: &mut [Value], diffs: Option<&HashMap<String, FileDif
 // Git
 // ---------------------------------------------------------------------------
 
-fn git_args(repo: &Repository, rest: &[&str]) -> Vec<String> {
+pub(crate) fn git_args(repo: &Repository, rest: &[&str]) -> Vec<String> {
     let mut args = repo.global_args_for_exec();
     args.extend(rest.iter().map(|s| (*s).to_owned()));
     args
@@ -484,24 +484,28 @@ fn response_value(code: u16, body: &str) -> Result<Value, AutterError> {
 }
 
 /// Everything `run` needs from the local repository.
-struct Local {
-    repo: Repository,
-    workdir: PathBuf,
-    repository: String,
-    branch: Option<String>,
+pub(crate) struct Local {
+    pub(crate) repo: Repository,
+    pub(crate) workdir: PathBuf,
+    pub(crate) repository: String,
+    pub(crate) branch: Option<String>,
 }
 
-fn local_context(options: &Options) -> Result<Local, AutterError> {
+/// The repository you are in, its remote (or `repository`) and branch (or `branch`).
+pub(crate) fn local_context_for(
+    repository: Option<String>,
+    branch: Option<String>,
+) -> Result<Local, AutterError> {
     let repo = crate::git::repository::find_repository(&Vec::<String>::new())
-        .map_err(|_| AutterError::Generic("Run autter findings inside a git repository.".into()))?;
+        .map_err(|_| AutterError::Generic("Run this inside a git repository.".into()))?;
     let workdir = repo.workdir()?;
-    let repository = match options.repository.clone() {
+    let repository = match repository {
         Some(repository) => repository,
         None => crate::authorship::post_commit::current_repo_url(&repo).ok_or_else(|| {
             AutterError::Generic("This repository has no remote. Pass --repo <owner/repo>.".into())
         })?,
     };
-    let branch = match options.branch.clone() {
+    let branch = match branch {
         Some(branch) => Some(branch),
         None => repo
             .head()
@@ -509,12 +513,6 @@ fn local_context(options: &Options) -> Result<Local, AutterError> {
             .and_then(|head| head.shorthand().ok())
             .filter(|name| !name.is_empty() && name != "HEAD"),
     };
-    if branch.is_none() && options.pr.is_none() {
-        return Err(AutterError::Generic(
-            "HEAD is detached. Check out a branch, or pass --branch <name> or --pr <number>."
-                .into(),
-        ));
-    }
     Ok(Local {
         repo,
         workdir,
@@ -523,25 +521,58 @@ fn local_context(options: &Options) -> Result<Local, AutterError> {
     })
 }
 
+fn local_context(options: &Options) -> Result<Local, AutterError> {
+    let local = local_context_for(options.repository.clone(), options.branch.clone())?;
+    if local.branch.is_none() && options.pr.is_none() {
+        return Err(AutterError::Generic(
+            "HEAD is detached. Check out a branch, or pass --branch <name> or --pr <number>."
+                .into(),
+        ));
+    }
+    Ok(local)
+}
+
 /// Fetch the findings and place them on the working tree.
 fn collect(options: &Options, local: &Local) -> Result<Value, AutterError> {
     let (context, slug): (ApiContext, String) =
         org_api_context(options.organization.as_deref(), TIMEOUT_SECS)?;
-    let path = findings_path(
-        &slug,
-        &local.repository,
-        if options.pr.is_some() {
-            None
-        } else {
-            local.branch.as_deref()
-        },
-        options.pr,
-    );
-    let response = context.get(&path)?;
-    let body = response
-        .as_str()
-        .map_err(|error| AutterError::Generic(error.to_string()))?;
-    let mut result = response_value(response.status_code, body)?;
+    collect_with(&context, &slug, options, local)
+}
+
+/// [`collect`] with a signed-in context, for `autter review --write`.
+pub(crate) fn collect_for_branch(
+    context: &ApiContext,
+    slug: &str,
+    local: &Local,
+) -> Result<Value, AutterError> {
+    let options = Options {
+        no_fetch: true,
+        ..Options::default()
+    };
+    collect_with(context, slug, &options, local)
+}
+
+fn collect_with(
+    context: &ApiContext,
+    slug: &str,
+    options: &Options,
+    local: &Local,
+) -> Result<Value, AutterError> {
+    let branch = if options.pr.is_some() {
+        None
+    } else {
+        local.branch.as_deref()
+    };
+    let mut result = if branch.is_none() && options.pr.is_none() {
+        json!({ "pullRequest": null, "review": null, "findings": [] })
+    } else {
+        let path = findings_path(slug, &local.repository, branch, options.pr);
+        let response = context.clone().with_timeout(TIMEOUT_SECS).get(&path)?;
+        let body = response
+            .as_str()
+            .map_err(|error| AutterError::Generic(error.to_string()))?;
+        response_value(response.status_code, body)?
+    };
 
     let reviewed = result["review"]["headSha"].as_str().map(str::to_owned);
     let pr_number = result["pullRequest"]["number"].as_u64();
@@ -576,7 +607,164 @@ fn collect(options: &Options, local: &Local) -> Result<Value, AutterError> {
         "reviewedCommitAvailable": available,
         "generatedAt": chrono::Utc::now().to_rfc3339(),
     });
+    attach_local_review(&mut result, local);
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// The saved local review (`autter review`)
+// ---------------------------------------------------------------------------
+
+pub(crate) const LOCAL_REVIEW_FILE: &str = "local-review.json";
+
+pub(crate) fn local_review_path(local: &Local) -> PathBuf {
+    local.workdir.join(FINDINGS_DIR).join(LOCAL_REVIEW_FILE)
+}
+
+/// Write each path's working-tree content into the object database and
+/// return its blob id (`git hash-object -w --stdin-paths`). Missing files are
+/// left out.
+pub(crate) fn snapshot_blobs(
+    local: &Local,
+    paths: &[String],
+) -> Result<HashMap<String, String>, AutterError> {
+    use std::io::Write;
+    let present: Vec<&String> = paths
+        .iter()
+        .filter(|p| local.workdir.join(p).is_file())
+        .collect();
+    if present.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let args = git_args(&local.repo, &["hash-object", "-w", "--stdin-paths"]);
+    let mut child = std::process::Command::new(crate::config::Config::get().git_cmd())
+        .args(&args)
+        .current_dir(&local.workdir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AutterError::Generic("Could not write to git hash-object.".into()))?;
+        for path in &present {
+            writeln!(stdin, "{path}")?;
+        }
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(AutterError::Generic(
+            "git hash-object failed while saving the reviewed files.".into(),
+        ));
+    }
+    let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    Ok(present
+        .into_iter()
+        .cloned()
+        .zip(shas)
+        .collect::<HashMap<_, _>>())
+}
+
+/// Place a saved local review's findings on the working tree: each file is
+/// compared with the copy the review saw (a blob saved at review time).
+pub(crate) fn place_local_findings(local: &Local, saved: &Value) -> Vec<Value> {
+    let mut findings: Vec<Value> = saved["result"]["findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let reviewed: HashMap<String, String> = saved["files"]
+        .as_object()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|(path, sha)| sha.as_str().map(|sha| (path.clone(), sha.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let paths: Vec<String> = findings
+        .iter()
+        .filter(|f| finding_has_line(f))
+        .filter_map(|f| f["path"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let current = snapshot_blobs(local, &paths).unwrap_or_default();
+    // Diffs keyed by path: None when the file is gone, Some(empty) when unchanged.
+    let mut diffs: HashMap<String, Option<FileDiff>> = HashMap::new();
+    for path in &paths {
+        let Some(before) = reviewed.get(path) else {
+            continue;
+        };
+        let diff = match current.get(path) {
+            None => None,
+            Some(now) if now == before => Some(FileDiff::default()),
+            Some(now) => {
+                let args = git_args(
+                    &local.repo,
+                    &[
+                        "diff",
+                        "-U0",
+                        "--no-color",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        before,
+                        now,
+                    ],
+                );
+                match exec_git(&args) {
+                    Ok(out) => parse_diff(&String::from_utf8_lossy(&out.stdout))
+                        .remove(before.as_str())
+                        .or(Some(FileDiff::default())),
+                    Err(_) => continue,
+                }
+            }
+        };
+        diffs.insert(path.clone(), diff);
+    }
+    for finding in findings.iter_mut() {
+        let placement = if !finding_has_line(finding) {
+            Placement::NoLine
+        } else {
+            let path = finding["path"].as_str().unwrap_or_default();
+            let line = finding["line"].as_u64().unwrap_or(0) as u32;
+            match diffs.get(path) {
+                Some(Some(diff)) => map_line(Some(diff), line),
+                Some(None) => Placement::FileDeleted,
+                None => Placement::Unverified,
+            }
+        };
+        finding["local"] = json!({ "status": placement.status(), "line": placement.line() });
+    }
+    findings
+}
+
+/// Add `localReview` (the saved `autter review` result, placed on the working
+/// tree) when there is one for the branch you are on.
+pub(crate) fn attach_local_review(result: &mut Value, local: &Local) {
+    let Ok(text) = std::fs::read_to_string(local_review_path(local)) else {
+        return;
+    };
+    let Ok(saved) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if saved["branch"].as_str() != local.branch.as_deref() {
+        return;
+    }
+    let findings = place_local_findings(local, &saved);
+    result["localReview"] = json!({
+        "reviewId": saved["result"]["review"]["reviewId"],
+        "reviewedAt": saved["reviewedAt"],
+        "base": saved["base"],
+        "baseRef": saved["baseRef"],
+        "files": saved["files"].as_object().map(|f| f.len()).unwrap_or(0),
+        "bundles": saved["result"]["review"]["bundles"],
+        "findings": findings,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -590,14 +778,14 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     printable(text)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn short_sha(sha: &str) -> &str {
+pub(crate) fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
@@ -616,6 +804,11 @@ fn location(finding: &Value) -> String {
         None if path.is_empty() => String::new(),
         None => path.to_owned(),
     }
+}
+
+/// `2026-11-17T09:12:34.000Z` → `2026-11-17 09:12 UTC`.
+fn when(at: &str) -> String {
+    format!("{} UTC", at.get(..16).unwrap_or(at).replace('T', " "))
 }
 
 /// Indent every line of a Markdown block so it stays inside a list item.
@@ -652,7 +845,7 @@ fn render_markdown_finding(out: &mut String, finding: &Value, number: usize) {
             ),
             Some("file_deleted") => ", deleted since the review".into(),
             Some("unverified") => format!(
-                ", line {} at the reviewed commit, which isn't available locally",
+                ", line {} when reviewed; the reviewed copy isn't available locally to check it",
                 finding["line"].as_u64().unwrap_or(0)
             ),
             _ => String::new(),
@@ -676,103 +869,131 @@ fn render_markdown_finding(out: &mut String, finding: &Value, number: usize) {
     if let Some(url) = finding["url"].as_str() {
         out.push_str(&format!("   - Link: {url}\n"));
     }
+    // One blank line between items.
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
     out.push('\n');
 }
 
-fn render_markdown(result: &Value) -> String {
-    let mut out = String::from("# Autter findings\n\n");
-    out.push_str("<!-- Written by `autter findings --write`. It is replaced on every run; don't edit it. -->\n\n");
-    // No time of the run in here: the file only changes when the findings
-    // do, so an editor showing it doesn't reload on every refresh.
-    let branch = result["local"]["branch"].as_str().unwrap_or("this branch");
-    let pr = &result["pullRequest"];
-    if pr.is_null() {
-        out.push_str(&format!(
-            "No open pull request for `{}`, so there is no review yet.\n",
-            one_line(branch)
-        ));
-        return out;
-    }
-    let number = pr["number"].as_u64().unwrap_or(0);
-    let title = one_line(pr["title"].as_str().unwrap_or_default());
-    match pr["url"].as_str() {
-        Some(url) => out.push_str(&format!("Pull request [#{number} {title}]({url})")),
-        None => out.push_str(&format!("Pull request #{number} {title}")),
-    }
-    out.push_str(&format!(" on `{}`.\n\n", one_line(branch)));
+fn status_of(finding: &Value) -> &str {
+    finding["local"]["status"].as_str().unwrap_or_default()
+}
 
-    let review = &result["review"];
-    if review.is_null() {
-        out.push_str("Autter has not reviewed this pull request yet.\n");
-        return out;
-    }
-    let sha = review["headSha"].as_str().unwrap_or_default();
-    out.push_str(&format!("Reviewed commit `{}`", short_sha(sha)));
-    if let Some(at) = review["reviewedAt"].as_str() {
-        out.push_str(&format!(
-            " at {}",
-            at.get(..16).unwrap_or(at).replace('T', " ")
-        ));
-        out.push_str(" UTC");
-    }
-    if review["stale"].as_bool().unwrap_or(false) {
-        out.push_str(" (an older push: the newest one has not been reviewed yet)");
-    }
-    out.push_str(".\n\n");
-
-    let findings: Vec<&Value> = result["findings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .collect();
+/// The counts line and the findings grouped into in-your-code, changed since
+/// the review, and about the change as a whole.
+fn render_markdown_groups(out: &mut String, findings: &[Value], number: &mut usize, whole: &str) {
     if findings.is_empty() {
-        out.push_str("No findings.\n");
-        return out;
+        out.push_str("No findings.\n\n");
+        return;
     }
-    let status = |f: &&Value| f["local"]["status"].as_str().unwrap_or_default().to_owned();
-    let in_code: Vec<&Value> = findings
-        .iter()
-        .copied()
-        .filter(|f| matches!(status(f).as_str(), "unchanged" | "moved" | "unverified"))
-        .collect();
-    let changed: Vec<&Value> = findings
-        .iter()
-        .copied()
-        .filter(|f| matches!(status(f).as_str(), "changed" | "file_deleted"))
-        .collect();
-    let general: Vec<&Value> = findings
-        .iter()
-        .copied()
-        .filter(|f| status(f) == "no_line")
-        .collect();
-
+    let pick = |statuses: &[&str]| -> Vec<&Value> {
+        findings
+            .iter()
+            .filter(|f| statuses.contains(&status_of(f)))
+            .collect()
+    };
+    let in_code = pick(&["unchanged", "moved", "unverified"]);
+    let changed = pick(&["changed", "file_deleted"]);
+    let general = pick(&["no_line"]);
     let critical = findings
         .iter()
         .filter(|f| f["severity"].as_str() == Some("critical"))
         .count();
     out.push_str(&format!(
-        "**{} finding{}** ({critical} critical): {} in your code, {} on lines you have changed since the review, {} about the pull request.\n\n",
+        "**{} finding{}** ({critical} critical): {} in your code, {} on lines you have changed since the review, {} about the {whole}.\n\n",
         findings.len(),
         if findings.len() == 1 { "" } else { "s" },
         in_code.len(),
         changed.len(),
         general.len(),
     ));
-
-    let mut number = 0;
+    let about = format!("About the {whole}");
     for (heading, list) in [
         ("In your code", &in_code),
         ("Changed since the review (may be fixed)", &changed),
-        ("About the pull request", &general),
+        (about.as_str(), &general),
     ] {
         if list.is_empty() {
             continue;
         }
-        out.push_str(&format!("## {heading}\n\n"));
+        out.push_str(&format!("### {heading}\n\n"));
         for finding in list.iter() {
-            number += 1;
-            render_markdown_finding(&mut out, finding, number);
+            *number += 1;
+            render_markdown_finding(out, finding, *number);
         }
+    }
+}
+
+fn findings_of(value: &Value) -> Vec<Value> {
+    value["findings"].as_array().cloned().unwrap_or_default()
+}
+
+pub(crate) fn render_markdown(result: &Value) -> String {
+    let mut out = String::from("# Autter findings\n\n");
+    out.push_str("<!-- Written by `autter findings --write` and `autter review --write`. It is replaced on every run; don't edit it. -->\n\n");
+    // No time of the run in here: the file only changes when the findings
+    // do, so an editor showing it doesn't reload on every refresh.
+    let branch = result["local"]["branch"].as_str().unwrap_or("this branch");
+    let mut number = 0;
+
+    out.push_str("## Pull request review\n\n");
+    let pr = &result["pullRequest"];
+    if pr.is_null() {
+        out.push_str(&format!(
+            "No open pull request for `{}` yet. Run `autter review` to review your changes before you open one.\n\n",
+            one_line(branch)
+        ));
+    } else {
+        let pr_number = pr["number"].as_u64().unwrap_or(0);
+        let title = one_line(pr["title"].as_str().unwrap_or_default());
+        match pr["url"].as_str() {
+            Some(url) => out.push_str(&format!("Pull request [#{pr_number} {title}]({url})")),
+            None => out.push_str(&format!("Pull request #{pr_number} {title}")),
+        }
+        out.push_str(&format!(" on `{}`.\n\n", one_line(branch)));
+        let review = &result["review"];
+        if review.is_null() {
+            out.push_str("Autter has not reviewed this pull request yet.\n\n");
+        } else {
+            let sha = review["headSha"].as_str().unwrap_or_default();
+            out.push_str(&format!("Reviewed commit `{}`", short_sha(sha)));
+            if let Some(at) = review["reviewedAt"].as_str() {
+                out.push_str(&format!(" at {}", when(at)));
+            }
+            if review["stale"].as_bool().unwrap_or(false) {
+                out.push_str(" (an older push: the newest one has not been reviewed yet)");
+            }
+            out.push_str(".\n\n");
+            render_markdown_groups(&mut out, &findings_of(result), &mut number, "pull request");
+        }
+    }
+
+    let local_review = &result["localReview"];
+    if !local_review.is_null() {
+        out.push_str("## Local review\n\n");
+        out.push_str("Your changes as `autter review` saw them");
+        let base = match (
+            local_review["baseRef"].as_str(),
+            local_review["base"].as_str(),
+        ) {
+            (Some(name), _) if name != "HEAD" => Some(one_line(name)),
+            (_, Some(sha)) => Some(short_sha(sha).to_owned()),
+            _ => None,
+        };
+        if let Some(base) = base {
+            out.push_str(&format!(", compared with `{base}`"));
+        }
+        if let Some(at) = local_review["reviewedAt"].as_str() {
+            out.push_str(&format!(", at {}", when(at)));
+        }
+        out.push_str(". A local review runs the core checks before a pull request exists; its findings are not verified.\n\n");
+        render_markdown_groups(
+            &mut out,
+            &findings_of(local_review),
+            &mut number,
+            "change as a whole",
+        );
     }
     out
 }
@@ -794,7 +1015,7 @@ fn with_exclude_entry(existing: &str) -> Option<String> {
 }
 
 /// Add `/.autter/` to `.git/info/exclude` (once) so the file never gets committed.
-fn exclude_findings_dir(repo: &Repository) -> std::io::Result<()> {
+pub(crate) fn exclude_findings_dir(repo: &Repository) -> std::io::Result<()> {
     let info = repo.common_dir().join("info");
     let exclude = info.join("exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
@@ -805,7 +1026,7 @@ fn exclude_findings_dir(repo: &Repository) -> std::io::Result<()> {
     std::fs::write(exclude, text)
 }
 
-fn write_markdown(local: &Local, markdown: &str) -> Result<PathBuf, AutterError> {
+pub(crate) fn write_markdown(local: &Local, markdown: &str) -> Result<PathBuf, AutterError> {
     let dir = local.workdir.join(FINDINGS_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(FINDINGS_FILE);
@@ -816,11 +1037,13 @@ fn write_markdown(local: &Local, markdown: &str) -> Result<PathBuf, AutterError>
 }
 
 /// Rewrite only when the text changed, so editors watching it don't reload for nothing.
-fn write_if_changed(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_if_changed(path: &Path, text: &str) -> std::io::Result<()> {
     if std::fs::read_to_string(path).ok().as_deref() == Some(text) {
         return Ok(());
     }
-    let tmp = path.with_extension("md.tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, text)?;
     std::fs::rename(tmp, path)
 }
@@ -829,52 +1052,16 @@ fn write_if_changed(path: &Path, text: &str) -> std::io::Result<()> {
 // Terminal output
 // ---------------------------------------------------------------------------
 
-fn render_text(result: &Value) -> String {
-    let mut out = String::new();
-    let pr = &result["pullRequest"];
-    let branch = result["local"]["branch"].as_str().unwrap_or("this branch");
-    if pr.is_null() {
-        out.push_str(&format!(
-            "No open pull request for {}, so there is no review yet.\n",
-            one_line(branch)
-        ));
-        return out;
-    }
-    out.push_str(&format!(
-        "PR #{} {}\n",
-        pr["number"].as_u64().unwrap_or(0),
-        one_line(pr["title"].as_str().unwrap_or_default())
-    ));
-    if let Some(url) = pr["url"].as_str() {
-        out.push_str(&format!("{url}\n"));
-    }
-    let review = &result["review"];
-    if review.is_null() {
-        out.push_str("Autter has not reviewed this pull request yet.\n");
-        return out;
-    }
-    out.push_str(&format!(
-        "Reviewed {}{}\n\n",
-        short_sha(review["headSha"].as_str().unwrap_or_default()),
-        if review["stale"].as_bool().unwrap_or(false) {
-            " (an older push; the newest is not reviewed yet)"
-        } else {
-            ""
-        }
-    ));
-    let findings: Vec<&Value> = result["findings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .collect();
+/// One line per finding with a place in the code (or about the change), then
+/// how many are on lines changed since the review.
+pub(crate) fn render_text_findings(out: &mut String, findings: &[Value]) {
     if findings.is_empty() {
         out.push_str("No findings.\n");
-        return out;
+        return;
     }
     let mut changed = 0;
-    for finding in &findings {
-        let status = finding["local"]["status"].as_str().unwrap_or_default();
-        if matches!(status, "changed" | "file_deleted") {
+    for finding in findings {
+        if matches!(status_of(finding), "changed" | "file_deleted") {
             changed += 1;
             continue;
         }
@@ -896,10 +1083,57 @@ fn render_text(result: &Value) -> String {
             if changed == 1 { " is" } else { "s are" }
         ));
     }
-    if result["local"]["reviewedCommitAvailable"].as_bool() == Some(false) {
-        out.push_str(
-            "\nThe reviewed commit isn't available locally, so lines may have moved. Run `git fetch` and try again.\n",
-        );
+}
+
+fn render_text(result: &Value) -> String {
+    let mut out = String::new();
+    let pr = &result["pullRequest"];
+    let branch = result["local"]["branch"].as_str().unwrap_or("this branch");
+    if pr.is_null() {
+        out.push_str(&format!(
+            "No open pull request for {} yet. Run `autter review` to review your changes before you open one.\n",
+            one_line(branch)
+        ));
+    } else {
+        out.push_str(&format!(
+            "PR #{} {}\n",
+            pr["number"].as_u64().unwrap_or(0),
+            one_line(pr["title"].as_str().unwrap_or_default())
+        ));
+        if let Some(url) = pr["url"].as_str() {
+            out.push_str(&format!("{url}\n"));
+        }
+        let review = &result["review"];
+        if review.is_null() {
+            out.push_str("Autter has not reviewed this pull request yet.\n");
+        } else {
+            out.push_str(&format!(
+                "Reviewed {}{}\n\n",
+                short_sha(review["headSha"].as_str().unwrap_or_default()),
+                if review["stale"].as_bool().unwrap_or(false) {
+                    " (an older push; the newest is not reviewed yet)"
+                } else {
+                    ""
+                }
+            ));
+            render_text_findings(&mut out, &findings_of(result));
+            if result["local"]["reviewedCommitAvailable"].as_bool() == Some(false) {
+                out.push_str(
+                    "\nThe reviewed commit isn't available locally, so lines may have moved. Run `git fetch` and try again.\n",
+                );
+            }
+        }
+    }
+    let local_review = &result["localReview"];
+    if !local_review.is_null() {
+        out.push_str(&format!(
+            "\nLocal review{}\n\n",
+            local_review["reviewedAt"]
+                .as_str()
+                .map(|at| format!(" ({})", when(at)))
+                .unwrap_or_default()
+        ));
+        render_text_findings(&mut out, &findings_of(local_review));
     }
     out
 }
@@ -1124,14 +1358,16 @@ diff --git \"a/sp\\303\\251cial \\\"q\\\".ts\" \"b/sp\\303\\251cial \\\"q\\\".ts
         assert!(md.contains("[#7 Add thing](https://app/pull/7)"));
         assert!(md.contains("Reviewed commit `abcdef1` at 2026-11-17 09:12 UTC."));
         assert!(!md.contains("2026-11-17T00:00:00Z"), "no run time: {md}");
-        assert!(md.contains("## In your code"));
+        assert!(md.contains("## Pull request review"));
+        assert!(md.contains("### In your code"));
         assert!(md.contains("Location: `src/a.ts:5` (line 3 when reviewed)"));
-        assert!(md.contains("## Changed since the review"));
+        assert!(md.contains("### Changed since the review"));
+        assert!(!md.contains("## Local review"));
         assert!(md.contains("Location: `src/a.ts`, line 10 when reviewed"));
         assert!(md.contains("   - Next steps:\n\n   Do X."));
 
         let none = render_markdown(&json!({ "pullRequest": null, "local": { "branch": "feat" } }));
-        assert!(none.contains("No open pull request for `feat`"));
+        assert!(none.contains("No open pull request for `feat` yet"));
     }
 
     #[test]
@@ -1207,5 +1443,79 @@ diff --git \"a/sp\\303\\251cial \\\"q\\\".ts\" \"b/sp\\303\\251cial \\\"q\\\".ts
         assert_eq!(map_line(file, 9), Placement::Changed);
         assert_eq!(map_line(file, 10), Placement::Moved(11));
         assert_eq!(map_line(file, 12), Placement::Moved(13));
+    }
+
+    /// A saved local review is placed by diffing the reviewed blob against the file now.
+    #[test]
+    fn places_a_saved_local_review_on_the_working_tree() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        let original: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("a.ts"), &original).unwrap();
+        std::fs::write(dir.path().join("b.ts"), "x\n").unwrap();
+
+        let repo =
+            crate::git::repository::find_repository_in_path(&dir.path().to_string_lossy()).unwrap();
+        let local = Local {
+            workdir: repo.workdir().unwrap(),
+            repo,
+            repository: "acme/web".into(),
+            branch: Some("feat".into()),
+        };
+        let blobs = snapshot_blobs(&local, &["a.ts".into(), "b.ts".into()]).unwrap();
+        assert_eq!(blobs.len(), 2);
+
+        // After the review: a line added at the top, line 6 edited, b.ts deleted.
+        let edited = format!("new\n{}", original.replace("line 6\n", "line six\n"));
+        std::fs::write(dir.path().join("a.ts"), edited).unwrap();
+        std::fs::remove_file(dir.path().join("b.ts")).unwrap();
+
+        let saved = json!({
+            "branch": "feat",
+            "files": blobs,
+            "result": { "findings": [
+                finding("a.ts", 2), finding("a.ts", 6), finding("b.ts", 1), finding("c.ts", 1),
+            ] },
+        });
+        let placed = place_local_findings(&local, &saved);
+        let local_of = |i: usize| placed[i]["local"].clone();
+        assert_eq!(local_of(0), json!({ "status": "moved", "line": 3 }));
+        assert_eq!(local_of(1), json!({ "status": "changed", "line": null }));
+        assert_eq!(
+            local_of(2),
+            json!({ "status": "file_deleted", "line": null })
+        );
+        // Not in the snapshot: can't be checked.
+        assert_eq!(local_of(3), json!({ "status": "unverified", "line": null }));
+
+        // Shown only on the branch it was made on.
+        std::fs::create_dir_all(dir.path().join(FINDINGS_DIR)).unwrap();
+        std::fs::write(local_review_path(&local), saved.to_string()).unwrap();
+        let mut result = json!({});
+        attach_local_review(&mut result, &local);
+        assert_eq!(
+            result["localReview"]["findings"].as_array().unwrap().len(),
+            4
+        );
+        let other = Local {
+            branch: Some("main".into()),
+            ..local
+        };
+        let mut result = json!({});
+        attach_local_review(&mut result, &other);
+        assert!(result["localReview"].is_null());
     }
 }

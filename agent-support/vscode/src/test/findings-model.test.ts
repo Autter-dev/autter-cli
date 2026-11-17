@@ -35,7 +35,7 @@ function result(findings: CliFinding[]): CliFindingsResult {
 }
 
 function placed(line: number, id = "f"): PlacedFinding {
-  return { finding: finding(id), path: "src/a.ts", line };
+  return { finding: finding(id), origin: "pr", path: "src/a.ts", line };
 }
 
 suite("Findings model", () => {
@@ -78,6 +78,26 @@ suite("Findings model", () => {
     assert.strictEqual(byPath.size, 1);
   });
 
+  test("places the saved local review next to the PR's findings", () => {
+    const byPath = placeFindings({
+      ...result([finding("pr")]),
+      localReview: {
+        findings: [
+          finding("local-1", { local: { status: "moved", line: 7 } }),
+          finding("local-2", { local: { status: "changed", line: null } }),
+        ],
+      },
+    });
+    assert.deepStrictEqual(
+      (byPath.get("src/a.ts") ?? []).map((p) => [p.finding.id, p.origin, p.line]),
+      [
+        ["pr", "pr", 2],
+        ["local-1", "local", 6],
+      ],
+    );
+    assert.strictEqual(inlineText(finding("x"), 90, "local"), "autter review warning: Title x");
+  });
+
   test("an edit above a finding moves it; an edit on its line drops it", () => {
     const list = [placed(2, "a"), placed(5, "b"), placed(9, "c")];
     // Two lines inserted at the end of line 0.
@@ -109,5 +129,11 @@ suite("Findings model", () => {
     assert.strictEqual(summary.text, "$(error) autter: 2");
     assert.ok(summary.tooltip.includes("1 not shown in the code"));
     assert.strictEqual(statusSummary({ ...result([]), pullRequest: null }, 0).text, "$(shield) autter: no PR");
+    const withLocal = statusSummary(
+      { ...result([]), pullRequest: null, review: null, localReview: { findings: [finding("l", { severity: "critical" })] } },
+      1,
+    );
+    assert.strictEqual(withLocal.text, "$(error) autter: 1");
+    assert.ok(withLocal.tooltip.includes("1 from your last local review"));
   });
 });

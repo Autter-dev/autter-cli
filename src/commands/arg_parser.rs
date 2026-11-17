@@ -937,6 +937,40 @@ autter findings [--write] [--branch <name>] [--pr <number>] [--repo <remote|owne
   findings inline.",
     },
     HelpEntry {
+        name: "review",
+        aliases: &[],
+        summary: "Review your changes before you open a pull request",
+        body: "\
+autter review [<path>...] [--base <ref> | --uncommitted] [--write] [--repo <remote|owner/repo>]
+              [--org <slug>] [--json]
+
+  Runs the core of Autter's pull request review on your changes, so you learn
+  about problems before a pull request exists: secrets, static security,
+  auth and permissions, race conditions, and (when your organization has it
+  on) the deep correctness pass. Your organization's review settings apply.
+  It takes a minute or two.
+
+  By default it reviews what a pull request from this branch would contain:
+  everything since the merge base with the default branch (origin/HEAD,
+  else main or master), committed or not, untracked files included. Up to
+  60 files; pass paths to review fewer.
+
+  The result is kept in .autter/local-review.json. `autter findings` and the
+  VS Code extension show it next to the pull request's findings, with lines
+  moved to follow your edits; a finding whose line you have edited since is
+  listed as changed.
+
+  <path>...      Only changes under these files or directories
+  --base <ref>   Compare with the merge base of this branch or commit
+  --uncommitted  Only changes not committed yet (compared with HEAD)
+  --write        Also write .autter/findings.md
+  --repo         The repository, when the remote doesn't identify it
+  --org <slug>   Another organization you belong to
+  --json         The result as JSON, with a `local` placement per finding
+
+  Uses your autter login. The files you review are sent to Autter.",
+    },
+    HelpEntry {
         name: "lineage",
         aliases: &[],
         summary: "From a Runtime issue to its release, commit, PR, owner and AI authorship",

@@ -72,6 +72,7 @@ export class FindingsManager implements vscode.CodeActionProvider {
         providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
       }),
       vscode.commands.registerCommand("autter.findings.refresh", () => this.refreshAll(true)),
+      vscode.commands.registerCommand("autter.findings.reviewChanges", () => this.reviewChanges()),
       vscode.commands.registerCommand("autter.findings.signIn", () => this.signIn()),
       vscode.commands.registerCommand("autter.findings.openFile", () => this.openFindingsFile()),
       vscode.commands.registerCommand("autter.findings.copyFixPrompt", (f: CliFinding) => this.copyFixPrompt(f)),
@@ -305,9 +306,11 @@ export class FindingsManager implements vscode.CodeActionProvider {
           : vscode.DiagnosticSeverity.Information;
     const diagnostic = new vscode.Diagnostic(range, diagnosticMessage(p.finding), severity);
     diagnostic.source = SOURCE;
-    diagnostic.code = p.finding.url
-      ? { value: severityLabel(p.finding.severity), target: vscode.Uri.parse(p.finding.url) }
-      : severityLabel(p.finding.severity);
+    const label =
+      p.origin === "local"
+        ? `${severityLabel(p.finding.severity)}, local review`
+        : severityLabel(p.finding.severity);
+    diagnostic.code = p.finding.url ? { value: label, target: vscode.Uri.parse(p.finding.url) } : label;
     return diagnostic;
   }
 
@@ -336,7 +339,12 @@ export class FindingsManager implements vscode.CodeActionProvider {
         options.push({
           range: new vscode.Range(line, 0, line, 0),
           renderOptions: {
-            after: { contentText: more > 0 ? `${inlineText(p.finding)} (+${more} more)` : inlineText(p.finding) },
+            after: {
+              contentText:
+                more > 0
+                  ? `${inlineText(p.finding, 90, p.origin)} (+${more} more)`
+                  : inlineText(p.finding, 90, p.origin),
+            },
           },
         });
       }
@@ -506,6 +514,97 @@ export class FindingsManager implements vscode.CodeActionProvider {
       return;
     }
     await vscode.commands.executeCommand("workbench.actions.view.problems");
+  }
+
+  /** The work tree to review: the active editor's, else the first folder's. */
+  private reviewFolder(): string | null {
+    const active = vscode.window.activeTextEditor?.document.uri;
+    const folder =
+      (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
+    return folder?.uri.fsPath ?? null;
+  }
+
+  /**
+   * `autter review`: review the branch's changes before a pull request, then
+   * show the findings like the PR's. Saves open files first: the review reads
+   * them from disk.
+   */
+  private async reviewChanges(): Promise<void> {
+    const cwd = this.reviewFolder();
+    if (!cwd) {
+      void vscode.window.showWarningMessage("autter: Open a folder in a git repository to review your changes.");
+      return;
+    }
+    if (!(await resolveAutterBinary())) {
+      void vscode.window.showWarningMessage("autter: The autter CLI is not installed.");
+      return;
+    }
+    await vscode.workspace.saveAll(false);
+    const args = ["review", "--json"];
+    if (Config.isFindingsFileEnabled()) {
+      args.push("--write");
+    }
+    const outcome = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "autter: Reviewing your changes (a minute or two)…",
+        cancellable: true,
+      },
+      (_progress, token) =>
+        new Promise<{ stdout: string; code: number | null; cancelled: boolean }>((resolve) => {
+          let stdout = "";
+          const proc = spawn(getAutterBinary(), args, { cwd, timeout: 11 * 60_000 });
+          token.onCancellationRequested(() => {
+            proc.kill();
+            resolve({ stdout: "", code: null, cancelled: true });
+          });
+          proc.stdout.on("data", (d) => {
+            stdout += d.toString();
+          });
+          proc.stderr.on("data", () => {});
+          proc.on("error", () => resolve({ stdout: "", code: null, cancelled: false }));
+          proc.on("close", (code) => resolve({ stdout, code, cancelled: false }));
+        }),
+    );
+    if (outcome.cancelled) {
+      return;
+    }
+    let parsed: { error?: string; message?: string; localReview?: { findings?: CliFinding[] } | null } | null = null;
+    try {
+      parsed = JSON.parse(outcome.stdout.trim() || "null");
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) {
+      void vscode.window.showErrorMessage("autter: The review failed. Is the autter CLI up to date?");
+      return;
+    }
+    if (parsed.error) {
+      if (/autter login|HTTP 401/i.test(parsed.error)) {
+        const choice = await vscode.window.showWarningMessage(`autter: ${parsed.error}`, "Sign in");
+        if (choice === "Sign in") {
+          await this.signIn();
+        }
+      } else {
+        void vscode.window.showErrorMessage(`autter: ${parsed.error}`);
+      }
+      return;
+    }
+    if (!parsed.localReview) {
+      void vscode.window.showInformationMessage(`autter: ${parsed.message ?? "No changes to review."}`);
+      return;
+    }
+    const findings = parsed.localReview.findings ?? [];
+    const shown = findings.filter((f) => f.local?.status === "unchanged" || f.local?.status === "moved").length;
+    this.refreshAll(true);
+    const text =
+      findings.length === 0
+        ? "autter: The review found nothing in your changes."
+        : `autter: The review found ${findings.length} issue${findings.length === 1 ? "" : "s"}${shown < findings.length ? ` (${shown} shown in the code)` : ""}.`;
+    const choice = await vscode.window.showInformationMessage(text, "Open findings");
+    if (choice === "Open findings") {
+      await this.openFindingsFile();
+    }
   }
 
   /** Sign in with the CLI's device flow in a terminal, then refresh. */

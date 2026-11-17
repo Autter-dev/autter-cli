@@ -37,6 +37,7 @@ pub mod notes_migrate;
 pub mod onboard;
 pub mod output;
 pub mod personal_dashboard;
+pub mod review;
 pub mod setup_notices;
 pub mod show;
 pub mod show_prompt;

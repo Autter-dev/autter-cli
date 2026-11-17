@@ -97,6 +97,11 @@
         "category": "Autter"
       },
       {
+        "command": "autter.findings.reviewChanges",
+        "title": "Review My Changes",
+        "category": "Autter"
+      },
+      {
         "command": "autter.findings.refresh",
         "title": "Refresh Review Findings",
         "category": "Autter"
