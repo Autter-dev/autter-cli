@@ -944,11 +944,12 @@ autter findings [--write] [--branch <name>] [--pr <number>] [--repo <remote|owne
 autter review [<path>...] [--base <ref> | --uncommitted] [--write] [--repo <remote|owner/repo>]
               [--org <slug>] [--json]
 
-  Runs the core of Autter's pull request review on your changes, so you learn
-  about problems before a pull request exists: secrets, static security,
-  auth and permissions, race conditions, and (when your organization has it
-  on) the deep correctness pass. Your organization's review settings apply.
-  It takes a minute or two.
+  Runs the deterministic (rule-based) checks of Autter's pull request review
+  on your changes, so you learn about problems before a pull request exists:
+  secrets, static security, auth and permissions, and race conditions. Your
+  organization's review settings apply. It makes no AI model calls and
+  usually takes a few seconds; the full review, AI checks included, runs on
+  the pull request.
 
   By default it reviews what a pull request from this branch would contain:
   everything since the merge base with the default branch (origin/HEAD,

@@ -547,7 +547,7 @@ export class FindingsManager implements vscode.CodeActionProvider {
     const outcome = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "autter: Reviewing your changes (a minute or two)…",
+        title: "autter: Checking your changes…",
         cancellable: true,
       },
       (_progress, token) =>

@@ -987,7 +987,7 @@ pub(crate) fn render_markdown(result: &Value) -> String {
         if let Some(at) = local_review["reviewedAt"].as_str() {
             out.push_str(&format!(", at {}", when(at)));
         }
-        out.push_str(". A local review runs the core checks before a pull request exists; its findings are not verified.\n\n");
+        out.push_str(". A local review runs the deterministic (rule-based) checks before a pull request exists, with no AI; the full review runs on the pull request.\n\n");
         render_markdown_groups(
             &mut out,
             &findings_of(local_review),

@@ -34,7 +34,7 @@ Findings are only shown on lines the review saw. Line numbers follow your edits:
 
 The extension keeps `.autter/findings.md` up to date with every finding: a summary, its location, next steps, and a link. `.autter/` is added to `.git/info/exclude`, so it is never committed.
 
-**Before a pull request exists**, run *Autter: Review My Changes*. It saves your files and runs `autter review`, which reviews everything a pull request from this branch would contain (committed or not, new files included) with the core of Autter's PR review. Its findings show up the same way, labelled "local review", and follow your edits the same way. The result is kept until you review again on that branch.
+**Before a pull request exists**, run *Autter: Review My Changes*. It saves your files and runs `autter review`, which checks everything a pull request from this branch would contain (committed or not, new files included) with the deterministic, rule-based checks of Autter's PR review: secrets, static security, auth and race conditions. It makes no AI calls and usually takes a few seconds; the full review runs on the pull request. Its findings show up the same way, labelled "local review", and follow your edits the same way. The result is kept until you review again on that branch.
 
 - **Sign in**: click **autter: Sign in** in the status bar. It runs `autter login` in a terminal.
 - **Settings**: `autter.findings.display` (`inline`, `problems` or `off`; default `inline`) and `autter.findings.writeFile` (default `true`).
