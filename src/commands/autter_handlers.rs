@@ -147,6 +147,8 @@ pub fn handle_autter(args: &[String]) {
             | "logout"
             | "whoami"
             | "ask"
+            | "findings"
+            | "review"
             | "logs"
             | "threads"
             | "badge"
@@ -219,6 +221,8 @@ pub fn handle_autter(args: &[String]) {
             }
             None => commands::lineage::handle(&args[1..]),
         },
+        "findings" => commands::findings::handle(&args[1..]),
+        "review" => commands::review::handle(&args[1..]),
         "memory" => commands::memory::handle(&args[1..]),
         "tests" => commands::generated_tests::handle(&args[1..]),
         "context" => commands::context::handle(&args[1..]),
@@ -495,6 +499,7 @@ const AUTTER_COMMANDS: &[&str] = &[
     "fetch-notes",
     "fetch_authorship_notes",
     "file-changes",
+    "findings",
     "flush-metrics-db",
     "git-hooks",
     "git-path",
@@ -516,6 +521,7 @@ const AUTTER_COMMANDS: &[&str] = &[
     "personal_dashboard",
     "push-authorship-notes",
     "push_authorship_notes",
+    "review",
     "setup",
     "show",
     "show-prompt",

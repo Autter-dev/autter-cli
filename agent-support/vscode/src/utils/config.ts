@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 
 export type BlameMode = 'off' | 'line' | 'all';
 
+export type FindingsDisplay = 'off' | 'problems' | 'inline';
+
 export class Config {
   private static getRoot(): vscode.WorkspaceConfiguration {
     return vscode.workspace.getConfiguration("autter");
@@ -27,6 +29,20 @@ export class Config {
       return mode;
     }
     return 'line'; // default
+  }
+
+  static getFindingsDisplay(): FindingsDisplay {
+    const mode = this.getRoot().get<string>("findings.display");
+    if (mode === 'off' || mode === 'problems' || mode === 'inline') {
+      return mode;
+    }
+    return 'inline'; // default
+  }
+
+  static isFindingsFileEnabled(): boolean {
+    // Defaults to true when unset.
+    const value = this.getRoot().get<boolean>("findings.writeFile");
+    return value === undefined ? true : value;
   }
 
   static async setBlameMode(mode: BlameMode): Promise<void> {

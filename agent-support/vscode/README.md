@@ -26,6 +26,21 @@ You can enable toast messages from the extension when it calls checkpoints to ge
 "autter.enableCheckpointLogging": true
 ```
 
+### Review findings in the editor
+
+When the branch you have checked out has an open pull request that Autter reviewed, its findings show up next to the code: squiggles on the affected lines, entries in the Problems panel, and (by default) the finding's title after the line. Quick fixes on each finding copy a fix prompt for your AI agent, open the finding in the dashboard, or dismiss it.
+
+Findings are only shown on lines the review saw. Line numbers follow your edits: lines added or removed above a finding move it, and a finding whose own line you've edited since the review is no longer shown in the code (it's listed in the findings file as possibly fixed).
+
+The extension keeps `.autter/findings.md` up to date with every finding: a summary, its location, next steps, and a link. `.autter/` is added to `.git/info/exclude`, so it is never committed.
+
+**Before a pull request exists**, run *Autter: Review My Changes*. It saves your files and runs `autter review`, which reviews everything a pull request from this branch would contain (committed or not, new files included) with the core of Autter's PR review. Its findings show up the same way, labelled "local review", and follow your edits the same way. The result is kept until you review again on that branch.
+
+- **Sign in**: click **autter: Sign in** in the status bar. It runs `autter login` in a terminal.
+- **Settings**: `autter.findings.display` (`inline`, `problems` or `off`; default `inline`) and `autter.findings.writeFile` (default `true`).
+- **Commands**: *Autter: Review My Changes*, *Autter: Refresh Review Findings*, *Autter: Open Review Findings File*, *Autter: Show Dismissed Review Findings Again*.
+- Requires an `autter` CLI with the `autter findings` and `autter review` commands.
+
 ### AI tab tracking (experimental)
 
 Adds support for tracking AI tab-completion insertions

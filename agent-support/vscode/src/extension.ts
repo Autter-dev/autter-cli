@@ -11,6 +11,7 @@ import { BlameLensManager, registerBlameLensCommands } from "./blame-lens-manage
 import { initBinaryResolver } from "./utils/binary-path";
 import { KnownHumanCheckpointManager } from "./known-human-checkpoint-manager";
 import { checkNativeHooksHealth } from "./native-hooks-health";
+import { FindingsManager } from "./findings-manager";
 
 function getDistinctId(): string {
   try {
@@ -76,6 +77,13 @@ export function activate(context: vscode.ExtensionContext) {
   blameLensManager.activate();
   context.subscriptions.push({
     dispose: () => blameLensManager.dispose()
+  });
+
+  // Review findings of the branch's pull request, next to the code.
+  const findingsManager = new FindingsManager(context);
+  findingsManager.activate();
+  context.subscriptions.push({
+    dispose: () => findingsManager.dispose()
   });
 
   if (Config.isAiTabTrackingEnabled()) {

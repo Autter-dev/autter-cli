@@ -907,6 +907,70 @@ autter login [--token <token>]
         body: "autter threads [search <keywords>] [--repo <name>] [--org <slug>] [--offset <n>] [--json]\nautter threads show <id> [--org <slug>] [--json]\n\n  Search your questions and answers across Dashboard and CLI. Lists 50 threads\n  at a time. Continue an investigation with autter ask <question> --thread <id>.",
     },
     HelpEntry {
+        name: "findings",
+        aliases: &[],
+        summary: "Review findings for this branch's pull request, on your working tree's lines",
+        body: "\
+autter findings [--write] [--branch <name>] [--pr <number>] [--repo <remote|owner/repo>]
+                [--org <slug>] [--no-fetch] [--json]
+
+  Prints the Autter review findings of the pull request open for the current
+  branch: severity, file:line and title, most severe first.
+
+  Line numbers are moved to match your working tree: the command diffs the
+  commit Autter reviewed against your files. A finding whose line you have
+  edited since the review is listed as changed, with no line, because the
+  review never saw the new code. If the reviewed commit is missing locally,
+  the command fetches the pull request's head (never prompting for
+  credentials); --no-fetch skips that.
+
+  --write        Also write .autter/findings.md: a summary, location, next
+                 steps and a dashboard link for every finding. .autter/ is
+                 added to .git/info/exclude so it is never committed.
+  --branch       Another branch's pull request
+  --pr           A pull request by number, open or closed
+  --repo         The repository, when the remote doesn't identify it
+  --org <slug>   Another organization you belong to
+  --json         The response as JSON, with a `local` placement per finding
+
+  Uses your autter login. The autter VS Code extension shows the same
+  findings inline.",
+    },
+    HelpEntry {
+        name: "review",
+        aliases: &[],
+        summary: "Review your changes before you open a pull request",
+        body: "\
+autter review [<path>...] [--base <ref> | --uncommitted] [--write] [--repo <remote|owner/repo>]
+              [--org <slug>] [--json]
+
+  Runs the core of Autter's pull request review on your changes, so you learn
+  about problems before a pull request exists: secrets, static security,
+  auth and permissions, race conditions, and (when your organization has it
+  on) the deep correctness pass. Your organization's review settings apply.
+  It takes a minute or two.
+
+  By default it reviews what a pull request from this branch would contain:
+  everything since the merge base with the default branch (origin/HEAD,
+  else main or master), committed or not, untracked files included. Up to
+  60 files; pass paths to review fewer.
+
+  The result is kept in .autter/local-review.json. `autter findings` and the
+  VS Code extension show it next to the pull request's findings, with lines
+  moved to follow your edits; a finding whose line you have edited since is
+  listed as changed.
+
+  <path>...      Only changes under these files or directories
+  --base <ref>   Compare with the merge base of this branch or commit
+  --uncommitted  Only changes not committed yet (compared with HEAD)
+  --write        Also write .autter/findings.md
+  --repo         The repository, when the remote doesn't identify it
+  --org <slug>   Another organization you belong to
+  --json         The result as JSON, with a `local` placement per finding
+
+  Uses your autter login. The files you review are sent to Autter.",
+    },
+    HelpEntry {
         name: "lineage",
         aliases: &[],
         summary: "From a Runtime issue to its release, commit, PR, owner and AI authorship",
