@@ -418,6 +418,8 @@ Use `autter memory search "<question>"` to rank what Autter knows about the repo
 
 For coding agents, `autter context "<task>"` is the one call to start with: the memory facts (with `rmf_…` ids to cite), wiki pages and code structure that matter for the task, ranked and cut to a token budget, as Markdown. It is the CLI form of the `get_context` MCP tool, and the `repo-memory` skill tells agents to use it when the Autter MCP server isn't connected. `autter memory skills install` writes the repository's memory skill into the checkout (`.agents/skills/autter-repo-memory/SKILL.md` and a Cursor rule) so teammates' agents get it from git.
 
+When a review's generated tests catch a bug, the failing test is not committed to the PR. On the PR's branch, `autter tests run` writes the failing tests Autter kept into your checkout and runs them with their framework's command (it asks first: the tests are model-written and run with your environment). `autter tests list` shows what Autter wrote and why each failed, and `autter tests clean` removes the files again. A test that used Autter's temporary database runs only with `--database-url` pointing at a scratch database.
+
 ### Connect your agents to Autter's MCP server
 
 `autter mcp connect` adds Autter's MCP server to every installed agent's user-level config (Claude Code, Codex, Cursor, VS Code, Gemini CLI, OpenCode). Only the URL is written; each agent signs you in with your Autter account the first time it uses it. `--dry-run` shows the changes, `--agent <name>` picks agents, and `autter mcp disconnect` removes the entry again.

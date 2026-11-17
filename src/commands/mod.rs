@@ -17,6 +17,7 @@ pub mod exchange_nonce;
 pub mod fetch_notes;
 pub mod file_changes;
 pub mod flush_metrics_db;
+pub mod generated_tests;
 pub mod git_handlers;
 pub mod git_hook_handlers;
 pub mod home;
