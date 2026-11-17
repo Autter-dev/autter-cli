@@ -58,6 +58,7 @@ const HELP_INVOCATIONS: &[&[&str]] = &[
     &["logout", "--help"],
     &["whoami", "--help"],
     &["ask", "--help"],
+    &["findings", "--help"],
     &["lineage", "--help"],
     &["lineage", "src/main.rs:1", "--help"],
     &["logs", "--help"],

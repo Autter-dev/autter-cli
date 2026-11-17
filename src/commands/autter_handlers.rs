@@ -147,6 +147,7 @@ pub fn handle_autter(args: &[String]) {
             | "logout"
             | "whoami"
             | "ask"
+            | "findings"
             | "logs"
             | "threads"
             | "badge"
@@ -218,6 +219,7 @@ pub fn handle_autter(args: &[String]) {
             }
             None => commands::lineage::handle(&args[1..]),
         },
+        "findings" => commands::findings::handle(&args[1..]),
         "memory" => commands::memory::handle(&args[1..]),
         "context" => commands::context::handle(&args[1..]),
         "mcp" => commands::mcp::handle(&args[1..]),
@@ -499,6 +501,7 @@ const AUTTER_COMMANDS: &[&str] = &[
     "help",
     "install",
     "install-hooks",
+    "findings",
     "lineage",
     "log",
     "login",

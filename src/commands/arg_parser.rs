@@ -907,6 +907,36 @@ autter login [--token <token>]
         body: "autter threads [search <keywords>] [--repo <name>] [--org <slug>] [--offset <n>] [--json]\nautter threads show <id> [--org <slug>] [--json]\n\n  Search your questions and answers across Dashboard and CLI. Lists 50 threads\n  at a time. Continue an investigation with autter ask <question> --thread <id>.",
     },
     HelpEntry {
+        name: "findings",
+        aliases: &[],
+        summary: "Review findings for this branch's pull request, on your working tree's lines",
+        body: "\
+autter findings [--write] [--branch <name>] [--pr <number>] [--repo <remote|owner/repo>]
+                [--org <slug>] [--no-fetch] [--json]
+
+  Prints the Autter review findings of the pull request open for the current
+  branch: severity, file:line and title, most severe first.
+
+  Line numbers are moved to match your working tree: the command diffs the
+  commit Autter reviewed against your files. A finding whose line you have
+  edited since the review is listed as changed, with no line, because the
+  review never saw the new code. If the reviewed commit is missing locally,
+  the command fetches the pull request's head (never prompting for
+  credentials); --no-fetch skips that.
+
+  --write        Also write .autter/findings.md: a summary, location, next
+                 steps and a dashboard link for every finding. .autter/ is
+                 added to .git/info/exclude so it is never committed.
+  --branch       Another branch's pull request
+  --pr           A pull request by number, open or closed
+  --repo         The repository, when the remote doesn't identify it
+  --org <slug>   Another organization you belong to
+  --json         The response as JSON, with a `local` placement per finding
+
+  Uses your autter login. The autter VS Code extension shows the same
+  findings inline.",
+    },
+    HelpEntry {
         name: "lineage",
         aliases: &[],
         summary: "From a Runtime issue to its release, commit, PR, owner and AI authorship",
