@@ -161,6 +161,7 @@ mod superuser_guard;
 mod sweep_e2e;
 mod sync_authorship_types;
 mod test_utils_unit;
+mod tests_command;
 mod tls_native_certs;
 mod unsupported_agents;
 mod upload_hold;
