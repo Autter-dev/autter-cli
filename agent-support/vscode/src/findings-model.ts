@@ -235,3 +235,8 @@ export function statusSummary(result: CliFindingsResult, shown: number): { text:
   const icon = all.some((f) => f.severity === "critical") ? "$(error)" : total > 0 ? "$(warning)" : "$(pass)";
   return { text: `${icon} autter: ${total}`, tooltip: lines.join("\n") };
 }
+
+/** A finding from a local review (`autter review`), whose dismissal is sent to Autter. */
+export function isLocalFindingId(id: string): boolean {
+  return /^local-[0-9a-f]{1,8}-\d+$/i.test(id);
+}

@@ -6,6 +6,11 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-17
+
+- Dismissing a finding from **Autter: Review My Changes** also tells Autter, so the pull request's page shows it as dismissed. *Show Dismissed Review Findings Again* restores it there too.
+- Local reviews run many more rule-based checks (needs autter CLI 3.15.0).
+
 ## [0.2.1] - 2026-11-17
 
 - **Autter: Review My Changes** runs only the deterministic, rule-based checks (no AI calls), so it usually finishes in a few seconds. The full review runs on the pull request.

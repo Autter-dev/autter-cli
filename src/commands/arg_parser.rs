@@ -943,13 +943,16 @@ autter findings [--write] [--branch <name>] [--pr <number>] [--repo <remote|owne
         body: "\
 autter review [<path>...] [--base <ref> | --uncommitted] [--write] [--repo <remote|owner/repo>]
               [--org <slug>] [--json]
+autter review --dismiss <finding-id> [--undo] [--json]
 
   Runs the deterministic (rule-based) checks of Autter's pull request review
   on your changes, so you learn about problems before a pull request exists:
-  secrets, static security, auth and permissions, and race conditions. Your
-  organization's review settings apply. It makes no AI model calls and
-  usually takes a few seconds; the full review, AI checks included, runs on
-  the pull request.
+  secrets, security (static, auth, rate limiting, resilience, LLM, RLS,
+  privacy), race conditions, logging, infrastructure and CI/CD, supply chain,
+  architecture, code health and hygiene, TODOs and UI. Your organization's
+  review settings apply. It makes no AI model calls and usually takes a few
+  seconds; the full review, AI checks included, runs on the pull request.
+  Its findings, and the ones you dismiss, show on the pull request's page.
 
   By default it reviews what a pull request from this branch would contain:
   everything since the merge base with the default branch (origin/HEAD,
@@ -965,6 +968,9 @@ autter review [<path>...] [--base <ref> | --uncommitted] [--write] [--repo <remo
   --base <ref>   Compare with the merge base of this branch or commit
   --uncommitted  Only changes not committed yet (compared with HEAD)
   --write        Also write .autter/findings.md
+  --dismiss <id> Dismiss one finding of your last local review: it leaves
+                 `autter findings`, and the pull request page shows it as
+                 dismissed. --undo restores it.
   --repo         The repository, when the remote doesn't identify it
   --org <slug>   Another organization you belong to
   --json         The result as JSON, with a `local` placement per finding

@@ -5,6 +5,7 @@ import {
   type CliFindingsResult,
   diagnosticMessage,
   inlineText,
+  isLocalFindingId,
   parseFindingsOutput,
   type PlacedFinding,
   placeFindings,
@@ -135,5 +136,11 @@ suite("Findings model", () => {
     );
     assert.strictEqual(withLocal.text, "$(error) autter: 1");
     assert.ok(withLocal.tooltip.includes("1 from your last local review"));
+  });
+
+  test("tells local-review findings from PR findings", () => {
+    assert.strictEqual(isLocalFindingId("local-0123abcd-3"), true);
+    assert.strictEqual(isLocalFindingId("f-123"), false);
+    assert.strictEqual(isLocalFindingId("local-xyz"), false);
   });
 });
