@@ -13,6 +13,6 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - **Autter: Review My Changes** reviews your changes before a pull request exists (`autter review`); its findings show up the same way, labelled "local review".
 - `.autter/findings.md` is kept up to date with every finding (`autter.findings.writeFile`).
 - The status bar shows the count of findings, or **autter: Sign in** when you are signed out.
-- Requires autter CLI 3.13.0 or later.
+- Requires autter CLI 3.14.0 or later.
 
 - Initial release

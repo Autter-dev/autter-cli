@@ -153,6 +153,7 @@ pub fn handle_autter(args: &[String]) {
             | "threads"
             | "badge"
             | "memory"
+            | "tests"
             | "context"
             | "mcp"
     ) || (args[0] == "lineage"
@@ -223,6 +224,7 @@ pub fn handle_autter(args: &[String]) {
         "findings" => commands::findings::handle(&args[1..]),
         "review" => commands::review::handle(&args[1..]),
         "memory" => commands::memory::handle(&args[1..]),
+        "tests" => commands::generated_tests::handle(&args[1..]),
         "context" => commands::context::handle(&args[1..]),
         "mcp" => commands::mcp::handle(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -528,6 +530,7 @@ const AUTTER_COMMANDS: &[&str] = &[
     "status",
     "sync",
     "telemetry",
+    "tests",
     "threads",
     "uninstall",
     "uninstall-hooks",

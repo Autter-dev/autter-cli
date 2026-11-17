@@ -327,7 +327,7 @@ pub(crate) fn response_json_or(
                 format!("{message} Connected: {}.", repos.join(", "))
             }
         }
-        (_, None) => format!("Repository memory request failed (HTTP {code})."),
+        (_, None) => format!("The Autter request failed (HTTP {code})."),
     };
     Err(AutterError::Generic(message))
 }

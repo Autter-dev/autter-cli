@@ -1039,6 +1039,42 @@ autter memory skills preview [--repo <remote|owner/repo>] [--org <slug>] [--json
   excluded from sharing. Use --json in scripts and coding agents.",
     },
     HelpEntry {
+        name: "tests",
+        aliases: &[],
+        summary: "Pull and run the tests Autter wrote for a pull request",
+        body: "autter tests list  [--pr <n>] [--repo <remote|owner/repo>] [--org <slug>] [--json]
+autter tests pull  [--pr <n>] [--all] [--only <path|gap>]... [--force] [--json]
+autter tests run   [--pr <n>] [--all] [--only <path|gap>]... [--database-url <postgres-url>]
+                   [--yes] [--dry-run] [--force] [--json]
+autter tests clean [--pr <n>] [--force] [--json]
+
+  On a review Autter writes tests for changed code that had none and runs them
+  on the PR's base and head. A test that fails on the head reproduces a bug the
+  PR introduces; those are never committed, so this command brings them here.
+
+  list   What Autter wrote for the PR: which tests failed, where and why, which
+         passed, and what could not run in its sandbox.
+  pull   Write the test files into this checkout (default: the failing ones;
+         --all for every kept test; --only for one file or gap id). Never
+         overwrites a file Autter did not write.
+  run    Pull, then run each file with its framework's command (vitest, jest,
+         mocha, node --test, pytest, go test, cargo test, rspec, phpunit) from
+         its project directory, with CI=true. Asks first: the files are
+         model-written from the PR's code and run with your environment here.
+         --yes skips the question; --dry-run prints what would run.
+         A test that used Autter's temporary database runs only with
+         --database-url, pointing at a scratch Postgres database it may write
+         to; it never inherits your DATABASE_URL.
+  clean  Remove the files pull wrote (all PRs, or --pr). A file you edited
+         stays unless --force.
+
+  The PR is --pr, else the one open from this checkout's branch. The
+  repository is this checkout's default remote unless --repo is given. If
+  this checkout is not at the commit the tests were checked on, a note says
+  so. Exit status 1 when a test fails, is skipped or cannot be written.
+  Uses your autter login.",
+    },
+    HelpEntry {
         name: "context",
         aliases: &[],
         summary: "What Autter knows that matters for a task, for coding agents",
@@ -1124,6 +1160,7 @@ const HANDLES_OWN_HELP: &[&str] = &[
     "logs",
     "threads",
     "memory",
+    "tests",
     "context",
     "mcp",
     "ci",
