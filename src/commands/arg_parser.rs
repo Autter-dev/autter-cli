@@ -978,6 +978,46 @@ autter review --dismiss <finding-id> [--undo] [--json]
   Uses your autter login. The files you review are sent to Autter.",
     },
     HelpEntry {
+        name: "sandbox",
+        aliases: &[],
+        summary: "Build, test and rule-check a pushed branch without opening a pull request",
+        body: "\
+autter sandbox run [--branch <name>] [--checks build,test,rules] [--no-wait]
+                   [--repo <remote|owner/repo>] [--org <slug>] [--json]
+autter sandbox status <id> [--org <slug>] [--json]
+autter sandbox list [--all] [--limit <n>] [--repo <remote|owner/repo>] [--org <slug>] [--json]
+
+  Tries your branch in Autter's sandbox without a pull request: Autter
+  checks out the branch's commit from GitHub, runs the repository's own build
+  and test commands, and runs the same rule-based checks as `autter review`
+  over the branch's changes against the default branch. It makes no AI calls
+  and posts nothing to GitHub: the result is shown here and on the run's
+  page on the dashboard (the repository's Sandbox runs).
+
+  The branch must be pushed. Nothing is uploaded from your machine: Autter
+  builds the commit GitHub has, so uncommitted changes and commits you have
+  not pushed are not part of the run (the command stops if your branch is
+  ahead of its upstream).
+
+  Each organization gets 10 sandbox runs a day, one at a time per
+  repository. You need write access to the repository on GitHub, and your
+  GitHub account connected in Autter.
+
+  run            Start a run of the current branch and wait for its result
+  status <id>    Show one run
+  list           This repository's runs, newest first (--all: every one)
+  --branch       Another pushed branch than the one checked out
+  --checks       Which checks: build, test, rules (default: all three)
+  --no-wait      Start the run and return; check on it with `status`
+  --limit <n>    How many runs `list` shows (default 20)
+  --repo         The repository, when the remote doesn't identify it
+  --org <slug>   Another organization you belong to
+  --json         The run (or list) as JSON
+
+  `run` and `status` exit 1 when a check failed or could not run.
+  Uses your autter login.",
+    },
+    HelpEntry {
         name: "lineage",
         aliases: &[],
         summary: "From a Runtime issue to its release, commit, PR, owner and AI authorship",
