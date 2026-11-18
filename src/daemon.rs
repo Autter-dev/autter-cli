@@ -8391,6 +8391,38 @@ impl ActorDaemonCoordinator {
                     };
                     let stash_sha =
                         Self::resolve_stash_sha_for_event(cmd, &operation, stash_ref.as_deref())?;
+                    if stash_sha.is_none()
+                        && matches!(
+                            operation,
+                            StashOperation::Apply
+                                | StashOperation::Pop
+                                | StashOperation::Branch
+                                | StashOperation::Drop
+                        )
+                    {
+                        // A failed command with no target (a `pop` on an empty
+                        // stack) changed nothing. A successful one with no
+                        // target loses only this stash's attribution.
+                        if cmd.exit_code != 0 {
+                            tracing::debug!(
+                                component = "daemon",
+                                root_sid = %cmd.root_sid,
+                                ?operation,
+                                ?stash_ref,
+                                exit_code = cmd.exit_code,
+                                "skipping failed stash event without a target oid"
+                            );
+                        } else {
+                            tracing::warn!(
+                                component = "daemon",
+                                root_sid = %cmd.root_sid,
+                                ?operation,
+                                ?stash_ref,
+                                "skipping stash event: target oid is unresolved"
+                            );
+                        }
+                        continue;
+                    }
                     let head_sha = match operation {
                         StashOperation::Create => Self::resolve_stash_create_head_for_event(
                             cmd,
@@ -8412,19 +8444,6 @@ impl ActorDaemonCoordinator {
                     } else {
                         Vec::new()
                     };
-                    if matches!(
-                        operation,
-                        StashOperation::Apply
-                            | StashOperation::Pop
-                            | StashOperation::Branch
-                            | StashOperation::Drop
-                    ) && stash_sha.is_none()
-                    {
-                        return Err(AutterError::Generic(format!(
-                            "stash {:?} missing resolvable target oid sid={} ref={:?}",
-                            operation, cmd.root_sid, stash_ref
-                        )));
-                    }
                     if matches!(
                         operation,
                         StashOperation::Create
