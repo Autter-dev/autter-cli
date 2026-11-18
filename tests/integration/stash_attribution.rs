@@ -350,6 +350,36 @@ fn test_stash_pop_empty_repo() {
 }
 
 #[test]
+fn test_stash_pop_empty_stack_does_not_fail_daemon_side_effects() {
+    let repo = TestRepo::new();
+
+    let mut readme = repo.filename("README.md");
+    readme.set_contents(vec!["# Test Repo".to_string()]);
+    repo.stage_all_and_commit("initial commit")
+        .expect("commit should succeed");
+    readme.assert_committed_lines(vec!["# Test Repo".human()]);
+
+    // Pop with no stash ever created.
+    assert!(repo.git(&["stash", "pop"]).is_err());
+    // Panics if the daemon recorded a side-effect error for the failed pop.
+    repo.sync_daemon();
+
+    let mut example = repo.filename("example.txt");
+    example.set_contents(vec!["AI content".ai()]);
+    repo.git(&["stash"]).expect("stash should succeed");
+    repo.git(&["stash", "pop"])
+        .expect("stash pop should succeed");
+
+    // Pop again after the stack is empty.
+    assert!(repo.git(&["stash", "pop"]).is_err());
+    repo.sync_daemon();
+
+    repo.stage_all_and_commit("apply stashed changes")
+        .expect("commit should succeed");
+    example.assert_committed_lines(vec!["AI content".ai()]);
+}
+
+#[test]
 fn test_stash_mixed_human_and_ai() {
     let repo = TestRepo::new();
 
