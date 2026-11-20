@@ -8930,6 +8930,19 @@ impl ActorDaemonCoordinator {
 
         let rewrite_events = match self.rewrite_events_from_semantic_events(cmd, events) {
             Ok(rewrite_events) => rewrite_events,
+            // A repository deleted before the daemon handled the command (e.g. an
+            // agent's temporary worktree) is a benign race. Log at debug level
+            // and let the caller's vanished-repo guard skip the side effect.
+            Err(error) if is_vanished_repo_error(&error, cmd.worktree.as_deref()) => {
+                tracing::debug!(
+                    command = ?cmd.primary_command,
+                    root_sid = %cmd.root_sid,
+                    ?family,
+                    %error,
+                    "strict rewrite synthesis skipped: repository no longer exists (benign race)"
+                );
+                return Err(error);
+            }
             Err(error) => {
                 tracing::error!(
                     component = "daemon",
@@ -12785,6 +12798,32 @@ mod tests {
             &AutterError::Generic("boom".to_string()),
             Some(&worktree)
         ));
+    }
+
+    #[test]
+    fn vanished_repo_error_detects_find_repository_on_deleted_worktree() {
+        // Rewrite synthesis calls `find_repository` for the command's worktree.
+        // An agent can delete a temporary worktree before the daemon handles
+        // the command.
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("wt");
+        init_fake_repo(&worktree);
+        fs::remove_dir_all(&worktree).unwrap();
+
+        let error = match find_repository_in_path(&worktree.to_string_lossy()) {
+            Ok(_) => panic!("find_repository must fail for a deleted worktree"),
+            Err(error) => error,
+        };
+        assert!(is_vanished_repo_error(&error, Some(&worktree)));
+
+        // The shape git reports on Windows for the same race.
+        let not_a_repo = AutterError::GitCliError {
+            code: Some(128),
+            stderr: "fatal: not a git repository (or any of the parent directories): .git"
+                .to_string(),
+            args: vec!["rev-parse".to_string(), "--show-toplevel".to_string()],
+        };
+        assert!(is_vanished_repo_error(&not_a_repo, Some(&worktree)));
     }
 
     #[test]
