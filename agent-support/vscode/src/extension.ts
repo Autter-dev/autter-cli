@@ -43,7 +43,8 @@ export function activate(context: vscode.ExtensionContext) {
   // Initialize PostHog and emit startup event (respects telemetry_oss config)
   if (!isTelemetryOssDisabled()) {
     const posthog = new PostHog("phc_XANaHNpDXBERPosyM8Bp0INVoGsgW8Gk92HsB090r6A", { host: "https://us.i.posthog.com" });
-    posthog.capture({
+    // capture() is fire-and-forget in posthog-node 6; shutdown() flushes the queue on dispose.
+    void posthog.capture({
       distinctId: getDistinctId(),
       event: "vscode_extension_startup",
       properties: {
