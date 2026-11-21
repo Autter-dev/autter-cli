@@ -9,6 +9,7 @@
 //! report on a single line.
 
 use crate::api::{ApiClient, ApiContext};
+use crate::auth::key_kind::{KeyKind, classify_key, wrong_key_message};
 use crate::auth::{AuthState, collect_auth_status, format_unix_timestamp};
 use crate::commands::arg_parser::{self, ScanMode};
 use crate::config::{self, Config};
@@ -1236,11 +1237,24 @@ fn copilot_capture_verdict(
 
 /// Auth state check. Returns the check plus whether the user is authenticated
 /// for sync (logged in or API key), which gates the connectivity probe.
+/// A runtime key in `AUTTER_API_KEY` is the wrong key for the CLI: say which one to use.
+fn runtime_key_warning() -> Option<String> {
+    let kind = classify_key(Config::get().api_key()?).kind;
+    kind.is_runtime().then(|| {
+        format!(
+            "warning: AUTTER_API_KEY holds a runtime key, which the CLI cannot use. {}",
+            wrong_key_message(KeyKind::Pat, kind, &crate::commands::login::web_app_url())
+        )
+    })
+}
+
 fn check_auth() -> (DoctorCheck, bool) {
     let name = "authentication".to_string();
     let status = collect_auth_status();
     let has_api_key = Config::get().api_key().is_some();
     let mut details = vec![format!("credential backend: {}", status.backend)];
+    let key_warning = runtime_key_warning();
+    details.extend(key_warning.clone());
     let live_context = ApiContext::new(None);
     let live_token = live_context.auth_token.is_some();
     if let Some(issue) = &live_context.auth_issue {
@@ -1377,7 +1391,11 @@ fn check_auth() -> (DoctorCheck, bool) {
             DoctorCheck {
                 section: SECTION_ACCOUNT,
                 name,
-                status: DoctorStatus::Passed,
+                status: if key_warning.is_some() {
+                    DoctorStatus::Warning
+                } else {
+                    DoctorStatus::Passed
+                },
                 summary: "authenticated via configured API key".to_string(),
                 details,
                 remediation: None,

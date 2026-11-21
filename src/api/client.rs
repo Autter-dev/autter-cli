@@ -1,3 +1,4 @@
+use crate::auth::key_kind::PAT_PREFIX;
 use crate::auth::types::{RefreshFailure, StoredCredentials, TokenRequestError};
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
@@ -282,9 +283,6 @@ fn acquire_refresh_file_lock() -> Option<crate::utils::LockFile> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
-
-/// Prefix marking a Personal Access Token (mirrors the backend).
-const PAT_PREFIX: &str = "autter_pat_";
 
 /// How long a repo → org answer is trusted before asking the server again, so a
 /// repo connected (or disconnected) on the web is picked up by a running daemon.

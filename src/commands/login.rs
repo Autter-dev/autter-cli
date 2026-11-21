@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::auth::key_kind::{
+    KeyKind, classify_key, key_problem_message, mcp_only_pat_message, wrong_key_message,
+};
 use crate::auth::types::StoredCredentials;
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::ui::signin::{self, SigninEnd, SigninScreen};
@@ -186,12 +189,12 @@ fn run_interactive(store: &CredentialStore, login_ui: LoginUi) -> Result<LoginOu
         match failure_choice(login_ui.decline) {
             FailureChoice::Retry => {}
             FailureChoice::Token => {
-                let Some(token) = ui::secret("Paste your access token") else {
+                let Some(token) = ui::secret("Paste your personal access token") else {
                     continue;
                 };
                 match exchange_pat(&token) {
                     Ok(creds) => return finish_interactive(store, &creds, login_ui),
-                    Err(e) => rail::print_warn(&e),
+                    Err(e) => rail::print_warn(e.message()),
                 }
             }
             FailureChoice::Decline => {
@@ -286,7 +289,7 @@ fn failure_choice(decline: Decline) -> FailureChoice {
         Decline::Cancel => SelectItem::new("Cancel", "Run `autter login` again anytime."),
     };
     let token_hint = format!(
-        "Create one at {} under any organization's Settings \u{2192} Access Tokens.",
+        "Create one at {} under Settings > Keys and tokens.",
         web_app_url()
     );
     let items = [
@@ -294,7 +297,7 @@ fn failure_choice(decline: Decline) -> FailureChoice {
             "Try again with a new code",
             "Opens a fresh sign-in in your browser.",
         ),
-        SelectItem::new("Paste an access token", &token_hint),
+        SelectItem::new("Paste a personal access token", &token_hint),
         last,
     ];
     match ui::select("What next?", &items, 0) {
@@ -308,31 +311,75 @@ fn cli_authorization_failure(detail: impl std::fmt::Display) -> String {
     format!("CLI authorization failed: {detail}\nNo credentials were issued or changed.")
 }
 
+/// Why a token sign-in failed. `Local` was decided on this machine before any
+/// network call (the user passed the wrong kind of key, or a mangled one);
+/// `Server` came back from the API.
+#[derive(Debug)]
+enum PatError {
+    Local(String),
+    Server(String),
+}
+
+impl PatError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Local(m) | Self::Server(m) => m,
+        }
+    }
+}
+
 /// Exchange a Personal Access Token for credentials, validating it up-front
 /// so a bad token fails immediately rather than being stored.
-fn exchange_pat(token: &str) -> Result<StoredCredentials, String> {
-    let token = token.trim();
-    if token.is_empty() {
-        return Err("No token provided. Usage: autter login --token <token>".to_string());
+fn exchange_pat(token: &str) -> Result<StoredCredentials, PatError> {
+    let classified = classify_key(token);
+    if classified.key.is_empty() {
+        return Err(PatError::Local(
+            "No token provided. Usage: autter login --token <token>".to_string(),
+        ));
     }
-    OAuthClient::new().exchange_pat(token)
+    if let Some(problem) = classified.problem
+        && problem.is_fatal()
+    {
+        return Err(PatError::Local(key_problem_message(problem).to_string()));
+    }
+    if classified.kind.is_runtime() {
+        return Err(PatError::Local(wrong_key_message(
+            KeyKind::Pat,
+            classified.kind,
+            &web_app_url(),
+        )));
+    }
+    OAuthClient::new()
+        .exchange_pat(&classified.key)
+        .map_err(|e| {
+            if e.contains("restricted to the MCP endpoint") {
+                PatError::Local(mcp_only_pat_message(&web_app_url()))
+            } else {
+                PatError::Server(e)
+            }
+        })
 }
 
 /// Sign in with a Personal Access Token instead of the interactive device flow.
-/// A failed `autter login --token` with what to do next.
-fn pat_login_failure_message(error: &str) -> String {
-    format!(
-        "{error}\nCheck that the token was copied whole (Org Settings -> Access Tokens), then run `autter login --token <token>` again, or run `autter login` to sign in in the browser."
-    )
+/// A failed `autter login --token` with what to do next. Only a server
+/// rejection gets the "copy it whole" advice: a locally detected problem
+/// already says what to do.
+fn pat_login_failure_message(error: &PatError) -> String {
+    match error {
+        PatError::Local(message) => message.clone(),
+        PatError::Server(message) => format!(
+            "{message}\nCheck that the token was copied whole, then run `autter login --token <token>` again, or run `autter login` to sign in in the browser."
+        ),
+    }
 }
 
-pub fn run_pat_login(token: &str) -> Result<LoginOutcome, String> {
+fn run_pat_login(token: &str) -> Result<LoginOutcome, PatError> {
     let creds = exchange_pat(token)?;
 
     let store = CredentialStore::new();
     store
         .store(&creds)
-        .map_err(|e| format!("Failed to store credentials: {}", e))?;
+        .map_err(|e| PatError::Local(format!("Failed to store credentials: {}", e)))?;
     crate::auth::notice::clear_sync_auth_blocked();
 
     eprintln!("Successfully logged in with a Personal Access Token.");
@@ -504,13 +551,17 @@ fn derive_web_url_from_api(api_base_url: &str) -> Option<String> {
 
 /// Print the PAT fallback for when the interactive device flow cannot complete.
 pub fn print_pat_fallback_instructions() {
-    eprintln!("Interactive login didn't finish. Paste an access token on this same step:\n");
+    eprintln!(
+        "Interactive login didn't finish. Paste a personal access token on this same step:\n"
+    );
     eprintln!("  1. Open the Autter dashboard:");
     eprintln!("       {}", web_app_url());
-    eprintln!("  2. Open any organization's Settings -> Access Tokens");
+    eprintln!("  2. Open Settings > Keys and tokens");
     eprintln!("  3. Click \"Create token\", copy it, and run:");
     eprintln!("       autter login --token <paste-your-token>\n");
-    eprintln!("  (This is a CLI/MCP access token — not a Runtime ingest key.)\n");
+    eprintln!(
+        "  (Use a personal access token (autter_pat_\u{2026}), not a runtime key (autter_rt_, autter_rtc_, autter_rtu_).)\n"
+    );
 }
 
 /// Handle the `autter login` command.
@@ -594,10 +645,64 @@ mod tests {
 
     #[test]
     fn a_failed_token_login_says_what_to_do_next() {
-        let text = pat_login_failure_message("Token sign-in failed: 401");
+        let text = pat_login_failure_message(&PatError::Server("Token sign-in failed: 401".into()));
         assert!(text.starts_with("Token sign-in failed: 401"), "{text}");
         assert!(text.contains("autter login --token"), "{text}");
         assert!(text.contains("autter login`"), "{text}");
+    }
+
+    #[test]
+    fn a_local_token_failure_has_no_copy_whole_suffix() {
+        let text = pat_login_failure_message(&PatError::Local("wrong key".into()));
+        assert_eq!(text, "wrong key");
+    }
+
+    fn local_message(token: &str) -> String {
+        match exchange_pat(token) {
+            Err(PatError::Local(m)) => m,
+            other => panic!("expected a local refusal for {token:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_keys_are_refused_locally_with_the_right_advice() {
+        let web = web_app_url();
+        for (token, got) in [
+            ("autter_rt_xxxx", KeyKind::Server),
+            ("autter_rtc_xxxx", KeyKind::Client),
+            ("autter_rtu_xxxx", KeyKind::Upload),
+        ] {
+            assert_eq!(
+                local_message(token),
+                wrong_key_message(KeyKind::Pat, got, &web),
+                "{token}"
+            );
+        }
+        let text = local_message("autter_rt_xxxx");
+        assert!(text.starts_with(
+            "This is a runtime server key (autter_rt_\u{2026}), for backend telemetry."
+        ));
+        assert!(text.contains("autter login --token <token>"));
+        assert!(text.contains("Settings > Keys and tokens."));
+    }
+
+    #[test]
+    fn quoted_and_bearer_runtime_keys_are_still_recognised() {
+        assert!(local_message("\"autter_rt_xxxx\"").contains("runtime server key"));
+        assert!(local_message("Bearer autter_rtc_xxxx").contains("runtime client key"));
+    }
+
+    #[test]
+    fn masked_and_broken_tokens_are_refused_locally() {
+        assert_eq!(
+            local_message("autter_pat_AbCd\u{2026}"),
+            key_problem_message(crate::auth::key_kind::KeyProblem::Masked)
+        );
+        assert_eq!(
+            local_message("autter_pat_ab cd"),
+            key_problem_message(crate::auth::key_kind::KeyProblem::Whitespace)
+        );
+        assert!(local_message("   ").starts_with("No token provided."));
     }
 
     #[test]

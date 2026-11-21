@@ -874,7 +874,7 @@ autter login [--token <token>]
   until you approve the device. No token paste is required.
 
   --token <token>   Non-interactive fallback: complete sign-in with a
-                    Personal Access Token from Settings -> Access Tokens",
+                    personal access token (autter_pat_...) from\n                    Settings > Keys and tokens. Runtime keys (autter_rt_,\n                    autter_rtc_, autter_rtu_) are for telemetry, not login.",
     },
     HelpEntry {
         name: "logout",
