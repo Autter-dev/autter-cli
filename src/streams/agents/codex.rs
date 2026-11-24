@@ -615,4 +615,34 @@ mod tests {
         assert_eq!(total["output_tokens"], 812);
         assert_eq!(total["reasoning_output_tokens"], 448);
     }
+
+    /// Codex CLIs before `cache_write_input_tokens` was added to `TokenUsage`
+    /// (0.133.0 and 0.137.0-alpha rollouts, observed) write only
+    /// `cached_input_tokens`. The missing key must stay missing, so the
+    /// backend can tell "no cache writes reported" from "0 cache writes".
+    #[test]
+    fn test_token_count_without_cache_write_key_is_not_zero_filled() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let line = r#"{"timestamp":"2026-06-08T09:15:12.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":16346754,"cached_input_tokens":15534592,"output_tokens":69081,"reasoning_output_tokens":13886,"total_tokens":16415835},"last_token_usage":{"input_tokens":37142,"cached_input_tokens":35712,"output_tokens":267,"reasoning_output_tokens":95,"total_tokens":37409},"model_context_window":258400},"rate_limits":null}}"#;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{}", line).unwrap();
+        file.flush().unwrap();
+
+        let (events, _) = drain_all(&CodexAgent::new(), file.path());
+        assert_eq!(events.len(), 1);
+        let event = crate::daemon::transcript_redaction::redact_json_secrets(events[0].clone());
+        for key in ["total_token_usage", "last_token_usage"] {
+            let usage = &event["payload"]["info"][key];
+            assert!(usage["cached_input_tokens"].is_u64());
+            assert!(
+                usage.get("cache_write_input_tokens").is_none(),
+                "{key}: a key Codex did not write must not appear"
+            );
+        }
+        let total = &event["payload"]["info"]["total_token_usage"];
+        assert_eq!(total["input_tokens"], 16346754);
+        assert_eq!(total["cached_input_tokens"], 15534592);
+    }
 }

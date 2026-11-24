@@ -21,7 +21,12 @@
 //! - `scope` is `session_total`: every count is the session's running total
 //!   when the snapshot was taken, so the backend must diff snapshots rather
 //!   than sum them;
-//! - `cost_usd` is the cost the agent itself reported, when it reports one.
+//! - `cost_usd` is the cost the agent itself reported, when it reports one;
+//! - `cache_read_reported` / `cache_write_reported` say whether the source had
+//!   the cache-read / cache-write key at all, so a consumer can tell "0 cached"
+//!   from "this source does not report cache tokens" (the count is then 0).
+//!   Added in place to version 1: a consumer that does not know the flags reads
+//!   the counts exactly as before.
 
 use serde_json::{Value, json};
 
@@ -43,6 +48,12 @@ pub struct SessionUsageSnapshot {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Whether the source has a cache-read count (`cache_read_tokens` is 0
+    /// when it does not).
+    pub cache_read_reported: bool,
+    /// Whether the source has a cache-write count (`cache_write_tokens` is 0
+    /// when it does not).
+    pub cache_write_reported: bool,
     /// Reasoning tokens, a subset of `output_tokens`, when reported.
     pub reasoning_tokens: Option<u64>,
     /// Cost the agent itself reported, in USD.
@@ -74,6 +85,8 @@ impl SessionUsageSnapshot {
                 "output_tokens": self.output_tokens,
                 "cache_read_tokens": self.cache_read_tokens,
                 "cache_write_tokens": self.cache_write_tokens,
+                "cache_read_reported": self.cache_read_reported,
+                "cache_write_reported": self.cache_write_reported,
                 "reasoning_tokens": self.reasoning_tokens,
                 "cost_usd": self.cost_usd,
                 "input_includes_cache": false,
@@ -102,6 +115,11 @@ fn optional_count(value: Option<&Value>) -> Option<u64> {
     value.filter(|v| !v.is_null()).map(|v| count(Some(v)))
 }
 
+/// Whether a count key is present with a value (`null` counts as absent).
+fn reported(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| !v.is_null())
+}
+
 /// Droid's `<session>.settings.json`:
 /// `{"model": "...", "tokenUsage": {"inputTokens", "outputTokens",
 /// "cacheCreationTokens", "cacheReadTokens", "thinkingTokens"}}`.
@@ -122,6 +140,8 @@ pub fn from_droid_settings(settings: &Value) -> Option<SessionUsageSnapshot> {
         output_tokens: count(usage.get("outputTokens")),
         cache_read_tokens: count(usage.get("cacheReadTokens")),
         cache_write_tokens: count(usage.get("cacheCreationTokens")),
+        cache_read_reported: reported(usage.get("cacheReadTokens")),
+        cache_write_reported: reported(usage.get("cacheCreationTokens")),
         reasoning_tokens: optional_count(usage.get("thinkingTokens")),
         cost_usd: None,
     })
@@ -139,13 +159,17 @@ pub fn from_droid_settings(settings: &Value) -> Option<SessionUsageSnapshot> {
 pub fn from_continue_session_usage(usage: &Value) -> Option<SessionUsageSnapshot> {
     let usage = usage.as_object()?;
     let details = usage.get("promptTokensDetails");
+    let cached = details.and_then(|d| d.get("cachedTokens"));
+    let cache_write = details.and_then(|d| d.get("cacheWriteTokens"));
     Some(SessionUsageSnapshot {
         source: "continue_session",
         model: None,
         input_tokens: count(usage.get("promptTokens")),
         output_tokens: count(usage.get("completionTokens")),
-        cache_read_tokens: count(details.and_then(|d| d.get("cachedTokens"))),
-        cache_write_tokens: count(details.and_then(|d| d.get("cacheWriteTokens"))),
+        cache_read_tokens: count(cached),
+        cache_write_tokens: count(cache_write),
+        cache_read_reported: reported(cached),
+        cache_write_reported: reported(cache_write),
         reasoning_tokens: None,
         cost_usd: usage
             .get("totalCost")
@@ -196,8 +220,29 @@ mod tests {
         assert_eq!(s["input_includes_cache"], false);
         assert_eq!(s["cache_read_tokens"], 42496);
         assert_eq!(s["cache_write_tokens"], 0);
+        // Droid wrote `cacheCreationTokens: 0`: a real zero, not a missing key.
+        assert_eq!(s["cache_read_reported"], true);
+        assert_eq!(s["cache_write_reported"], true);
         assert_eq!(s["reasoning_tokens"], 1088);
         assert!(s["cost_usd"].is_null());
+    }
+
+    #[test]
+    fn droid_settings_without_cache_keys_say_cache_is_not_reported() {
+        let settings = json!({
+            "model": "claude-sonnet-4-6",
+            "tokenUsage": {"inputTokens": 1200, "outputTokens": 300, "cacheReadTokens": null}
+        });
+        let snap = from_droid_settings(&settings).unwrap();
+        assert_eq!(snap.cache_read_tokens, 0);
+        assert_eq!(snap.cache_write_tokens, 0);
+        assert!(!snap.cache_read_reported, "null counts as not reported");
+        assert!(!snap.cache_write_reported);
+        let s = &snap.to_event(None).unwrap()["autter_usage_snapshot"];
+        assert_eq!(s["cache_read_tokens"], 0);
+        assert_eq!(s["cache_read_reported"], false);
+        assert_eq!(s["cache_write_reported"], false);
+        assert_eq!(s["version"], USAGE_SNAPSHOT_VERSION);
     }
 
     #[test]
@@ -223,11 +268,40 @@ mod tests {
         assert_eq!(snap.cache_read_tokens, 4366);
         assert_eq!(snap.cache_write_tokens, 2183);
         assert_eq!(snap.cost_usd, Some(0.002423));
+        assert!(snap.cache_read_reported);
+        assert!(snap.cache_write_reported);
 
         let event = snap.to_event(None).unwrap();
         assert!(event.get("timestamp").is_none());
         assert_eq!(event["autter_usage_snapshot"]["cost_usd"], 0.002423);
         assert!(event["autter_usage_snapshot"]["model"].is_null());
+        assert_eq!(event["autter_usage_snapshot"]["cache_read_reported"], true);
+        assert_eq!(event["autter_usage_snapshot"]["cache_write_reported"], true);
+    }
+
+    #[test]
+    fn continue_session_usage_without_cache_details_says_not_reported() {
+        // Continue's session total for a provider whose adapter fills no cache
+        // fields (only `cachedTokens` here, no `cacheWriteTokens`).
+        let snap = from_continue_session_usage(&json!({
+            "totalCost": 0.01,
+            "promptTokens": 5000,
+            "completionTokens": 400,
+            "promptTokensDetails": {"cachedTokens": 0}
+        }))
+        .unwrap();
+        assert!(snap.cache_read_reported, "an explicit 0 is reported");
+        assert!(!snap.cache_write_reported);
+
+        let snap = from_continue_session_usage(&json!({
+            "totalCost": 0.01,
+            "promptTokens": 5000,
+            "completionTokens": 400
+        }))
+        .unwrap();
+        assert!(!snap.cache_read_reported);
+        assert!(!snap.cache_write_reported);
+        assert_eq!(snap.cache_read_tokens, 0);
     }
 
     #[test]

@@ -492,6 +492,8 @@ mod tests {
         assert_eq!(usage["output_tokens"], 1450);
         assert_eq!(usage["cache_read_tokens"], 42496);
         assert_eq!(usage["cache_write_tokens"], 0);
+        assert_eq!(usage["cache_read_reported"], true);
+        assert_eq!(usage["cache_write_reported"], true);
         assert_eq!(usage["reasoning_tokens"], 1088);
         assert_eq!(usage["input_includes_cache"], false);
 

@@ -966,4 +966,56 @@ mod tests {
         assert_eq!(result.events[6]["type"], "tool.execution_start");
         assert_eq!(result.events[6]["data"]["toolName"], "read_file");
     }
+
+    /// VS Code Copilot Chat session files (Copilot Chat 0.37) record
+    /// `result.usage` with `promptTokens` / `completionTokens` and a
+    /// `promptTokenDetails` breakdown in percentages: no cache-read or
+    /// cache-write count exists in this source (those come from the OTel
+    /// traces database). The usage that is there is forwarded verbatim.
+    #[test]
+    fn test_chat_session_usage_is_forwarded_and_has_no_cache_counts() {
+        use std::path::PathBuf;
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/copilot_session_multiline.jsonl");
+        let result = CopilotAgent::new()
+            .read_incremental(
+                &fixture,
+                Box::new(ByteOffsetWatermark::new(0)),
+                "test-session",
+            )
+            .unwrap();
+
+        let snapshot =
+            crate::daemon::transcript_redaction::redact_json_secrets(result.events[0].clone());
+        let usage = &snapshot["v"]["requests"][0]["result"]["usage"];
+        assert_eq!(usage["promptTokens"], 9723);
+        assert_eq!(usage["completionTokens"], 33);
+
+        let patch = result
+            .events
+            .iter()
+            .find(|e| e["kind"] == 2 && e["v"][0]["result"]["usage"].is_object())
+            .expect("the request patch with a result");
+        let usage = &patch["v"][0]["result"]["usage"];
+        assert_eq!(usage["promptTokens"], 9948);
+        assert_eq!(usage["completionTokens"], 40);
+
+        for usage in [
+            &snapshot["v"]["requests"][0]["result"]["usage"],
+            &patch["v"][0]["result"]["usage"],
+        ] {
+            let keys: Vec<&str> = usage
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                keys.iter()
+                    .all(|k| !k.to_ascii_lowercase().contains("cache")),
+                "unexpected cache key in {keys:?}"
+            );
+        }
+    }
 }

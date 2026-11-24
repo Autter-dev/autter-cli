@@ -427,6 +427,42 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"].as_u64(), Some(300));
     }
 
+    /// The usage block Claude Code 2.1.x writes (key set observed in real
+    /// transcripts): disjoint `input_tokens`, cache reads, cache writes, and
+    /// the writes split by TTL under `cache_creation`. The 1-hour share must
+    /// reach the backend unchanged, through secret redaction too.
+    #[test]
+    fn test_usage_with_one_hour_cache_writes_is_forwarded() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","uuid":"a1","message":{{"id":"msg_01","role":"assistant","model":"claude-opus-4-6","content":[{{"type":"text","text":"Done."}}],"usage":{{"input_tokens":2,"cache_creation_input_tokens":3482,"cache_read_input_tokens":904018,"output_tokens":460,"output_tokens_details":{{"thinking_tokens":0}},"cache_creation":{{"ephemeral_1h_input_tokens":3000,"ephemeral_5m_input_tokens":482}},"service_tier":"standard"}}}},"timestamp":"2026-11-20T10:00:01Z"}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let result = ClaudeAgent::new()
+            .read_incremental(
+                file.path(),
+                Box::new(ByteOffsetWatermark::new(0)),
+                "test-session",
+            )
+            .unwrap();
+        assert_eq!(result.events.len(), 1);
+        let event =
+            crate::daemon::transcript_redaction::redact_json_secrets(result.events[0].clone());
+        let usage = &event["message"]["usage"];
+        assert_eq!(usage["input_tokens"], 2);
+        assert_eq!(usage["cache_read_input_tokens"], 904018);
+        assert_eq!(usage["cache_creation_input_tokens"], 3482);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 3000);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 482);
+        assert_eq!(usage["output_tokens"], 460);
+    }
+
     fn make_jsonl_line(i: usize) -> String {
         format!(
             r#"{{"type":"user","id":{},"message":{{"content":"msg-{}"}}}}"#,

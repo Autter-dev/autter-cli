@@ -451,6 +451,8 @@ mod tests {
         assert_eq!(usage["output_tokens"], 305);
         assert_eq!(usage["cache_read_tokens"], 4366);
         assert_eq!(usage["cache_write_tokens"], 2183);
+        assert_eq!(usage["cache_read_reported"], true);
+        assert_eq!(usage["cache_write_reported"], true);
         assert_eq!(usage["cost_usd"], 0.002423);
 
         // The snapshot is not a history record: the watermark counts history only.
@@ -462,6 +464,71 @@ mod tests {
             .read_incremental(&fixture, Box::new(RecordIndexWatermark::new(wm.0)), "test")
             .unwrap();
         assert!(again.events.is_empty());
+    }
+
+    /// Newer Continue CLIs keep the provider's raw usage on each assistant
+    /// history item (`message.usage`, snake_case, plus Continue's `model` and
+    /// `cost_cents`). With the Anthropic adapter, `prompt_tokens_details`
+    /// carries `cache_read_tokens` / `cache_write_tokens` and `prompt_tokens`
+    /// excludes them; other adapters pass OpenAI's `cached_tokens` through.
+    /// Both shapes are forwarded verbatim, with no key added or zero-filled.
+    #[test]
+    fn test_assistant_message_usage_cache_fields_are_forwarded() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let json = serde_json::json!({
+            "history": [
+                {"message": {"role": "user", "content": "Fix the test"}},
+                {"message": {"role": "assistant", "content": "Done.", "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 245,
+                    "total_tokens": 257,
+                    "prompt_tokens_details": {"cache_read_tokens": 13248, "cache_write_tokens": 2959},
+                    "model": "claude-sonnet-4-6",
+                    "cost_cents": 2
+                }}},
+                {"message": {"role": "assistant", "content": "Also done.", "usage": {
+                    "prompt_tokens": 20480,
+                    "completion_tokens": 310,
+                    "prompt_tokens_details": {"cached_tokens": 16384},
+                    "model": "gpt-5.2",
+                    "cost_cents": 1
+                }}}
+            ]
+        });
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", json).unwrap();
+        file.flush().unwrap();
+
+        let (events, _) = drain_all(&ContinueAgent::new(), file.path());
+        assert_eq!(events.len(), 3, "no session total, so no snapshot");
+        let events: Vec<_> = events
+            .into_iter()
+            .map(crate::daemon::transcript_redaction::redact_json_secrets)
+            .collect();
+
+        let anthropic = &events[1]["message"]["usage"];
+        assert_eq!(anthropic["prompt_tokens"], 12);
+        assert_eq!(
+            anthropic["prompt_tokens_details"]["cache_read_tokens"],
+            13248
+        );
+        assert_eq!(
+            anthropic["prompt_tokens_details"]["cache_write_tokens"],
+            2959
+        );
+
+        let openai = &events[2]["message"]["usage"];
+        assert_eq!(openai["prompt_tokens"], 20480);
+        assert_eq!(openai["prompt_tokens_details"]["cached_tokens"], 16384);
+        assert!(
+            openai["prompt_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none(),
+            "a key the source lacks stays missing"
+        );
     }
 
     #[test]
